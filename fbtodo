@@ -108,7 +108,7 @@ import textwrap
 import time
 import unicodedata
 
-VERSION = "4.23.0"
+VERSION = "4.24.0"
 HOME = os.path.expanduser("~")
 # FBTODO_HOME points state/lock/log elsewhere — used by the self-check so it never
 # touches the real watcher's files.
@@ -4061,6 +4061,107 @@ def step_shape_bucket(times: dict, task) -> str:
     return shape_of(((times or {}).get(str(task)) or {}).get("shape"))
 
 
+# In plain words: what a WAITING step is probably going to be. It has made no calls, so it
+# has no size and the size memory cannot price it — but it does have its wording. Measured
+# 2026-09-29 over the 170 ticked steps recovered from the CLI journals, a keyword class of
+# that wording predicts the call count well enough that `class x seconds-per-call`, blended
+# 50/50 in log space with the list's pace, beats the pace ALONE on every column: median
+# 2.10x against 2.89x, mean 3.63x against 4.71x, p90 6.37x against 8.48x, and it wins on 74%
+# of steps. Used by itself the label model fixes the median and wrecks the tail, which is
+# exactly why it is only ever a half of the answer.
+CLASS_RULES = (
+    ("deploy", ("deploy", "nas", "ssh", "container", "docker", "publish", "push")),
+    ("run", ("run", "test", "tests", "verify", "execute", "build", "sweep", "selfcheck",
+             "check", "profile", "measure", "bench")),
+    ("docs", ("document", "docs", "readme", "doc", "comment", "comments", "explain")),
+    ("edit", ("add", "write", "fix", "implement", "update", "edit", "change", "refactor",
+              "create", "remove", "delete", "rename", "move", "wire", "retire", "switch")),
+    ("inspect", ("read", "look", "check", "confirm", "find", "search", "examine", "review",
+                 "inspect", "locate", "understand", "explore", "map", "recon", "see")),
+)
+CLASS_WORDS = 64   # words of a label the class test looks at, so a whole paragraph is cheap
+STOP_WORDS = frozenset(
+    "the a an to of and or for in on with into from it its this that is are be as at by "
+    "not no new so if then else my your our their".split()
+)
+
+
+def label_class(task: str) -> str:
+    """The coarse kind of work a step's wording names: deploy / run / docs / edit / inspect."""
+    text = re.sub(r"\([^)]*\)", " ", str(task or "")).lower()
+    words = {w for w in re.findall(r"[a-z0-9]+", text)
+             if len(w) > 1 and w not in STOP_WORDS}
+    for name, needles in CLASS_RULES:
+        if words.intersection(needles):
+            return name
+    return "other"
+
+
+def call_memory_from_log(tasks: dict, now_ms: int | None = None, model: str | None = None) -> dict:
+    """{classes: {cls: calls}, calls: int, rate_ms: int} learned from finished steps.
+
+    The one memory a waiting step can use. Model-aware and age-gated like the span memories,
+    and it counts only real steps (a sub-10 s flip has no shape worth learning from).
+    """
+    now_ms = now_ms or int(time.time() * 1000)
+    cutoff = now_ms - HISTORY_MAX_AGE_DAYS * 86400 * 1000
+    mine: dict[str, list[int]] = {}
+    every: dict[str, list[int]] = {}
+    mine_rate: list[int] = []
+    every_rate: list[int] = []
+    for key, rec in (tasks or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        started, stopped = rec.get("started_ms"), rec.get("done_ms")
+        if not started or not stopped or stopped <= started or stopped < cutoff:
+            continue
+        span = min(stopped - started, EST_CAP_MS)
+        if span < MIN_LABEL_MS:
+            continue
+        total = 0
+        for n in (rec.get("shape") or {}).values():
+            try:
+                total += int(n)
+            except (TypeError, ValueError):
+                continue
+        if total <= 0:
+            continue
+        label = key.split("\x1f", 1)[1] if "\x1f" in key else key
+        cls = label_class(label)
+        every.setdefault(cls, []).append(total)
+        every_rate.append(max(1, round(span / total)))
+        if model and rec.get("model") == model:
+            mine.setdefault(cls, []).append(total)
+            mine_rate.append(max(1, round(span / total)))
+    classes, rates = (mine, mine_rate) if mine else (every, every_rate)
+    if not classes:
+        return {}
+    return {
+        "classes": {c: _median_ms(v) for c, v in classes.items()},
+        "calls": _median_ms([n for v in classes.values() for n in v]),
+        "rate_ms": _median_ms(rates) or 0,
+    }
+
+
+def pending_blend_ms(task: str, pace_ms: int, calls_mem: dict | None) -> int | None:
+    """A waiting step's projection: label-class calls x seconds-per-call, blended with the pace.
+
+    50/50 in log space, which is the geometric mean — and the weight was measured, not
+    chosen (see `call_memory_from_log`). None when there is nothing to blend with, and then
+    the pace stands alone exactly as it did before.
+    """
+    if not calls_mem or not pace_ms:
+        return None
+    calls = (calls_mem.get("classes") or {}).get(label_class(task)) or calls_mem.get("calls")
+    rate = calls_mem.get("rate_ms")
+    if not calls or not rate:
+        return None
+    predicted = int(calls) * int(rate)
+    if predicted <= 0:
+        return None
+    return min(int((predicted * pace_ms) ** 0.5), EST_CAP_MS)
+
+
 # In plain words: one remembered span, read the same way whether it was stored as a bare
 # number (an older build's task log) or as a small record of the samples behind it.
 def hist_med(entry) -> int | None:
@@ -4126,31 +4227,41 @@ def step_pace_ms(times: dict, todos: list, now_ms: int, history: dict | None = N
 # In plain words: one step's estimate, in the order the evidence deserves — what this exact
 # step took before, then what steps of the same SHAPE took, then the list's pace.
 def estimate_for(
-    times: dict, task: str, pace_ms: int, shapes: dict | None = None
+    times: dict, task: str, pace_ms: int, shapes: dict | None = None,
+    calls_mem: dict | None = None,
 ) -> int:
     """One step's projection, from the best evidence available about it."""
-    return task_estimate_ms(task, pace_ms, shapes, step_shape_bucket(times, task))
+    return task_estimate_ms(
+        task, pace_ms, shapes, step_shape_bucket(times, task), calls_mem
+    )
 
 
 # In plain words: the ladder the estimate walks, written once so that no caller can drift
 # from it. `None` for the value means "nothing better than the list's pace was available",
 # and the source it returns is what the error report files the result under.
 def pick_estimate(
-    shapes: dict | None = None, bucket: str = ""
+    task: str, shapes: dict | None = None, bucket: str = "",
+    pace_ms: int | None = None, calls_mem: dict | None = None,
 ) -> tuple[int | None, str]:
-    """(value or None, source) — the shared size memory, else the list's pace.
+    """(value or None, source) — the size memory, then the label blend, then the pace.
 
     There is deliberately no `own wording` rung any more. It was the first rung for a long
     time and, measured 2026-09-29, it never once fired: replayed over the 258 steps recovered
     from the CLI journals, 0 of 170 ticked steps met their own wording in another session
     (172 of the 173 labels ever written have been seen exactly once). A rung that cannot
     answer is not a safety net; it is a branch that only hides the pace under it.
+
+    What replaced it is the other direction: not "has this step run before", but "what kind
+    of step is this" — which is the only question a row that has not STARTED can answer.
     """
     entry = (shapes or {}).get(bucket) if bucket else None
     if isinstance(entry, dict) and int(entry.get("n") or 0) >= SHAPE_MIN_SAMPLES:
         seen = hist_med(entry)
         if seen:
             return min(seen, EST_CAP_MS), "shape"
+    blended = pending_blend_ms(task, pace_ms or 0, calls_mem)
+    if blended:
+        return blended, "blend"
     return None, "pace"
 
 
@@ -4159,8 +4270,9 @@ def task_estimate_ms(
     pace_ms: int,
     shapes: dict | None = None,
     bucket: str = "",
+    calls_mem: dict | None = None,
 ) -> int:
-    """The estimate for one step: the size memory's number, else the list's pace.
+    """The estimate for one step: the size memory, else the label blend, else the pace.
 
     The log remembers every finished step by how big it was — the calls it made (see
     `shape_of`) — so a step already running, whose calls are being counted as it works, is
@@ -4172,7 +4284,7 @@ def task_estimate_ms(
     honest limit of this memory, and the reason `EST REM` — mostly waiting rows — moves
     little as the memory learns.
     """
-    value, _source = pick_estimate(shapes, bucket)
+    value, _source = pick_estimate(task, shapes, bucket, pace_ms, calls_mem)
     return value if value else pace_ms
 
 
@@ -4316,6 +4428,7 @@ def remaining_estimate_ms(
     now_ms: int,
     pace_ms: int,
     shapes: dict | None = None,
+    calls_mem: dict | None = None,
 ) -> int:
     """Projected time still to run, at the pace (and history) learned from finished steps.
 
@@ -4329,7 +4442,7 @@ def remaining_estimate_ms(
     for i, t in enumerate(todos or []):
         if t.get("completed"):
             continue
-        est = estimate_for(times, t.get("task", ""), pace_ms, shapes)
+        est = estimate_for(times, t.get("task", ""), pace_ms, shapes, calls_mem)
         if i == idx:
             elapsed = live_elapsed(
                 (times or {}).get(str(t.get("task", ""))) or {}, now_ms
@@ -4365,6 +4478,7 @@ def total_estimate_ms(
     now_ms: int,
     pace_ms: int,
     shapes: dict | None = None,
+    calls_mem: dict | None = None,
 ) -> int | None:
     """The overall time to reach the goal: what the list has spent plus what is left.
 
@@ -4378,7 +4492,7 @@ def total_estimate_ms(
     spent = elapsed_total_ms(times, todos, now_ms)
     if spent is None:
         return None
-    return spent + remaining_estimate_ms(times, todos, now_ms, pace_ms, shapes)
+    return spent + remaining_estimate_ms(times, todos, now_ms, pace_ms, shapes, calls_mem)
 
 
 def run_variance_ms(times: dict, todos: list, now_ms: int, pace_ms: int) -> int | None:
@@ -4652,6 +4766,10 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
     # with use: wordings never repeat (172 of 173 seen once) while shapes do, so samples
     # accumulate in a bucket instead of scattering one per step name.
     state["task_shapes"] = shape_history_from_log(tasks, now_ms, state.get("model"))
+    # ...and the one memory a WAITING step can use, since it has no calls to size it by: the
+    # calls a step of its KIND makes, and the seconds each of those calls costs (see
+    # call_memory_from_log). This is what prices a pending row, blended with the pace.
+    state["task_calls"] = call_memory_from_log(tasks, now_ms, state.get("model"))
     # What the pane is projecting for the step in flight at this moment, stamped onto its
     # record. The moment that step closes, its estimate and its actual span are a matched
     # pair, and `estimate_error` reads the pair straight back out of the log — which is the
@@ -4662,11 +4780,15 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
         label = str(todos[idx].get("task", ""))
         rec = tasks.get(task_key(session, label))
         if isinstance(rec, dict) and rec.get("started_ms"):
+            pace = step_pace_ms(times, todos, now_ms, state["task_history"])
             value, src = pick_estimate(
+                label,
                 state["task_shapes"],
                 step_shape_bucket(times, label),
+                pace,
+                state.get("task_calls"),
             )
-            rec["est_ms"] = value or step_pace_ms(times, todos, now_ms, state["task_history"])
+            rec["est_ms"] = value or pace
             rec["est_src"] = src
     if persist and json.dumps(log, sort_keys=True) != before:
         try:
@@ -5130,6 +5252,7 @@ def _render_plain(
     times = state.get("task_times") or {}
     history = state.get("task_history") or {}
     shapes = state.get("task_shapes") or {}
+    calls_mem = state.get("task_calls") or {}
     blocks: list[list[str]] = []
     cur_index = current_index(todos)
     pace_ms = step_pace_ms(times, todos, now_ms, history)
@@ -5164,7 +5287,7 @@ def _render_plain(
         # When the token does not fit, it is simply dropped — the duration above, when
         # there is one, has already had its say.
         if not done_flag:
-            est_ms = estimate_for(times, task, pace_ms, shapes)
+            est_ms = estimate_for(times, task, pace_ms, shapes, calls_mem)
             spread = estimate_spread_ms(
                 times, task, shapes, step_shape_bucket(times, task)
             ) or pace_spread_ms(times, todos, now_ms, history)
@@ -5210,7 +5333,7 @@ def _render_plain(
     # finished turn is idle even if the file still says the clock is counting
     cur_elapsed = live_elapsed(cur_rec or {}, now_ms) if step_is_running(state, cur_rec) else None
     cur_est_ms = estimate_for(
-        times, str(current.get("task", "")) if current else "", pace_ms, shapes
+        times, str(current.get("task", "")) if current else "", pace_ms, shapes, calls_mem
     )
     if cur_elapsed is not None:
         working = "working " + (short_duration(cur_elapsed, seconds=True) or "0s")
@@ -5236,13 +5359,13 @@ def _render_plain(
     # all-or-nothing rule they had, and the overall time to the goal is appended after them
     # so a narrow strip gains the total rather than losing the remaining count.
     extra = ""
-    rem_ms = remaining_estimate_ms(times, todos, now_ms, pace_ms, shapes)
+    rem_ms = remaining_estimate_ms(times, todos, now_ms, pace_ms, shapes, calls_mem)
     if rem_ms > 0:
         suffix = " | EST REM: " + (short_duration(rem_ms, seconds=True) or "0s")
         suffix += " | ETA " + fmt_eta(rem_ms, now_ms)
         if _cell_width(progress) + _cell_width(extra) + len(suffix) <= width:
             extra += suffix
-    tot_ms = total_estimate_ms(times, todos, now_ms, pace_ms, shapes)
+    tot_ms = total_estimate_ms(times, todos, now_ms, pace_ms, shapes, calls_mem)
     if tot_ms is not None:
         tot_suffix = " | TOT " + (short_duration(tot_ms) or "0s")
         if _cell_width(progress) + _cell_width(extra) + len(tot_suffix) <= width:
@@ -5728,6 +5851,7 @@ def _render_rich(
     times = state.get("task_times") or {}
     history = state.get("task_history") or {}
     shapes = state.get("task_shapes") or {}
+    calls_mem = state.get("task_calls") or {}
     cur_index = current_index(todos)
     # The pace the whole list is projected at, learned from the steps already finished —
     # and from what those steps took in earlier sessions.
@@ -5760,7 +5884,7 @@ def _render_rich(
         # piped `snap` is a published, script-parsed contract, and a range would change the
         # shape of a token those scripts already match. The framed pane and `fbtodo status`
         # are where the spread is shown (see `fmt_estimate_spread`).
-        est_ms = estimate_for(times, task, pace_ms, shapes)
+        est_ms = estimate_for(times, task, pace_ms, shapes, calls_mem)
         est = fmt_estimate(est_ms)
         budget = max(0, inner - indent - 8)
         if done_flag:
@@ -5865,7 +5989,7 @@ def _render_rich(
     # the pace is the first field to go there, and it went).
     pace_field = f"{fmt_estimate(pace_ms)} · {model}" if model and pace_ms else ""
 
-    rem_ms = remaining_estimate_ms(times, todos, now_ms, pace_ms, shapes)
+    rem_ms = remaining_estimate_ms(times, todos, now_ms, pace_ms, shapes, calls_mem)
     # Vertical room for a row of its own is decided above, where the step rows were fitted.
     spent_ms = elapsed_total_ms(times, todos, now_ms)
     tot_ms = (
@@ -5938,7 +6062,7 @@ def _render_rich(
     # Uppercase, like the title chip: the pane's chrome is one voice, so a badge never
     # mixes `FREEBUFF TODOS` with `All done` in the same frame.
     cur_est_ms = estimate_for(
-        times, current.get("task", "") if current else "", pace_ms, shapes
+        times, current.get("task", "") if current else "", pace_ms, shapes, calls_mem
     )
     over_ms = (cur_elapsed - cur_est_ms) if cur_elapsed is not None else 0
     if cur_elapsed is not None:
@@ -6650,6 +6774,7 @@ def cmd_status(args) -> int:
     model = (view or {}).get("model") or None
     history = task_history_from_log(log.get("tasks") or {}, model=model)
     shapes = shape_history_from_log(log.get("tasks") or {}, model=model)
+    calls_mem = call_memory_from_log(log.get("tasks") or {}, model=model)
     todos = (view or {}).get("todos") or []
     times = (view or {}).get("task_times") or {}
     now_est = int(time.time() * 1000)
@@ -6675,13 +6800,25 @@ def cmd_status(args) -> int:
         print(f"  remembered sizes  : {len(shapes)} kept — {shown}")
     else:
         print("  remembered sizes  : none yet (a size is learned when a step finishes)")
+    # What a WAITING step is priced from: its wording's kind, the calls that kind usually
+    # takes, and what each of those calls costs. Printed because it is the memory behind
+    # every row that has not started, and those are most of what `EST REM` sums.
+    if calls_mem:
+        kinds = ", ".join(
+            f"{k} {v}" for k, v in sorted((calls_mem.get("classes") or {}).items())
+        )
+        print(f"  remembered calls  : {calls_mem.get('calls')} calls x "
+              f"{short_duration(calls_mem.get('rate_ms') or 0, seconds=True)} "
+              f"({kinds})")
+    else:
+        print("  remembered calls  : none yet (a kind is learned when a step finishes)")
     # The one line that answers "is this getting better?" — and the only honest way to
     # answer it, since the estimate and the outcome are both in the log. Split by source so
     # a shape that is pulling its weight shows up as a lower median than the list's pace.
     err = estimate_error(log.get("tasks") or {}, model=model)
     parts = [
         f"{src} {err[src]['med']:.2f}x median over {err[src]['n']}"
-        for src in ("shape", "pace")
+        for src in ("shape", "blend", "pace")
         if err.get(src)
     ]
     if parts:
@@ -6700,14 +6837,17 @@ def cmd_status(args) -> int:
         bucket = step_shape_bucket(times, task)
         entry = shapes.get(bucket) if bucket else None
         samples = len(step_spans_ms(times, todos, now_est))
+        blended = pending_blend_ms(task, pace, calls_mem)
         if isinstance(entry, dict) and int(entry.get("n") or 0) >= SHAPE_MIN_SAMPLES:
             source = f"size {bucket}, {entry.get('n')} sample(s)"
+        elif blended:
+            source = f"label blend, {label_class(task)}"
         else:
             source = f"list pace, {samples} sample(s)" if samples else "list pace"
         spread = estimate_spread_ms(times, task, shapes, bucket) or pace_spread
         print(
             f"  estimate          : {_clip(task, 44)}  "
-            f"{fmt_estimate_spread(estimate_for(times, task, pace, shapes), spread)}"
+            f"{fmt_estimate_spread(estimate_for(times, task, pace, shapes, calls_mem), spread)}"
             f"  ({source})"
         )
     print(f"  scratch           : {scratch_size()} bytes in {SCRATCH}")

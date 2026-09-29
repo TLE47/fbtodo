@@ -1044,6 +1044,32 @@ try:
     assert module.task_estimate_ms("anything", 600_000, {}, "") == 600_000
     say("estimates: the size only answers behind a same-sized step: ok")
 
+    # ---- a WAITING step has made no calls, so it has no size — but it does have its
+    #      wording, and its kind of work is a real predictor. Measured 2026-09-29 over the
+    #      170 ticked steps recovered from the CLI journals: `class x seconds-per-call`,
+    #      blended 50/50 in log space with the pace, beats the pace alone on the median
+    #      (2.10x against 2.89x), the mean (3.63x against 4.71x) and the p90 (6.37x vs
+    #      8.48x), and wins on 74% of steps. Alone the label model wrecks the tail, so it is
+    #      only ever a half of the answer.
+    assert module.label_class("Run the tests") == "run"
+    assert module.label_class("Update the README") == "docs"
+    assert module.label_class("Deploy to the NAS") == "deploy"
+    assert module.label_class("frobnicate the widget") == "other"
+    cm = {"classes": {"run": 4, "edit": 8}, "calls": 5, "rate_ms": 30_000}
+    # 4 calls x 30s = 2m, blended with an 8m pace = sqrt(120_000 * 480_000) = 4m
+    assert module.pending_blend_ms("Run the tests", 480_000, cm) == 240_000
+    assert module.task_estimate_ms("Run the tests", 480_000, {}, "", cm) == 240_000
+    assert module.pick_estimate("Run the tests", {}, "", 480_000, cm) == (240_000, "blend")
+    # a size that IS known still wins: the blend is for rows with no calls yet
+    assert module.pick_estimate(
+        "Run the tests", {"calls2": {"med": 90_000, "n": 2}}, "calls2", 480_000, cm
+    ) == (90_000, "shape")
+    # no call memory (a fresh log): nothing to blend, and the pace stands alone
+    assert module.pick_estimate("Run the tests", {}, "", 480_000, {}) == (None, "pace")
+    assert module.task_estimate_ms("Run the tests", 480_000, {}, "", {}) == 480_000
+    assert module.pending_blend_ms("Run the tests", 0, cm) is None
+    say("estimates: a waiting step is priced from its wording, blended with the pace: ok")
+
     # ...which the pane's journal reader has to know in the first place: the model comes
     # out of the same backward pass that finds the list, with no json parse per line.
     model_home = os.path.join(TEST_HOME, "model-home")
@@ -2308,10 +2334,10 @@ try:
     # ...and the source is named, so the error report knows which rung of the ladder missed:
     # two remembered `calls2` steps at 10s and 30s stand behind this one
     assert e_rec["est_src"] == "shape", e_rec
-    assert mod.pick_estimate({}, "") == (None, "pace")
-    assert mod.pick_estimate(shapes, "calls2") == (20_000, "shape")
-    # the retired `own` rung is never a source any more: only size and pace remain
-    assert mod.pick_estimate(shapes, "calls9") == (None, "pace")
+    assert mod.pick_estimate("anything", {}, "") == (None, "pace")
+    assert mod.pick_estimate("e-one", shapes, "calls2") == (20_000, "shape")
+    # the retired `own` rung is never a source any more: only size, blend and pace remain
+    assert mod.pick_estimate("e-one", shapes, "calls9") == (None, "pace")
 
     # ---- did the estimates get better? The pair (projection, outcome) is in the records, so
     #      the answer is computed from them per source rather than kept in a tally of its own

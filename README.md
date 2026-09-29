@@ -636,8 +636,11 @@ Which is where most of the care in this tool has gone.
   seconds move even when nothing else does.
 - **Estimates** ride the same row as the duration: `~1m` for a pending step, `4m10s / ~3m`
   for the active one. The number walks a ladder of evidence: what steps of the same **size**
-  took — the calls a step has made so far, log-binned (`calls2` is 4-7 calls) — then the
-  list's own pace. All of it lives in `~/.freebuff/fbtodo-tasks.json`.
+  took — the calls a step has made so far, log-binned (`calls2` is 4-7 calls) — else what
+  steps of the same **kind** took, read from the wording (a `run`-ish step's usual number of
+  calls times what a call costs), blended half-and-half with the list's own pace. All of it
+  lives in `~/.freebuff/fbtodo-tasks.json`. A step that has made no calls *and* has nothing
+  to blend still falls back to the pace, so a fresh log behaves exactly as it always did.
 - **A step under 10 s is a list flip, not work.** It is shown on its row, but it sets no pace
   and enters no memory: measured 2026-09-29, a 2 s flip had once projected a whole list at
   `~2s` while the next step took 1m53s.
@@ -648,7 +651,8 @@ Which is where most of the care in this tool has gone.
   behind every number, so `~2m, 1 sample` and `~2m, 9 samples` are told apart. A piped
   `snap` deliberately keeps the bare `~2m`: that token is a published contract.
 - **Every estimate is scored once the step closes**, and `fbtodo status` shows the running
-  result by source (e.g. `shape 1.8x median over 9 · pace 3.4x median over 31`; the numbers
+  result by source (e.g. `shape 1.8x median over 9 · blend 2.2x median over 40 · pace 3.4x
+  median over 31`; the numbers
   are whatever your own steps did).
   A factor of 1.0x would be exact; two steps that took twice their estimate and half of it
   count the same. That line is the only honest answer to "are these numbers getting
