@@ -6,6 +6,10 @@ Entries start at the newest release; each one is a contract change, not a diff.
 ## Unreleased
 
 ### Changed
+- `render` takes the palette and the colour depth as arguments (resolved from the environment only
+  when they are left out), so a frame is a function of the state, the clock and the size it was
+  asked for — what a recorded frame and a row-by-row repaint both need. The depth still changes
+  only the ink.
 - The task log is an **append-only stream** (`fbtodo-tasks.jsonl`); `fbtodo-tasks.json` is a
   fold of it carrying the offset it was folded to (`events`). A poll appends the records it
   actually changed instead of rewriting the log, and an append that lands without the rewrite
@@ -37,11 +41,26 @@ Entries start at the newest release; each one is a contract change, not a diff.
 ### Added
 - `tests/golden.py` plus recorded `json` / `bar` / `snap` / frame output: the display
   contract, checked against fixtures with a frozen clock, and the checker itself checked by
-  the suite pointing it at a mutated copy.
+  the suite pointing it at a mutated copy. Recorded frames also cover a **finished** list, a list
+  longer than the pane and a narrow strip, and the environment now pins `TZ` — the frames tick a
+  local clock, so without it a golden only matched on the machine that recorded it.
 - The self-check reads the package statically and fails when a module loads a name that nothing
   under `fbtodo/` provides — a forgotten layer, caught before the line that needs it runs.
 
+### Performance
+- The pane repaints only the rows that changed, in place, and writes **nothing** when the frame
+  is unchanged (it used to clear the screen and write the whole frame on every tick: measured on
+  a live pane, 3,384 → 773 B/s and one screen clear instead of one per second). A frame whose
+  shape moved is still painted whole. `pane_repaint` is the whole of it, and the contract is in
+  the self-check.
+
 ### Fixed
+- No frame is wider than the pane it was asked for: the goal and `now` lines wrapped at a floor
+  of 16 columns, the plain strip's bar kept a six-cell minimum, and a 12-column pane was drawn
+  14–16 cells wide (which wraps, and takes the frame's shape with it). Nor taller: a five-row pane
+  showing a long list stayed nine rows tall, and three early returns skipped the fit-down pass
+  entirely. `_clamp_widths`/`_clamp_rows` are the guarantee now, and the self-check sweeps seven
+  widths by seven heights over a long list, an empty one and both renderers.
 - The phone's summary line had its markdown left in (`**Goal:**`, backticks, emphasis): two
   helpers were both called `_plain` and the renderer's ANSI-stripper, defined later in the file,
   won every call. The prose one is `prose_text` now.

@@ -171,7 +171,11 @@ network.
    noticing a session in tmux with no pane.
 2. The pane's `ensure_daemon` starts a watcher for that instance, if there is not one.
 3. The watcher polls the store, writes `fbtodo-state.json`, and runs the watches on their
-   clocks. The pane repaints from the state file, on its own faster clock.
+   clocks. The pane repaints from the state file, on its own faster clock — and only the rows
+   that **moved** are written (`pane_repaint`): an unchanged frame writes nothing at all, a
+   changed row is one addressed rewrite, and only a frame whose shape moved (a resize, the
+   first paint) is painted whole. Measured on a pane whose step clock and footer are running:
+   3,384 → 773 B/s, and one screen clear instead of one per tick.
 4. When the instance exits, the pane exits; the watcher drops its lock and stops; the keeper
    stops once no freebuff is left (after a grace period, because the wrapper splits the pane
    *before* the CLI exists).
@@ -182,6 +186,24 @@ network.
 The keeper has its own lock on purpose: sharing the watcher's meant a watcher for another
 source could hold the lock while a local window's pane was gone, and the pane never came
 back.
+
+## The frame's contract
+
+`render(state, color, watching, width, height, now_ms, theme, truecolor)` is the whole of it. Two
+of those are the reason a frame can be a recorded contract at all: the **palette** and the
+**colour depth** are arguments, resolved by `render` only when they are left out, so with a state
+and a frozen clock the same bytes come back whatever the terminal, the env or the theme files say
+(what `tests/golden.py` checks). The depth changes the ink, never the layout: a 256-colour pane
+and a 24-bit one disagree about escape sequences and nothing else.
+
+The frame also fits the pane it was asked for, always, and that is enforced rather than intended:
+`_clamp_widths` cuts every row of whichever renderer ran to `width`, and `_clamp_rows` cuts the
+frame to `height`, keeping the ends (the title row and the bar/footer, or the bottom border) and
+letting the middle — the list — give way. The rows each have their own budget; these two are the
+guarantee behind them, and they are no-ops for a frame that already fits (`tests/golden` proves
+it: not one recorded row moved when they were added). Below 30 columns there is no room for a
+box, so the plain strip is drawn even on a colour terminal — the same rule that decides what
+`snap` prints.
 
 ## Conventions worth keeping
 
