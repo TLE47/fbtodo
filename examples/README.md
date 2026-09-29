@@ -37,10 +37,12 @@ and new ones are very welcome.
 
 ## `fb`: the launcher
 
-Source [`fb.sh`](fb.sh) from your shell startup file and `fb` replaces `freebuff`: it opens
-the todo pane bound to the session it is about to start, then runs the agent in the current
-pane. `--instance-of $$` is what makes the pane follow *that* session rather than whichever
-one is newest in the directory, and `FBTODO_NO_PANE=1` still turns the pane off.
+Source [`fb.sh`](fb.sh) from your shell startup file and `fb` replaces `freebuff`. It does
+three things in the order that matters: refreshes the released CLI (`npm i -g freebuff`,
+quiet unless the version moved — `FREEBUFF_NO_REFRESH=1` skips it, which scripts and tests
+want), opens the todo pane bound to the session it is about to start, then runs the agent in
+the current pane. `--instance-of $$` is what makes the pane follow *that* session rather than
+whichever one is newest in the directory, and `FBTODO_NO_PANE=1` still turns the pane off.
 
 If you would rather have the short name on the tool instead, the same file ends with the
 one-line alternative: `alias ft=fbtodo` (`ft snap`, `ft bar`, `ft why`).
