@@ -3605,6 +3605,69 @@ try:
     assert "no step carries a forecast yet" in mod.fmt_ledger([], t0, None, 20)
     say("estimates: `fbtodo ledger` prints the vector beside the outcome: ok")
 
+    # ---- and the verdict is not a number a reader has to take on faith: `doctor` prints the
+    #      pair, who won, how lopsided the draws were and the sample they came from, and
+    #      `fbtodo ledger` prints the same sentence over the rows underneath it. A pair nobody
+    #      has scored is left out rather than printed as a draw.
+    note = mod.duel_note("pace", "blend", duel)
+    assert note == ("pace beats blend — 1.00 of 4,000 draws over 16 step(s) in 4 session(s)"), note
+    assert mod.duel_note("pace", "blend", tied).startswith("pace vs blend — unresolved, "), note
+    assert mod.duel_note("pace", "blend", tied).endswith("16 step(s) in 4 session(s)"), note
+    assert "4,000" in note and mod.DUEL_RESAMPLES == 4_000, note
+    # ...and a bootstrap over ONE session cannot resample anything: every draw is the sample
+    # it started from, so the share comes back at 1.0 and would crown whichever rung led by
+    # an accident of one session. Below the floor the duel reports the sample, not a winner.
+    one = mod.rung_duel(mod.ledger_rows(
+        {k: v for k, v in duel_log.items() if k.startswith("S1\x1f")}, t0 + 1000, None, "m/e"),
+        "pace", "blend")
+    assert one["steps"] == 4 and one["sessions"] == 1 and one["winner"] is None, one
+    assert f"needs {mod.DUEL_MIN_SESSIONS} session(s)" in mod.duel_note("pace", "blend", one), one
+    # the ledger carries the sentence, once, and only for a pair that was scored
+    led = mod.fmt_ledger(rows, t0 + 1000, None, 0)
+    assert note in led, led
+    assert led.count("rung duel") == 1, led
+    only_pace = mod.ledger_rows({mod.task_key("P", "one"): {
+        "started_ms": t0, "done_ms": t0 + 100_000, "model": "m/e", "fc": {"pace": 100_000}}},
+        t0 + 1000, None, "m/e")
+    assert "rung duel" not in mod.fmt_ledger(only_pace, t0 + 1000, None, 0)
+    # ...and the surface a reader actually runs: a real `status` over a real log of its own,
+    # where the interval beside the median has to appear and the duel has to name its winner.
+    # Its own FBTODO_HOME, because the task log is read from a path decided at import and this
+    # check is about what the command prints, not about what the suite's log happens to hold.
+    duel_home = os.path.join(TEST_HOME, "duel-home")
+    shutil.rmtree(duel_home, ignore_errors=True)
+    os.makedirs(duel_home, exist_ok=True)
+    # a wall-clock base rather than the synthetic `t0` this block scores against: the child is
+    # the real program, and its log is read inside a 60-day window, so a 1970 fixture is
+    # correctly invisible to it — which is exactly how this check first failed.
+    fresh = int(time.time() * 1000)
+    duel_log_rows = {}
+    for sess in ("D1", "D2", "D3", "D4"):
+        for n in range(4):
+            duel_log_rows[mod.task_key(sess, f"step {n}")] = {
+                "started_ms": fresh - 100_000, "done_ms": fresh, "model": "m/e",
+                "fc": {"at": fresh - 100_000, "v": "9.9.9",
+                       "pace": 100_000 * (n + 1), "blend": 500_000},
+            }
+    # the file name because `mod`'s own TASKS_PATH is pointed at the suite's unit fixture,
+    # and the child decides its path at import — the same reason the status-home checks above
+    # name the file rather than reading it off the module
+    with open(os.path.join(duel_home, "fbtodo-tasks.json"), "w") as fh:
+        json.dump({"schema": mod.TASKLOG_SCHEMA, "tasks": duel_log_rows}, fh)
+    sproc = subprocess.run(
+        [sys.executable, FB, "status"], capture_output=True, text=True, cwd=CWD,
+        env=dict(env, FBTODO_HOME=duel_home), timeout=90,
+    )
+    sout = sproc.stdout
+    assert "task records      : 16 kept" in sout, sout[-800:]
+    # the spread of the pace rung — ratios 1..4, so the 10th percentile is its own sample's
+    # smallest and the 90th its largest — printed beside the median it belongs to, while a
+    # rung whose every sample is the same ratio prints no bracket at all
+    assert "[1.00–4.00]" in sout, sout[-800:]
+    assert "blend 5.00x over 16" in sout, sout[-800:]
+    assert "rung duel         : pace beats blend" in sout, sout[-800:]
+    say("estimates: `status` shows each rung's spread, and who won the duel: ok")
+
     # ---- and how far the log is from re-choosing its own constants: the clip is consulted
     #      only on a young list, and moves the number only sometimes, so the count that
     #      governs it is the second one. Measured over the 161-span replay, 157 of those spans
