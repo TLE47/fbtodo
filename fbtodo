@@ -7345,6 +7345,120 @@ def daemon_loop(args) -> int:
     return stop_code
 
 
+def cmd_doctor(args) -> int:
+    """Whether this machine can show a pane, and what to fix when it cannot.
+
+    Every question here is one the tool asks for real somewhere else in this file — tmux,
+    a writable scratch dir, the terminal's colour story, the tools discovery needs — asked
+    all at once and ANSWERED rather than assumed. `ok` needs no action, `warn` is a
+    preference that is not met (a pane still works), `FAIL` is something that stops one,
+    and any FAIL exits non-zero: that is what makes this a gate a wrapper or a CI job can
+    call, rather than a paragraph of advice. `--json` is the same list for a machine.
+    """
+    checks: list = []  # (level, name, detail)
+
+    py = sys.version_info
+    checks.append(("ok" if py >= (3, 9) else "FAIL", "python",
+                   f"{py.major}.{py.minor}.{py.micro} at {sys.executable}"))
+
+    tmux_bin = TMUX_BIN[0] if TMUX_BIN else "tmux"
+    if not _shutil.which(tmux_bin):
+        checks.append(("FAIL", "tmux", f"no {tmux_bin} on PATH — a pane cannot be opened"))
+    else:
+        ver = ""
+        try:
+            ver = subprocess.run(TMUX_BIN + ["-V"], capture_output=True, text=True,
+                                 timeout=5).stdout.strip()
+        except Exception:
+            ver = ""
+        checks.append(("ok" if ver else "warn", "tmux", ver or "present, but would not answer -V"))
+        feats = ""
+        try:
+            feats = subprocess.run(TMUX_BIN + ["show", "-gv", "terminal-features"],
+                                   capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            feats = ""
+        if not feats:
+            checks.append(("warn", "tmux colour", "no server to ask (a pane will start one)"))
+        elif "RGB" in feats:
+            checks.append(("ok", "tmux colour", "RGB in terminal-features"))
+        else:
+            # tmux's own forwarding story, which is NOT what the pane's colours are decided
+            # by (that is the `colour` line below, from COLORTERM/TERM): a server without
+            # RGB takes the 256-colour palette, and the pane knows it.
+            checks.append(("warn", "tmux colour",
+                           "no RGB in terminal-features — tmux forwards 256 colours"))
+
+    truecolor = _supports_truecolor()
+    checks.append(("ok" if truecolor else "warn", "colour",
+                   f"{'24-bit' if truecolor else '256-colour'} "
+                   f"(TERM={os.environ.get('TERM') or '—'}, "
+                   f"COLORTERM={os.environ.get('COLORTERM') or '—'})"
+                   + ("" if truecolor else " — COLORTERM=truecolor gets the designed palette")))
+    loc = os.environ.get("LC_ALL") or os.environ.get("LC_CTYPE") or os.environ.get("LANG") or ""
+    enc = sys.stdout.encoding or ""
+    utf8 = "utf" in loc.lower() or "utf" in enc.lower()
+    checks.append(("ok" if utf8 else "warn", "locale",
+                   f"{loc or 'unset'} / stdout {enc or '—'}"
+                   + ("" if utf8 else " — the frame's glyphs need a UTF-8 locale")))
+
+    for tool, level, why in (
+        ("ps", "FAIL", "the process table is how the instance is found"),
+        ("lsof", "warn" if os.path.isdir(PROC_ROOT) else "FAIL", "cwd discovery"),
+    ):
+        found = _shutil.which(tool)
+        checks.append(("ok", tool, found) if found else (level, tool, f"missing — {why}"))
+    checks.append(("ok", "cwd source",
+                   f"/proc at {PROC_ROOT}" if os.path.isdir(PROC_ROOT) else "lsof (no /proc)"))
+
+    try:
+        os.makedirs(SCRATCH, mode=0o700, exist_ok=True)
+        probe = os.path.join(SCRATCH, ".fbtodo-doctor-probe")
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("ok")
+        os.unlink(probe)
+        checks.append(("ok", "scratch", SCRATCH))
+    except OSError as exc:
+        checks.append(("FAIL", "scratch", f"{SCRATCH}: {exc.__class__.__name__}"))
+    holder = lock_holder(LOCK_PATH)
+    checks.append(("ok" if holder else "warn", "watcher",
+                   f"pid {holder} holds {os.path.basename(LOCK_PATH)}" if holder
+                   else "not running (a pane starts one)"))
+
+    kit = os.path.dirname(NAS_NOTIFY)
+    if not os.path.isdir(kit):
+        checks.append(("warn", "notify kit", f"not installed ({kit}) — panes work, bells do not"))
+    else:
+        missing = [n for n in ("phone.sh", "todo-bell.py", "bell.sh")
+                   if not os.path.exists(os.path.join(kit, n))]
+        checks.append(("warn", "notify kit", f"missing {', '.join(missing)}") if missing
+                      else ("ok", "notify kit", kit))
+
+    inst, inst_cwd = find_instance(os.path.realpath(os.getcwd()))
+    checks.append(("ok", "instance", f"freebuff pid {inst} in {inst_cwd}") if inst
+                  else ("warn", "instance",
+                        "no freebuff for this directory — a watcher here would exit 66"))
+
+    fails = [c for c in checks if c[0] == "FAIL"]
+    warns = [c for c in checks if c[0] == "warn"]
+    if args.json:
+        json.dump({"version": VERSION, "ok": not fails, "fail": len(fails),
+                   "warn": len(warns),
+                   "checks": [{"level": lv, "name": name, "detail": detail}
+                              for lv, name, detail in checks]},
+                  sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 1 if fails else 0
+    ink = {"ok": "2", "warn": "33", "FAIL": "1;31"}
+    c = paint(use_color())
+    print(f"{c('1', 'fbtodo doctor')}  {c('2', VERSION)}")
+    for level, name, detail in checks:
+        print(f"  {c(ink[level], level.ljust(4))} {name.ljust(11)} {detail}")
+    print(f"  {len(checks) - len(warns) - len(fails)} ok · {len(warns)} warn · {len(fails)} fail"
+          + (f"   first problem: {fails[0][1]}" if fails else ""))
+    return 1 if fails else 0
+
+
 def cmd_stop(args) -> int:
     pid = daemon_pid()
     if not pid:
@@ -8445,7 +8559,7 @@ def build_parser():
     )
     ap.add_argument("command", nargs="?", default="pane",
                     choices=["pane", "snap", "json", "bar", "daemon", "stop", "status",
-                             "prune", "nas", "pane-watch", "pin", "why", "ledger"])
+                             "prune", "nas", "pane-watch", "pin", "why", "ledger", "doctor"])
     ap.add_argument(
         "--label-floor", type=float, default=None, metavar="SEC",
         help="estimates: a finished span under SEC is not evidence — it sets no pace and "
@@ -8633,6 +8747,8 @@ def main(argv=None) -> int:
         return cmd_stop(args)
     if args.command == "status":
         return cmd_status(args)
+    if args.command == "doctor":
+        return cmd_doctor(args)
     if args.command == "prune":
         return cmd_prune(args)
     if args.command == "ledger":

@@ -519,6 +519,28 @@ try:
     module._FREEBUFF_WHICH[:] = saved_which
     say("discovery: a launcher's argv is matched by shape, and a probe that names it is not: ok")
 
+    # ---- doctor: the machine's own answer, as a gate. A machine with the tools a pane
+    #      needs passes and exits 0; one that cannot even write its scratch dir says so and
+    #      exits non-zero, which is what makes this callable from a wrapper or CI.
+    doc = run("doctor")
+    djson = json.loads(run("doctor", "--json").stdout)
+    assert djson["version"] == module.VERSION and isinstance(djson["checks"], list), djson
+    assert {c["level"] for c in djson["checks"]} <= {"ok", "warn", "FAIL"}, djson
+    if shutil.which("tmux") and shutil.which("ps"):
+        assert doc.returncode == 0, (doc.returncode, doc.stdout[-300:])
+        assert djson["ok"] is True and djson["fail"] == 0, djson
+        assert "0 fail" in doc.stdout, doc.stdout[-200:]
+    else:  # a machine without tmux/ps is exactly the case doctor exists for
+        assert djson["ok"] is False and djson["fail"] >= 1, djson
+        assert doc.returncode != 0 and "FAIL" in doc.stdout, doc.stdout[-300:]
+    broken = subprocess.run(
+        [sys.executable, FB, "doctor"], capture_output=True, text=True, cwd=CWD,
+        env=dict(env, PATH="/nonexistent"), timeout=30,
+    )
+    assert broken.returncode != 0, (broken.returncode, broken.stdout[-300:])
+    assert "FAIL" in broken.stdout and "tmux" in broken.stdout, broken.stdout[-300:]
+    say("doctor: a healthy machine passes, and a missing tool fails with a non-zero exit: ok")
+
     old = module.finish_state(
         {"session": "S1", "todos": [{"task": "a", "completed": True}]}, None
     )

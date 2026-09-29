@@ -513,6 +513,12 @@ conventions that make a list worth watching.
 `bar` is the one built for a status line, and the dash is deliberate: `todos -` is something
 you can read at a glance, where an empty string would look like the command failed.
 
+`fbtodo doctor` answers a different question — can this machine show a pane at all? It asks
+the things the tool asks for real (python, `tmux` and its RGB story, `COLORTERM`/`TERM`, the
+locale, `ps` and `lsof`, the scratch dir's writability, the notify kit, whether a freebuff is
+running here) and prints one line each, `ok` / `warn` / `FAIL`. Any `FAIL` exits non-zero, so
+a wrapper or a CI job can gate on it; `fbtodo doctor --json` is the same list for a machine.
+
 **When a session has no list**, the pane says so in words rather than drawing an empty frame,
 and the words differ by cause:
 
