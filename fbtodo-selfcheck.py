@@ -46,6 +46,14 @@ def bar_row_of(framed: str) -> str:
     raise AssertionError(f"no progress row in the frame:\n{framed}")
 
 env = dict(os.environ, FBTODO_HOME=TEST_HOME)
+# ...and the state root in THIS process too, which is not only about `env`. The module
+# instances this script loads in-process (`module`, `mod`, `mp`, `panes_mod`) fix their
+# state and task-log paths at import, and so does a `fbtodo` a phase spawns without an
+# explicit `env` — a module loaded with the real root writes the real log. Found
+# 2026-09-29: the live task stream held a fixture session's events, appended by a phase
+# while the throwaway home sat there empty. The root is decided at import, so this is the
+# one place that covers every one of them.
+os.environ["FBTODO_HOME"] = TEST_HOME
 # The phone notifiers, muted for the whole run — in THIS process's environment too, not
 # just in `env`. Some phases start a REAL watcher (the zshrc autostart hook inherits the
 # shell's environment), and a real watcher reading the fixture's dead-looking session
