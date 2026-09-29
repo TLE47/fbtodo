@@ -142,6 +142,41 @@ fbtodo --instance-of $$    # the list for the agent running in this pane
 `--instance-of` is how a wrapper — or you — attaches a pane to a specific session rather
 than to whatever is newest in the directory.
 
+### One word: `fb`
+
+Typing `freebuff` *and* remembering to open a pane is friction, and friction is what decides
+whether a pane ever gets used. Source [`examples/fb.sh`](examples/fb.sh) from `~/.zshrc` or
+`~/.bashrc` and `fb` does both — the pane first, the agent second:
+
+```sh
+fb() {
+    case "$1" in
+        -h|--help|-V|--version) command freebuff "$@"; return $? ;;   # one-shots: no pane
+    esac
+
+    if [ -n "${TMUX:-}" ] && [ -z "${FBTODO_NO_PANE:-}" ] && command -v fbtodo >/dev/null 2>&1; then
+        tmux split-window "-${FBTODO_SPLIT:-v}" -l "${FBTODO_PANE_SIZE:-12}" -d \
+            "fbtodo --instance-of $$ --stale-after 0"
+    fi
+
+    command freebuff "$@"
+}
+```
+
+Four things in there are worth knowing:
+
+- **`--instance-of $$`** binds the pane to the session *this shell* launches, not to the
+  newest one in the directory — the difference between your pane and somebody else's list.
+- **`-d`** places the pane without stealing the cursor, so the agent still starts here.
+- **`--stale-after 0`** says a quiet transcript is never the reason to close: `0` is the
+  tool's "never" for store silence, so the session's own lifecycle decides.
+- **`FBTODO_NO_PANE=1`** turns the pane off; `FBTODO_SPLIT=h` and `FBTODO_PANE_SIZE=N` size
+  it. A pane killed by hand comes back on its own while the session lives.
+
+If you would rather have the short name on the tool itself, the alternative is one line:
+`alias ft=fbtodo` — then `ft snap`, `ft bar`, `ft why`. Or `alias fb=fbtodo` if you would
+rather launch the agent with `freebuff` and keep the short word for the pane.
+
 ### See it move
 
 [`docs/demo`](docs/demo) is a demo harness: a fixture session, a driver that replays it, and
@@ -572,6 +607,7 @@ welcome; each item below is scoped so one person could land it.
 | Idea | Why it would matter |
 |---|---|
 | **`brew install fbtodo` + `uvx fbtodo` + a one-line installer** | Removing "clone and symlink" is the single biggest adoption lever. |
+| **`fb` as a first-class command** — ship the launcher, or a `fbtodo init` that writes it into your shell startup file | One word to launch an agent *and* its pane; today it is a snippet to paste. |
 | **`fbtodo board` — all live sessions in one pane** | People run two or three agents at once. One pane showing every session, its list and its clock beats switching windows. |
 | **`fbtodo serve` — a read-only web mirror** | Watch from your phone or another machine, no ssh. Pairs with the notify kit you already have. |
 | **Theme presets and `fbtodo theme`** (`catppuccin`, `gruvbox`, `nord`, `dracula`, `--preview`) | [`examples/`](examples) ships three hand-written presets today; a picker would make it a gallery. |
@@ -607,8 +643,9 @@ tests to copy). The self-check below is the contract — a change is done when i
 ## Examples
 
 [`examples/`](examples) is a folder of copy-paste-able starting points, none of them
-required: a tmux status line, three theme presets (Catppuccin, Gruvbox, Nord), and the
-remote marker wrapper as a file you can read. See [examples/README.md](examples/README.md).
+required: the [`fb` launcher](examples/fb.sh), a tmux status line, three theme presets
+(Catppuccin, Gruvbox, Nord), and the remote marker wrapper as a file you can read. See
+[examples/README.md](examples/README.md).
 
 ---
 

@@ -30,6 +30,12 @@ Sleep 200ms
 # the name in it — out of a published GIF.
 Type "export FBTODO_HOME=/tmp/fbtodo-demo FBTODO_PATCH_LOG=$PWD/docs/demo/fixture/patch.log FBTODO_ALERT_LOG=$PWD/docs/demo/fixture/phone.log"
 Enter
+Sleep 200ms
+# A pane watching this fixture would reach "done and the turn ended" — which is a real bell
+# on a machine with the notify kit installed. Point the watches at a path that does not
+# exist and they are skipped, so recording a demo cannot ring anyone's phone.
+Type "export FBTODO_NOTIFY=/none FBTODO_DROP=/none FBTODO_ASK=/none FBTODO_PAUSE=/none FBTODO_PANE_BELL=/none"
+Enter
 Sleep 400ms
 Type "docs/demo/drive.sh &"
 Enter

@@ -37,9 +37,15 @@ sh docs/demo/drive.sh
 ```sh
 export FBTODO_HOME=/tmp/fbtodo-demo \
        FBTODO_PATCH_LOG=$PWD/docs/demo/fixture/patch.log \
-       FBTODO_ALERT_LOG=$PWD/docs/demo/fixture/phone.log
+       FBTODO_ALERT_LOG=$PWD/docs/demo/fixture/phone.log \
+       FBTODO_NOTIFY=/none FBTODO_DROP=/none FBTODO_ASK=/none \
+       FBTODO_PAUSE=/none FBTODO_PANE_BELL=/none
 fbtodo pane --no-daemon --chat docs/demo/fixture -i 0.5 --tick 0.5 --stale-after 0
 ```
+
+The five `/none` paths are the notify kit's watches, pointed at a file that does not exist so
+fbtodo skips them. The fixture *does* reach "done, and the turn ended" — which is a real bell
+(and a real push) on a machine with the kit installed. The demo should not ring your phone.
 
 `--chat` takes a directory, `--no-daemon` skips instance detection (there is no Freebuff
 process behind this list), and `--stale-after 0` says "never treat it as stale, keep

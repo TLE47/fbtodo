@@ -5,6 +5,7 @@ configuration at all — and none of them touches the tool's code.
 
 | File | What it is |
 |---|---|
+| [`fb.sh`](fb.sh) | the `fb` launcher: agent and its pane in one word |
 | [`tmux.conf`](tmux.conf) | `fbtodo bar` in your tmux status line — progress at a glance, no pane |
 | [`theme-catppuccin-mocha.json`](theme-catppuccin-mocha.json) | a theme preset (24-bit colour) |
 | [`theme-gruvbox-dark.json`](theme-gruvbox-dark.json) | a theme preset |
@@ -34,6 +35,16 @@ also takes a raw SGR code (`"1;36"`) if you want the terminal's own colour; the 
 
 The presets here are plain hand-written files: a two-line change is all a pull request needs,
 and new ones are very welcome.
+
+## `fb`: the launcher
+
+Source [`fb.sh`](fb.sh) from your shell startup file and `fb` replaces `freebuff`: it opens
+the todo pane bound to the session it is about to start, then runs the agent in the current
+pane. `--instance-of $$` is what makes the pane follow *that* session rather than whichever
+one is newest in the directory, and `FBTODO_NO_PANE=1` still turns the pane off.
+
+If you would rather have the short name on the tool instead, the same file ends with the
+one-line alternative: `alias ft=fbtodo` (`ft snap`, `ft bar`, `ft why`).
 
 ## The status line
 
