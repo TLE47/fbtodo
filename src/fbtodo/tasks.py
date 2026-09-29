@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import tempfile
 import time
+import zlib
 from .base import *  # noqa: F401,F403 — the package is one namespace
 
 def scratch_size() -> int:
@@ -166,6 +168,25 @@ LIST_BEHIND_MS = 10 * 60_000   # a FINISHED list this far behind a still-writing
 MIN_TASK_TEXT = 18              # columns a tagged row keeps for the task text itself
 
 
+# A rung's score is a distribution, not a number: two rungs can share a median off very
+# different spreads, and a median alone cannot say whether the next step will land where the
+# last one did. `lo`/`hi` are the 10th and 90th percentile of the ratios by nearest rank —
+# the sample's own values, no interpolation, because with eleven steps an interpolated
+# quantile would be arithmetic on nothing. The tails are deliberately dropped rather than
+# reported: what a rung did on its very worst step is `worst`, and letting that one step
+# define the interval would make every rung look equally uncertain.
+SPREAD_LO_PCT = 10              # percentile a rung's low end is read at
+SPREAD_HI_PCT = 90              # ...and its high end
+
+# Judging a duel. Both rungs are scored on the SAME steps — paired, so neither can win by
+# being asked an easier set of them — and the resampling is over SESSIONS rather than steps:
+# the steps inside one session are not independent, and drawing them separately would treat
+# one session of long steps as a dozen pieces of evidence. `DUEL_RESOLVED` is how lopsided
+# the resampled share has to be before the gap is called rather than reported.
+DUEL_RESAMPLES = 4_000          # session-level bootstrap draws
+DUEL_RESOLVED = 0.95            # share of draws one side must take to be the winner
+
+
 def step_spans_ms(times: dict, todos: list, now_ms: int) -> list[int]:
     """The measured duration of every finished step that was actually seen running."""
     spans: list[int] = []
@@ -191,6 +212,20 @@ def _median_ms(values: list[int]) -> int | None:
     spans = sorted(values)
     mid = len(spans) // 2
     return spans[mid] if len(spans) % 2 else (spans[mid - 1] + spans[mid]) // 2
+
+
+def rank_quantile(values: list[float], pct: int) -> float:
+    """The sample's own value at `pct` — nearest rank, on a SORTED list.
+
+    No interpolation on purpose: an estimate is scored on a handful of steps, and a
+    interpolated value between two of them would be a number no step ever produced. The rank
+    is computed in whole percent with integer arithmetic so a float multiply cannot land the
+    index one place off on a sample of exactly ten.
+    """
+    if not values:
+        return 0.0
+    rank = (max(1, min(pct, 100)) * len(values) + 99) // 100
+    return values[max(0, min(rank - 1, len(values) - 1))]
 
 
 # In plain words: a memory of how long each named step took, kept between sessions and kept
@@ -706,7 +741,7 @@ def forecast_error(
     model: str | None = None,
     days: float | None = None,
 ) -> dict:
-    """{rung: {n, med, mean, worst}} — each rung scored on its FIRST-poll forecast.
+    """{rung: {n, med, mean, worst, lo, hi}} — each rung scored on its FIRST-poll forecast.
 
     Rungs whose one vector was stamped too late to be a forecast (see `LEDGER_FRESH_MS`) are
     left out of every rung and counted under `late`, so a watcher restart mid-step cannot
@@ -763,10 +798,89 @@ def forecast_error(
             "med": round(med, 2),
             "mean": round(sum(fs) / len(fs), 2),
             "worst": round(max(fs), 1),
+            # the spread the median sits in — see SPREAD_LO_PCT
+            "lo": round(rank_quantile(fs, SPREAD_LO_PCT), 2),
+            "hi": round(rank_quantile(fs, SPREAD_HI_PCT), 2),
         }
     if late:
+        # guarded, not scored: rounding a fault to zero is what keeps a rung from being
+        # improved by the very rows the flag set aside. No `lo`/`hi` here — this is a count.
         report["late"] = {"n": late, "med": 0.0, "mean": 0.0, "worst": 0.0}
     return report
+
+
+def rung_duel(
+    rows: list[dict],
+    a: str,
+    b: str,
+    resamples: int | None = None,
+) -> dict:
+    """Does rung `a` really beat rung `b`, or does this log not say?
+
+    The scoreboard answers "which rung is closest on the median". That is not the same
+    question as "is one of them better", because a median gap of a few percent on twenty
+    steps is as likely to be the sample as the rung. This pairs the two rungs over the SAME
+    steps — a rung cannot win by being asked an easier set of them — and resamples to see
+    how much the answer depends on WHICH steps happened to be logged.
+
+    The resampling is over SESSIONS, not steps. The steps inside one session are not
+    independent: one session that ran twelve long steps is one story, not twelve pieces of
+    evidence, and drawing steps separately would let it vote twelve times. So whole sessions
+    are drawn with replacement, which is the coarsest unit the log actually has.
+
+    `share_steps` is the raw share of paired steps `a` won; `share_resamples` is the share of
+    bootstrap draws it won, and that is the number that decides. `winner` is None unless the
+    draws are lopsided past `DUEL_RESOLVED`, which is the whole point: a duel that does not
+    resolve says the log is too small, rather than crowning the rung that leads today. A
+    rung with nothing to score it against is not a winner by default — no pairing, no verdict.
+
+    The draws are seeded from the two rung names and the sample shape, so the same log
+    reports the same verdict twice in a row (`--twice` and the goldens depend on it) without
+    the answer being a constant.
+    """
+    resamples = DUEL_RESAMPLES if resamples is None else max(1, int(resamples))
+    pairs: list[tuple[str, float, float]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        errs = row.get("errors") or {}
+        ea, eb = errs.get(a), errs.get(b)
+        if ea is None or eb is None or a == b:
+            continue
+        pairs.append((row.get("session") or "", ea, eb))
+    sessions = sorted({s for s, _ea, _eb in pairs})
+    steps = len(pairs)
+    if not steps or not sessions:
+        return {"steps": steps, "sessions": len(sessions), "share_steps": None,
+                "share_resamples": None, "winner": None, "resamples": resamples}
+    by_session: dict[str, list[tuple[float, float]]] = {}
+    for session, ea, eb in pairs:
+        by_session.setdefault(session, []).append((ea, eb))
+    share_steps = sum(1 for _s, ea, eb in pairs if ea < eb) / steps
+    rng = random.Random(zlib.crc32(f"{a}\x1f{b}\x1f{steps}\x1f{len(sessions)}".encode()))
+    wins = 0
+    for _ in range(resamples):
+        drew = took = 0
+        for session in rng.choices(sessions, k=len(sessions)):
+            for ea, eb in by_session[session]:
+                drew += 1
+                took += ea < eb
+        if took * 2 >= drew:  # a draw won by a half or better goes to `a`
+            wins += 1
+    share_resamples = wins / resamples
+    winner = None
+    if share_resamples >= DUEL_RESOLVED:
+        winner = a
+    elif share_resamples <= 1 - DUEL_RESOLVED:
+        winner = b
+    return {
+        "steps": steps,
+        "sessions": len(sessions),
+        "share_steps": round(share_steps, 4),
+        "share_resamples": round(share_resamples, 4),
+        "winner": winner,
+        "resamples": resamples,
+    }
 
 
 def refit_readiness(
@@ -1518,7 +1632,8 @@ __all__ = [
     "STOP_WORDS", "label_class", "call_memory_from_log", "pending_blend_ms", "hist_med",
     "step_pace_ms", "estimate_for", "pick_estimate", "task_estimate_ms", "_spread_ms",
     "fmt_range", "is_wide", "fmt_estimate_spread", "pace_spread_ms", "entry_spread",
-    "forecast_error", "refit_readiness", "estimate_error", "estimate_spread_ms",
+    "forecast_error", "rung_duel", "DUEL_RESAMPLES", "DUEL_RESOLVED", "rank_quantile",
+    "SPREAD_LO_PCT", "SPREAD_HI_PCT", "refit_readiness", "estimate_error", "estimate_spread_ms",
     "remaining_estimate_ms", "elapsed_total_ms", "total_estimate_ms", "run_variance_ms",
     "fmt_estimate", "fmt_variance", "fmt_eta", "task_key", "_task_event", "_events_size",
     "_stamp_events_cursor", "append_task_events", "fold_task_events", "compact_task_events",
