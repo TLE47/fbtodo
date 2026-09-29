@@ -53,6 +53,12 @@ except ImportError:  # pragma: no cover - not a POSIX host
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.environ.get("FREEBUFF_PAUSE_BELL_STATE") or os.path.join(HERE, "pause-bell.state")
+# Agent prose is opt-in — see todo-bell.py's `TEXT_AGENT`. Off by default the body is the
+# metadata fbtodo itself measured (how long the store has been quiet, how many steps are
+# done); `FREEBUFF_PHONE_TEXT=agent` adds the heading and the goal on top.
+TEXT_AGENT = (os.environ.get("FREEBUFF_PHONE_TEXT") or "").strip().lower() in (
+    "agent", "on", "1", "all", "full",
+)
 PHONE = os.environ.get("FREEBUFF_PHONE_SH") or os.path.join(HERE, "phone.sh")
 TMUX = os.environ.get("FREEBUFF_TMUX") or os.environ.get("FBTODO_TMUX") or "tmux"
 TIMEOUT = 20.0
@@ -219,11 +225,16 @@ def short(seconds: float) -> str:
 def phone_message(state, why, pane) -> tuple[str, str]:
     project = os.path.basename((state.get("cwd") or "").rstrip("/"))
     title = f"freebuff stalled · {project}" if project else "freebuff stalled"
+    where = f"at {pane} on the Mac" if pane else "not in tmux"
+    if not TEXT_AGENT:
+        # metadata only: `why` is fbtodo's own measurement ("stopped 12m ago with 2/5 steps
+        # done"), and the session is named so a silent push can still be traced
+        session = str(state.get("session") or "-")
+        return title, "\n".join(part for part in (why, f"session {session}", where) if part)
     goal = " ".join(str(state.get("goal") or "").split())
     head = f"Goal: {goal}" if goal else " ".join(str(state.get("first_prompt") or "").split())
     if len(head) > 200:
         head = head[:197] + "…"
-    where = f"at {pane} on the Mac" if pane else "not in tmux"
     return title, "\n".join(part for part in (head, why, where) if part)
 
 

@@ -703,7 +703,9 @@ PNASDEAD="{\"backend\":\"nas\",\"session\":\"s2\",\"list_id\":\"N1\",\"done\":4,
 pb_run "$PDONE" >/dev/null
 pb_wait 1
 check "pushes when the local task is finished" "$(pb_sends)" "1"
-check_match "and the push names the goal" "$(cat "$PB/sends.log")" 'make the push land'
+check_match "and the push carries the count" "$(cat "$PB/sends.log")" '3/3 steps done'
+check_match "...with the agent's own words left out by default" \
+  "$(printf %s "$(cat "$PB/sends.log")" | grep -c 'make the push land' || true)" '^0$'
 pb_run "$PDONE" >/dev/null
 check "a finished list that just sits there pushes once" "$(pb_sends)" "1"
 # The same list with the store moved on is still the SAME list: keying the claim on the
@@ -727,7 +729,9 @@ check_match "...and says why" "$out" 'the store is still moving'
 pb_run "$PNAS" >/dev/null
 pb_wait 3
 check "pushes for a NAS session whose list is done and store gone quiet" "$(pb_sends)" "3"
-check_match "the NAS push carries its goal" "$(tail -1 "$PB/sends.log")" 'finish the NAS run'
+check_match "the NAS push carries its metadata" "$(tail -1 "$PB/sends.log")" '4/4 steps done'
+check_match "...and not its prose" \
+  "$(printf %s "$(tail -1 "$PB/sends.log")" | grep -c 'finish the NAS run' || true)" '^0$'
 pb_run "$PNAS" >/dev/null
 check "and not twice for the same quiet store" "$(pb_sends)" "3"
 pb_run "$PNASDEAD" >/dev/null
@@ -785,7 +789,7 @@ check "and a later local pass stays silent for the same finish" "$(pb_sends)" "1
 # THE BUG THIS PINS: the claim was ONE slot, so the NAS watcher and a local session
 # overwrote each other's — and then each pushed again on every pass, which is the
 # "freebuff done" landing every ~15s until the thread gets muted. Two instances must
-each hold their own claim, however often the other one asks.
+# each hold their own claim, however often the other one asks.
 rm -f "$PB/sends.log" "$PB/bell.json"
 pb_run "$PDONE" >/dev/null
 pb_run "$PNAS" --nas-watch --once >/dev/null
@@ -805,23 +809,39 @@ rm -f "$PB/sends.log"
 pb_run "$PDONE" >/dev/null
 check "an old single-slot claim is honoured, not re-pushed" "$(pb_sends)" "0"
 
-# A push that cannot be dated is useless hours later, and the goal is the part worth
-# waking up for. store_mtime_ms 1790038500000 renders as 2026-09-22 00:55 under TZ=UTC.
+# A push that cannot be dated is useless hours later, and the count says how much of the
+# list it got through. store_mtime_ms 1790038500000 renders as 2026-09-22 00:55 under
+# TZ=UTC. The DEFAULT IS METADATA: the goal, the summary and the question are written by a
+# model and arrive on a phone, where a link, a number or an instruction reads as real — so
+# they are opt-in (`FREEBUFF_PHONE_TEXT=agent`), and the metadata always goes.
 PWHEN='{"backend":"cli","cwd":"/Users/x/proj","session":"s9","list_id":"P9","done":3,"total":3,"turn_ended":true,"store_mtime_ms":1790038500000,"goal":"ship the fix","summary":"the watchdog now leaves a live session alone"}'
 rm -f "$PB/sends.log" "$PB/bell.json"
 pb_run "$PWHEN" >/dev/null
 pb_wait 1
 out=$(tail -1 "$PB/sends.log")
-check_match "the body carries the big goal" "$out" 'Goal: ship the fix'
+check_match "the default push carries the count" "$out" '3/3 steps done'
+check_match "...the date and time it finished" "$out" '2026-09-22 00:55'
+check_match "...and the session it was, so a quiet push can still be traced" "$out" \
+  'session s9'
+check_match "...and not one word the agent wrote" \
+  "$(printf %s "$out" | grep -c 'ship the fix' || true)" '^0$'
+check_match "...nor what it said it did" \
+  "$(printf %s "$out" | grep -c 'leaves a live session alone' || true)" '^0$'
+
+# ...and the prose comes back only when the owner asks for it
+rm -f "$PB/sends.log" "$PB/bell.json"
+FREEBUFF_PHONE_TEXT=agent pb_run "$PWHEN" >/dev/null
+pb_wait 1
+out=$(tail -1 "$PB/sends.log")
+check_match "FREEBUFF_PHONE_TEXT=agent carries the big goal" "$out" 'Goal: ship the fix'
 check_match "below it, what the agent said it did" "$out" \
   'Goal: ship the fix~the watchdog now leaves a live session alone'
-check_match "...the date and time it finished" "$out" '2026-09-22 00:55'
 check_match "...and the count last" "$out" 'the watchdog now leaves a live session alone~3/3 steps done'
 
 # An empty summary must not leave a blank line between the heading and the count.
 PNOSUM='{"backend":"cli","cwd":"/Users/x/proj","session":"s9x","list_id":"P9b","done":1,"total":1,"turn_ended":true,"store_mtime_ms":1790038500000,"goal":"no prose over there","summary":null}'
 rm -f "$PB/sends.log" "$PB/bell.json"
-pb_run "$PNOSUM" >/dev/null
+FREEBUFF_PHONE_TEXT=agent pb_run "$PNOSUM" >/dev/null
 pb_wait 1
 check_match "a run with no summary keeps the two-line body" \
   "$(tail -1 "$PB/sends.log")" 'Goal: no prose over there~1/1 steps done'
@@ -829,10 +849,15 @@ check_match "a run with no summary keeps the two-line body" \
 # A run with no `Goal:` line must not have its opening request labelled as one.
 PNOWHEN='{"backend":"cli","cwd":"/Users/x/proj","session":"s9","list_id":"P8","done":3,"total":3,"turn_ended":true,"store_mtime_ms":1790038500000,"first_prompt":"why is the bell silent"}'
 rm -f "$PB/sends.log"
-pb_run "$PNOWHEN" >/dev/null
+FREEBUFF_PHONE_TEXT=agent pb_run "$PNOWHEN" >/dev/null
 pb_wait 1
 check_match "a list with no goal falls back to the request, unlabelled" \
   "$(tail -1 "$PB/sends.log")" 'why is the bell silent~3/3 steps done'
+rm -f "$PB/sends.log"
+pb_run "$PNOWHEN" >/dev/null
+pb_wait 1
+check_match "...and off by default that request is not sent either" \
+  "$(printf %s "$(tail -1 "$PB/sends.log")" | grep -c 'why is the bell silent' || true)" '^0$'
 
 PNASRUN="{\"backend\":\"nas\",\"session\":\"/srv/app/state/manicode/projects/chats/2026-09-21T21-49-13.448Z\",\"list_id\":\"N9\",\"done\":2,\"total\":2,\"instance_alive\":true,\"store_mtime_ms\":$(((NOW - 600) * 1000)),\"goal\":\"tidy the settings panel\"}"
 rm -f "$PB/sends.log"
@@ -930,6 +955,15 @@ check "...without touching ntfy" "$(pcalls)" "$n"
 check "...exactly one send" "$(osa_calls)" "$((o + 1))"
 check_match "the sender was given the handle" "$(cat "$OSA")" '^someone@icloud\.com$'
 check_match "and the title as the first line" "$(cat "$OSA")" '^t$'
+# The body is an ARGUMENT too — `on run {target, body}` reads it from argv — so a message
+# carrying quotes, `&` or AppleScript of its own arrives as written instead of becoming
+# source. H8 asked whether phone.sh builds the script by interpolation: it does not, and
+# this is what keeps it that way.
+tricky='say "hi" & do shell script "rm -rf /"'
+ph --title 'a "title"' --message "$tricky" >/dev/null 2>&1
+check_match "a hostile body reaches osascript as one argument" "$(tail -1 "$OSA")" \
+  '^say "hi" & do shell script "rm -rf /"$'
+check_match "...and never as script text" "$(grep -c '^-e.*rm -rf /' "$OSA" || true)" '^0$'
 check_match "and logged as an iMessage, handle masked" \
   "$(tail -1 "$PH/home/.config/freebuff-notify/phone.log")" 'sent imessage to so…@icloud.com'
 
@@ -1030,6 +1064,15 @@ rm -f "$PH/home/.config/freebuff-notify/phone-state"
 ph_conf "topic-secret-abc"
 out=$(ph --init 2>&1)
 check_match "--init refuses to overwrite an existing config" "$out" 'already exists'
+
+# ...and a fresh config's topic is 128 bits of hex, drawn from /dev/urandom: on a public
+# ntfy server the TOPIC is the authentication, so it is never a typed word and never a
+# guess, and it is never an argument (argv is world-readable in `ps`).
+rm -f "$PH/home/.config/freebuff-notify/phone.conf"
+out=$(ph --init 2>&1)
+check_match "--init mints a new topic" "$out" 'subscribe in the ntfy app to:  freebuff-'
+check_match "...128 random bits of it" "$(sed -n 's/^NTFY_TOPIC=freebuff-\([0-9a-f]*\)$/\1/p' \
+  "$PH/home/.config/freebuff-notify/phone.conf" | tr -d '\n' | wc -c | tr -d ' ')" '32'
 
 echo
 echo "== the drop watch: it died on its own, and what it said =="
@@ -1365,10 +1408,25 @@ check_match "...with the question, not the options" "$out" 'Put the four taskboa
 
 ab_run >/dev/null
 check "a pending question pushes once" "$(ab_sends)" "1"
-check_match "...carrying the question as the phone's body" "$(cat "$AB/sends.log")" 'Put the four taskboard items back\?'
-check_match "...and the answer options under it" "$(cat "$AB/sends.log")" '3\) Leave the board empty'
+check_match "...saying a session is stopped and waiting, and how many options are up" \
+  "$(cat "$AB/sends.log")" 'a question is on screen, waiting \(4 options\)'
+check_match "...naming the pane it is waiting in" "$(cat "$AB/sends.log")" 'at %7'
+check_match "...but not the question itself, which a model wrote" \
+  "$(printf %s "$(cat "$AB/sends.log")" | grep -c 'Put the four taskboard items back' || true)" '^0$'
 check_match "...high priority, because a waiting agent is a stopped session" \
   "$(cat "$AB/sends.log")" 'priority high'
+
+# ...and the question itself comes back only when the owner asks for it. The claim is set
+# aside for the run and put back after, because the checks below count on it (`pushes only
+# once` for a question that stays up).
+cp "$AB/state.json" "$AB/state.json.claim"
+rm -f "$AB/sends.log" "$AB/state.json"
+FREEBUFF_PHONE_TEXT=agent ab_run >/dev/null
+check "...and it is asked for explicitly" "$(ab_sends)" "1"
+check_match "FREEBUFF_PHONE_TEXT=agent puts the question back" \
+  "$(cat "$AB/sends.log")" 'Put the four taskboard items back\?'
+check_match "...with the answer options under it" "$(cat "$AB/sends.log")" '3\) Leave the board empty'
+mv "$AB/state.json.claim" "$AB/state.json"
 
 ab_run >/dev/null
 ab_run >/dev/null
@@ -1446,13 +1504,18 @@ exit 0
 TMUX
 chmod +x "$SB/bin/tmux"
 
-sb_run() { # pause-bell args...
+sb_run() { # pause-bell args...; the push is detached, so wait for it to land (a count
+  # read straight after the decision beat the sender to it and made `a stop pushes once`
+  # fail about one run in four — measured 2026-09-29 while the self-check ran beside it)
   local quiet="${SB_QUIET:-150}"
+  local before
+  before=$(sb_sends)
   PATH="$SB/bin:$PATH" HOME="$SB/home" \
     FREEBUFF_FBTODO="$SB/bin/fbtodo" FREEBUFF_TMUX="$SB/bin/tmux" \
     FREEBUFF_PHONE_SH="$SB/notify/phone.sh" FREEBUFF_PAUSE_QUIET="$quiet" \
     FREEBUFF_PAUSE_BELL_STATE="$SB/state-bell.json" \
     python3 "$SB/notify/pause-bell.py" "$@"
+  case " $* " in *" --print "*) : ;; *) wait_for_change 1 sb_sends "$before" ;; esac
 }
 sb_sends() { if [ -r "$SB/sends.log" ]; then grep -c -e '^--title' "$SB/sends.log"; else echo 0; fi; }
 sb_state() { # turn_ended, quiet_seconds, done, total
@@ -1472,6 +1535,16 @@ check "a stop pushes once" "$(sb_sends)" "1"
 check_match "...by iMessage and ntfy (phone.sh picks), high priority" \
   "$(cat "$SB/sends.log")" 'priority high'
 check_match "...naming the project it stopped in" "$(cat "$SB/sends.log")" 'freebuff stalled · stall-demo'
+check_match "...and not the goal the agent wrote, while it says how long and how much" \
+  "$(printf %s "$(cat "$SB/sends.log")" | grep -c 'wire the stall watch' || true)" '^0$'
+# ...the goal is opt-in, like the other bells: the claim is set aside and put back, so the
+# `stays quiet` count below still has the push it expects
+cp "$SB/state-bell.json" "$SB/state-bell.json.claim"
+rm -f "$SB/sends.log" "$SB/state-bell.json"
+FREEBUFF_PHONE_TEXT=agent sb_run --watch-pid $$ --pane %7 >/dev/null
+check_match "FREEBUFF_PHONE_TEXT=agent puts the goal back on it" \
+  "$(cat "$SB/sends.log")" 'Goal: wire the stall watch'
+mv "$SB/state-bell.json.claim" "$SB/state-bell.json"
 sb_run --watch-pid $$ --pane %7 >/dev/null
 check "the same stop stays quiet" "$(sb_sends)" "1"
 check_match "...and says why" "$(sb_run --watch-pid $$ --pane %7 --print)" '^silent: already pushed'

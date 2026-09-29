@@ -63,6 +63,17 @@ Environment wins over the file: `NTFY_URL`, `NTFY_TOPIC`, `NTFY_TOKEN`, `IMESSAG
 `FREEBUFF_PHONE_TRANSPORT`. `FREEBUFF_PHONE=off` (or a `phone-state` file) mutes sending
 without unsetting anything. `FREEBUFF_PHONE_CONF` points at a different config file.
 
+`--init` mints the topic from `/dev/urandom` — 128 bits, as hex — because on a public ntfy
+server the topic *is* the authentication; it never reaches an argument, a shell history or
+the log, and nothing guesses one if the read fails (exit `69`, no config written).
+
+**The bells send metadata by default.** A push says which session, which state and how much
+of the list finished — never the agent's own words: a model's sentence arriving on a phone
+reads as real, links and numbers included. `FREEBUFF_PHONE_TEXT=agent` puts the prose back
+(the `Goal:` line, the sentence it finished on, the question on screen) for an owner who
+wants it. The iMessage text is passed to `osascript` as an argument, so a message containing
+quotes, `&` or newlines arrives as written and never becomes AppleScript source.
+
 Exit codes: `0` sent or muted · `2` usage · `69` delivery failed · `78` not configured.
 
 ## The chime

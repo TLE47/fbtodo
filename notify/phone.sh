@@ -32,7 +32,7 @@
 #   FREEBUFF_PHONE_TRANSPORT=auto    # auto | imessage | ntfy | both
 #   IMESSAGE_TO=you@icloud.com       # the iMessage target (your own handle = note to self)
 #   NTFY_URL=https://ntfy.sh
-#   NTFY_TOPIC=freebuff-0123456789abcdef
+#   NTFY_TOPIC=freebuff-0123456789abcdef0123456789abcdef   # --init mints 128 bits of hex
 #   NTFY_TOKEN=tk_...                # optional, self-hosted instances with access control
 # Environment wins over the file: NTFY_URL / NTFY_TOPIC / NTFY_TOKEN / IMESSAGE_TO /
 # FREEBUFF_PHONE_TRANSPORT, and FREEBUFF_PHONE=off (or a `phone-state` file) mutes sending
@@ -104,9 +104,13 @@ if [ "${init:-0}" = 1 ]; then
   if [ -s "$conf" ]; then
     printf 'phone.sh: %s already exists — edit it, or remove it and re-run --init\n' "$conf" >&2
     exit 78
-  fi
-  hex=$(LC_ALL=C tr -dc 'a-f0-9' </dev/urandom 2>/dev/null | head -c 24)
-  [ ${#hex} -eq 24 ] || hex=$(printf '%s%s' "$(date +%s)" "$$")
+  fi  # 128 bits: the topic IS the authentication for a public ntfy server, so it is drawn
+  # from the kernel's entropy and never typed, never an argument, never in the log
+  hex=$(LC_ALL=C tr -dc 'a-f0-9' </dev/urandom 2>/dev/null | head -c 32)
+  [ ${#hex} -eq 32 ] || {
+    printf 'phone.sh: could not read 128 bits from /dev/urandom — no topic written\n' >&2
+    exit 69
+  }
   mkdir -p "$dir"
   (umask 077; : >"$conf")
   chmod 600 "$conf"

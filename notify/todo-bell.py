@@ -56,6 +56,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # the one piece of state that must not be shared with a real session.
 STATE = os.environ.get("FREEBUFF_TODO_BELL_STATE") or os.path.join(HERE, "todo-bell.state")
 BELL = os.path.join(HERE, "bell.sh")
+# Is the AGENT's own text allowed in the push? Off by default: the goal, the sentence it
+# finished on and the question on screen are written by a model and land on a phone, where
+# a link, a number or an instruction reads as real. `FREEBUFF_PHONE_TEXT=agent` puts them
+# back for an owner who wants them. The metadata (session, state, counts) always goes.
+TEXT_AGENT = (os.environ.get("FREEBUFF_PHONE_TEXT") or "").strip().lower() in (
+    "agent", "on", "1", "all", "full",
+)
 PHONE = os.environ.get("FREEBUFF_PHONE_SH") or os.path.join(HERE, "phone.sh")
 TIMEOUT = 6.0
 
@@ -277,14 +284,23 @@ def phone_message(state: dict) -> tuple[str, str]:
     else:
         project = os.path.basename((state.get("cwd") or "").rstrip("/"))
         title = f"freebuff done · {project}" if project else "freebuff done"
+    ended = ended_at(state)
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ended / 1000.0)) if ended else ""
+    count = f"{int(state.get('done') or 0)}/{int(state.get('total') or 0)} steps done"
+    tail = " · ".join(part for part in (count, when) if part)
+    # METADATA ONLY by default: which session, which state, how much of the list it got
+    # through. The prose below is the agent's own words — an LLM's sentence arriving on a
+    # phone, where a link, a number or an instruction reads as real — so it is opt-in
+    # (`FREEBUFF_PHONE_TEXT=agent`), not a default.
+    if not TEXT_AGENT:
+        session = str(state.get("session") or "-")
+        return title, "\n".join(part for part in (tail, f"session {session}") if part)
     # The big goal is the agent's own `Goal:` line; only when the list has none is the
     # session's opening request worth showing — and then it must not be labelled a goal.
     goal = " ".join(str(state.get("goal") or "").split())
     head = f"Goal: {goal}" if goal else " ".join(str(state.get("first_prompt") or "").split())
     if len(head) > 200:
         head = head[:197] + "…"
-    ended = ended_at(state)
-    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ended / 1000.0)) if ended else ""
     # What came of it, in the agent's own words: the heading says what the task was FOR,
     # this says what happened and what changed. fbtodo takes the first line of the agent's
     # last answer and keeps it to SUMMARY_MAX_CHARS; the cap here is the phone's, not the
@@ -293,8 +309,6 @@ def phone_message(state: dict) -> tuple[str, str]:
     said = " ".join(str(state.get("summary") or "").split())
     if len(said) > 220:
         said = said[:219] + "…"
-    count = f"{int(state.get('done') or 0)}/{int(state.get('total') or 0)} steps done"
-    tail = " · ".join(part for part in (count, when) if part)
     return title, "\n".join(part for part in (head, said, tail) if part)
 
 

@@ -61,6 +61,13 @@ except ImportError:  # pragma: no cover - not a POSIX host
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.environ.get("FREEBUFF_ASK_BELL_STATE") or os.path.join(HERE, "ask-bell.state")
+# Agent prose is opt-in — see todo-bell.py's `TEXT_AGENT`. The question and its options are
+# written by the model, so off by default the push says only that a session is stopped and
+# waiting for an answer, and how many options are on screen; `FREEBUFF_PHONE_TEXT=agent`
+# sends the question itself.
+TEXT_AGENT = (os.environ.get("FREEBUFF_PHONE_TEXT") or "").strip().lower() in (
+    "agent", "on", "1", "all", "full",
+)
 PHONE = os.environ.get("FREEBUFF_PHONE_SH") or os.path.join(HERE, "phone.sh")
 TMUX = os.environ.get("FREEBUFF_TMUX") or os.environ.get("FBTODO_TMUX") or "tmux"
 TIMEOUT = 8.0
@@ -270,6 +277,17 @@ def phone_message(finding: dict) -> tuple[str, str]:
     """(title, body): the question you have to answer, then what you may answer."""
     project = where_of(finding)
     title = f"freebuff asks · {project}" if project else "freebuff asks"
+    if not TEXT_AGENT:
+        # metadata only: the model is stopped until a human answers, so the push has one
+        # job — say so, and say where the screen is
+        options = len(finding.get("options") or [])
+        body = "\n".join([
+            f"a question is on screen, waiting ({options} option"
+            f"{'s' if options != 1 else ''})",
+            "",
+            f"at {finding['pane']} ({finding['window']}) on the Mac",
+        ])
+        return title, body
     bits = [finding["question"]]
     if finding["options"]:
         bits.append("")
