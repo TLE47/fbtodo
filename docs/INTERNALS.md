@@ -5,7 +5,6 @@ is the layer underneath it.
 
 - [Files under `FBTODO_HOME`](#files-under-fbtodo_home)
 - [The state file](#the-state-file)
-- [The remote probe protocol](#the-remote-probe-protocol)
 - [Notifier contracts](#notifier-contracts)
 - [The pane lifecycle](#the-pane-lifecycle)
 - [Conventions worth keeping](#conventions-worth-keeping)
@@ -24,8 +23,6 @@ stays out of the real one).
 | `fbtodo-pane.log` | keeper | one line per pane that came **back** — never one that did not |
 | `fbtodo-pins.json` | `pin` | per-window, per-role side/size |
 | `fbtodo-last.json` | keeper | the layout each pane was last left at, per window and role |
-| `fbtodo-nas-pane.pid` / `.json` / `.log` | remote watcher | its lock, its last probe state, its log |
-| `fbtodo-nas.json` | remote source | the cached last list, so an `UNCHANGED` reply can be served |
 
 Locks are pid files that are validated, not trusted: a lock whose process is gone, or whose
 record does not name this server/build, is replaced rather than respected.
@@ -40,9 +37,9 @@ fields that matter:
 | `schema` | state layout version; a state from another build is ignored, not trusted |
 | `instance_pid` | the freebuff process this state describes |
 | `cwd` | the directory the session runs in |
-| `backend` | `cli` \| `desktop` \| `nas` |
-| `target` | the chat directory, database or remote store that was read |
-| `source` | how it was read (`cli-journal`, `desktop-db`, `nas-journal`, `fallback`, `last`) |
+| `backend` | `cli` \| `desktop` |
+| `target` | the chat directory or database that was read |
+| `source` | how it was read (`cli-journal`, `desktop-db`, `fallback`, `last`) |
 | `session` | the session/thread identifier |
 | `title`, `first_prompt`, `summary` | what the session is about, when the store carries it |
 | `goal`, `goal_source` | the agent's `Goal:` line and where it was found |
@@ -59,43 +56,8 @@ fields that matter:
 | `tool_version` | the build that wrote it |
 
 `snap` / `json` / `bar` read this file when a watcher is live and re-derive it otherwise,
-and an explicit `-s cli|nas|desktop` is never answered from it unless the state describes
+and an explicit `-s cli|desktop` is never answered from it unless the state describes
 that backend.
-
-## The remote probe protocol
-
-One `ssh` round trip per poll, multiplexed (`ControlMaster`, `ControlPersist 60`), 12 s
-timeout. The remote script prints these lines in order, and the local parser reads them back
-**by prefix**, so a reply from a build that sends fewer of them still parses:
-
-| Line | Content |
-|---|---|
-| `DIR <name>` | the chat directory chosen (`NODIR` and nothing else when there is none) |
-| `SIZE <bytes>` | size of `chat-messages.json` |
-| `MTIME <epoch-s>` | its mtime — the far side skips its parse entirely when this has not moved |
-| `LIVE <0\|1>` | a freebuff process exists somewhere on the host |
-| `FB <1\|0\|->\|<stale-dir>\|<started>` | the wrapper marker's verdict, and the project it names |
-| state | `NONE`, `UNCHANGED`, `ERR <msg>`, or one compact JSON object (`todos`, `goal`, `now`, `nudge`, `calls`, `tools`, `ts`) |
-| `PATCH <blob>` | the tail of the patch log, entries joined with `\x1c` — optional |
-| `ALERT <blob>` | the same for the notifier log — optional |
-
-Two details that are easy to get wrong:
-
-- The parse runs **on the remote host** with `python3`; the conversation store is megabytes
-  and pulling it across per poll would be absurd. `UNCHANGED` is what an idle poll costs.
-- `LIVE` is answered by `pgrep -f` on the session process, and the pattern's first character
-  is **bracketed** (`[m]anicode/freebuff`) — the probe's own `sh -c` argv contains the
-  pattern, so an unbracketed one matched *itself* and reported a live session on a host with
-  no session at all.
-
-The marker is a one-line file on the remote host, three fields:
-
-```
-<pid> <started> <dir>
-```
-
-…written by whatever wrapper the operator uses, and read for a sharper answer than the
-process probe can give: which session is live, and where it started.
 
 ## Notifier contracts
 
@@ -104,11 +66,9 @@ the decision and the "already sent" record. Each is optional: a missing script i
 
 | Watch | Invocation | Cadence flag |
 |---|---|---|
-| finish | `todo-bell.py --nas-watch --once --quiet` | `--notify-seconds` (15) |
 | ask | `ask-bell.py --quiet` | `--ask-seconds` (3) |
 | stall | `pause-bell.py --watch-pid PID --quiet` | `--pause-seconds` (30) |
 | pane | `pane-bell.py --quiet --keeper PATH` | `--pane-bell-seconds` (60) |
-| drop | `drop-bell.py --nas --quiet` | on session death |
 
 Every one of them also takes `--print` (resolve and report, send nothing) plus
 `--title`/`--message`/`--priority`/`--tags` to send something specific, which is how you
@@ -129,8 +89,9 @@ network.
    `move-pane` a drifted pane back **in place** — same process, same scrollback, same step
    clocks.
 
-The keeper has its own lock on purpose: sharing the watcher's meant a `-s nas` watcher could
-hold the lock while a local window's pane was gone, and the pane never came back.
+The keeper has its own lock on purpose: sharing the watcher's meant a watcher for another
+source could hold the lock while a local window's pane was gone, and the pane never came
+back.
 
 ## Conventions worth keeping
 
@@ -149,6 +110,6 @@ hold the lock while a local window's pane was gone, and the pane never came back
 
 ```sh
 python3 fbtodo-selfcheck.py --list          # the phases, with line numbers
-python3 fbtodo-selfcheck.py --only nas-live # the cheap body + that phase, ~20 s
+python3 fbtodo-selfcheck.py --only local-session  # the cheap body + that phase, ~20 s
 bash notify/test-freebuff-notify.sh         # the notification kit
 ```

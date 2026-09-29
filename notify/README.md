@@ -118,11 +118,9 @@ of the same kit (and the same test suite).
 
 | Watch | Invocation |
 |---|---|
-| finish | `todo-bell.py --nas-watch --once --quiet` (remote sessions) |
 | ask | `ask-bell.py --quiet` |
 | stall | `pause-bell.py --watch-pid PID --quiet` |
 | pane | `pane-bell.py --quiet --keeper PATH` |
-| drop | `drop-bell.py --nas --quiet` |
 
 Each one is also runnable by hand, which is how you debug it: every bell takes `--print`
 (resolve and report, send nothing) plus `--title`, `--message`, `--priority`, `--tags` to

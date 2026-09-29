@@ -10,7 +10,6 @@ configuration at all — and none of them touches the tool's code.
 | [`theme-catppuccin-mocha.json`](theme-catppuccin-mocha.json) | a theme preset (24-bit colour) |
 | [`theme-gruvbox-dark.json`](theme-gruvbox-dark.json) | a theme preset |
 | [`theme-nord.json`](theme-nord.json) | a theme preset |
-| [`remote-wrapper.sh`](remote-wrapper.sh) | the marker hook a remote session needs, as a file you can read |
 
 ## Themes
 
@@ -54,9 +53,3 @@ than the transcript — cheap enough for a status line that refreshes every few 
 
 If you only want the status line, set `FBTODO_NO_PANE=1` so no pane is ever opened.
 
-## The remote marker
-
-`-s nas` reads a session on another host. It works without any hook (it falls back to a
-process probe), but the marker makes it exact: it says which pid is the session, when it
-started and which directory it started in. [`remote-wrapper.sh`](remote-wrapper.sh) is the
-wrapper from the README as a runnable file, with the `FBTODO_NAS*` variables it expects.
