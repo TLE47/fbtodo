@@ -771,6 +771,22 @@ try:
     module._FREEBUFF_WHICH[:] = saved_which
     say("discovery: a launcher's argv is matched by shape, and a probe that names it is not: ok")
 
+    # ---- how the program names itself back to itself. Every pane, the keeper and the daemon
+    #      are re-invocations, so this must name something that RUNS. That is the launcher
+    #      beside the package; a copy carrying the package without one has to fall back to the
+    #      package's own entry file — the guard then re-enters the package, where today it would
+    #      start a second copy of everything as `__main__` beside the package.
+    argv = module.self_argv()
+    assert argv[0] == sys.executable and os.path.basename(argv[1]) == "fbtodo", argv
+    ver = subprocess.run([*argv, "--version"], capture_output=True, text=True, timeout=60)
+    assert ver.returncode == 0 and ver.stdout.strip() == module.VERSION, (ver.returncode,
+                                                                         ver.stdout, ver.stderr)
+    copy_root = os.path.join(TEST_HOME, "copy-without-launcher")
+    assert module.self_argv(here=os.path.join(copy_root, "src", "fbtodo", "base.py")) == [
+        sys.executable, os.path.join(copy_root, "src", "fbtodo", "__init__.py")], \
+        "the no-launcher fallback names the package's entry, not the file that asked"
+    say("argv: the re-invocations name the launcher, or the package when there is none: ok")
+
     # ---- doctor: the machine's own answer, as a gate. A machine with the tools a pane
     #      needs passes and exits 0; one that cannot even write its scratch dir says so and
     #      exits non-zero, which is what makes this callable from a wrapper or CI.

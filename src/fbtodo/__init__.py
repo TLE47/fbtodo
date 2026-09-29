@@ -249,19 +249,26 @@ def events_path(path: str = "") -> str:
     return (path or TASKS_PATH) + "l"
 
 
-def self_argv() -> list:
+def self_argv(here: str = "") -> list:
     """This program as a command line — how the panes, the keeper and the daemon name it.
 
-    The LAUNCHER beside the package, not this file. A package's `__init__.py` is not the
+    The LAUNCHER beside the package, not the file asking. A package's `__init__.py` is not the
     package when it is run as a script (a second copy of every module, and no relative
-    imports), so pointing the re-invocations at it would work only until the first
-    submodule existed. A copy that carries the package without the launcher falls back to
-    the file itself, which the `__main__` guard at the top turns back into the package.
+    imports), so pointing the re-invocations at whichever file happens to hold this function
+    would break as soon as the program lived in more than one of them. A copy that carries the
+    package without the launcher falls back to the package's own entry file — named from the
+    asker's directory, so `src/fbtodo/anything.py` still answers `src/fbtodo/__init__.py` —
+    which the `__main__` guard at the top turns back into the package.
+
+    `here` is the file asking: this file in practice, and a stand-in in the self-check, which
+    is how the fallback is exercised without a launcher-less copy on disk.
     """
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    here = os.path.abspath(here or __file__)
+    root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
     launcher = os.path.join(root, "fbtodo")
-    return [sys.executable, launcher if os.path.exists(launcher)
-            else os.path.abspath(__file__)]
+    if os.path.exists(launcher):
+        return [sys.executable, launcher]
+    return [sys.executable, os.path.join(os.path.dirname(here), "__init__.py")]
 LOCK_PATH = os.path.join(SCRATCH, "fbtodo-daemon.pid")
 LOG_PATH = os.path.join(SCRATCH, "fbtodo-daemon.log")
 # The NAS pane watcher: its own lock, log and state, because it is a different question
