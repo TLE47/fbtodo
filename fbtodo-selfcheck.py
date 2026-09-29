@@ -322,7 +322,12 @@ try:
     # ---- status reports a live watcher
     out = run("status").stdout
     assert "not running" not in out, out
-    say("status shows the live watcher: ok")
+    # The build is named, and no stale-watcher warning rides beside it: this watcher was
+    # started by this same file, so the two versions must agree.
+    ver = run("-V").stdout.strip()
+    assert ver and f"  tool version      : {ver}" in out, (ver, out)
+    assert "stale" not in out.split("tool version")[1].splitlines()[0], out
+    say("status shows the live watcher and names the build: ok")
 
     # ---- kill the instance: the watcher must shut itself down and drop its lock
     kill_tree(victim)

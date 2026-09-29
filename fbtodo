@@ -108,7 +108,7 @@ import textwrap
 import time
 import unicodedata
 
-VERSION = "4.19.0"
+VERSION = "4.20.0"
 HOME = os.path.expanduser("~")
 # FBTODO_HOME points state/lock/log elsewhere — used by the self-check so it never
 # touches the real watcher's files.
@@ -5766,6 +5766,18 @@ def cmd_status(args) -> int:
         )
         print(f"  other instances   : {shown}  — pin one with --instance-of/--watch-pid")
     print(f"  watcher           : {pid or '— not running'}")
+    # In plain words: which build of fbtodo is actually running. The version is
+    # hand-maintained, so a watcher left over from an earlier copy keeps working while the
+    # pane beside it is a different build — the one way this pane has ever misled its
+    # owner. Both numbers on one line make that self-diagnosing: they agree when the pane
+    # and its watcher are the same build, and the state's own stamp is exactly what a
+    # version-stale watcher is killed for on the next start (see `live_watcher_pid`).
+    watching = (st or {}).get("tool_version")
+    stale_note = (
+        f"  (watcher {watching} — stale, replaced on the next start)"
+        if watching and watching != VERSION else ""
+    )
+    print(f"  tool version      : {VERSION}{stale_note}")
     sess = (st or {}).get("session")
     reason = (st or {}).get("stop_reason")
     bits = ["fresh" if state_is_fresh(st) else "stale"]
