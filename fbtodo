@@ -83,6 +83,10 @@ a session that skips the line says `big goal · — none stated` in the plain re
 in the framed pane simply draws no heading row. When a newer
 request has arrived since, a `now` line says so: a list can sit unchanged for hours while
 the session works on.
+
+A comment that begins `# In plain words:` explains the code under it for a reader who does
+not program. They are asides, not part of the program: read them straight down for a tour
+of the file, or skip every one with a search for `In plain words`.
 """
 from __future__ import annotations
 
@@ -444,6 +448,10 @@ EX_CODES = {
 
 
 # --------------------------------------------------------------------- helpers
+# In plain words: save, then swap. The new copy is written to a scratch name in the same
+# folder and only then renamed over the real one, so a reader can never catch a
+# half-written file — they see the old copy or the new one, never a mixture. The fsync
+# calls mean "get this onto the disk", not just into the computer's memory.
 def atomic_write_json(path: str, payload: dict, mode: int = 0o600) -> None:
     """Temp file in the target's own directory, fsync, rename, fsync the dir."""
     d = os.path.dirname(path)
@@ -600,6 +608,10 @@ def instance_of_parent(parent_pid: int) -> int | None:
     return descendant_instance(process_table(), parent_pid)
 
 
+# In plain words: every running program has a number, and knows the number of the program
+# that started it. Following those links downwards lists everything a program has spawned,
+# and going widest-first means the shallowest match comes out first — which is what "the
+# freebuff process this shell started" means.
 def descendant_pids(table: dict, parent_pid: int) -> list[tuple[int, int]]:
     """(pid, depth) for everything under this pid, breadth-first, from a fetched table.
 
@@ -645,6 +657,10 @@ def descendant_instance(table: dict, parent_pid: int) -> int | None:
     return best[1] if best else None
 
 
+# In plain words: "which freebuff is mine?" Several can run at once, so this narrows it the
+# way a person would — the one started from this folder, and where there is more than one,
+# the one started most recently. `--instance-of` skips the guessing: the shell that opened
+# the pane hands over its own number and this walks down from there.
 def find_instance(
     cwd: str, watch_pid: int | None = None, instance_of: int | None = None
 ) -> tuple[int | None, str | None]:
@@ -816,6 +832,11 @@ def _record_turn(rec: dict):
     return ended if isinstance(ended, bool) else None
 
 
+# In plain words: is this message just "keep going"? When every word of it is one of the
+# handful of continuation words, the ask is not new work — it is a nudge to carry on, and
+# the agent's own instructions say a nudge means re-publish the list first, so the pane says
+# so until a newer list arrives. A message carrying any real content fails this test on
+# purpose: better to call a nudge a request than to lose a request as a nudge.
 def is_nudge(text: str) -> bool:
     """Is this request just "keep going"? Then it is a continuation, not a task.
 
@@ -852,6 +873,10 @@ def _newest(entries):
     return best
 
 
+# In plain words: one block of the agent's transcript, read newest line first. Most lines
+# are brushed off by a plain text search — "this line cannot contain a to-do list" — and
+# only the few that might are decoded as data. That is the difference between a pane you
+# can leave open all day and one that heats the laptop.
 def journal_scan(blob: bytes, thread: str, chunk: int = 0):
     """(hit, hit_key, prompts, goals, turns, summaries) for one chunk, newest line first.
 
@@ -912,6 +937,10 @@ def journal_scan(blob: bytes, thread: str, chunk: int = 0):
     return hit, hit_key, prompts, goals, turns, summaries, models
 
 
+# In plain words: the transcript behind the pane. It only ever grows, one line per event,
+# and what matters is at the end, so this reads it backwards in blocks and stops as soon as
+# it has both things the pane needs: the most recent to-do list the agent wrote, and the
+# most recent thing you asked for.
 def scan_live_log(chat_dir: str) -> dict:
     """The last `write_todos` call and the prompts that give it meaning.
 
@@ -3380,6 +3409,9 @@ def _tidy(text: str, limit: int = PATCH_REASON_MAX) -> str:
     return _clip(" ".join(str(text or "").split()), limit)
 
 
+# In plain words: the PATCH and ALERT rows are borrowed from two log files that other
+# parts of this setup write to. Rather than watch them, this reads their last few lines
+# whenever the pane is drawn and reports the newest line it understands.
 def local_patch_alert(patch_log: str | None = None, alert_log: str | None = None) -> dict:
     """The last patch outcome and the last alert, from this Mac's own logs.
 
@@ -3642,6 +3674,9 @@ def step_spans_ms(times: dict, todos: list, now_ms: int) -> list[int]:
     return spans
 
 
+# In plain words: the middle value, not the average. Five steps of 1, 2, 3, 4 and 40
+# minutes average about 10 and have a middle of 3 — and 3 is the better guess for the next
+# one. A single freak-slow step must not drag every estimate with it.
 def _median_ms(values: list[int]) -> int | None:
     """The middle of a list of spans, robust to one value running away."""
     if not values:
@@ -3651,6 +3686,10 @@ def _median_ms(values: list[int]) -> int | None:
     return spans[mid] if len(spans) % 2 else (spans[mid - 1] + spans[mid]) // 2
 
 
+# In plain words: a memory of how long each named step took, kept between sessions and kept
+# per model — the same step costs very different time under different models. It is filed
+# under the step's own wording, so "Run the tests" is estimated from the last "Run the
+# tests" and not from the average of whatever this list happens to hold.
 def task_history_from_log(tasks: dict, now_ms: int | None = None, model: str | None = None) -> dict:
     """Per-task remembered span (median), read from the log's finished records.
 
@@ -3707,6 +3746,9 @@ def task_history_from_log(tasks: dict, now_ms: int | None = None, model: str | N
     return history
 
 
+# In plain words: the rate the estimates borrow from, for steps with no history of their
+# own. The middle duration of the steps finished in THIS list; failing that, the middle of
+# the remembered ones; and only with no past at all, a flat couple of minutes.
 def step_pace_ms(times: dict, todos: list, now_ms: int, history: dict | None = None) -> int:
     """The pace the estimates ride on: the median duration of the steps already finished.
 
@@ -3736,6 +3778,9 @@ def task_estimate_ms(task: str, pace_ms: int, history: dict | None = None) -> in
     return pace_ms
 
 
+# In plain words: how much is left — each remaining step at its usual duration, less the
+# time the step in progress has already spent. So the number falls as work lands rather
+# than sitting still until the next list.
 def remaining_estimate_ms(
     times: dict, todos: list, now_ms: int, pace_ms: int, history: dict | None = None
 ) -> int:
@@ -3866,6 +3911,10 @@ def current_index(todos: list) -> int | None:
     return None
 
 
+# In plain words: a number written down is not the same as work happening. A step with a
+# recorded start and no recorded finish is, as far as this record knows, still running —
+# and that is all this answers. Whether it is running *now* is a different question; the
+# next function asks it.
 def live_clock(rec: dict | None) -> bool:
     """Is this step's clock counting, as the record stands?
 
@@ -3884,6 +3933,10 @@ def live_clock(rec: dict | None) -> bool:
     return rec.get("started_ms") is not None and rec.get("done_ms") is None
 
 
+# In plain words: the pane's real question — is anything being worked on at this moment?
+# Two sources must agree. The record says a clock is counting; the transcript says whether
+# the agent has finished its turn. Once the turn has ended nothing is in progress, whatever
+# a number left behind by the last write may suggest.
 def step_is_running(state: dict, rec: dict | None) -> bool:
     """The question the pane actually asks: is a step in progress *right now*?
 
@@ -3898,6 +3951,9 @@ def step_is_running(state: dict, rec: dict | None) -> bool:
     return live_clock(rec)
 
 
+# In plain words: the clock is worked out from the recorded start and the current time,
+# rather than copied from the last update, so the number keeps moving between the watcher's
+# writes instead of standing still and then jumping.
 def live_elapsed(rec: dict, now_ms: int) -> int | None:
     """The clock as of *now*, not as of the watcher's last write.
 
@@ -4057,6 +4113,10 @@ def _plain(text: str) -> str:
     return _ANSI_RE.sub("", str(text))
 
 
+# In plain words: a terminal is not a grid of equal letters. An emoji or a Japanese
+# character takes two columns on screen where an ordinary letter takes one, so counting
+# characters miscounts them and the box's right-hand wall ends up ragged. This counts
+# screen columns, which is what keeps the frame square.
 def _cell_width(text: str) -> int:
     """Visible columns, so box borders and emoji line up in a terminal."""
     width = 0
@@ -4067,6 +4127,9 @@ def _cell_width(text: str) -> int:
     return width
 
 
+# In plain words: shorten a coloured line to a width without cutting a colour code in half.
+# Those invisible instructions have to survive, or everything after the cut inherits the
+# wrong ink; the ellipsis is the polite way of saying the line was trimmed.
 def _clip_cells(text: str, width: int) -> str:
     """Clip a styled string to a visible-column budget, keeping ANSI intact."""
     visible = _plain(text)
@@ -5269,6 +5332,9 @@ def daemon_pid() -> int | None:
     return None
 
 
+# In plain words: a note left on disk saying "a watcher is running, and its number is
+# this". The number is the point: a note whose owner is no longer alive is how a leftover
+# from a crash or an upgrade gets noticed and replaced, instead of blocking the fresh one.
 def write_lock(cwd: str, instance_pid, path: str | None = None) -> None:
     # `path` exists for the NAS pane watcher, whose claim on the scratch dir is a second
     # lock file: two daemons, two responsibilities (one follows a local instance, the
@@ -5297,6 +5363,9 @@ def clear_lock(pid: int | None = None, path: str | None = None) -> None:
         pass
 
 
+# In plain words: has the watcher written anything recently? Every write carries the time
+# it was made, so a file that stops being stamped belongs to a watcher that has stopped —
+# which is how "the list has not changed" is told apart from "nobody is updating it".
 def state_is_fresh(state: dict | None, max_age: float = HEARTBEAT_GRACE) -> bool:
     if not state or state.get("status") != "watching":
         return False
