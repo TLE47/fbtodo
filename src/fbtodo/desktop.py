@@ -6,7 +6,7 @@ import glob
 import json
 import os
 import sqlite3
-from .base import *  # noqa: F401,F403 (the package is one namespace)
+from .base import *  # noqa: F401,F403 — the package is one namespace
 
 # ============================================================ desktop backend
 def project_path_of(db: str):

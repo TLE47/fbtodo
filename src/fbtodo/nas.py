@@ -10,8 +10,9 @@ import json
 import os
 import shlex
 import subprocess
-from .base import *  # noqa: F401,F403 (the package is one namespace)
-from .alerts import *  # noqa: F401,F403 (the package is one namespace)
+from .base import *  # noqa: F401,F403 — the package is one namespace
+from .alerts import *  # noqa: F401,F403 — the package is one namespace
+from .scan import *  # noqa: F401,F403 — the package is one namespace
 
 # ==================================================================== NAS backend
 def nas_ssh(script: str, host: str, timeout: float = NAS_TIMEOUT) -> bytes:

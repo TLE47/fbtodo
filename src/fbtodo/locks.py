@@ -10,7 +10,7 @@ import json
 import os
 import signal
 import time
-from .base import *  # noqa: F401,F403 (the package is one namespace)
+from .base import *  # noqa: F401,F403 — the package is one namespace
 
 # In plain words: a claim is a file HOLDING A LOCK THE OPERATING SYSTEM OWNS. The number
 # is written inside the file for a person reading the scratch dir, but the exclusion comes

@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shlex
+import shutil as _shutil
 import subprocess
 import sys
 import tempfile

@@ -12,7 +12,7 @@ import json
 import os
 import re
 import zlib
-from .base import *  # noqa: F401,F403 (the package is one namespace)
+from .base import *  # noqa: F401,F403 — the package is one namespace
 
 def _iso_ms(ts):
     if not ts:

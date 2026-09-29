@@ -10,7 +10,7 @@ import os
 import re
 import subprocess
 import time
-from .base import *  # noqa: F401,F403 (the package is one namespace)
+from .base import *  # noqa: F401,F403 — the package is one namespace
 
 # ------------------------------------------- the patches themselves, and the alerts
 # The pane says two things about the CLI patches that no store knows: what the last
