@@ -3,8 +3,8 @@
 **Watch your coding agent work — its checklist, live, in a pane under the session.**
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org)
-[![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#requirements)
-[![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#requirements)
+[![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#start-here)
+[![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#start-here)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Tests: self-check](https://img.shields.io/badge/tests-self--check%20%2B%20notify%20suite-blueviolet)](#development)
 
@@ -30,9 +30,75 @@ through — the very list the agent keeps for itself — and draws it in a small
 times each step from the moment the step actually starts, estimates what is left, and can
 ring your phone when a session finishes, stalls, stops on a question, or loses its pane.
 
-Quick links: [What it does](#what-it-does) · [Does it work with my setup?](#does-it-work-with-my-setup) ·
-[Install](#install-60-seconds) · [Commands](#everyday-commands) · [Settings](#settings) ·
-[FAQ](#faq) · [Ideas & roadmap](#ideas--roadmap)
+Quick links: [Start here](#start-here) · [What is tmux?](#what-is-tmux) · [What it does](#what-it-does) ·
+[Commands](#everyday-commands) · [Settings](#settings) · [FAQ](#faq) ·
+[Ideas & roadmap](#ideas--roadmap)
+
+Everything past the first two sections is optional: read it when you want it. If something
+does not work, [troubleshooting](#troubleshooting) and the [FAQ](#faq) are the two places to
+look.
+
+---
+
+## Start here
+
+Two commands and one habit.
+
+```sh
+# 1. tmux — only the pane needs it
+brew install tmux                     # macOS · `sudo apt install tmux` on Debian/Ubuntu
+
+# 2. fbtodo: one clone, one symlink
+git clone https://github.com/TLE47/fbtodo ~/Projects/fbtodo
+mkdir -p ~/.local/bin && ln -sf ~/Projects/fbtodo/fbtodo ~/.local/bin/fbtodo
+```
+
+Then, in tmux, start your agent the way you always do:
+
+```sh
+tmux new -s work      # 1. a tmux session
+freebuff              # 2. your agent, in it
+#                      3. a FBTODO pane opens underneath, on its own
+```
+
+That is the whole setup. No config file, no hook, nothing to add to a prompt: fbtodo reads
+the todo list the agent **already keeps for itself**. You need **Python 3.9+** (it is
+already on macOS and most Linux) and **tmux**, and something to watch.
+
+<details>
+<summary><b>The pane did not appear — the four usual reasons</b></summary>
+
+| What you see | What it is |
+|---|---|
+| nothing at all | you are not in tmux: run `tmux new -s work`, then start the agent inside it |
+| `fbtodo: command not found` | `~/.local/bin` is not on your `PATH` — the one line to add is in [Install, in detail](#is-it-on-your-path) |
+| a pane, but no list | the agent has not written a todo list yet; `fbtodo status` says what it sees |
+| the pane is somewhere odd | `fbtodo why` — it names the pane, the anchor and where the placement came from |
+
+</details>
+
+## What is tmux?
+
+tmux is a *terminal multiplexer*: it keeps terminal sessions alive when a window closes, and
+it lets one window hold several **panes** — rectangles you split, each running its own
+program. That is the only reason fbtodo wants it: the list is drawn in a small pane
+**underneath the pane your agent runs in**, which is where a glance looks for it.
+
+| Keys | What it does |
+|---|---|
+| `tmux new -s work` | start a session called `work` |
+| `Ctrl-b "` | split the current pane, top and bottom |
+| `Ctrl-b %` | split the current pane, side by side |
+| `Ctrl-b` then an arrow key | move between panes |
+| `Ctrl-b d` | detach — everything keeps running · `tmux a -t work` comes back |
+
+A pane is a rectangle inside a **window**, and a window lives in a **session**. fbtodo cares
+about that hierarchy for one reason: "underneath the session" has to mean underneath the
+actual pane, not merely somewhere in the same window.
+
+**Do you have to use it?** Only for the pane. `fbtodo snap`, `json` and `bar` are plain
+commands that work anywhere, and a status line is a perfectly good tmux-free setup — see
+[`examples/tmux.conf`](examples/tmux.conf). Pane and no-pane are equally supported.
 
 ---
 
@@ -76,35 +142,25 @@ says so explicitly.
 
 ---
 
-## Install (60 seconds)
+## Install, in detail
 
-### Requirements
+[Start here](#start-here) is the whole install; this is the same thing with the reasoning,
+and the parts you only need if the pane is not quite what you wanted.
 
-- **Python 3.9+** — already on macOS and most Linux boxes; no `pip install` of anything.
-- **tmux** — only for the pane itself. `snap`, `json` and `bar` work fine without it.
-- **macOS or Linux**, and Freebuff running somewhere to watch.
+### Is it on your `PATH`?
+
+`~/.local/bin` is not on `PATH` everywhere. If `fbtodo: command not found` was what you got,
+this is the line to add to `~/.zshrc` or `~/.bashrc`:
 
 ```sh
-# tmux, if you do not have it yet
-brew install tmux            # macOS
-sudo apt install tmux        # Debian / Ubuntu
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-### Install it
+Then say hello — this needs no tmux and no session:
 
 ```sh
-git clone https://github.com/TLE47/fbtodo ~/Projects/fbtodo
-mkdir -p ~/.local/bin && ln -sf ~/Projects/fbtodo/fbtodo ~/.local/bin/fbtodo
-```
-
-Two commands — the clone keeps the executable bit, so there is nothing to `chmod`.
-
-Make sure `~/.local/bin` is on your `PATH` (add
-`export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` or `~/.bashrc` if it is not), then:
-
-```sh
-fbtodo -V          # prints the version — you are installed
-fbtodo snap        # one plain-text snapshot of the list (works with no tmux)
+fbtodo -V          # the version
+fbtodo snap        # one plain-text snapshot, when a session is running in this directory
 ```
 
 ### Or try it in 30 seconds, with no tmux at all
@@ -120,18 +176,11 @@ fbtodo bar      # "todos 3/5", what a status line shows
 Those three need nothing but Python. The pane is the pretty one; these are the ones you can
 script.
 
-### Use it
+### Placing the pane yourself
 
-The intended setup is *be in tmux*: the pane keeper opens a todo pane by itself for any
-local session that is in tmux and does not have one yet.
-
-```sh
-tmux new -s work           # 1. start a tmux session
-freebuff                   # 2. run your agent in it
-#                           3. a FBTODO pane appears underneath, on its own
-```
-
-If you would rather place it yourself, split the pane and bind it to *that* shell:
+You do not have to: the pane keeper opens a pane by itself for any local session in tmux
+that has none (that is the habit in [Start here](#start-here)). If you would rather place it
+yourself, split the pane and bind it to *that* shell:
 
 ```
 Ctrl-b "                   # split the current pane downwards
@@ -145,13 +194,16 @@ than to whatever is newest in the directory.
 
 Typing `freebuff` *and* remembering to open a pane is friction, and friction is what decides
 whether a pane ever gets used. Source [`examples/fb.sh`](examples/fb.sh) from `~/.zshrc` or
-`~/.bashrc` and `fb` does both — the pane first, the agent second:
+`~/.bashrc` and `fb` does three things in the order that matters: it refreshes the released
+CLI, opens the pane, then starts the agent.
 
 ```sh
 fb() {
     case "$1" in
         -h|--help|-V|--version) command freebuff "$@"; return $? ;;   # one-shots: no pane
     esac
+
+    _fb_refresh                      # stay on the current release
 
     if [ -n "${TMUX:-}" ] && [ -z "${FBTODO_NO_PANE:-}" ] && command -v fbtodo >/dev/null 2>&1; then
         tmux split-window "-${FBTODO_SPLIT:-v}" -l "${FBTODO_PANE_SIZE:-12}" -d \
@@ -160,10 +212,40 @@ fb() {
 
     command freebuff "$@"
 }
+
+# `npm i -g freebuff`, quietly: the version moving is the point, the install is not.
+_fb_refresh() {
+    [ -n "${FREEBUFF_NO_REFRESH:-}" ] && return 0
+    command -v npm >/dev/null 2>&1 || return 0
+
+    local pkg before after
+    pkg="$(command npm root -g 2>/dev/null)/freebuff/package.json"
+    before=$(_fb_version "$pkg")
+
+    if command npm i -g freebuff --no-fund --no-audit >/dev/null 2>&1; then
+        after=$(_fb_version "$pkg")
+        if [ -z "$before" ] && [ -n "$after" ]; then
+            printf 'fb: installed freebuff %s\n' "$after" >&2
+        elif [ -n "$after" ] && [ "$before" != "$after" ]; then
+            printf 'fb: freebuff updated %s -> %s\n' "$before" "$after" >&2
+        fi
+    else
+        printf '%s\n' "fb: npm i -g freebuff failed; launching the installed version" >&2
+    fi
+}
+
+_fb_version() {                      # the version in a package.json, or nothing
+    [ -r "$1" ] || return 0
+    sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -n 1
+}
 ```
 
-Four things in there are worth knowing:
+Five things in there are worth knowing:
 
+- **`_fb_refresh`** is `npm i -g freebuff --no-fund --no-audit` before anything else, and it
+  speaks only when the version moved (`fb: freebuff updated 1.2.0 -> 1.2.1` on stderr). A
+  launch with no npm, or a registry having a bad day, still starts the installed version.
+  Scripts and tests want `FREEBUFF_NO_REFRESH=1` — this is a network round trip per launch.
 - **`--instance-of $$`** binds the pane to the session *this shell* launches, not to the
   newest one in the directory — the difference between your pane and somebody else's list.
 - **`-d`** places the pane without stealing the cursor, so the agent still starts here.
@@ -185,22 +267,6 @@ real tool — the pane in your recording is `fbtodo pane`, reading a real file.
 ```sh
 brew install vhs && docs/demo/record.sh     # → docs/demo/demo.gif
 ```
-
-<details>
-<summary><b>New to tmux? The four keys you need</b></summary>
-
-| Keys | What it does |
-|---|---|
-| `tmux new -s work` | start a named session |
-| `Ctrl-b "` | split the current pane, top and bottom |
-| `Ctrl-b %` | split the current pane, side by side |
-| `Ctrl-b` then arrow | move between panes |
-| `Ctrl-b d` | detach (everything keeps running) · `tmux a -t work` re-attaches |
-
-A pane is a rectangle inside a window; a window holds the panes; a session holds the
-windows. fbtodo cares about that hierarchy because "underneath the session" has to mean
-underneath the actual pane, not merely somewhere in the same window.
-</details>
 
 ---
 
@@ -303,6 +369,24 @@ cp -R notify/* ~/.config/freebuff-notify/
 
 See [notify/README.md](notify/README.md) for the transports, the topics and the tests.
 
+### Turning the alerts off
+
+The phone is written by exactly one program — `phone.sh` — and it has a mute switch that
+costs nothing to flip:
+
+| You want | Do this |
+|---|---|
+| no phone alerts, bells still chime and log | `FREEBUFF_PHONE=off` |
+| …and to keep it that way | `echo off > ~/.config/freebuff-notify/phone-state` |
+| one launch silenced | `FREEBUFF_PHONE=off freebuff` |
+| one watch off | `FBTODO_ASK_SECONDS=0`, `FBTODO_PAUSE_SECONDS=0`, `FBTODO_PANE_BELL_SECONDS=0` |
+| one watch gone | point its path at a file that does not exist (`FBTODO_ASK=/none`) — a missing script is skipped, not an error |
+| nothing leaving the machine at all | do not install the kit — that is also the default state |
+
+`FREEBUFF_PHONE` accepts `off`, `0`, `false`, `no` or `disabled`, and it is read when a bell
+sends, so a launch can silence itself. Quiet hours are not implemented yet; they are on the
+[roadmap](#ideas--roadmap).
+
 ---
 
 ## How it works
@@ -311,7 +395,7 @@ Enough to be useful, without the tour of every corner. The genuinely deep detail
 state-file contract, the notifier contracts and the pane
 lifecycle — is in **[docs/INTERNALS.md](docs/INTERNALS.md)**.
 
-### Where the list comes from: three stores
+### Where the list comes from: two stores
 
 A coding agent's todo list is not a side channel — it is written to whatever transcript
 store the client keeps. Freebuff keeps two, and picking the wrong one is the usual reason a
