@@ -19,9 +19,8 @@ twice and asserts the two runs agree.
 
 import argparse
 import difflib
-import importlib.machinery
-import importlib.util
 import json
+import importlib
 import os
 import shutil
 import sys
@@ -31,7 +30,6 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 GOLDEN = os.path.join(HERE, "golden")
-FB = os.path.join(ROOT, "fbtodo")
 
 # 2026-09-29T12:00:00Z. The fixture's own timestamps are anchored to it, so "the list was
 # written 4m ago" in a golden file means exactly that, forever.
@@ -70,12 +68,11 @@ def frozen_env(home: str) -> dict:
 
 
 def load_module():
-    spec = importlib.util.spec_from_loader(
-        "fbtodo", importlib.machinery.SourceFileLoader("fbtodo", FB)
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    """The program as a module: the package beside the launcher (`ROOT/src/fbtodo`)."""
+    sys.path.insert(0, os.path.join(ROOT, "src"))
+    for name in [n for n in sys.modules if n == "fbtodo" or n.startswith("fbtodo.")]:
+        del sys.modules[name]
+    return importlib.import_module("fbtodo")
 
 
 def products(module, home: str, golden: str = GOLDEN) -> dict:

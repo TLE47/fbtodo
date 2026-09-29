@@ -10,6 +10,7 @@ The suite drives real tmux servers it starts itself and takes ~90-160 s. It clea
 up only that one directory — created by this script, verified by path — never a
 parent.
 """
+import importlib
 import json
 import os
 import re
@@ -25,6 +26,10 @@ FB = os.path.join(HERE, "fbtodo")
 TEST_HOME = os.path.join(HOME, ".freebuff", "fbtodo-test")
 REAL_HOME = os.path.join(HOME, ".freebuff")
 PANES = os.path.join(HERE, "fbtodo")
+# The program is the package under `src/`; `FB` above is the launcher beside it, which is
+# what every subprocess phase runs and what `self_argv` names back to us.
+SRC = os.path.join(HERE, "src")
+sys.path.insert(0, SRC)
 CWD = HOME
 STRIP = lambda s: re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", s)  # noqa: E731
 
@@ -134,6 +139,22 @@ def say(msg):
 
 
 say.last = time.monotonic()
+
+
+def load_fbtodo(home: str | None = None) -> object:
+    """The program as a module: the package, freshly imported for `home`.
+
+    Its paths (state root, task log, lock) are decided at import, and this suite asks for
+    several roots in one process — which is why it used to load the single file by path
+    under a new name each time. Dropping the package's modules and importing it again does
+    the same thing for a package, and gives a module object whose globals are patchable
+    exactly as the single file's were.
+    """
+    if home is not None:
+        os.environ["FBTODO_HOME"] = home
+    for name in [n for n in sys.modules if n == "fbtodo" or n.startswith("fbtodo.")]:
+        del sys.modules[name]
+    return importlib.import_module("fbtodo")
 
 
 def spawn_quiet(*args):
@@ -495,14 +516,7 @@ try:
         "changed contract fails the check: ok")
 
     # ---- new session drops the previous list instead of showing it
-    import importlib.machinery
-    import importlib.util
-
-    spec = importlib.util.spec_from_loader(
-        "fbtodo", importlib.machinery.SourceFileLoader("fbtodo", FB)
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = load_fbtodo()
 
     # ---- what decides a state write: the clock comes out of the comparison, everything
     #      else stays, and "everything else" includes fields this does not know about — a
@@ -2864,13 +2878,7 @@ try:
     # ---- per-task timing is measured, so it must behave under observation: the clock
     #      belongs to the step being worked on, counts up while it runs, freezes when it
     #      is ticked off, and moves on to the next one
-    import importlib.machinery
-
-    spec0 = importlib.util.spec_from_loader(
-        "fbtodo", importlib.machinery.SourceFileLoader("fbtodo", FB)
-    )
-    mod = importlib.util.module_from_spec(spec0)
-    spec0.loader.exec_module(mod)
+    mod = load_fbtodo()
     mod.TASKS_PATH = os.path.join(TEST_HOME, "tasks-unit.json")
 
     def seq(a, b, c):
@@ -3518,11 +3526,7 @@ try:
     saved_home = os.environ.get("FBTODO_HOME")
     os.environ["FBTODO_HOME"] = TEST_HOME
     try:
-        spec_p = importlib.util.spec_from_loader(
-            "fbtodo_prune", importlib.machinery.SourceFileLoader("fbtodo_prune", FB)
-        )
-        mp = importlib.util.module_from_spec(spec_p)
-        spec_p.loader.exec_module(mp)
+        mp = load_fbtodo()
         assert mp.SCRATCH == TEST_HOME, mp.SCRATCH
 
         now = int(time.time() * 1000)
@@ -4483,13 +4487,7 @@ try:
         # over and three rows down, under a NAS pane: the wrapper had split a WINDOW, and
         # tmux answered that with the window's active pane, which is not necessarily the
         # one running freebuff.
-        import importlib.machinery
-
-        spec_p = importlib.util.spec_from_loader(
-            "fbtodo_panes", importlib.machinery.SourceFileLoader("fbtodo_panes", FB)
-        )
-        panes_mod = importlib.util.module_from_spec(spec_p)
-        spec_p.loader.exec_module(panes_mod)
+        panes_mod = load_fbtodo()
         panes_mod.TMUX_BIN = list(tmux)  # the private server, as the keeper has it
         panes_mod.TASKS_PATH = os.path.join(TEST_HOME, "tasks-unit.json")
 
@@ -5054,13 +5052,7 @@ try:
     # ---- the liveness pattern: it must match a real session and never its own probe.
     #      `pgrep -f` saw the probe's own script line, which carried the pattern, so a NAS
     #      with no session at all read as live — and the pane never closed.
-    import importlib.machinery as _im
-    import importlib.util as _iu
-
-    # `fbtodo` has no .py extension, so it needs a loader named explicitly
-    _loader = _im.SourceFileLoader("fbtodo_mod", FB)
-    _mod = _iu.module_from_spec(_iu.spec_from_loader("fbtodo_mod", _loader))
-    _loader.exec_module(_mod)
+    _mod = load_fbtodo()
     pat = _mod.nas_pgrep("manicode/freebuff")
     assert not re.search(pat, f"sh -c \"pgrep -f {pat} >/dev/null && echo 1\""), pat
     assert re.search(pat, "node /root/.config/manicode/freebuff/index.js"), pat
