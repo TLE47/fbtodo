@@ -28,6 +28,23 @@ PANES = os.path.join(HERE, "fbtodo")
 CWD = HOME
 STRIP = lambda s: re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", s)  # noqa: E731
 
+# The pane's progress row, found by what is ON it rather than by a label: the bar labels
+# itself (`[████▉░░░]  25% (2/8)`), because `PROGRESS` cost eight columns of a 68-column row
+# and started one column left of `PATCH`, `GOAL`, `ALERT` and `REFIT`.
+BAR_CELLS = re.compile(r"\[[█▏▎▍▌▋▊▉░]+\]")
+
+
+def bar_row_of(framed: str) -> str:
+    """The one row of a rendered frame that carries a bracketed progress bar.
+
+    Matched on the STRIPPED line and returned as it was drawn: every cell of the bar is a
+    glyph wrapped in its own escape, so between `[` and `]` there is more than the bar.
+    """
+    for line in framed.splitlines():
+        if BAR_CELLS.search(STRIP(line)):
+            return line
+    raise AssertionError(f"no progress row in the frame:\n{framed}")
+
 env = dict(os.environ, FBTODO_HOME=TEST_HOME)
 # The phone notifiers, muted for the whole run — in THIS process's environment too, not
 # just in `env`. Some phases start a REAL watcher (the zshrc autostart hook inherits the
@@ -1355,7 +1372,8 @@ try:
     assert not any(ch in rich for ch in "┌┐└┘"), rich
     assert "FREEBUFF TODOS" in rich and "watcher: pid 999" in rich, rich
     assert "🎯 Goal:" in rich and "✔" in rich and "➔" in rich, rich
-    assert "PROGRESS" in rich and "LIVE:" in rich, rich
+    assert BAR_CELLS.search(rich) and "LIVE:" in rich, rich
+    assert "PROGRESS" not in rich, "the bar row still carries its old label"
     assert len(rich.splitlines()) <= 20, rich
     for line in rich.splitlines():
         assert module._cell_width(line) <= 46, (line, module._cell_width(line))
@@ -1519,11 +1537,9 @@ try:
         ],
         done=1, total=3,
     )
-    bar_row = [
-        line for line in ansi.sub("", module.render(
-            third, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW,
-        )).splitlines() if "PROGRESS" in line
-    ]
+    bar_row = [bar_row_of(ansi.sub("", module.render(
+        third, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW,
+    )))]
     # the bar is two glyphs at EVERY percentage — a cell that would be a fraction rounds to
     # the nearer of them, rather than drawing a third glyph in the middle of the ramp. A
     # third of a 20-cell bar is 6.67 cells, so seven of them are filled.
@@ -1534,12 +1550,9 @@ try:
     # character-based rendering that survives any background scheme: every filled cell is
     # the `█` GLYPH painted with a foreground colour, and nothing on the row is ever a
     # background-filled block (40-47, 48, 100-107)
-    raw_bar = next(
-        line for line in module.render(
-            third, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW,
-        ).splitlines()
-        if "PROGRESS" in line
-    )
+    raw_bar = bar_row_of(module.render(
+        third, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW,
+    ))
     filled = re.findall(r"(\x1b\[[0-9;]*m)(?:█|▋)", raw_bar)
     assert len(filled) == 7, raw_bar  # the assertions below are about THESE cells
     assert all(esc.startswith("\x1b[38;") for esc in filled), raw_bar
@@ -1548,6 +1561,24 @@ try:
     # index is a background, so `\x1b[45m█` painted a magenta block instead of a character.
     assert not re.search(r"\x1b\[(4[0-7]|10[0-7])m", raw_bar), raw_bar
     assert "\x1b[48" not in raw_bar, raw_bar
+    # ---- ...and the frame never falls off the TOP of the pane it is drawn in: the top
+    #      border carries the title and the session's identity, and a row that scrolls away
+    #      takes them with it — a 9-line pane used to show a list with nothing over it,
+    #      because the two elision summaries had spent the height the steps were given.
+    #      Swept from 9 — the height of the pane this was found on — up to a tall one, for a
+    #      long list and a short one. Below 9 the step area cannot hold even one wrapped step
+    #      plus its summary, and no pane that short is opened by anything: the wrapper wants a
+    #      20-line window and the default pane is 12.
+    for h in range(9, 25):
+        for state_dict in (rich_state, dict(rich_state, todos=steps, task_times={})):
+            framed = module.render(state_dict, True, watching=999, width=66, height=h,
+                                   now_ms=SWEEP_NOW)
+            got = STRIP(framed).splitlines()
+            assert len(got) <= h, (h, framed)
+            assert got[0].startswith("╭──  FREEBUFF TODOS") and got[-1].startswith("╰"), (
+                h, framed)
+    say("fits the pane it is given, at every height, without losing its own title: ok")
+
     say("renders the framed colour pane inside its width and height: ok")
 
     # ---- the pane's own layout rules: a tight checkmark whose wrapped lines hang under
@@ -1573,7 +1604,7 @@ try:
     zero = ansi.sub("", module.render(
         nothing_done, True, width=66, height=20, now_ms=SWEEP_NOW,
     ))
-    zero_bar = next(line for line in zero.splitlines() if "PROGRESS" in line)
+    zero_bar = bar_row_of(zero)
     assert set(zero_bar.split("[", 1)[1].split("]", 1)[0]) == {"░"}, zero_bar
     # no heading written means no heading row at all — the old `— none stated` spent one
     # of a fixed-height strip's rows saying nothing
@@ -1605,14 +1636,20 @@ try:
     )
     assert " IDLE  │ LIST: #3 · 2m ago │ LIVE: " in no_model_row, repr(no_model_row)
     assert "space-bunny" not in no_model_row, repr(no_model_row)
-    # A row with room for all four fields carries the pace as well, and a longer model name
+    # A wider strip keeps its age rather than trading it for a pace, and a longer model name
     # is clipped, never wrapped: the row is one line by contract.
     long_row, _ = footer_of(
         dict(rich_state, model="some-provider/space-bunny-alpha-preview",
              task_times={}, source_updated_ms=SWEEP_NOW - 143_000),
         width=70,
     )
-    assert " ~2m · space-bunny-a… │ LIST: #3 · 2m ago │ LIVE: " in long_row, repr(long_row)
+    # The strip is the state, the list's age and the clock — three fields, and the pace is
+    # not one of them any more: `~2m · model` was the same number every step row already
+    # carries, on the row where it is a prediction about THAT step, and it was spending the
+    # age's room on a 70-column pane. The model stays on the top border, where a long name
+    # is clipped rather than wrapped: the border is one line by contract.
+    assert "~2m" not in long_row and "IDLE  │ LIST: #3 · 2m ago │ LIVE: " in long_row, \
+        repr(long_row)
     assert "preview" not in long_row, repr(long_row)
     # ...and the model is named on the TOP BORDER too, where there is room for it at any
     # width the strip cannot hold: the pane that quotes a pace says whose pace it is.
@@ -1623,13 +1660,14 @@ try:
     # as a clock was on it.
     tick_row, _ = footer_of(dict(rich_state, source_updated_ms=SWEEP_NOW - 143_000,
                                  task_times=SHORT_CLOCKS))
-    assert " WORKING 42s  │ LIST: #3 · 2m ago │ LIVE: " in tick_row, repr(tick_row)
-    # The longest chip a step can wear does spend the age, because the row still has to fit:
-    # `59m59s (+58m29s)` is 23 columns, and the age is what goes rather than the list itself.
+    assert " WORKING  │ LIST: #3 · 2m ago │ LIVE: " in tick_row, repr(tick_row)
     run_row, _ = footer_of(dict(rich_state, source_updated_ms=SWEEP_NOW - 143_000))
-    # The step has long outrun the pace its list taught (the one finished step took 90s),
-    # so the running clock names the overrun inline, and the chip is flagged red.
-    assert " WORKING 59m59s (+58m29s)  │ LIST: #3 │ LIVE: " in run_row, repr(run_row)
+    # The chip is the STATE and nothing else: the running clock that used to be repeated
+    # here — `WORKING 11m07s` beside `11m07s [~3m]` on the step's own row — is the row's,
+    # where the estimate it is being compared against is. The overrun is not restated here
+    # either; the chip turning red is all the footer has to say about it.
+    assert " WORKING  │ LIST: #3 · 2m ago │ LIVE: " in run_row, repr(run_row)
+    assert "59m59s" not in run_row and "(+58m29s)" not in run_row, repr(run_row)
     raw_run = module.render(rich_state, True, watching=999, width=66, height=20,
                             now_ms=SWEEP_NOW)
     assert "\x1b[7;31m" in raw_run, repr(raw_run)
@@ -1706,13 +1744,32 @@ try:
         todos=[{"task": f"step {n}", "completed": n < 4} for n in range(8)],
     )
     mid_frame = ansi.sub("", module.render(
+        middling, True, watching=999, width=70, height=12, now_ms=SWEEP_NOW,
+    ))
+    assert len(mid_frame.splitlines()) == 12, mid_frame
+    assert "50% (4/8)" in mid_frame, mid_frame
+    # The wording is the marker's own rule, checked where it is decided: a run of steps that
+    # are all DONE says `completed` whatever side of the window it sits on, and a run with
+    # anything still to do says `pending` (the bug this replaced: a finished list read `7
+    # more steps pending` at 100%, right above a bar saying All done).
+    assert module._elision_note(7, [True] * 7, "earlier") == "  │ 7 earlier steps completed"
+    assert module._elision_note(3, [False] * 3, "more") == "  │ 3 more steps pending"
+    assert module._elision_note(1, [True], "more") == "  │ 1 earlier step completed"
+    assert module._elision_note(1, [False], "earlier") == "  │ 1 earlier step pending"
+    # ...and on the frame while the pane has the rows for them. Two markers and two steps
+    # here, and the frame is exactly its pane's height — it used to be three rows over and
+    # lost its own title off the top.
+    assert "4 earlier steps completed" in mid_frame, mid_frame
+    assert "2 more steps pending" in mid_frame, mid_frame
+    squat_elide = ansi.sub("", module.render(
         middling, True, watching=999, width=46, height=9, now_ms=SWEEP_NOW,
     ))
-    assert "50% (4/8)" in mid_frame, mid_frame
-    assert "4 earlier steps completed" in mid_frame, mid_frame
-    assert "3 more steps pending" in mid_frame, mid_frame
+    assert len(squat_elide.splitlines()) == 9, squat_elide
+    assert "50% (4/8)" in squat_elide, squat_elide
+    assert sum("steps" in ln for ln in squat_elide.splitlines()) == 1, squat_elide
+    assert "4 earlier steps completed" in squat_elide, squat_elide
     # the bar's total width is defined at a partial percentage: half filled, half track
-    mid_bar = next(line for line in mid_frame.splitlines() if "PROGRESS" in line)
+    mid_bar = bar_row_of(mid_frame)
     glyphs = mid_bar.split("[", 1)[1].split("]", 1)[0]
     assert glyphs.count("█") == 10 and glyphs.count("░") == 10, mid_bar
     # the ramp spans the FILLED run, so a quarter-done bar still ends in the gradient's
@@ -1724,9 +1781,9 @@ try:
             rich_state, task_times={},
             todos=[{"task": f"step {n}", "completed": n < 1} for n in range(4)],
         )
-        q_row = next(line for line in module.render(
+        q_row = bar_row_of(module.render(
             quarter, True, watching=999, width=46, now_ms=SWEEP_NOW,
-        ).splitlines() if "PROGRESS" in line)
+        ))
     finally:
         os.environ.pop("FBTODO_TRUECOLOR", None)
         module._THEME_CACHE = None
@@ -1734,8 +1791,15 @@ try:
         r"\x1b\[38;2;(\d+);(\d+);(\d+)m█", q_row
     )]
     assert len(q_stops) == 5, q_row  # a quarter of a 20-cell bar
-    assert q_stops[0][2] > 225, q_stops  # cyan at the left edge of the fill...
-    assert q_stops[-1][2] < 190, q_stops  # ...emerald at its leading edge
+    # The ramp is the PALETTE's, and the assertion is against the palette rather than
+    # against two magic numbers: the fill starts at the accent's cyan and ends near the
+    # success green — the two hues the pane is built from — and never goes back the other
+    # way along the way.
+    start_rgb = module._hex_rgb(module.THEME_DEFAULTS["gradient_start"])
+    end_rgb = module._hex_rgb(module.THEME_DEFAULTS["gradient_end"])
+    assert abs(q_stops[0][2] - start_rgb[2]) < 40 and q_stops[0][2] > end_rgb[2], q_stops
+    assert abs(q_stops[-1][2] - end_rgb[2]) < 40, q_stops
+    assert all(a[2] >= b[2] for a, b in zip(q_stops, q_stops[1:])), q_stops
     # one symbol per row, no box glued to it, and the three of them put the text in the
     # same column — a wrapped line then hangs under the words, not under the marker
     three_kinds = ansi.sub("", module.render(
@@ -1783,17 +1847,27 @@ try:
     ))
     est_lines = est_wide.splitlines()
     active_est = next(line for line in est_lines if "➔" in line)
-    assert "30s / ~2m" in active_est and "STUCK" not in active_est, active_est
+    # the active row's number is a BADGE: the clock, then the estimate in brackets, so the
+    # row reads as one item and the estimate cannot be mistaken for another duration
+    assert "30s [~2m]" in active_est and "STUCK" not in active_est, active_est
     pending_est = next(line for line in est_lines if "○" in line)
     assert pending_est.rstrip().endswith("~2m │"), pending_est
-    est_bar = next(line for line in est_lines if "PROGRESS" in line)
+    est_bar = bar_row_of(est_wide)
     # The finished steps are 1m, 2m and 3m, so the spread behind the pace is 1m–3m — 3x, and
     # therefore wide enough to be said out loud. Where the row has room for only one of
     # them the RANGE takes it and the ETA does not: the range says something the bare number
     # cannot, while the ETA is that same number told as a clock. The plain path (checked
     # below) keeps the bare token, because scripts parse it.
-    assert "EST REM: 3m30s (1m–3m)" in est_bar, est_bar
-    assert " | ETA " not in est_bar, est_bar
+    assert "EST REM 3m30s (1m–3m)" in est_bar, est_bar
+    # ...and on a wider row it carries the ETA as well: dropping the row's label and the
+    # duplicate pace bought the columns. The PRIORITY is what the width decides, not
+    # whether the fact exists — `EST REM` and the range come first, the clock is added only
+    # when the range has already fitted.
+    assert " | ETA " in est_bar, est_bar
+    mid_est_bar = bar_row_of(ansi.sub("", module.render(
+        est_state, True, watching=999, width=68, height=20, now_ms=SWEEP_NOW,
+    )))
+    assert "EST REM 3m30s (1m–3m)" in mid_est_bar and "ETA" not in mid_est_bar, mid_est_bar
     # ...and a list whose finished steps AGREE shows no range at all: 2m from 2m is a real
     # 2m, so the eye keeps the plain number and the ETA keeps its place on the row
     even_times = {
@@ -1808,12 +1882,10 @@ try:
     assert module.pace_spread_ms(even_times, even_todos, SWEEP_NOW) == (120_000, 120_000)
     assert not module.is_wide(120_000, 120_000), "2m from 2m must not be called wide"
     assert module.fmt_estimate_spread(120_000, (120_000, 120_000)) == "~2m"
-    even_bar = next(
-        line for line in ansi.sub("", module.render(
-            dict(est_state, task_times=even_times, todos=even_todos, done=2, total=3),
-            True, watching=999, width=80, height=20, now_ms=SWEEP_NOW,
-        )).splitlines() if "PROGRESS" in line
-    )
+    even_bar = bar_row_of(ansi.sub("", module.render(
+        dict(est_state, task_times=even_times, todos=even_todos, done=2, total=3),
+        True, watching=999, width=80, height=20, now_ms=SWEEP_NOW,
+    )))
     assert "~2m (" not in even_bar and " | ETA " in even_bar, even_bar
     # ---- the overall time to the goal: 30s already spent plus the 3m30s still to run.
     #      The active step is the only one with a real start (0 means "never seen
@@ -1827,8 +1899,12 @@ try:
     assert module.elapsed_total_ms({}, est_state["todos"], SWEEP_NOW) is None
     assert module.total_estimate_ms({}, est_state["todos"], SWEEP_NOW, 120_000) is None
     goal_row = next(line for line in est_lines if "GOAL" in line)
-    assert "4m00s to the goal" in goal_row and "30s in" in goal_row, goal_row
-    assert "3m30s left" in goal_row, goal_row
+    # Two numbers, not three: what this row has and nowhere else has is how much is behind
+    # the owner and how much the whole thing is. The third it used to print — the time
+    # left — is the `EST REM` on the bar row above, and saying it twice was the repetition
+    # the footer was carrying.
+    assert "30s spent" in goal_row and "4m00s total" in goal_row, goal_row
+    assert "left" not in goal_row, goal_row
     # the row is bought with height the owner gave the pane, never with a step off the
     # list: a pane too short for one drops the row, and the number moves onto the bar's
     # own row instead of being lost
@@ -1836,7 +1912,7 @@ try:
         est_state, True, watching=999, width=120, height=8, now_ms=SWEEP_NOW,
     ))
     assert not any("GOAL" in line for line in est_squat.splitlines()), est_squat
-    squat_bar = next(line for line in est_squat.splitlines() if "PROGRESS" in line)
+    squat_bar = bar_row_of(est_squat)
     assert "TOT 4m" in squat_bar, squat_bar
     # ...and the row is additive height inside the budget, not a step traded for it: the
     # frame still fits `height`, and all five steps are still on screen
@@ -1848,7 +1924,7 @@ try:
     est_narrow = ansi.sub("", module.render(
         est_state, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW,
     ))
-    narrow_bar = next(line for line in est_narrow.splitlines() if "PROGRESS" in line)
+    narrow_bar = bar_row_of(est_narrow)
     assert "EST REM" not in narrow_bar, narrow_bar
     narrow_cells = narrow_bar.split("[", 1)[1].split("]", 1)[0]
     assert narrow_cells.count("█") + narrow_cells.count("░") == 20, narrow_bar
@@ -1883,8 +1959,8 @@ try:
     ))
     hist_row = next(line for line in hist_wide.splitlines() if "○" in line)
     assert hist_row.rstrip().endswith("~2m │"), hist_row
-    hist_bar = next(line for line in hist_wide.splitlines() if "PROGRESS" in line)
-    assert "EST REM: 3m30s" in hist_bar, hist_bar
+    hist_bar = bar_row_of(hist_wide)
+    assert "EST REM 3m30s" in hist_bar, hist_bar
 
     # ---- the bound on a YOUNG list's pace, and the measurement behind it. A median of one
     #      or two finished steps is not a distribution, and that is exactly where the
@@ -1949,11 +2025,23 @@ try:
         # border, the rules and the collapsed-run connectors are all that one ink
         assert "\x1b[38;2;107;107;115m╭── " in painted, repr(painted.splitlines()[0])
         assert "\x1b[2m" not in painted, "the pane still rides on the dim attribute"
-        # the tick stays green and loud; the description it belongs to is dimmed grey
-        assert "\x1b[32m  ✔\x1b[0m" in grey_row, repr(grey_row)
+        # A finished row recedes as ONE unit: the tick is the success hue dimmed exactly
+        # like the description beside it, so the marker no longer out-shouts the words it
+        # belongs to — and nothing in the frame is a bright raw green any more.
+        assert "\x1b[2;38;2;46;160;67m  ✔\x1b[0m" in grey_row, repr(grey_row)
+        assert "\x1b[32m" not in painted and "\x1b[1;32m" not in painted, repr(painted)
+        # ...the goal is the `active` ink rather than a second bold white, and the one row
+        # being worked on is the only text in the frame carrying weight
+        goal_row = next(line for line in painted.splitlines() if "🎯" in line)
+        assert "\x1b[38;2;230;237;243m" in goal_row, repr(goal_row)
+        active_row = next(line for line in painted.splitlines() if "➔" in line)
+        assert "\x1b[1;38;2;230;237;243m" in active_row, repr(active_row)
+        # ...with its estimate as an accent badge, which is what tells the row apart from
+        # `○ ~2m` on the steps that have not started
+        assert "\x1b[1;36m" in active_row and "[" in active_row, repr(active_row)
         assert "\x1b[2;38;2;255;136;0mDiagnose" in grey_row, repr(grey_row)
         assert "\x1b[38;2;255;136;0m🎯 Goal:" in painted, repr(painted)
-        painted_bar = next(line for line in painted.splitlines() if "PROGRESS" in line)
+        painted_bar = bar_row_of(painted)
         assert "\x1b[38;2;0;0;255m░" in painted_bar, repr(painted_bar)
     finally:
         for key, value in saved_greys.items():
@@ -2010,13 +2098,24 @@ try:
         os.environ["FBTODO_GRADIENT_START"] = "#ff0000"
         os.environ["FBTODO_GRADIENT_END"] = "#0000ff"
         os.environ["FBTODO_TRUECOLOR"] = "1"
+        # `with_patch` so the frame carries every footer label at once: the bar's column is
+        # the one the others keep, which is only checkable beside one of them
         themed = module.render(
-            rich_state, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW,
+            with_patch, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW,
         )
         # the title is the accent as a reverse-video chip, not a plain bold word
         assert "\x1b[7;1;33m FREEBUFF TODOS " in themed, repr(themed.splitlines()[0])
-        bar_row = next(line for line in themed.splitlines() if "PROGRESS" in line)
-        assert "\x1b[1;33mPROGRESS" in bar_row, repr(bar_row)
+        bar_row = bar_row_of(themed)
+        # the bar row has no label to paint any more, and the ratio on it is the `active`
+        # ink — the accent is spent on the ramp and the chip, not on a word
+        assert "PROGRESS" not in themed, repr(bar_row)
+        assert re.search(r"\x1b\[38;2;230;237;243m\d+% \(\d+/\d+\)", bar_row), repr(bar_row)
+        # ...and the footer's rows now share one left edge: the bar's own row starts in the
+        # column `PATCH` and `GOAL` start in, which the 8-column label it used to wear pushed
+        # it one cell left of
+        patch_led = next(line for line in themed.splitlines() if "PATCH" in line)
+        assert (STRIP(bar_row).index("[") == STRIP(patch_led).index("PATCH") == 4), (
+            repr(bar_row), repr(patch_led))
         # the ramp is sampled off the FILLED cells only: the empty track is painted in
         # its own colour, and counting that as a stop would hide a flat bar
         stops = [tuple(int(v) for v in s) for s in re.findall(
@@ -2030,7 +2129,7 @@ try:
         os.environ.pop("FBTODO_GRADIENT_START", None)
         os.environ["FBTODO_GRADIENT_END"] = "mauve"
         assert module._theme_gradient(module.read_theme())[0] == module._hex_rgb("#ff0000")
-        assert module._theme_gradient(module.read_theme())[1] == module._hex_rgb("#34d399")
+        assert module._theme_gradient(module.read_theme())[1] == module._hex_rgb("#2ea043")
         with open(local_file, "w", encoding="utf-8") as fh:
             fh.write("[1, 2, 3]")
         assert module.read_theme()["accent"] == "1;33", module.read_theme()

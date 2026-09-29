@@ -111,7 +111,7 @@ import textwrap
 import time
 import unicodedata
 
-VERSION = "4.27.0"
+VERSION = "4.29.0"
 HOME = os.path.expanduser("~")
 # FBTODO_HOME points state/lock/log elsewhere — used by the self-check so it never
 # touches the real watcher's files.
@@ -5814,10 +5814,25 @@ def _top_border(width: int, frame, title: str, right: str, badge) -> str:
 # the gradient stops are colours. Precedence is the tool's usual one: FBTODO_ACCENT /
 # FBTODO_GRADIENT_START / FBTODO_GRADIENT_END beat a project `.fbtodo-theme.json`,
 # which beats `~/.config/fbtodo/theme.json`, which beats these defaults.
+# The four inks the pane paints in, and nothing else but the two STATE colours kept in the
+# code (`warn` 33 for a step past its estimate or a patch that did not come out clean,
+# `error` 31 for a failure): a palette is not a licence to hide a failure in grey.
+#
+#   accent   the interactive ink — the title chip, the active row's marker and estimate
+#            badge, the bar's first stop
+#   active   the one thing being worked on: the active row and the goal it belongs to
+#   success  done: a finished step's tick, a patch that came out clean, the bar's last stop
+#   muted    everything secondary — a step's description, durations, the age, the strip;
+#            with `faint` for metadata that is not even claiming to be read: the frame's
+#            edges, the section labels, the watcher pid, the model
 THEME_DEFAULTS = {
     "accent": "1;36",
+    "active": "#e6edf3",
+    "success": "#2ea043",
     "gradient_start": "#22d3ee",
-    "gradient_end": "#34d399",
+    # the bar ramps accent -> success, so the two ends of the one piece of data on the
+    # frame are the same two hues as everything else on it
+    "gradient_end": "#2ea043",
     "muted": "#8b949e",   # secondary text: durations, the goal line, the age
     # The progress bar's empty cells. Mid grey on purpose: dark enough to read as empty
     # next to the gradient fill, light enough that the track's full length is visible on
@@ -5934,10 +5949,14 @@ def _styles(theme: dict, truecolor: bool) -> dict:
     This is the only place a colour is decided. The drawing code asks for a ROLE, so
     changing the palette — or how a role is expressed — never reaches into layout.
 
-    * `accent`  the title chip and the active marker
+    * `accent`  the title chip, the active row's marker and estimate badge
+    * `active`  the ink of the one thing being worked on: the active row, the goal
+    * `strong`  that ink with weight: the first line of the active row
+    * `success` a finished step's tick, a clean patch, the bar's last stop
     * `faint`   the frame's own ink: edges, rules, collapsed-run connectors, metadata
     * `muted`   secondary text: durations, the goal's label, the status strip
     * `done`    the description of a finished step (muted, plus the dim attribute)
+    * `tick`    a finished step's marker: the success hue, dimmed so the row recedes
     * `track`   the progress bar's empty cells
     * `badge`   the accent as a chip: reverse video, so no background selector is used
     """
@@ -5945,9 +5964,13 @@ def _styles(theme: dict, truecolor: bool) -> dict:
     accent, muted = sgr("accent"), sgr("muted")
     return {
         "accent": accent,
+        "active": sgr("active"),
+        "strong": f"1;{sgr('active')}",
+        "success": sgr("success"),
         "faint": sgr("faint"),
         "muted": muted,
         "done": f"2;{muted}",
+        "tick": f"2;{sgr('success')}",
         "track": sgr("track"),
         "badge": f"7;{accent}",
     }
@@ -6050,16 +6073,24 @@ def _render_rich(
     stable for scripts.  A live pane is a TTY with colour, and gets this layout.
     """
     c = paint(color)
-    bold, green, yellow, red = "1", "32", "33", "31"
+    # Only the two STATE colours are literals any more; everything else the drawing asks
+    # for is a role from `_styles`. `warn` is a step past its estimate, a nudge or a patch
+    # that did not come out clean; `red` is a failure or an overrun.
+    yellow, red = "33", "31"
     theme = read_theme()
     truecolor = _supports_truecolor()
     # Every colour decision lives in `_styles`; this function only asks for roles, so the
     # drawing below reads the same whatever the palette resolves to.
     st = _styles(theme, truecolor)
     accent, muted = st["accent"], st["muted"]
-    done_style = st["done"]
+    active_ink, success = st["active"], st["success"]
+    done_style, tick_style = st["done"], st["tick"]
     # A finished step's description is the muted grey plus the dim attribute: dim is what
-    # `muted` means on a terminal with no theme of its own.
+    # `muted` means on a terminal with no theme of its own — and its tick is the success
+    # hue dimmed the same way, so a row that is over recedes instead of shouting.
+    # The one row that is not over is the only one painted in `active` ink; the accent is
+    # spent on what the eye should find first (the title chip, the active marker, the
+    # estimate badge, the bar), never on prose.
 
     def frame(text: str) -> str:
         """The frame's own ink: edges, rules and the collapsed-run connectors."""
@@ -6079,9 +6110,11 @@ def _render_rich(
 
     def patch_row_styled(pairs: list) -> str:
         """A row as drawn: labels in the frame's grey, values in their own severity."""
-        ink = {"ok": muted, "warn": yellow, "bad": red}
+        # the label is metadata (faint), the value carries its own severity — and a clean
+        # patch reads as `success`, which is what the green is FOR
+        ink = {"ok": success, "warn": yellow, "bad": red}
         return "  " + "   ".join(
-            c(muted, f"{label}  ") + c(ink.get(sev, muted), text)
+            c(st["faint"], f"{label}  ") + c(ink.get(sev, muted), text)
             for label, text, sev in pairs
         )
 
@@ -6125,17 +6158,27 @@ def _render_rich(
             placeholder=" …",
         )
         # The icon and its label carry the identity in the muted grey; the goal itself is
-        # the one piece of prose in the frame, so it is drawn in the readable ink — bold on
-        # its first line — rather than being dimmed along with the label.
+        # the frame's heading, so it is drawn in the readable ink rather than being dimmed
+        # along with the label — and without weight, which belongs to the active row.
         pad = " " * _cell_width(goal_prefix)
-        head.append(c(muted, goal_prefix) + c(bold, segs[0][len(goal_prefix):]))
-        head += [c(muted, pad + seg[len(pad):]) for seg in segs[1:]]
+        # The label stays the muted grey; the goal itself is `active` ink WITHOUT the bold
+        # attribute — it is the list's heading, not its subject, and weight spent here was
+        # weight the active row could not have.
+        head.append(c(muted, goal_prefix) + c(active_ink, segs[0][len(goal_prefix):]))
+        head += [c(active_ink, pad + seg[len(pad):]) for seg in segs[1:]]
     if now_txt:
         segs = textwrap.wrap(
             now_txt, width=inner, initial_indent="NOW · ", subsequent_indent="      ",
             max_lines=1, placeholder=" …",
         )
-        head += [c(yellow, seg) for seg in segs]
+        # The macro goal and the micro step are separated by INK, not by two bright colours
+        # competing above the list: the goal's label is the muted grey, `NOW` is the accent
+        # (the one thing on this row that is a pointer), and both carry `active` prose. The
+        # yellow that used to be here is now only ever a warning.
+        body = segs[0][len("NOW · "):]
+        indent = segs[0][:len("NOW · ")] if segs[0].startswith("NOW · ") else "NOW · "
+        head += [c(accent, indent.rstrip(" ·")) + c(st["faint"], " · ")
+                 + c(active_ink, body)]
     if nudge and nudge != now_txt:
         segs = textwrap.wrap(
             "rewrite the list, then continue", width=inner,
@@ -6214,6 +6257,10 @@ def _render_rich(
         # one. The three markers are one cell each, so every row's text starts in the same
         # column, and a wrapped line hangs under it.
         prefix = "  ✔  " if done_flag else "  ➔  " if active else "  ○  "
+        # Every row's right-hand token carries the row's own state: muted for a step that is
+        # over or not started, the accent for the one in flight (its estimate is bracketed
+        # there, a badge rather than a second bare number), and red when it has run past it.
+        tag_ink = muted
         indent = _cell_width(prefix)
         # The row's right-margin token, in one voice per state: the frozen span of a
         # finished step, the running clock against the pace for the step in flight, or
@@ -6244,9 +6291,10 @@ def _render_rich(
             # stops being readable: `[STUCK?]` appears where the flag still leaves
             # MIN_TASK_TEXT columns of text, and on a tight pane the running/estimate pair
             # carries the alert on its own.
-            cands = ([f"{base} / {est} [STUCK?]"] if stuck else []) + [
-                f"{base} / {est}", clock,
+            cands = ([f"{base} [{est}] [STUCK?]"] if stuck else []) + [
+                f"{base} [{est}]", clock,
             ]
+            tag_ink = "7;31" if stuck else accent
             tag = clock
             for cand in cands:
                 if _cell_width(cand) > budget:
@@ -6265,22 +6313,23 @@ def _render_rich(
         for j, seg in enumerate(segs):
             if j == 0:
                 if done_flag:
-                    # the tick stays green and loud; the description it belongs to is
-                    # dimmed grey, so a finished step recedes without vanishing
-                    line = c(green, "  ✔") + "  " + c(done_style, seg)
+                    # both halves of a finished row are dim: the tick no longer out-shines
+                    # the description it belongs to, so the row recedes as one unit
+                    line = c(tick_style, "  ✔") + "  " + c(done_style, seg)
                 elif active:
-                    # the only loud row: an accent arrow and bold, high-contrast text
-                    line = c(accent, "  ➔") + "  " + c(bold, seg)
+                    # the one row in the frame with the accent on its marker and its
+                    # number: bright ink, and the estimate as a badge
+                    line = c(accent, "  ➔") + "  " + c(st["strong"], seg)
                 else:
                     line = c(muted, "  ○") + "  " + c(muted, seg)
                 if tag:
-                    line += " " * max(1, inner - _cell_width(line) - tag_w) + c(muted, tag)
+                    line += " " * max(1, inner - _cell_width(line) - tag_w) + c(tag_ink, tag)
             else:
                 # a wrapped line carries the same voice as its first line
                 if done_flag:
                     line = " " * indent + c(done_style, seg)
                 elif active:
-                    line = " " * indent + seg
+                    line = " " * indent + c(st["strong"], seg)
                 else:
                     line = " " * indent + c(muted, seg)
             block.append(line)
@@ -6290,9 +6339,13 @@ def _render_rich(
         blocks.append(block)
         flags.append(done_flag)
 
+    # Six rows of chrome, plus the optional ones this frame is actually carrying: the patch
+    # and refit facts, and the no-times explanation. That last one was missing here — it was
+    # subtracted where the HEADING was clipped but not from the step area's budget, so a
+    # session with no clocks to report painted one row past its pane and lost the title.
     avail = None if not height else max(
         1, height - len(head) - 6 - (1 if patch_row_here else 0)
-        - (1 if refit_row_here else 0)
+        - (1 if refit_row_here else 0) - (1 if no_times else 0)
     )
     anchor = _window_anchor(cur_index, len(blocks))
     start, end = _fit_blocks(blocks, avail, anchor)
@@ -6307,16 +6360,21 @@ def _render_rich(
                 + sum(len(blocks[i]) for i in range(s, e))
                 + (1 if e < len(blocks) else 0))
 
-    # A row for the overall time to the goal, out of height the steps did not need. The
-    # fit is re-run with one row held back and the row is dropped again if the steps turn
-    # out to want that row, so the frame can never grow past `height` and no step is
-    # elided to make space for a number about the list.
+    # Rows the steps did not need, held back one at a time: the first buys the total its own
+    # row (where the pane is tall enough to hand one over), the second buys the vertical
+    # breath between the list and the footer. The fit is re-run with each row held back and
+    # given straight back if the steps turn out to want it, so the frame can never grow past
+    # `height` and no step is ever elided to make room for a number ABOUT the list.
     spare = 0
     if avail is None:
         spare = 1
-    elif avail >= 2 and _rows_used(*_fit_blocks(blocks, avail - 1, anchor)) < avail - 1:
-        spare = 1
-        start, end = _fit_blocks(blocks, avail - 1, anchor)
+    else:
+        for hold in (1, 2):
+            if avail - hold < 1:
+                break
+            if _rows_used(*_fit_blocks(blocks, avail - hold, anchor)) < avail - hold:
+                spare = hold
+                start, end = _fit_blocks(blocks, avail - hold, anchor)
 
     # Counted from the list being drawn, not from the state's own tally: the two agree
     # when this build wrote the state, and a state left by another one must never paint
@@ -6328,13 +6386,12 @@ def _render_rich(
     # The bar keeps its size; the projection only borrows space the row already has left
     # over, so a narrow pane shows a shorter suffix (or none) rather than a squeezed bar.
     # `EST REM` and `ETA` are one step apart, and on a tight row the clock goes first.
-    base_w = _cell_width("PROGRESS  [] ") + _cell_width(label)
+    # The bar row is labelled by the bar: `PROGRESS` cost eight columns of a 68-column row
+    # and said what `[████░░]` already says, and it started one column left of `PATCH`,
+    # `GOAL`, `ALERT` and `REFIT` — the one footer label out of the fixed slot the others
+    # keep. It is not drawn any more, and the two spaces of that slot are.
+    base_w = _cell_width("  []  ") + _cell_width(label)
     bar_w = max(4, min(20, inner - base_w))
-    # The pace, on the row the estimates are on. Which model it belongs to is on the top
-    # border instead: that row has room for it, and a 66-column strip does not (measured —
-    # the pace is the first field to go there, and it went).
-    pace_field = f"{fmt_estimate(pace_ms)} · {model}" if model and pace_ms else ""
-
     rem_ms = remaining_estimate_ms(times, todos, now_ms, pace_ms, shapes, calls_mem)
     # Vertical room for a row of its own is decided above, where the step rows were fitted.
     spent_ms = elapsed_total_ms(times, todos, now_ms)
@@ -6350,7 +6407,6 @@ def _render_rich(
     # bar keeps its size, the text borrows what the row has left, and the first candidate
     # that fits wins — so a tight strip shows EST REM and says the pace on the strip
     # instead, where there is room when no step is running.
-    pace_suffix = f" | {pace_field}" if pace_field else ""
     cands: list[str] = []
     if rem_ms > 0:
         rem_txt = short_duration(rem_ms, seconds=True) or "0s"
@@ -6360,21 +6416,20 @@ def _render_rich(
         # Widest first — the whole range with the clock and the pace, then the same range
         # on its own, and only then the bare number.
         ranged = (
-            [f" | EST REM: {rem_txt} ({fmt_range(*rem_spread)})"]
+            [f" | EST REM {rem_txt} ({fmt_range(*rem_spread)})"]
             if rem_spread and is_wide(*rem_spread) else []
         )
+        # Widest form first, and the pace is not among them: the list's own pace used to
+        # ride here as `~8m · model`, which is the same number every step row already
+        # carries, on the rows where it is a prediction about THAT step. The model stayed
+        # on the top border, where there is room for it at any width.
         cands += [
-            (ranged[0] + f" | ETA {fmt_eta(rem_ms, now_ms)}{pace_suffix}") if ranged else None,
-            (ranged[0] + pace_suffix) if ranged else None,
-            ranged[0] if ranged else None,
-            f" | EST REM: {rem_txt} | ETA {fmt_eta(rem_ms, now_ms)}{pace_suffix}",
-            f" | EST REM: {rem_txt}{pace_suffix}",
-            f" | EST REM: {rem_txt} | ETA {fmt_eta(rem_ms, now_ms)}",
-            f" | EST REM: {rem_txt}",
+            (ranged[0] + f" | ETA {fmt_eta(rem_ms, now_ms)}") if ranged else None,
+            (ranged[0]) if ranged else None,
+            f" | EST REM {rem_txt} | ETA {fmt_eta(rem_ms, now_ms)}",
+            f" | EST REM {rem_txt}",
         ]
         cands = [c for c in cands if c]
-    if pace_suffix:
-        cands.append(pace_suffix)
     for cand in cands:
         if _cell_width(cand) <= room:
             suffix = cand
@@ -6391,8 +6446,11 @@ def _render_rich(
         elif suffix and _cell_width(suffix + tot_suffix) <= room:
             suffix += tot_suffix
     bar = _progress_bar(done, total, bar_w, c, truecolor, theme)
+    # The ratio is the row's primary datum: `active` ink (bright, no bold attribute — the
+    # bold white that used to be here was one of the weights the frame could not spend),
+    # and the projection is metadata, so it is muted.
     progress = (
-        c(accent, "PROGRESS") + "  [" + bar + "] " + c(bold, label)
+        "  [" + bar + "]  " + c(active_ink, label)
         + (c(muted, suffix) if suffix else "")
     )
 
@@ -6403,8 +6461,9 @@ def _render_rich(
     # on disk has not been rewritten yet.
     cur_elapsed = live_elapsed(cur_rec, now_ms) if step_is_running(state, cur_rec) else None
     # One state, not three tags: a finished list IS idle, so `ALL DONE` beside `IDLE 4m`
-    # spent half the footer saying the same thing twice. The age that the idle counter
-    # carried rides in the parentheses, and the LIVE clock stays rightmost.
+    # spent half the footer saying the same thing twice. The list's own age rides on the
+    # LIST field and the LIVE clock stays rightmost; the running step's clock is not here
+    # at all, because it is on the row this strip is about.
     # Uppercase, like the title chip: the pane's chrome is one voice, so a badge never
     # mixes `FREEBUFF TODOS` with `All done` in the same frame.
     cur_est_ms = estimate_for(
@@ -6413,16 +6472,15 @@ def _render_rich(
     over_ms = (cur_elapsed - cur_est_ms) if cur_elapsed is not None else 0
     if cur_elapsed is not None:
         spin = SPINNER[int(now_ms // 1000) % len(SPINNER)] + " "
-        word = f"{spin}WORKING " + (short_duration(cur_elapsed, seconds=True) or "0s")
-        if over_ms > 0:
-            # The step has already spent its estimate: name the overrun right where the
-            # running clock is, and let the chip turn red below.
-            word += " (+" + (short_duration(over_ms, seconds=True) or "0s") + ")"
-        short = f"{spin}WORKING"
+        # The footer says the STATE; the clock that goes with it is on the step's own row,
+        # and it is the same number — `WORKING 11m07s` here and `11m07s [~10m]` there was the
+        # footer repeating the row it is the footer for. The chip still turns red on an
+        # overrun, because the footer is where a glance lands.
+        word = f"{spin}WORKING"
     elif total and done == total:
-        word = short = "ALL DONE"
+        word = "ALL DONE"
     else:
-        word = short = "IDLE"
+        word = "IDLE"
     # The age belongs to a state that is waiting: beside a running step its own counter
     # is the honest number, and the two would read as a contradiction ("Working 42s
     # (2m ago)").
@@ -6452,12 +6510,12 @@ def _render_rich(
     # at a glance without adding a word to the strip.
     chip = badge if over_ms <= 0 else (lambda text: c("7;31", text))
 
-    def strip(text: str, keep_list: bool, keep_age: bool, keep_pace: bool = True) -> str:
+    def strip(text: str, keep_list: bool, keep_age: bool) -> str:
         """The status strip: the state on a badge, then the fields ` │ ` apart."""
         body = chip(f" {text} ")
-        fields = [pace_field] if (keep_pace and pace_field) else []
+        fields: list[str] = []
         if listed:
-            # the age is what a narrow strip spends after the pace, and it goes whole
+            # the age is what a narrow strip spends first, and it goes whole
             if keep_list:
                 fields.append(listed_age if keep_age else listed)
         elif keep_age and age_text:
@@ -6469,24 +6527,53 @@ def _render_rich(
             c(st["faint"], " │ ") + c(muted, field) for field in fields + [live_field]
         )
 
-    # On a strip too narrow for all of it the model's PACE goes first, then the list's own
-    # age, then LIST: itself — the state chip and the live clock are what the row is for.
-    # The tiers are (keep_list, keep_age, keep_pace). The pace is spent before the age
-    # because the two are not the same kind of fact: `~2m · model` is a nicety, while the
-    # age is the only thing on the row that says the list has fallen behind the work — and
-    # spending the age first, which is what this order used to do, hid it on exactly the
-    # panes with a step running in them.
-    for tier in ((word, True, True, True), (word, True, True, False),
-                 (word, True, False, False), (short, False, False, False)):
+    # On a strip too narrow for all of it the list's own age goes first, then LIST: itself —
+    # the state chip and the live clock are what the row is for. The tiers are (keep_list,
+    # keep_age). The age is the last field to go because it is the only thing on the row
+    # that says the list has fallen behind the work.
+    for tier in ((word, True, True), (word, True, False), (word, False, False)):
         status = strip(*tier)
         if _cell_width(status) <= inner:
             break
     else:
-        status = _clip_cells(strip(short, False, False, False), inner)
+        status = _clip_cells(strip(word, False, False), inner)
 
     rows += [_frame_row(h, width, frame) for h in head]
     rows.append(_divider_row(width, frame))
-    if start:
+    # The two summaries are rows of the step AREA, and at a budget of one or two there is no
+    # window that fits both of them and a step: the frame then grew past its pane and its top
+    # scrolled away, which is how a 9-line pane came to show a list with no title over it at
+    # all — the height the pane gave the steps had already been spent on the notes about the
+    # steps. A note is a courtesy to the steps it hides; the title and the goal are not, so
+    # the notes are drawn only while the area has rows left for them (the count of what is
+    # still AHEAD wins the one row, if only one is left).
+    def rows_free(s: int, e: int) -> int:
+        """Rows of the step area left over once the steps it keeps have painted."""
+        if avail is None:
+            return 2
+        return max(0, avail - sum(len(blocks[i]) for i in range(s, e)))
+
+    # ...and when the summaries were the thing that did not fit, the heading's LAST row is
+    # what buys them back: at this height `NOW` is a nicety, while `4 more steps pending` is
+    # the list itself. One row, one retry — never the goal, never the title.
+    note_room = rows_free(start, end)
+    if (height and note_room == 0 and len(head) > 1
+            and (start or end < len(blocks)) and avail is not None):
+        head = head[:-1]
+        avail = max(1, height - len(head) - 6 - (1 if patch_row_here else 0)
+                    - (1 if refit_row_here else 0) - (1 if no_times else 0))
+        start, end = _fit_blocks(blocks, avail, anchor)
+        note_room = rows_free(start, end)
+    # With one row to spend, it goes to the LARGER hidden run: that is where the work the
+    # window is not showing is, and on a finished list it is the completed steps above.
+    show_above = start > 0
+    show_below = end < len(blocks)
+    if note_room < 2:
+        if (len(blocks) - end) > start:
+            show_above = False
+        else:
+            show_below = False
+    if show_above:
         note = _elision_note(start, flags[:start], "earlier")
         # A run of finished work that collapses away can carry its net variance — how far
         # those steps ran from the pace — when there is one to speak of. It rides in the
@@ -6498,32 +6585,59 @@ def _render_rich(
         rows.append(_frame_row(c(muted, note), width, frame))
     for block in blocks[start:end]:
         rows += [_frame_row(line, width, frame) for line in block]
-    if end < len(blocks):
+    if show_below:
         rows.append(_frame_row(
             c(muted, _elision_note(len(blocks) - end, flags[end:], "more")), width, frame,
         ))
     rows.append(_divider_row(width, frame))
     rows.append(_frame_row(progress, width, frame))
     # The overall time to reach the goal, on a row of its own where the pane is tall enough
-    # to hand one over. Spent and left are both named because the total alone does not say
-    # which half of it is already behind the owner.
-    if tot_ms is not None and spare:
-        goal_bits = [f"{short_duration(tot_ms, seconds=True) or '0s'} to the goal"]
-        if spent_ms:
-            goal_bits.insert(0, f"{short_duration(spent_ms, seconds=True) or '0s'} in")
-        if rem_ms > 0:
-            goal_bits.append(f"{short_duration(rem_ms, seconds=True) or '0s'} left")
-        rows.append(_frame_row(
-            c(muted, "  GOAL  " + "  ·  ".join(goal_bits)), width, frame,
-        ))
+    # to hand one over. Two numbers, not three: spent and total are what this row has and
+    # nowhere else has, while the THIRD it used to print — `3m30s left` — is the `EST REM`
+    # on the bar row above, which is where the remaining work is projected from. The label
+    # is metadata like `PATCH`'s, so it is drawn in the frame's faint ink and stops
+    # competing with the number it introduces.
+    goal_at = len(rows)
+    if spare:
+        if tot_ms is not None:
+            goal_bits = [f"{short_duration(tot_ms, seconds=True) or '0s'} total"]
+            if spent_ms:
+                goal_bits.insert(0, f"{short_duration(spent_ms, seconds=True) or '0s'} spent")
+            rows.append(_frame_row(
+                "  " + c(st["faint"], "GOAL  ") + c(muted, "  ·  ".join(goal_bits)),
+                width, frame,
+            ))
+        # ...and a spare row past that is spent on a breath rather than on nothing: the one
+        # blank line between the list and the footer is the vertical padding a fixed-height
+        # pane can afford, because it is the row the steps did not want — never one taken
+        # off a step to buy it.
+        if spare >= 2 or tot_ms is None:
+            rows.append(_frame_row("", width, frame))
+    goal_n = len(rows) - goal_at
     if no_times:
         rows.append(_frame_row(c(muted, no_times), width, frame))
+    facts_at = len(rows)
     if patch_row_here:
         rows.append(_frame_row(patch_row_styled(patch_row_here), width, frame))
     if refit_row_here:
         rows.append(_frame_row(patch_row_styled(refit_row_here), width, frame))
+    facts_n = len(rows) - facts_at
     rows.append(_frame_row(status, width, frame))
     rows.append(_bottom_row(width, frame))
+    # ...and the frame still FITS: a row that scrolls off the top takes the title with it,
+    # which is what a short pane used to show — a list with nothing over it. What is given
+    # up is given up in the order of how little it changes what the pane is FOR: the patch
+    # and alert facts first (they are news, not state, and `fbtodo status` has them), then
+    # the total's own row, then the heading — never the list, the bar or the state, which
+    # are what the frame exists to say at all.
+    if height and len(rows) > height:
+        over = len(rows) - height
+        for at, count in ((facts_at, facts_n), (goal_at, goal_n), (1, len(head))):
+            if over <= 0:
+                break
+            take = min(over, count)
+            del rows[at + count - take:at + count]  # the LAST of them first: NOW, then goal
+            over -= take
     return "\n".join(rows)
 
 

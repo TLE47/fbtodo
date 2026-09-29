@@ -9,19 +9,24 @@
 [![Tests: self-check](https://img.shields.io/badge/tests-self--check%20%2B%20notify%20suite-blueviolet)](#development)
 
 ```
-┌ FBTODO ────────────────────────────── 4/7 ─·····──┐
-│ big goal  fit the pane heading whole              │
-│                                                   │
-│ ✓  read the existing renderer            1m12s    │
-│ ✓  resolve the palette into roles          44s    │
-│ ✓  draw the gradient bar                   29s    │
-│ ▸  clip the title to the frame          1m04s…    │   ~1m
-│ ·  split the drawing code into roles              │
-│ ·  run the self-check                             │
-│ ·  update the docs and land it                    │
-├───────────────────────────────────────────────────┤
-│ ● working 9m38s   4/7 steps · EST REM ~3m         │
-└───────────────────────────────────────────────────┘
+╭──  FREEBUFF TODOS  ──────────────── watcher: pid 4813 · v4-flash ──╮
+│ 🎯 Goal: fit the pane heading whole                                │
+│ NOW · keep the list readable while it does                         │
+├────────────────────────────────────────────────────────────────────┤
+│   ✔  Read the existing renderer                              1m12s │
+│   ✔  Resolve the palette into roles                            44s │
+│   ➔  Split the drawing code into roles                9m38s [~10m] │
+│   ○  Clip the title to the frame                               ~2m │
+│   ○  Draw the gradient bar                                     ~2m │
+│   ○  Update the docs                                           ~2m │
+│   ○  Land it                                                   ~2m │
+├────────────────────────────────────────────────────────────────────┤
+│   [█████▊░░░░░░░░░░░░░░]  29% (2/7) | EST REM 11m21s | ETA 12:09   │
+│   GOAL  11m12s spent  ·  22m33s total                              │
+│                                                                    │
+│   PATCH  ok · 0.1.4 · 11h ago   ALERT  freebuff done · 56m ago     │
+│  ⠏ WORKING  │ LIST: #47 · 11m ago │ LIVE: 11:57:59                 │
+╰────────────────────────────────────────────────────────────────────╯
 ```
 
 [fbtodo](.) mirrors the todo list a [Freebuff](https://freebuff.com) session is working
@@ -357,13 +362,19 @@ The palette is data, not code — layout never names a colour. Drop a
 variables directly:
 
 ```sh
-export FBTODO_ACCENT="#89b4fa"        # the title badge
-export FBTODO_GRADIENT_START="#89b4fa"  # progress bar, left
-export FBTODO_GRADIENT_END="#a6e3a1"    # progress bar, right
-export FBTODO_FAINT="#6c7086"         # the frame's own ink
-export FBTODO_MUTED="#9399b2"         # step durations, labels, the status strip
-export FBTODO_TRACK="#313244"         # the progress bar's empty cells
+export FBTODO_ACCENT="#89b4fa"          # badge, the running row's marker and badge, bar left
+export FBTODO_ACTIVE="#cdd6f4"          # the row being worked on, and the goal it belongs to
+export FBTODO_SUCCESS="#a6e3a1"         # a finished step's tick, a clean patch, bar right
+export FBTODO_MUTED="#9399b2"           # step durations, labels, the status strip
+export FBTODO_FAINT="#6c7086"           # the frame's own ink, labels, pid, model
+export FBTODO_TRACK="#313244"           # the progress bar's empty cells
+export FBTODO_GRADIENT_START="#89b4fa"  # progress bar, left stop
+export FBTODO_GRADIENT_END="#a6e3a1"    # progress bar, right stop
 ```
+
+Six roles are what the pane paints with: `accent`, `active`, `success`, `muted`, `faint` and
+a `track` for the bar's empty cells (the two gradient stops default to the accent and the
+success colour, so a bar and the ticks beside it agree).
 
 Colours are 24-bit where the terminal takes them and the nearest 256-colour entry where it
 does not; `FBTODO_TRUECOLOR=0|1` forces the choice.
@@ -609,16 +620,30 @@ mistake as a decision — it is your terminal, and the pane goes where you put i
 
 ### What the pane draws
 
-A frame with a status strip, in a themeable palette.
+A frame with a status strip, in a themeable palette. Four inks, each holding one job —
+`accent` for what to touch, `active` for what is being worked on, `success` for what is
+done, `muted`/`faint` for everything the eye may skip — plus `warn`/`error` kept in the code
+for a state (a step past its estimate, a failed patch), because a palette is not a licence to
+hide a failure in grey.
 
-- **Title** — `FBTODO` on an accent badge, in reverse video (so no background selector is
-  needed), with the `done/total` count on the right.
+- **Title** — `FREEBUFF TODOS` on an accent badge, in reverse video (so no background
+  selector is needed), with the watcher's pid and the model on the right, in the frame's
+  faint ink.
+- **Heading** — the agent's own `Goal:` line in `active` ink under a muted label, and below it
+  the newer request as `NOW` in the accent, so the macro goal and the micro step are told
+  apart by ink rather than by two bright colours competing.
 - **Progress bar** — a gradient of `█` over a visible `░` track, with an eighth block for the
-  one cell at the boundary.
-- **Steps** — `✓` done, `▸` running, `·` pending; durations right-aligned against the frame's
-  right wall so the numbers form a column.
-- **Status strip** — badges the live state (`working 9m38s`, `waiting`, `done`) and spins
-  while a step runs.
+  one cell at the boundary, ramping from the accent to the success green. No `PROGRESS`
+  label: the bar labels itself, and the eight columns it cost went to the projection on the
+  same row.
+- **Steps** — `✔` done, `➔` running, `○` pending, one cell each so every row's text starts in
+  the same column; durations right-aligned against the frame's right wall so the numbers form
+  a column. A finished row is one quiet unit — the tick is the success hue **dimmed** like
+  the description beside it — and the running row is the only one in `active` ink, with its
+  estimate as a bracketed accent badge (`9m38s [~6m]`, red with `[STUCK?]` past twice it).
+- **Status strip** — the state on a badge (`WORKING`, `IDLE`, `ALL DONE`) and spins while a
+  step runs, then the list's own age and the clock. The running step's time is **not** here:
+  it is on that step's row, next to the estimate it is being measured against.
 - **`PATCH` / `ALERT` row** — when there is something to say: the last outcome of an optional
   CLI-patch step, and the last thing the phone was told. Both are read from a log the
   producing step already writes, so neither costs a probe of its own.
@@ -724,7 +749,9 @@ Which is where most of the care in this tool has gone.
 - The bar carries `EST REM` and an `ETA`. Where a row has room for only one of them, the
   spread takes the place of the ETA — it says something the bare number cannot, while the
   ETA is that same number told as a clock. `fbtodo status` shows the remembered pace, its
-  spread, and where each step's number came from.
+  spread, and where each step's number came from. The pace and the model are **not** on the
+  strip: the pace is already on every step row, where it is a prediction about that step,
+  and the model is on the top border.
 
 ### The goal heading
 
@@ -785,7 +812,7 @@ Precedence is the usual one: a command-line flag, then the environment, then a f
 | `FBTODO_SPLIT` / `FBTODO_PANE_SIZE` | `v` / `12` | default pane geometry |
 | `FBTODO_NO_PANE` | — | set to disable panes entirely |
 | `FBTODO_PATCH_LOG` / `_META` / `_ALERT_LOG` | `~/.config/freebuff-patch-watch/watch.log`, `~/.config/manicode/freebuff-metadata.json`, `~/.config/freebuff-notify/phone.log` | the optional `PATCH`/`ALERT` row |
-| `FBTODO_ACCENT` / `_FAINT` / `_MUTED` / `_TRACK` | theme | palette overrides |
+| `FBTODO_ACCENT` / `_ACTIVE` / `_SUCCESS` / `_FAINT` / `_MUTED` / `_TRACK` | theme | palette overrides |
 | `FBTODO_GRADIENT_START` / `_END` | theme | `#rrggbb`, or a raw SGR code like `1;36` for the accent |
 | `FBTODO_TRUECOLOR` | auto | force 24-bit colour on or off |
 | `FBTODO_TMUX` | `tmux` | the tmux binary/args to drive (a test knob) |

@@ -105,7 +105,18 @@ back.
 ## Conventions worth keeping
 
 - **Layout never names a colour.** Styles are resolved into roles once, and the drawing code
-  asks for a role — that is what makes a theme a data change rather than a code change.
+  asks for a role — that is what makes a theme a data change rather than a code change. The
+  roles are `accent` (what to touch: the badge, the running row's marker and estimate, the
+  bar's left stop), `active` (the one thing being worked on, and the goal it belongs to),
+  `success` (done, dimmed for a finished step's tick, full for a clean patch and the bar's
+  right stop), `muted` and `faint` (secondary and skippable), and a `track` for the bar's
+  empty cells. `2` + a role is how "quiet but still that colour" is said (`done`, `tick`).
+  SGR 33/31 stay in the code as `warn`/`error` because they are STATES, not palette choices.
+- **One ink per job, on every row.** A finished step is one dim unit (tick and text), the
+  running row is the only text with weight and the only one whose number is a badge, and a
+  fact is stated once: the running clock is on the row, not repeated on the status chip;
+  `EST REM` is on the bar row, and the `GOAL` row carries only what it alone has (spent and
+  total).
 - **The plain renderer is the machine-readable path.** `snap`, `json` and `bar` stay
   line-oriented and uncoloured; colour belongs to the framed pane.
 - **Every subprocess has a timeout**, and every network or ssh call is bounded. A pane is
