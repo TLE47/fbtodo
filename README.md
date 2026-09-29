@@ -608,7 +608,8 @@ The instance to follow is found in this order:
 A pane cannot watch itself, so the work is split:
 
 - **`fbtodo daemon`** follows one running instance: while it lives, the todo state is
-  refreshed into `~/.freebuff/fbtodo-state.json`; when the process exits the daemon shuts
+  refreshed into `fbtodo-state.json` in the state directory (`~/.local/state/fbtodo`, or
+  `$XDG_STATE_HOME/fbtodo`); when the process exits the daemon shuts
   itself down and removes its lock (`fbtodo-daemon.pid`). Anything that needs it starts it
   for you; `-f` keeps it in the foreground.
 - **`fbtodo pane-watch`** is the pane keeper: one process per tmux *server*, 3 s cadence. It
@@ -710,7 +711,7 @@ Which is where most of the care in this tool has gone.
   is a tail-smoother rather than a clear win — measured on your own replay it is a coin flip
   on the typical step and only plainly better on the worst ones — so `FBTODO_BLEND_WEIGHT`
   turns it down if you would rather have the pace alone. All of it
-  lives in `~/.freebuff/fbtodo-tasks.json`. A step that has made no calls *and* has nothing
+  lives in `fbtodo-tasks.json` beside it. A step that has made no calls *and* has nothing
   to blend still falls back to the pace, so a fresh log behaves exactly as it always did.
 - **A step under 10 s is a list flip, not work.** It is shown on its row, but it sets no pace
   and enters no memory: measured 2026-09-29, a 2 s flip had once projected a whole list at
@@ -806,7 +807,7 @@ nothing has to be kept in sync and a machine without the directory simply never 
 The pane watch exists because every other failure here is quiet by construction: the keeper
 has no stderr anybody reads, and its log records a pane that came **back**, never one that did
 not. Ask it directly with
-`pane-bell.py --print --keeper ~/.freebuff/fbtodo-pane-keeper.pid`.
+`pane-bell.py --print` (it finds the keeper's claim on its own, and says where its log is).
 
 Cadences: `--ask-seconds` (3 s), `--pause-seconds` (30 s), `--pane-bell-seconds` (60 s).
 `0` switches any of them off. A fifth script, `drop-bell.py`, is
@@ -829,7 +830,8 @@ Precedence is the usual one: a command-line flag, then the environment, then a f
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FBTODO_HOME` | `~/.freebuff` | where state, locks and logs live |
+| `FBTODO_HOME` | — | one directory for state, locks and logs, overriding the XDG default below |
+| `XDG_STATE_HOME` | `~/.local/state` | state lives in `$XDG_STATE_HOME/fbtodo`; a legacy `~/.freebuff` is moved there once, when no watcher holds it |
 | `FBTODO_NOTIFY` / `_DROP` / `_ASK` / `_PAUSE` / `_PANE_BELL` | `~/.config/freebuff-notify/*.py` | the five watches |
 | `FBTODO_ASK_SECONDS` / `_PAUSE_SECONDS` / `_PANE_BELL_SECONDS` | 3 / 30 / 60 | their cadences (0 = never) |
 | `FBTODO_PANE_SECONDS` | 3 | how often the keeper looks |

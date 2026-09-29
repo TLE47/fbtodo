@@ -541,6 +541,70 @@ try:
     assert "FAIL" in broken.stdout and "tmux" in broken.stdout, broken.stdout[-300:]
     say("doctor: a healthy machine passes, and a missing tool fails with a non-zero exit: ok")
 
+    # ---- state root: the XDG directory by default, the legacy `~/.freebuff` moved there
+    #      ONCE, and only when nothing is still writing it. Driven through child processes
+    #      with their own HOME, because the root is decided at import — the same reason this
+    #      suite has to set FBTODO_HOME before it imports the module.
+    root = os.path.join(TEST_HOME, "state-root")
+    shutil.rmtree(root, ignore_errors=True)
+    no_fbhome = {k: v for k, v in env.items() if k != "FBTODO_HOME"}
+
+    def state_checks(home: str, legacy: dict = None, xdg: str = None, fbtodo_home: str = None):
+        """Doctor's checks for a child with `HOME=home` and `~/.freebuff` seeded."""
+        os.makedirs(os.path.join(home, ".freebuff"), exist_ok=True)
+        for name, blob in (legacy or {}).items():
+            with open(os.path.join(home, ".freebuff", name), "w") as fh:
+                fh.write(blob)
+        child = dict(no_fbhome, HOME=home)
+        child.pop("XDG_STATE_HOME", None)
+        if xdg is not None:
+            child["XDG_STATE_HOME"] = xdg
+        if fbtodo_home is not None:
+            child["FBTODO_HOME"] = fbtodo_home
+        proc = subprocess.run(
+            [sys.executable, FB, "doctor", "--json"], capture_output=True, text=True,
+            env=child, cwd=CWD, timeout=90,
+        )
+        doc = json.loads(proc.stdout)
+        return {c["name"]: c for c in doc["checks"]}
+
+    a_home = os.path.join(root, "a")
+    checks = state_checks(a_home)
+    assert checks["scratch"]["detail"] == os.path.join(a_home, ".local", "state", "fbtodo"), checks
+    assert "state" not in checks, "a fresh machine has nothing to move"
+    checks = state_checks(os.path.join(root, "a2"), fbtodo_home=os.path.join(root, "a2", "fbhome"))
+    assert checks["scratch"]["detail"] == os.path.join(root, "a2", "fbhome"), checks
+    assert "state" not in checks, checks
+    say("state root: XDG by default, FBTODO_HOME when set, and nothing moved on a fresh machine: ok")
+
+    b_xdg = os.path.join(root, "b-xdg")
+    b_home = os.path.join(root, "b")
+    seeded = {"fbtodo-state.json": '{"todos": [], "instance_pid": 1}', "fbtodo-last.json": "{}"}
+    checks = state_checks(b_home, seeded, xdg=b_xdg)
+    assert checks["scratch"]["detail"] == os.path.join(b_xdg, "fbtodo"), checks["scratch"]
+    assert checks["state"]["level"] == "ok" and "moved from" in checks["state"]["detail"], checks
+    assert not os.path.exists(os.path.join(b_home, ".freebuff", "fbtodo-state.json")), "old copy left"
+    assert os.path.exists(os.path.join(b_xdg, "fbtodo", "fbtodo-state.json")), "never arrived"
+    assert os.path.exists(os.path.join(b_xdg, "fbtodo", "fbtodo-last.json")), "moved part of the set"
+    again = state_checks(b_home, xdg=b_xdg)
+    assert again["scratch"]["detail"] == os.path.join(b_xdg, "fbtodo"), again["scratch"]
+    assert "state" not in again, "the move is not once"
+    say("state root: the legacy directory is moved once, whole, and reported: ok")
+
+    c_home = os.path.join(root, "c")
+    checks = state_checks(
+        c_home,
+        {"fbtodo-state.json": '{"todos": []}',
+         "fbtodo-daemon.pid": json.dumps({"pid": os.getpid(), "version": module.VERSION})},
+    )
+    assert checks["scratch"]["detail"] == os.path.join(c_home, ".freebuff"), checks["scratch"]
+    assert checks["state"]["level"] == "warn" and "live watcher" in checks["state"]["detail"], checks
+    assert os.path.exists(os.path.join(c_home, ".freebuff", "fbtodo-state.json")), "moved anyway"
+    assert not os.path.exists(
+        os.path.join(c_home, ".local", "state", "fbtodo", "fbtodo-state.json")
+    ), "copied out from under a live watcher"
+    say("state root: a live watcher keeps the old root, and the move waits for it: ok")
+
     old = module.finish_state(
         {"session": "S1", "todos": [{"task": "a", "completed": True}]}, None
     )

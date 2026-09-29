@@ -135,8 +135,9 @@ of the same kit (and the same test suite).
 
 Each one is also runnable by hand, which is how you debug it: every bell takes `--print`
 (resolve and report, send nothing) plus `--title`, `--message`, `--priority`, `--tags` to
-send something specific. `pane-bell.py --print --keeper ~/.freebuff/fbtodo-pane-keeper.pid`
-answers "is any session missing its pane?" directly, and `pause-bell.py --watch-pid PID
+send something specific. `pane-bell.py --print` (it looks the keeper's claim up itself:
+`$FBTODO_HOME` or `$XDG_STATE_HOME/fbtodo`, else the legacy `~/.freebuff`) answers "is any
+session missing its pane?" directly, and `pause-bell.py --watch-pid PID
 --print` says whether a session has stopped mid-list and why not, if not.
 
 Every read is bounded. A notification never blocks a watcher's poll: the push is handed to

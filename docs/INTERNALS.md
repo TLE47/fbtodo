@@ -9,10 +9,14 @@ is the layer underneath it.
 - [The pane lifecycle](#the-pane-lifecycle)
 - [Conventions worth keeping](#conventions-worth-keeping)
 
-## Files under `FBTODO_HOME`
+## The state directory
 
-Defaults to `~/.freebuff`; `FBTODO_HOME` moves the whole set (which is how the self-check
-stays out of the real one).
+`$XDG_STATE_HOME/fbtodo` (`~/.local/state/fbtodo`, as the XDG spec says), or `FBTODO_HOME`
+when it is set — one directory for the whole set, which is also how the self-check stays out
+of the real one. A machine that ran from the legacy `~/.freebuff` is moved there **once**, at
+import, and only when nothing is still writing it: a live watcher's pid or claim keeps the old
+root (and `fbtodo doctor` says so), because copying a store out from under the process that
+updates it would leave the pane reading a file nobody writes. `FBTODO_HOME` is never migrated.
 
 | File | Written by | What it is |
 |---|---|---|

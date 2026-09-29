@@ -23,7 +23,8 @@
                         1 MiB log); runs by itself about hourly either way
 
 The watcher (`daemon`) follows one running Freebuff process: while it lives, the
-todo state is refreshed into `~/.freebuff/fbtodo-state.json`; when the process
+todo state is refreshed into `fbtodo-state.json` in the state directory
+(`$XDG_STATE_HOME/fbtodo`, i.e. `~/.local/state/fbtodo`, or `FBTODO_HOME`); when the process
 exits, the watcher shuts itself down and removes its lock. A second process, the pane
 keeper (`pane-watch`), exists because a pane cannot be watched by itself: it puts a
 todo pane back when one is killed mid-session, for every local session, and exits when
@@ -121,8 +122,90 @@ import unicodedata
 VERSION = "4.29.0"
 HOME = os.path.expanduser("~")
 # FBTODO_HOME points state/lock/log elsewhere — used by the self-check so it never
-# touches the real watcher's files.
-SCRATCH = os.path.expanduser(os.environ.get("FBTODO_HOME") or os.path.join(HOME, ".freebuff"))
+# touches the real watcher's files. Failing that, state belongs where the XDG spec says it
+# does ($XDG_STATE_HOME/fbtodo) rather than in a dotdir of our own devising; the legacy
+# `~/.freebuff` is moved there once, and only when nothing is still writing it.
+LEGACY_SCRATCH = os.path.join(HOME, ".freebuff")
+STATE_DIR = os.path.join(
+    os.path.expanduser(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state")),
+    "fbtodo",
+)
+# What the move carries. Listed as names rather than taken from the paths below, because the
+# root has to be chosen before those are built.
+LEGACY_NAMES = (
+    "fbtodo-state.json", "fbtodo-tasks.json", "fbtodo-daemon.pid", "fbtodo-daemon.log",
+    "fbtodo-nas-pane.pid", "fbtodo-nas-pane.json", "fbtodo-nas-pane.log",
+    "fbtodo-pane-keeper.pid", "fbtodo-pane.log", "fbtodo-pins.json", "fbtodo-last.json",
+    "fbtodo-nas.json",
+)
+
+
+def _legacy_claim_live() -> bool:
+    """Is a live process still writing the legacy directory?
+
+    Two gates, both of which err towards "yes": the record at the legacy lock must not be
+    flocked, and its pid must not be alive. The second one matters because a watcher from
+    before there was a claim left a record nobody holds, and the pid is then the only thing
+    that says it is still there.
+    """
+    record = os.path.join(LEGACY_SCRATCH, "fbtodo-daemon.pid")
+    try:
+        with open(record, "r", encoding="utf-8") as fh:
+            pid = int((json.load(fh) or {}).get("pid") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        pid = 0
+    if pid:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return True
+    if fcntl is None:
+        return False
+    try:
+        with open(record, "r+", encoding="utf-8") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _state_root():
+    """(root, note) — where this run keeps its state, and how it got there.
+
+    The note is one of `None` (nothing to move), `"moved"`, or a reason the run stayed on
+    the legacy root: `"live"` (a watcher there still owns the store, so moving out from
+    under it would leave the pane reading a file nobody updates) or `"failed"` (the move
+    was refused; the old root still works, so it is what we use).
+    """
+    env_home = os.environ.get("FBTODO_HOME")
+    if env_home:
+        return os.path.expanduser(env_home), None
+    if os.path.abspath(STATE_DIR) == os.path.abspath(LEGACY_SCRATCH):
+        return STATE_DIR, None
+    if not os.path.exists(os.path.join(LEGACY_SCRATCH, "fbtodo-state.json")):
+        return STATE_DIR, None
+    if os.path.exists(os.path.join(STATE_DIR, "fbtodo-state.json")):
+        return STATE_DIR, None
+    if _legacy_claim_live():
+        return LEGACY_SCRATCH, "live"
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        for name in LEGACY_NAMES:
+            src = os.path.join(LEGACY_SCRATCH, name)
+            if os.path.exists(src):
+                os.replace(src, os.path.join(STATE_DIR, name))
+    except OSError:
+        return LEGACY_SCRATCH, "failed"
+    return STATE_DIR, "moved"
+
+
+SCRATCH, STATE_NOTE = _state_root()
 STATE_PATH = os.path.join(SCRATCH, "fbtodo-state.json")
 TASKS_PATH = os.path.join(SCRATCH, "fbtodo-tasks.json")
 LOCK_PATH = os.path.join(SCRATCH, "fbtodo-daemon.pid")
@@ -7420,6 +7503,14 @@ def cmd_doctor(args) -> int:
         checks.append(("ok", "scratch", SCRATCH))
     except OSError as exc:
         checks.append(("FAIL", "scratch", f"{SCRATCH}: {exc.__class__.__name__}"))
+    if STATE_NOTE == "moved":
+        checks.append(("ok", "state", f"{SCRATCH} (moved from {LEGACY_SCRATCH})"))
+    elif STATE_NOTE == "live":
+        checks.append(("warn", "state",
+                       f"still {SCRATCH} — a live watcher owns it; "
+                       f"`fbtodo stop` there finishes the move to {STATE_DIR}"))
+    elif STATE_NOTE == "failed":
+        checks.append(("warn", "state", f"still {SCRATCH} — could not move to {STATE_DIR}"))
     holder = lock_holder(LOCK_PATH)
     checks.append(("ok" if holder else "warn", "watcher",
                    f"pid {holder} holds {os.path.basename(LOCK_PATH)}" if holder
@@ -7842,6 +7933,12 @@ def cmd_status(args) -> int:
             f"  ({source})"
         )
     print(f"  scratch           : {scratch_size()} bytes in {SCRATCH}")
+    if STATE_NOTE == "moved":
+        print(f"  state             : {SCRATCH} (moved from {LEGACY_SCRATCH})")
+    elif STATE_NOTE in ("live", "failed"):
+        print(f"  state             : {SCRATCH} — "
+              + ("a watcher there still holds it; restart it to finish the move to "
+                 f"{STATE_DIR}" if STATE_NOTE == "live" else f"could not move to {STATE_DIR}"))
     return 0
 
 
@@ -8436,7 +8533,7 @@ def cmd_pin(args) -> int:
     is: a wide window reads better with the list beside the session, a tall one with it
     below. `fbtodo pin --side h --size 16` run in the window you mean (or with `--window`
     naming another, `main:2` or `@71`) files that under `<session>:<index>` in
-    ~/.freebuff/fbtodo-pins.json, and the pane keeper enforces both halves — the side it
+    `fbtodo-pins.json` in the state directory, and the pane keeper enforces both halves — the side it
     splits on and puts a drifted pane back on, and the size it resizes back to.
 
     `--role` says which list pane it is for: `local` (a session's), `nas` (the one a NAS

@@ -9,7 +9,7 @@ at all while a session is waiting for one.
 
 WHY THIS IS WORTH A NOTIFICATION. The pane keeper is the only thing that repairs a pane,
 and every failure it has is silent by construction: it has no stderr anybody reads, and
-what it writes (`~/.freebuff/fbtodo-pane.log`) records a pane that CAME BACK, never one
+what it writes (a log beside the keeper's claim record) records a pane that CAME BACK, never one
 that did not. Its two failure modes are both quiet — a pass that cannot open a pane (a
 window too small, a pin pointing at a window that is gone, tmux refusing the split), and
 the keeper itself being killed, replaced, or watching a server that has gone. Measured
@@ -64,9 +64,42 @@ TIMEOUT = 30.0
 # How long a session may have no list pane before it is a failure rather than a startup.
 # Ten keeper passes at the default 3s cadence.
 GRACE = float(os.environ.get("FREEBUFF_PANE_GRACE") or 30.0)
-KEEPER_LOG = os.path.expanduser("~/.freebuff/fbtodo-pane.log")
 CLAIM_MAX = 50
 SELF = "pane-bell"
+
+
+def default_state_dir() -> str:
+    """fbtodo's state root, without asking fbtodo.
+
+    `FBTODO_HOME`, then the XDG state directory the tool now uses, then — for a machine that
+    has not been moved yet — the legacy `~/.freebuff`. The legacy root wins only while the
+    new one has no keeper record and the old one does: that is a keeper still running from
+    the old directory, and the bell should read the claim it actually holds.
+    """
+    home = os.path.expanduser("~")
+    env = os.environ.get("FBTODO_HOME")
+    if env:
+        return os.path.expanduser(env)
+    xdg = os.path.expanduser(
+        os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state")
+    )
+    new = os.path.join(xdg, "fbtodo")
+    legacy = os.path.join(home, ".freebuff")
+    if not os.path.exists(os.path.join(new, "fbtodo-pane-keeper.pid")) and os.path.exists(
+        os.path.join(legacy, "fbtodo-pane-keeper.pid")
+    ):
+        return legacy
+    return new
+
+
+def keeper_log_for(keeper_path: str = "") -> str:
+    """The keeper's log sits in the same directory as its claim: one state root, not two."""
+    if keeper_path:
+        return os.path.join(os.path.dirname(os.path.abspath(keeper_path)), "fbtodo-pane.log")
+    return os.path.join(default_state_dir(), "fbtodo-pane.log")
+
+
+KEEPER_LOG = keeper_log_for()
 
 
 def fbtodo_binary() -> str | None:
@@ -304,10 +337,12 @@ def main() -> int:
     argv = sys.argv[1:]
     print_only = "--print" in argv
     quiet = "--quiet" in argv
+    global KEEPER_LOG
     keeper_path = (
         argv[argv.index("--keeper") + 1] if "--keeper" in argv
-        else os.path.expanduser("~/.freebuff/fbtodo-pane-keeper.pid")
+        else os.path.join(default_state_dir(), "fbtodo-pane-keeper.pid")
     )
+    KEEPER_LOG = keeper_log_for(keeper_path)
     records = why()
     if records is None:
         if print_only:

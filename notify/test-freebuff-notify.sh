@@ -1655,6 +1655,17 @@ check_match "every session has a pane, and a keeper is watching" \
   "$(pn_run 30 --print)" '^silent: every session that wants a pane has one, and a keeper is watching'
 check "nothing to report, nothing sent" "$(pn_sends)" "0"
 
+# With no --keeper, the claim is looked for where fbtodo actually keeps it: FBTODO_HOME,
+# then the XDG state directory, then the legacy `~/.freebuff`. This copy of the rule is the
+# bell's own, so the test drives the bell rather than trusting that the two agree.
+mkdir -p "$PN/homestate"
+cp "$PN/keeper.json" "$PN/homestate/fbtodo-pane-keeper.pid"
+check_match "with no --keeper it finds the claim where fbtodo keeps it" \
+  "$(FBTODO_HOME="$PN/homestate" HOME="$PN/home" FREEBUFF_FBTODO="$PN/bin/fbtodo" \
+    FREEBUFF_PHONE_SH="$PN/notify/phone.sh" FREEBUFF_PANE_BELL_STATE="$PN/state-bell.json" \
+    python3 "$PN/notify/pane-bell.py" --print)" \
+  '^silent: every session that wants a pane has one, and a keeper is watching'
+
 # The startup case, and the reason the grace exists: a session whose CLI has only just
 # started has no pane, and the keeper's first pass is what gives it one. A watch that
 # reported here would fire on every session, every time.
@@ -1673,6 +1684,8 @@ check "it pushes once" "$(pn_sends)" "1"
 check_match "...through phone.sh, high priority" "$(cat "$PN/sends.log")" 'priority high'
 check_match "...naming the window it is missing from" "$(cat "$PN/sends.log")" 'fbtodo pane missing . main'
 check_match "...and saying what to run" "$(cat "$PN/sends.log")" 'pane-watch --once'
+check_match "...and the log beside the claim it read, not a legacy path" \
+  "$(cat "$PN/sends.log")" 'its log: .*pane-watch/fbtodo-pane.log'
 pn_run 0 --quiet >/dev/null
 check "the same failure does not repeat" "$(pn_sends)" "1"
 check_match "...and says why" "$(pn_run 0 --print)" '^silent: already announced'
