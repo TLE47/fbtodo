@@ -1,0 +1,3551 @@
+#!/usr/bin/env python3
+"""Self-check for `fbtodo`, the copy sitting next to this file.
+
+Runs everything against a throwaway FBTODO_HOME (`.freebuff/fbtodo-test/`) and a
+fake "freebuff instance" (a sleep process) whose death must stop the watcher:
+
+    python3 fbtodo-selfcheck.py
+
+The suite drives real tmux servers it starts itself and takes ~90-160 s. It cleans
+up only that one directory — created by this script, verified by path — never a
+parent.
+"""
+import json
+import os
+import re
+import signal
+import subprocess
+import shutil
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+HERE = os.path.dirname(os.path.abspath(__file__))
+FB = os.path.join(HERE, "fbtodo")
+TEST_HOME = os.path.join(HOME, ".freebuff", "fbtodo-test")
+REAL_HOME = os.path.join(HOME, ".freebuff")
+PANES = os.path.join(HERE, "fbtodo")
+CWD = HOME
+STRIP = lambda s: re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", s)  # noqa: E731
+
+env = dict(os.environ, FBTODO_HOME=TEST_HOME)
+# The phone notifiers, muted for the whole run — in THIS process's environment too, not
+# just in `env`. Some phases start a REAL watcher (the zshrc autostart hook inherits the
+# shell's environment), and a real watcher reading the fixture's dead-looking session
+# pushes "freebuff dropped" to the owner's phone: measured 2026-09-22, three spurious
+# pairs while this suite ran. `/usr/bin/true` answers every notifier contract well enough
+# for phases that only assert a watcher came up; the NAS block below points its own
+# commands at logged stubs instead.
+MUTE = shutil.which("true") or "/usr/bin/true"
+for _var in ("FBTODO_NOTIFY", "FBTODO_DROP", "FBTODO_ASK", "FBTODO_PAUSE", "FBTODO_PANE_BELL"):
+    os.environ[_var] = MUTE
+    env[_var] = MUTE
+# The patch row's own sources, pointed at fixtures for the whole run — in this process's
+# environment too, because the module reads these paths when it is imported below. The
+# real ones are this Mac's (~/.config/freebuff-patch-watch/watch.log and
+# ~/.config/freebuff-notify/phone.log), and a suite whose rendered output changes with the
+# owner's last patch pass would be reporting history rather than the code. The version is
+# one no build can have, so a check can prove the pane read the fixture and not the host.
+PATCH_HOME = os.path.join(TEST_HOME, "patchlogs")
+PATCH_FIXTURE = os.path.join(PATCH_HOME, "watch.log")
+ALERT_FIXTURE = os.path.join(PATCH_HOME, "phone.log")
+META_FIXTURE = os.path.join(PATCH_HOME, "freebuff-metadata.json")
+NAS_PATCH_FIXTURE = os.path.join(PATCH_HOME, "nas-patch.log")
+NAS_ALERT_FIXTURE = os.path.join(PATCH_HOME, "nas-notify.log")
+for _key, _val in (
+    ("FBTODO_PATCH_LOG", PATCH_FIXTURE),
+    ("FBTODO_ALERT_LOG", ALERT_FIXTURE),
+    ("FBTODO_PATCH_META", META_FIXTURE),
+    ("FBTODO_NAS_PATCH_LOG", NAS_PATCH_FIXTURE),
+    ("FBTODO_NAS_ALERT_LOG", NAS_ALERT_FIXTURE),
+):
+    os.environ[_key] = _val
+    env[_key] = _val
+PATCH_FIXTURE_STAMP = ""  # filled in with the fixtures themselves, below
+ok = []
+START = time.monotonic()  # the suite's clock; `say()` reports each check's cost against it
+
+
+def run(*args, timeout=30, check=False):
+    p = subprocess.run(
+        [sys.executable, FB, *args], capture_output=True, text=True, env=env,
+        cwd=CWD, timeout=timeout,
+    )
+    if check and p.returncode != 0:
+        raise AssertionError(f"{args} -> {p.returncode}\n{p.stdout}\n{p.stderr}")
+    return p
+
+
+def say(msg):
+    """Report a passing check, and — with FBTODO_SELFCHECK_TIME=1 — what it cost.
+
+    The suite takes 90-160 s and the reason is not obvious from the outside (real tmux
+    servers, keeper passes, NAS fixtures), so the elapsed seconds since the last check go
+    on the line: `[+12.4s 3m21s]`. That is how the expensive phases are found instead of
+    guessed at.
+    """
+    ok.append(msg)
+    if os.environ.get("FBTODO_SELFCHECK_TIME") == "1":
+        now = time.monotonic()
+        since = now - say.last
+        print(f"{msg}  [+{since:.1f}s {now - START:.0f}s]")
+    else:
+        print(msg)
+        now = time.monotonic()
+    say.last = now
+
+
+say.last = time.monotonic()
+
+
+def spawn_quiet(*args):
+    """Detached from this process's stdio, in its own group.
+
+    Anything that inherits the caller's stdout keeps `… | tail` open after this
+    script exits — a leaked `sleep` holding the pipe looked exactly like a hang.
+    """
+    return subprocess.Popen(
+        list(args),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def tmux_geometry(tmux_cmd: list) -> dict:
+    """pane id -> [left, top, width, height], on whichever server `tmux_cmd` names.
+
+    The placement checks are about numbers, so they read the same fields fbtodo places
+    by — and restate the rule themselves rather than asking the code under test.
+    """
+    p = subprocess.run(
+        list(tmux_cmd) + ["list-panes", "-a", "-F",
+                          "#{pane_id} #{pane_left} #{pane_top} #{pane_width} #{pane_height}"],
+        capture_output=True, text=True,
+    )
+    rects = {}
+    for line in (p.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) == 5:
+            rects[parts[0]] = [int(v) for v in parts[1:]]
+    return rects
+
+
+def kill_tree(proc) -> None:
+    """Kill the whole group: `sleep 600 & wait` leaves a child behind."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+# ---- subset runs: `--only <sel>` and `--list` --------------------------------------
+# The suite is one long script, and deliberately so: the phases share the fixture home,
+# the muted notifiers and a live watcher, so a block cannot be called up on its own — it
+# depends on everything above it. What CAN be dropped is the expensive half: each phase
+# below starts its own tmux server and waits out real keeper passes, and they are the
+# reason the suite costs ~70 s (measured 2026-09-23, FBTODO_SELFCHECK_TIME=1). Each one
+# carries a `#@phase <name>` line; `--only` re-runs this file with the phases you did not
+# name cut out (as `pass`, line numbers preserved), keeping the cheap body — fixture
+# setup, marker checks, unit tests — that the phases depend on. `--list` shows them.
+#
+#   python3 fbtodo-selfcheck.py --list
+#   python3 fbtodo-selfcheck.py --only local-session
+#   python3 fbtodo-selfcheck.py --only 1 --only "nas pane"
+SUBSET_GUARD = "FBTODO_SELFCHECK_SUBSET"  # set for the re-run, so it does not recurse
+PHASE_MARK = "#@phase "
+
+
+def selector_phases(src: str) -> list:
+    """The `#@phase`-marked blocks: index, name, line range, checks, first check text."""
+    import ast
+
+    tree = ast.parse(src)
+    lines = src.splitlines()
+    hero = max((n for n in tree.body if isinstance(getattr(n, "body", None), list)),
+               key=lambda n: n.end_lineno)
+    out = []
+    for node in hero.body:
+        mark = lines[node.lineno - 2] if node.lineno >= 2 else ""
+        if not mark.lstrip().startswith(PHASE_MARK):
+            continue
+        says = [n for n in ast.walk(node) if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name) and n.func.id == "say"]
+        first = next((s.args[0].value for s in says
+                      if s.args and isinstance(s.args[0], ast.Constant)), "")
+        out.append({"i": len(out), "name": mark.split(PHASE_MARK, 1)[1].strip(),
+                    "start": node.lineno, "end": node.end_lineno,
+                    "checks": len(says), "first": first})
+    return out
+
+
+def selector_run() -> None:
+    """`--list` / `--only`: re-run this file with the unselected phases cut out."""
+    argv = sys.argv[1:]
+    if os.environ.get(SUBSET_GUARD) == "1":
+        return
+    want_list, only, rest, i = False, [], [], 0
+    while i < len(argv):
+        if argv[i] == "--list":
+            want_list, i = True, i + 1
+        elif argv[i] == "--only":
+            only.append(argv[i + 1] if i + 1 < len(argv) else "")
+            i += 2
+        elif argv[i].startswith("--only="):
+            only.append(argv[i].split("=", 1)[1])
+            i += 1
+        else:
+            rest.append(argv[i])
+            i += 1
+    if not (want_list or only):
+        return
+    path = os.path.abspath(__file__)
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    phases = selector_phases(src)
+    if want_list:
+        for p in phases:
+            print(f"{p['i']:2d}  L{p['start']:<5d} {p['checks']:2d} checks  {p['name']}\n"
+                  f"         {p['first'][:110]}")
+        print("\n--only <index|substring of the name or first check>  (no --only: all of them)")
+        raise SystemExit(0)
+    keep = set()
+    for sel in only:
+        hits = [p["i"] for p in phases
+                if sel == str(p["i"]) or sel.lower() in p["name"].lower()
+                or sel.lower() in p["first"].lower()]
+        if not hits:
+            raise SystemExit(
+                f"--only {sel!r} matched none of the {len(phases)} phases; --list shows them"
+            )
+        keep.update(hits)
+    lines = src.splitlines(keepends=True)
+    for p in phases:
+        if p["i"] in keep:
+            continue
+        for ln in range(p["start"] - 1, p["end"]):
+            line = lines[ln]
+            if ln == p["start"] - 1:
+                lines[ln] = line[: len(line) - len(line.lstrip())] + "pass\n"
+            else:
+                lines[ln] = "#" + line
+    print(f"--only {', '.join(only)}: running {len(keep)} of {len(phases)} phases, "
+          "the rest of the body as usual\n")
+    os.environ[SUBSET_GUARD] = "1"
+    sys.argv = [sys.argv[0], *rest]
+    exec(compile("".join(lines), path, "exec"),
+         {"__name__": "__main__", "__file__": path})
+    raise SystemExit(0)  # the re-run WAS the suite: this process must not run it again
+
+
+selector_run()
+
+if os.path.exists(TEST_HOME):
+    shutil.rmtree(TEST_HOME)
+os.makedirs(TEST_HOME, mode=0o700)
+# The patch row's fixtures: written HERE rather than with the paths above, because the
+# wipe just above takes the whole test home with it — and read by the module when it is
+# imported below, which is why the paths are set before this point.
+os.makedirs(PATCH_HOME, mode=0o700, exist_ok=True)
+PATCH_FIXTURE_STAMP = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 1800))
+with open(PATCH_FIXTURE, "w") as fh:
+    # a pass in progress above the finished one: the OUTCOME is the newest line that IS
+    # one, not simply the newest line
+    fh.write(f"{PATCH_FIXTURE_STAMP} binary changed (1:2:3) — converge, then re-anchor\n")
+    fh.write(f"{PATCH_FIXTURE_STAMP} patched — the collapse and the session-end reason are"
+             " in place (1:2:4)\n")
+with open(ALERT_FIXTURE, "w") as fh:
+    fh.write(f"{PATCH_FIXTURE_STAMP} phone: sent ntfy freebuff done · fixture\n")
+with open(META_FIXTURE, "w") as fh:
+    json.dump({"version": "9.9.9-fixture", "target": "darwin-arm64"}, fh)
+with open(NAS_PATCH_FIXTURE, "w") as fh:
+    fh.write("2026-01-01T00:00:00Z converge=ok patch=incomplete binary=9.9.9-nas [1 bytes]\n")
+    fh.write("    freebuff: local CLI patches incomplete (no window for fixture-window);"
+             " the rest were applied\n")
+with open(NAS_ALERT_FIXTURE, "w") as fh:
+    fh.write('2026-01-01 00:00:01 sent ntfy incomplete (2f14bfcf14a4d794) — http 200 {"id":"x"}\n')
+
+try:
+    state_path = os.path.join(TEST_HOME, "fbtodo-state.json")
+    lock_path = os.path.join(TEST_HOME, "fbtodo-daemon.pid")
+
+    # ---- a fake freebuff instance we are allowed to kill
+    victim = spawn_quiet("sleep", "600")
+    time.sleep(0.2)
+
+    # ---- daemon starts, watches the victim, refreshes the state file
+    daemon = subprocess.Popen(
+        [sys.executable, FB, "daemon", "--foreground", "--quiet",
+         "--instance-pid", str(victim.pid), "--cwd", CWD, "-i", "0.2"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True, env=env, cwd=CWD,
+    )
+    deadline = time.time() + 10
+    while time.time() < deadline and not os.path.exists(lock_path):
+        time.sleep(0.1)
+    assert os.path.exists(lock_path), "watcher never took its lock"
+
+    # the lock is taken before the first snapshot, so poll the file, don't assume
+    deadline = time.time() + 20
+    st = {}
+    while time.time() < deadline:
+        try:
+            st = json.load(open(state_path))
+        except (OSError, ValueError):
+            time.sleep(0.1)
+            continue
+        if st.get("status") == "watching" and st.get("heartbeat_ms"):
+            break
+        time.sleep(0.1)
+    assert st.get("status") == "watching", st
+    assert st.get("instance_pid") == victim.pid, st
+    assert st.get("backend") == "cli" and st.get("todos"), st
+    assert st.get("heartbeat_ms") and st.get("list_version"), st
+    say(f"watcher follows the instance and refreshes state: ok "
+        f"({st['done']}/{st['total']} todos, list #{st['list_version']})")
+
+    # ---- heartbeat must advance while the instance lives
+    hb1 = json.load(open(state_path))["heartbeat_ms"]
+    time.sleep(0.6)
+    hb2 = json.load(open(state_path))["heartbeat_ms"]
+    assert hb2 > hb1, (hb1, hb2)
+    say("heartbeat advances while freebuff is alive: ok")
+
+    # ---- status reports a live watcher
+    out = run("status").stdout
+    assert "not running" not in out, out
+    say("status shows the live watcher: ok")
+
+    # ---- kill the instance: the watcher must shut itself down and drop its lock
+    kill_tree(victim)
+    deadline = time.time() + 10
+    while time.time() < deadline and os.path.exists(lock_path):
+        time.sleep(0.1)
+    assert not os.path.exists(lock_path), "watcher kept its lock after the instance died"
+    assert daemon.wait(timeout=10) == 0, "watcher did not exit cleanly"
+    final = json.load(open(state_path))
+    assert final.get("status") == "stopped", final
+    assert final.get("stop_reason") == "instance-exited", final
+    assert "todos" not in final, "a stopped watcher kept a list"
+    say(f"watcher shuts down when the instance dies: ok ({final['stop_reason']})")
+
+    # ---- stop is idempotent on a dead watcher
+    assert run("stop").returncode == 0
+    say("stop is a no-op when nothing runs: ok")
+
+    # ---- a watcher whose lock vanishes stops instead of re-creating its home
+    victim_l = spawn_quiet("sleep", "600")
+    daemon_l = subprocess.Popen(
+        [sys.executable, FB, "daemon", "--foreground", "--quiet",
+         "--instance-pid", str(victim_l.pid), "--cwd", CWD, "-i", "0.2"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True, env=env, cwd=CWD,
+    )
+    deadline = time.time() + 10
+    while time.time() < deadline and not os.path.exists(lock_path):
+        time.sleep(0.1)
+    os.unlink(lock_path)
+    assert daemon_l.wait(timeout=15) == 0, "watcher ignored a removed lock"
+    assert not os.path.exists(lock_path), "a stopped watcher left a lock"
+    kill_tree(victim_l)
+    say("a removed lock stops the watcher without resurrecting its home: ok")
+
+    # ---- json/bar/snap contracts
+    j = json.loads(run("json").stdout)
+    assert j.get("backend") == "cli" and j.get("todos"), j
+    assert run("bar").stdout.strip().startswith("todos "), run("bar").stdout
+    assert "no conversation DB found" not in run("snap").stderr
+    say("json / bar / snap subcommands: ok")
+
+    # ---- new session drops the previous list instead of showing it
+    import importlib.machinery
+    import importlib.util
+
+    spec = importlib.util.spec_from_loader(
+        "fbtodo", importlib.machinery.SourceFileLoader("fbtodo", FB)
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    old = module.finish_state(
+        {"session": "S1", "todos": [{"task": "a", "completed": True}]}, None
+    )
+    new_session_empty = module.finish_state({"session": "S2", "todos": []}, old)
+    assert new_session_empty["cleared"] is True, new_session_empty
+    assert new_session_empty["list_version"] == 0, new_session_empty
+    assert new_session_empty["todos"] == [], new_session_empty
+    new_list = module.finish_state(
+        {"session": "S2", "todos": [{"task": "b", "completed": False}]}, new_session_empty
+    )
+    assert new_list["list_version"] == 1 and new_list["total"] == 1, new_list
+    same_list_again = module.finish_state(
+        {"session": "S2", "todos": [{"task": "b", "completed": True}]}, new_list
+    )
+    assert same_list_again["list_version"] == 1, same_list_again  # progress, not a new list
+    probe = module.finish_state(
+        {"session": "S3", "todos": [{"task": "c", "completed": False}]}, None
+    )
+    assert not probe.get("list_version"), probe  # a probe must not invent a counter
+    say("new session drops the old list; progress does not renumber it: ok")
+    say("a standalone probe reports no list counter instead of guessing #1: ok")
+
+    # ---- the big goal heading a list: the AGENT's own line, and drift since
+    goals = os.path.join(TEST_HOME, "goalstore")
+    os.makedirs(goals, exist_ok=True)
+
+    def rec(prompt=None, todos=None, filler=None, prose=None, ended=None):
+        data = {"iteration": 1}
+        if prompt is not None:
+            data["prompt"] = prompt
+        if prose is not None:
+            data["fullResponse"] = prose
+        if ended is not None:
+            data["shouldEndTurn"] = ended
+        if todos is not None:
+            data["toolCalls"] = [
+                {"toolName": "write_todos", "input": {"todos": todos}}
+            ]
+        if filler is not None:
+            data["toolResults"] = [filler]
+        return {"level": "DEBUG", "timestamp": "2026-09-21T01:00:00.000Z", "data": data}
+
+    def write_journal(rows):
+        with open(os.path.join(goals, "log.jsonl"), "w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+
+    # no agent line, no goal: the request is NOT promoted into the heading (a quote is
+    # the phrasing, not the objective), and the newer request still shows as `now`
+    write_journal(
+        [
+            rec(prompt="add a goal line to the pane", todos=[{"task": "t", "completed": False}]),
+            # "continue" is a nudge, not a goal: the newer REAL request must win
+            rec(prompt="continue"),
+            rec(prompt="and check why the list looks frozen"),
+        ]
+    )
+    st_g = module.read_cli(goals)
+    assert st_g["goal"] is None and st_g["goal_source"] is None, st_g
+    assert st_g["now"] == "and check why the list looks frozen", st_g
+    text_none = STRIP(module.render(dict(st_g, done=0, total=1), False, width=50))
+    assert "big goal · — none stated" in text_none, text_none
+    say("big goal: with no agent line the heading says so instead of quoting you: ok")
+
+    # a repeated request is not drift (the list already answers it)
+    write_journal(
+        [
+            rec(prompt="same request here", todos=[{"task": "t", "completed": False}]),
+            rec(prompt="same request here"),
+        ]
+    )
+    st_g = module.read_cli(goals)
+    assert st_g["now"] is None, st_g
+    say("a repeated prompt is not reported as drift: ok")
+
+    # ---- the summary the phone message carries under the heading: the agent's own
+    # last sentence, which is the only place a "what happened" line can come from
+    write_journal(
+        [
+            rec(
+                prompt="why did it stop",
+                todos=[{"task": "t", "completed": True}],
+                prose="**Goal:** find why finish pings stopped\n\n"
+                "Confirmed — the pipe was never the problem.\n\n| a | b |",
+            )
+        ]
+    )
+    st_s = module.read_cli(goals)
+    assert st_s["summary"] == "Confirmed — the pipe was never the problem.", st_s
+    say("summary: the first usable line of the agent's answer, markdown out: ok")
+
+    write_journal(
+        [rec(prompt="quiet turn", todos=[{"task": "t", "completed": True}], prose="")]
+    )
+    st_s = module.read_cli(goals)
+    assert st_s["summary"] is None, st_s
+    say("summary: an empty answer leaves the line out instead of blank: ok")
+
+    runaway = "x" * (module.SUMMARY_MAX_CHARS + 40)
+    write_journal(
+        [rec(prompt="a long answer", todos=[{"task": "t", "completed": True}], prose=runaway)]
+    )
+    st_s = module.read_cli(goals)
+    assert len(st_s["summary"]) == module.SUMMARY_MAX_CHARS, st_s
+    assert st_s["summary"].endswith("…"), st_s
+    say("summary: a runaway line is clipped to the phone's budget: ok")
+
+    # A `Goal:` line is skipped, not quoted: the heading already carries it, and the phone
+    # would otherwise show the same sentence twice.
+    write_journal(
+        [
+            rec(
+                prompt="goal only",
+                todos=[{"task": "t", "completed": True}],
+                prose="Goal: keep the notification short\n",
+            )
+        ]
+    )
+    st_s = module.read_cli(goals)
+    assert st_s["goal"] == "keep the notification short", st_s
+    assert st_s["summary"] is None, st_s
+    say("summary: a bare Goal: line is not repeated as the summary: ok")
+
+    # ---- a NUDGE after the list: "continue" is not a new task, but AGENTS.md asks for a
+    #      fresh list before carrying on — and the pane says so until one arrives
+    write_journal(
+        [
+            rec(prompt="add a goal line to the pane", todos=[{"task": "t", "completed": True}]),
+            rec(prompt="continue"),
+        ]
+    )
+    st_n = module.read_cli(goals)
+    assert st_n["nudge"] == "continue", st_n
+    nudge_txt = STRIP(
+        module.render(dict(st_n, done=1, total=1), False, width=60, goal_lines=2)
+    )
+    assert "nudge · continue — rewrite the list, then continue" in nudge_txt, nudge_txt
+    say("a nudge: `continue` asks for the list to be rewritten, and the pane says so: ok")
+
+    # ...and it clears itself the moment the agent complies with a newer list
+    write_journal(
+        [
+            rec(prompt="add a goal line to the pane", todos=[{"task": "t", "completed": True}]),
+            rec(prompt="continue"),
+            rec(todos=[{"task": "t", "completed": True}, {"task": "next", "completed": False}]),
+        ]
+    )
+    st_n = module.read_cli(goals)
+    assert st_n["nudge"] is None, st_n
+    say("a nudge: the line clears as soon as a newer list exists: ok")
+
+    # A continuation wears many hats, so it is recognised on WORDS, not length: every
+    # phrasing below means "keep going" to the agent and must reach the pane, while a
+    # prompt that adds real content stays a request — no heading is lost to the nudge slot.
+    for phrase, is_cont in (
+        ("continue", True),
+        ("Continue!", True),
+        ("continue please", True),
+        ("ok, carry on then", True),
+        ("keep going with it", True),
+        ("go on", True),
+        ("proceed", True),
+        ("continue with the NAS work", False),
+        ("keep going and fix the bell", False),
+        ("pick up where the compaction left off", False),
+    ):
+        write_journal(
+            [
+                rec(prompt="add a goal line to the pane", todos=[{"task": "t", "completed": True}]),
+                rec(prompt=phrase),
+            ]
+        )
+        st_p = module.read_cli(goals)
+        assert bool(st_p["nudge"]) == is_cont, (phrase, st_p)
+    say("a nudge: any phrasing of `continue` nags, one that adds content does not: ok")
+
+    # a real request after the nudge owns `now`, so there is nothing pending to nag about
+    write_journal(
+        [
+            rec(prompt="add a goal line to the pane", todos=[{"task": "t", "completed": True}]),
+            rec(prompt="continue"),
+            rec(prompt="now also handle the empty-store case"),
+        ]
+    )
+    st_n = module.read_cli(goals)
+    assert st_n["nudge"] is None and st_n["now"], st_n
+    say("a nudge: superseded by a real request, so only `now` shows: ok")
+
+    # ---- `turn_ended`: what the finished-task bell rings on. It is the AGENT's own
+    #      end-of-turn record, never a quiet journal — a long command writes nothing at
+    #      all while it runs, and silence would ring in the middle of it.
+    write_journal(
+        [
+            rec(prompt="ring when the task is done", todos=[{"task": "t", "completed": True}]),
+            rec(ended=False, filler="run_terminal_command: 4 minutes of nothing written"),
+            rec(ended=True, prose="done"),
+        ]
+    )
+    st_t = module.read_cli(goals)
+    assert st_t["turn_ended"] is True, st_t
+    say("turn_ended: true once the agent's own end-of-turn record lands: ok")
+
+    # the same journal one record earlier: still working, however quiet it has gone
+    write_journal(
+        [
+            rec(prompt="ring when the task is done", todos=[{"task": "t", "completed": True}]),
+            rec(ended=False, filler="run_terminal_command: 4 minutes of nothing written"),
+        ]
+    )
+    st_t = module.read_cli(goals)
+    assert st_t["turn_ended"] is False, st_t
+    say("turn_ended: false while a tool call is in flight, however quiet: ok")
+
+    # a request that came after the turn ended means the agent owes an answer again
+    write_journal(
+        [
+            rec(prompt="first", todos=[{"task": "t", "completed": True}]),
+            rec(ended=True, prose="done"),
+            rec(prompt="and now do this instead"),
+        ]
+    )
+    st_t = module.read_cli(goals)
+    assert st_t["turn_ended"] is False, st_t
+    say("turn_ended: false again when a newer request has no answer yet: ok")
+
+    # ---- the agent's own line is the heading: the journal keeps prose in fullResponse,
+    # nowhere else, and AGENTS.md is what makes the agent write it
+    write_journal(
+        [
+            rec(prose="Goal: head every list with its objective.",
+                prompt="for each fbtodo list can you add thea big goal on the top"),
+            rec(todos=[{"task": "t", "completed": False}]),
+        ]
+    )
+    st_g = module.read_cli(goals)
+    assert st_g["goal"] == "head every list with its objective.", st_g
+    assert st_g["goal_source"] == "agent", st_g
+    assert "for each fbtodo list" not in str(st_g["goal"]), st_g
+    say("big goal: the agent's own Goal: line heads the list, not your wording: ok")
+
+    # a line 1.6 MB deep is still found: the scan walks back past the filler, which is
+    # what a real journal looks like hours into a session
+    write_journal(
+        [
+            rec(prose="Goal: plant the heading before the list",
+                prompt="plant the seed request"),
+            rec(todos=[{"task": "t", "completed": False}]),
+            *[rec(filler="x" * 8000) for _ in range(200)],
+            rec(prompt="a much later request altogether"),
+        ]
+    )
+    st_g = module.read_cli(goals)
+    assert st_g["goal"] == "plant the heading before the list", st_g
+    assert st_g["now"] == "a much later request altogether", st_g
+    say("big goal: found past 1.6 MB of later journal, not just in the tail: ok")
+
+    # markdown emphasis and bullets are what a reply actually looks like
+    for prose in ("**Goal:** summarize the ask in one line.", "- Goal: summarize the ask in one line."):
+        write_journal(
+            [rec(prose=prose, prompt="do the thing"), rec(todos=[{"task": "t", "completed": False}])]
+        )
+        st_g = module.read_cli(goals)
+        assert st_g["goal"] == "summarize the ask in one line.", (prose, st_g)
+    say("big goal: `**Goal:**` and `- Goal:` forms are read too: ok")
+
+    # prose that merely mentions the word is not a goal
+    write_journal(
+        [
+            rec(prose="we discussed the goal: it was unclear", prompt="a proper request here"),
+            rec(todos=[{"task": "t", "completed": False}]),
+        ]
+    )
+    st_g = module.read_cli(goals)
+    assert st_g["goal"] is None, st_g
+    say("big goal: a mid-sentence 'goal:' is not mistaken for one: ok")
+
+    # a newer Goal: line is what "now" shows — and a repeat is not drift
+    write_journal(
+        [
+            rec(prose="Goal: fix the frozen pane.", prompt="the pane is frozen"),
+            rec(todos=[{"task": "t", "completed": False}]),
+            rec(prose="Goal: say big goal instead.", prompt="change the word"),
+        ]
+    )
+    st_g = module.read_cli(goals)
+    assert st_g["goal"] == "fix the frozen pane.", st_g
+    assert st_g["now"] == "say big goal instead.", st_g
+    write_journal(
+        [
+            rec(prose="Goal: same line both times.", prompt="p"),
+            rec(todos=[{"task": "t", "completed": False}]),
+            rec(prose="Goal: same line both times.", prompt="p2"),
+        ]
+    )
+    st_g = module.read_cli(goals)
+    assert st_g["goal"] == "same line both times.", st_g
+    say("big goal: a newer Goal: line becomes `now`: ok")
+
+    # prose and the tool call are separate iterations, so the line heading a turn often
+    # lands just AFTER its list: with no newer request in between it is still that list's
+    # goal — otherwise a turn that writes todos first would never get an agent heading
+    write_journal(
+        [
+            rec(prompt="state the objective properly here"),
+            rec(todos=[{"task": "t", "completed": False}]),
+            rec(prose="Goal: state the objective."),
+        ]
+    )
+    st_g = module.read_cli(goals)
+    assert st_g["goal"] == "state the objective.", st_g
+    assert st_g["goal_source"] == "agent" and st_g["now"] is None, st_g
+    # ...but a line after a NEWER request belongs to that request, not to the list — and
+    # a line from the PREVIOUS turn (before the newest request) still heads its own list
+    write_journal(
+        [
+            rec(prompt="the first request"),
+            rec(todos=[{"task": "t", "completed": False}]),
+            rec(prose="Goal: the previous turn's heading."),
+            rec(prompt="a newer request arrived"),
+            rec(prose="Goal: handle the newer request."),
+        ]
+    )
+    st_g = module.read_cli(goals)
+    assert st_g["goal"] == "the previous turn's heading.", st_g
+    assert st_g["now"] == "handle the newer request.", st_g
+    say("big goal: turn boundaries decide which line heads the list: ok")
+
+    # ---- the heading is SIZED for the strip: a compliant line renders whole, not cut
+    base_state = {
+        "backend": "cli", "session": "S", "todos": [{"task": "t", "completed": False}],
+        "done": 0, "total": 1, "goal": "fit the pane heading whole",
+    }
+    assert len(base_state["goal"]) <= module.GOAL_MAX_CHARS
+
+    def goal_lines_rendered(state, width, **kw):
+        rendered = STRIP(module.render(state, False, width=width, **kw)).splitlines()
+        # 11 spaces: the heading's own continuation indent (tasks use 6, so a 6-space
+        # prefix would match them too)
+        return [
+            line for line in rendered if line.startswith(("big goal ·", "now ·", " " * 11))
+        ]
+
+    for width in (50, 46, 60):
+        lines = goal_lines_rendered(base_state, width)
+        assert lines and not lines[0].endswith("…"), (width, lines)
+        assert len(lines) <= 2, (width, lines)
+    # the wrapper's own strip: one line, whole, which is what GOAL_MAX_CHARS is sized for
+    assert len(goal_lines_rendered(base_state, 50)) == 1, goal_lines_rendered(base_state, 50)
+    # only a line that ignores the budget is cut, and then only past --goal-lines
+    huge = dict(base_state, goal="word " * 200)
+    assert goal_lines_rendered(huge, 46)[-1].endswith("…"), goal_lines_rendered(huge, 46)
+    assert goal_lines_rendered(huge, 90)[-1].endswith("…"), goal_lines_rendered(huge, 90)
+    assert len(goal_lines_rendered(huge, 90)) == 3, goal_lines_rendered(huge, 90)
+    assert "big goal ·" not in STRIP(module.render(base_state, False, width=46, goal_lines=0))
+    assert module.build_parser().parse_args(["--goal-lines", "0"]).goal_lines == 0
+    # the request the list was written for is never rendered as the heading
+    assert "now · and check" in STRIP(
+        module.render(dict(base_state, now="and check the frozen pane"), False, width=46)
+    ), STRIP(module.render(dict(base_state, now="and check the frozen pane"), False, width=46))
+    say("big goal: a compliant line renders whole, and only overruns are elided: ok")
+
+    # without the rule in ~/AGENTS.md there is no line at all: the convention IS the
+    # feature, so the file and the tool's budget are checked together
+    agents_md = os.path.join(HOME, "AGENTS.md")
+    agents_text = open(agents_md, encoding="utf-8").read() if os.path.isfile(agents_md) else ""
+    assert "`Goal:`" in agents_text, "~/AGENTS.md lost the `Goal:` convention the pane reads"
+    assert "concise rewrite" in agents_text, "~/AGENTS.md no longer asks for a concise goal"
+    assert f"{module.GOAL_MAX_CHARS} characters" in agents_text, (
+        f"~/AGENTS.md and GOAL_MAX_CHARS ({module.GOAL_MAX_CHARS}) disagree on the budget"
+    )
+    say("big goal: ~/AGENTS.md asks for a line that fits, at the tool's own budget: ok")
+
+    # ...and the other half of the convention: a list is only as true as its last call, so
+    # the rule has to ask for the update as each step lands rather than in a batch
+    assert "the moment a step lands" in agents_text, (
+        "~/AGENTS.md no longer asks for the list to be updated as steps land"
+    )
+    assert "batch" in agents_text, "~/AGENTS.md dropped the reason it must not be batched"
+    assert "On a bare continuation" in agents_text and "nudge" in agents_text, (
+        "~/AGENTS.md no longer asks for a fresh list on `continue` — the pane's nudge line "
+        "would then nag about a rule nobody has"
+    )
+    assert "steps in the list, not an epilogue" in agents_text, (
+        "~/AGENTS.md no longer asks for the checks to BE steps in the list — a list that "
+        "stops at the implementation hides the verification from the pane"
+    )
+    say("the list rule: ~/AGENTS.md asks for the update the moment a step lands: ok")
+    say("the list rule: and for a re-written list before continuing from a nudge: ok")
+    say("the list rule: and for the checks themselves to be steps of it: ok")
+
+    # the NAS program carries its own copy of the heading rule (it runs standalone out
+    # there), so both patterns are compared on the forms that matter
+    # Only the regex line is executed: the program itself wants argv and a store.
+    nas_ns = {}
+    exec(
+        "import re\n"
+        + "\n".join(
+            line for line in module.NAS_EXTRACT.splitlines() if line.startswith("GOAL_RE = ")
+        ),
+        nas_ns,
+    )
+    for sample in ("Goal: x", "**Goal:** y", "- Goal: z", "we discussed the goal: no"):
+        assert bool(module.GOAL_LINE_RE.match(sample)) == bool(
+            nas_ns["GOAL_RE"].match(sample)
+        ), sample
+    say("big goal: the NAS extractor's rule matches the local one: ok")
+
+    # a sentence where a heading belongs is reported, not silently clipped. Its own
+    # FBTODO_HOME: the shared one holds the watcher's state, and doctoring that would
+    # leak into every later check.
+    long_goal = "rewrite the whole pane so that the heading can hold a long sentence"
+    status_home = os.path.join(TEST_HOME, "status-home")
+    os.makedirs(status_home, mode=0o700, exist_ok=True)
+    module.atomic_write_json(
+        os.path.join(status_home, "fbtodo-state.json"),
+        {
+            "backend": "cli", "session": "S", "tool_version": module.VERSION,
+            "goal": long_goal, "goal_source": "agent",
+            "heartbeat_ms": int(time.time() * 1000), "todos": [],
+        },
+    )
+    status_out = STRIP(
+        subprocess.run(
+            [sys.executable, FB, "status"], capture_output=True, text=True, cwd=CWD,
+            env=dict(env, FBTODO_HOME=status_home), timeout=30,
+        ).stdout
+    )
+    assert long_goal[:40] in status_out, status_out
+    assert "chars over" in status_out, status_out
+    say("status: a goal too long for the strip is called out, not just clipped: ok")
+
+    # ---- the estimate memory is auditable: which steps are remembered, the pace they
+    #      set, and where each waiting step's number comes from
+    now_ms = int(time.time() * 1000)
+    module.atomic_write_json(
+        os.path.join(status_home, "fbtodo-tasks.json"),
+        {
+            "schema": module.TASKLOG_SCHEMA, "session": "S",
+            "tasks": {
+                module.task_key("S", "Run the tests"): {
+                    "started_ms": now_ms - 240_000, "done_ms": now_ms - 60_000,
+                },
+                module.task_key("S", "Deploy"): {
+                    "started_ms": now_ms - 400_000, "done_ms": now_ms - 100_000,
+                },
+            },
+        },
+    )
+    module.atomic_write_json(
+        os.path.join(status_home, "fbtodo-state.json"),
+        {
+            "backend": "cli", "session": "S", "tool_version": module.VERSION,
+            "heartbeat_ms": now_ms, "list_version": 3,
+            "todos": [
+                {"task": "Run the tests", "completed": False},
+                {"task": "Deploy the app", "completed": False},
+            ],
+        },
+    )
+    hist_out = STRIP(
+        subprocess.run(
+            [sys.executable, FB, "status"], capture_output=True, text=True, cwd=CWD,
+            env=dict(env, FBTODO_HOME=status_home), timeout=30,
+        ).stdout
+    )
+    # the remembered spans are 3m and 5m, so the pace is their median, 4m; `Run the tests`
+    # projects from its own history while the reworded `Deploy the app` falls to the pace
+    assert "remembered pace   : 4m00s" in hist_out, hist_out
+    assert "2 remembered step(s)" in hist_out, hist_out
+    assert "Run the tests" in hist_out and "~3m" in hist_out and "own history" in hist_out, hist_out
+    assert "Deploy the app" in hist_out and "list pace" in hist_out, hist_out
+    say("status: the remembered pace and each step's estimate are shown: ok")
+
+    # ---- the memory is PER MODEL. Measured 2026-09-26: the same step on
+    #      `deepseek/deepseek-v4-flash` and on `stealth/space-bunny-alpha` differed by more
+    #      than the whole estimate, so a remembered span from one must not project the
+    #      other. Records carry the model; the history prefers this session's model and
+    #      falls back to every model only while the current one has nothing of its own.
+    fast, slow = "stealth/space-bunny-alpha", "deepseek/deepseek-v4-flash"
+    keyed = {"schema": module.TASKLOG_SCHEMA, "session": "S", "tasks": {}}
+    for name, model, span in (("Run the tests", fast, 30_000), ("Deploy", slow, 600_000)):
+        keyed["tasks"][module.task_key("S", name)] = {
+            "started_ms": now_ms - span - 60_000, "done_ms": now_ms - 60_000, "model": model,
+        }
+    assert module.task_history_from_log(keyed["tasks"], now_ms, fast) == {"Run the tests": 30_000}
+    assert module.task_history_from_log(keyed["tasks"], now_ms, slow) == {"Deploy": 600_000}
+    # a model with no history of its own still gets a number, borrowed from any model
+    borrowed = module.task_history_from_log(keyed["tasks"], now_ms, "some/new-model")
+    assert borrowed == {"Run the tests": 30_000, "Deploy": 600_000}, borrowed
+    # ...and with no model named at all, nothing is filtered
+    assert module.task_history_from_log(keyed["tasks"], now_ms) == borrowed
+    say("estimates: a step's remembered span is kept per model, not pooled: ok")
+
+    # ...which the pane's journal reader has to know in the first place: the model comes
+    # out of the same backward pass that finds the list, with no json parse per line.
+    model_home = os.path.join(TEST_HOME, "model-home")
+    os.makedirs(model_home, exist_ok=True)
+    model_chat = os.path.join(model_home, "2026-09-26T00-00-00.000Z")
+    os.makedirs(model_chat, exist_ok=True)
+    def mrec(prompt=None, todos=None, prose=None):
+        # the same record shape the journal fixtures above use, with the model field
+        # this check is about
+        data = {"iteration": 1}
+        if prompt is not None:
+            data["prompt"] = prompt
+        if prose is not None:
+            data["fullResponse"] = prose
+        if todos is not None:
+            data["toolCalls"] = [
+                {"toolName": "write_todos", "input": {"todos": todos}}]
+        row = {"level": "DEBUG", "timestamp": "2026-09-26T00:00:00.000Z", "data": data}
+        row["model"] = fast
+        return row
+
+    with open(os.path.join(model_chat, "log.jsonl"), "w") as fh:
+        for row in (mrec(prompt="do the thing"),
+                    mrec(todos=[{"task": "one", "completed": False}], prose="working")):
+            fh.write(json.dumps(row) + "\n")
+    got = module.read_cli(model_chat)
+    assert [t["task"] for t in got["todos"]] == ["one"], got
+    assert got.get("model") == fast, got.get("model")
+    say("estimates: the model is read out of the journal with the list: ok")
+
+    # ---- the pane is a fixed height: the goal, the current step and the bar all have
+    # to survive a list that is longer than the strip
+    tall = dict(
+        base_state,
+        todos=[{"task": f"step {i}", "completed": i < 4} for i in range(14)],
+        done=4,
+        total=14,
+    )
+    steps_shown = lambda text: sum(  # noqa: E731
+        1 for line in text.splitlines() if re.match(r"^  \[[ x]\] ", line)
+    )
+    for rows in (12, 16, 24, 40):
+        out = STRIP(module.render(tall, False, width=46, height=rows)).splitlines()
+        assert len(out) <= rows, (rows, out)
+        assert any(line.startswith("big goal ·") for line in out), (rows, out)
+        assert any(line.startswith("  [") and "done" in line for line in out), (rows, out)
+    short = STRIP(module.render(tall, False, width=46, height=16))
+    assert "[ ] step 4" in short, short  # the step being worked on is never elided
+    assert steps_shown(short) < 14, short
+    assert "earlier step" in short and "more step" in short, short
+    assert "step 0" not in short, short  # finished steps give way, not the current one
+    deep = dict(tall, todos=[{"task": f"step {i}", "completed": i < 20} for i in range(40)], done=20, total=40)
+    deep_out = STRIP(module.render(deep, False, width=46, height=16))
+    assert "[ ] step 20" in deep_out, deep_out
+    say("pane height: the goal, the current step and the bar fit, the rest is elided: ok")
+
+    # one verbose step must not become the whole pane (and piped output keeps it whole)
+    verbose = dict(base_state, todos=[{"task": "word " * 60, "completed": False}], done=0, total=1)
+    pane_out = STRIP(module.render(verbose, False, width=46, height=16)).splitlines()
+    full_out = STRIP(module.render(verbose, False, width=46)).splitlines()
+    first_task = next(i for i, line in enumerate(pane_out) if line.startswith("  [ ]"))
+    block = [
+        line for line in pane_out[first_task:] if line.startswith(("  [ ]", "      "))
+    ]
+    assert len(block) <= 3, pane_out
+    assert len(full_out) > len(pane_out), (len(full_out), len(pane_out))
+    say("a very long step is capped in the pane, whole in piped output: ok")
+
+    # ---- upgrade mid-flight: a watcher still writing the old layout must not answer a
+    # pane that expects the new fields (it silently lost them before)
+    args_auto = module.build_parser().parse_args([])
+    assert not module.state_matches_request({"backend": "cli", "tool_version": "0.0.0"}, args_auto)
+    assert module.state_matches_request(
+        {"backend": "cli", "tool_version": module.VERSION}, args_auto
+    )
+    say("a state file from another build is ignored rather than trusted: ok")
+
+    # ---- the pane exits when its instance disappears
+    victim2 = spawn_quiet("sleep", "600")
+    time.sleep(0.2)
+    import pty
+    import select
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ["FBTODO_HOME"] = TEST_HOME
+        os.execv(sys.executable, [sys.executable, PANES, "pane", "--watch-pid",
+                                 str(victim2.pid), "--no-daemon", "-i", "0.2"])
+    time.sleep(1.5)
+    kill_tree(victim2)
+    # Drain the pane's pty while waiting. The pane paints into this pty and a terminal
+    # always reads it; nobody here did, so once the 64 KB buffer filled the pane sat in
+    # write() and could not reach the top-of-loop liveness check — measured 2026-09-23:
+    # the same pane, pty drained, exits 0.20 s after its instance dies (that is the
+    # behaviour under test); undrained, this check spent 11.8 s and looked like a slow
+    # pane. The test, not the tool, was the slow part.
+    deadline = time.time() + 10
+    status = None
+    while time.time() < deadline:
+        while select.select([fd], [], [], 0)[0]:
+            try:
+                if not os.read(fd, 65536):
+                    break
+            except OSError:  # the child closed its side
+                break
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid:
+            break
+        time.sleep(0.05)
+    os.close(fd)
+    assert status is not None, "pane did not exit after its instance died"
+    assert os.waitstatus_to_exitcode(status) == 0, os.waitstatus_to_exitcode(status)
+    say("pane closes itself when the instance dies: ok (exit 0)")
+
+    # ---- rendering: narrow panes must not wrap mid-word, and the footer clock
+    # must move so a still pane still proves it is alive
+    ansi = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+    # The shape (the keys, and every field the pane receives) comes from the live `json`,
+    # so a check cannot drift from what the renderer is actually handed. What VARIES is
+    # pinned here: a check that read the model or the remembered history live passed or
+    # failed with whatever session this machine happened to be running, and the footer's
+    # `pace · model` field is decided by exactly those two. A machine with no session at
+    # all is fine too — `json` always answers with a full state (`todos: []`).
+    base_state = dict(
+        json.loads(run("json").stdout),
+        model="some-provider/space-bunny-alpha-preview",
+        task_history={},        # no remembered pace: the default keeps `~2m` in the strip
+    )
+    steps = [
+        {"task": "Diagnose the frozen-looking pane and prove it is alive", "completed": True},
+        {"task": "Add a liveness tick so the pane repaints on a clock", "completed": False},
+    ]
+    # Durations too: the suffix rides on the last line of a step, so a 22-column strip
+    # is where an untouched task line used to run past the edge. One frozen clock, one
+    # counting up through the seconds, at "59m59s" — the widest a duration gets below
+    # the hour, which is where the seconds are shown.
+    SWEEP_NOW = 3_599_999
+    clocks = {
+        "Diagnose the frozen-looking pane and prove it is alive": {
+            "started_ms": 1, "done_ms": 90_000, "elapsed_ms": 90_000,
+        },
+        "Add a liveness tick so the pane repaints on a clock": {
+            "started_ms": 1, "done_ms": None, "elapsed_ms": 3_599_998,
+        },
+    }
+    for heading, extra in (
+        ("a heading", {"goal": "diagnose the frozen pane", "now": None, "nudge": None}),
+        ("no heading", {"goal": None, "now": None, "nudge": None}),
+        ("a pending nudge", {"goal": None, "now": None, "nudge": "continue"}),
+    ):
+        wide_state = dict(
+            base_state, todos=steps, done=1, total=2, list_version=3,
+            task_times=clocks, **extra
+        )
+        for w in (22, 34, 80, 120):
+            rendered = module.render(wide_state, False, watching=999, width=w, now_ms=SWEEP_NOW)
+            for line in ansi.sub("", rendered).splitlines():
+                assert len(line) <= w, (heading, w, repr(line))
+    wide_state = dict(
+        base_state, todos=steps, done=1, total=2, list_version=3,
+        goal="diagnose the frozen pane",
+    )
+    assert module.render(wide_state, False, width=80, now_ms=1000) != module.render(
+        wide_state, False, width=80, now_ms=2000
+    ), "footer clock does not move — a still pane would look frozen"
+
+    # the colour pane is framed and high-density: boxes line up, the active step is
+    # the only loud one, and every visible row still fits the pane it was drawn in
+    rich_state = dict(wide_state, task_times=clocks)
+    rich = ansi.sub("", module.render(
+        rich_state, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW,
+    ))
+    assert "╭" in rich and "╯" in rich, rich
+    # rounded corners everywhere and no square ones anywhere: the frame is drawn with
+    # `╭ ╮ ╰ ╯` only, which the corner assertions above and this one pin
+    assert not any(ch in rich for ch in "┌┐└┘"), rich
+    assert "FREEBUFF TODOS" in rich and "watcher: pid 999" in rich, rich
+    assert "🎯 Goal:" in rich and "✔" in rich and "➔" in rich, rich
+    assert "PROGRESS" in rich and "LIVE:" in rich, rich
+    assert len(rich.splitlines()) <= 20, rich
+    for line in rich.splitlines():
+        assert module._cell_width(line) <= 46, (line, module._cell_width(line))
+    # The patch row: what the last patch pass did, and when the phone was last told
+    # something — the two facts the pane used to need an ssh to see. Built into the state
+    # here (rather than taken from a `json` child, whose facts depend on WHOSE state file
+    # is fresh) so the renderer is checked on its own.
+    facts = {
+        "patch": {"outcome": "incomplete", "severity": "bad", "version": "9.9.9-fixture",
+                  "at_ms": int(time.time() * 1000) - 60_000, "reason": "no window for x"},
+        "alert": {"kind": "sent", "severity": "ok", "text": "sent ntfy incomplete",
+                  "at_ms": int(time.time() * 1000) - 60_000},
+    }
+    with_patch = dict(rich_state, **facts)
+    rich_patch = ansi.sub("", module.render(
+        with_patch, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW,
+    ))
+    assert "PATCH" in rich_patch and "ALERT" in rich_patch, rich_patch
+    for line in rich_patch.splitlines():
+        assert module._cell_width(line) <= 46, (line, module._cell_width(line))
+    plain_rows = ansi.sub("", module.render(with_patch, False, width=80, now_ms=SWEEP_NOW))
+    assert "PATCH" in plain_rows and "ALERT" in plain_rows, plain_rows
+    # A state from a build that read neither fact (or a fixture written for one) renders
+    # exactly as it always did: the row is drawn from the state, not from the host.
+    no_facts = {k: v for k, v in rich_state.items() if k not in ("patch", "alert")}
+    assert "PATCH" not in ansi.sub("", module.render(
+        no_facts, False, width=80, now_ms=SWEEP_NOW))
+    short_rich = ansi.sub("", module.render(
+        rich_state, True, watching=999, width=46, height=12, now_ms=SWEEP_NOW,
+    ))
+    assert len(short_rich.splitlines()) <= 12, short_rich
+    assert "Add a liveness tick" in short_rich, short_rich
+    # ...and the row costs ONE line of a fixed-height pane, whatever the width: the ladder
+    # trades detail (the alert's words, then the patch's version) rather than another row
+    short_patch = ansi.sub("", module.render(
+        with_patch, True, watching=999, width=46, height=12, now_ms=SWEEP_NOW,
+    ))
+    assert len(short_patch.splitlines()) <= 12, short_patch
+    assert sum(1 for ln in short_patch.splitlines() if "PATCH" in ln) == 1, short_patch
+    assert "Add a liveness tick" in short_patch, short_patch
+
+    # ---- the patch row's two readers, on fixtures
+    rep = module.local_patch_alert()
+    assert rep["patch"]["outcome"] == "ok", rep
+    assert rep["patch"]["version"] == "9.9.9-fixture", rep  # the fixture, not this Mac
+    assert rep["patch"]["reason"].endswith("in place"), rep
+    assert rep["patch"]["severity"] == "ok", rep
+    assert rep["alert"]["kind"] == "sent" and "fixture" in rep["alert"]["text"], rep
+    say("patch row: the last patch outcome and the last alert are read from their logs: ok")
+    # a failure is the newest OUTCOME, and the `reanchor:` note above it is not mistaken
+    # for one — reading the newest line would report a failure as a success
+    with open(PATCH_FIXTURE, "a") as fh:
+        fh.write(f"{PATCH_FIXTURE_STAMP} reanchor: freebuff: local CLI patches incomplete"
+                 " (no window for x)\n")
+        fh.write(f"{PATCH_FIXTURE_STAMP} FAILED — the patches are still not in the"
+                 " binary; will retry\n")
+    rep = module.local_patch_alert()
+    assert rep["patch"]["outcome"] == "failed" and rep["patch"]["severity"] == "bad", rep
+    assert "will retry" in rep["patch"]["reason"], rep
+    with open(PATCH_FIXTURE, "w") as fh:  # restored for everything below
+        fh.write(f"{PATCH_FIXTURE_STAMP} patched — the collapse and the session-end reason"
+                 " are in place (1:2:4)\n")
+    say("patch row: a failure is reported, and a `reanchor:` note is not read as one: ok")
+    # the NAS formats: the hook's own line with its complaint under it, and the notifier's,
+    # whose ` — http 200 {…}` transport reply is not the row's business
+    nas_p = module.nas_patch_from_tail("\x1c".join([
+        "2026-01-01T00:00:00Z converge=ok patch=incomplete binary=9.9.9-nas [1 bytes]",
+        "    freebuff: local CLI patches incomplete (no window for fixture-window);"
+        " the rest were applied",
+    ]))
+    assert nas_p["outcome"] == "incomplete" and nas_p["severity"] == "bad", nas_p
+    assert "no window for fixture-window" in nas_p["reason"], nas_p
+    assert module.nas_patch_from_tail("") is None
+    nas_p = module.nas_patch_from_tail(
+        "2026-01-01T00:00:00Z converge=ok patch=ok binary=9.9.9-nas [1 bytes]"
+    )
+    assert nas_p["outcome"] == "ok" and nas_p["reason"] == "", nas_p
+    nas_a = module.alert_from_lines([
+        '2026-01-01 00:00:01 sent ntfy incomplete (2f14bfcf14a4d794) — http 200 {"id":"x"}',
+    ], "fixture")
+    assert nas_a["kind"] == "sent" and nas_a["text"] == "sent ntfy incomplete", nas_a
+    nas_a = module.alert_from_lines([
+        "2026-01-01 00:00:02 resolved — the patches are in place again",
+    ], "fixture")
+    assert nas_a["kind"] == "resolved" and nas_a["severity"] == "ok", nas_a
+    nas_a = module.alert_from_lines([
+        "2026-01-01 00:00:03 muted — failed (7be3655000448c52) not sent",
+    ], "fixture")
+    assert nas_a["kind"] == "muted" and nas_a["severity"] == "warn", nas_a
+    assert module.alert_from_lines([], "fixture") is None
+    # The NAS container logs UTC while this Mac's kit logs LOCAL time, and both use the
+    # space-separated form — so the source has to say which. Guessing made a 28-minute-old
+    # NAS alert read as `0s ago`: its UTC stamp is a future time on a PDT clock.
+    utc_stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 1800))
+    utc_alert = module.alert_from_lines(
+        [f"{utc_stamp} sent ntfy incomplete"], "fixture", utc=True
+    )
+    assert 1740 < utc_alert["age_s"] < 1890, utc_alert
+    say("patch row: the NAS notifier's clock is UTC, and its ages are read as such: ok")
+    # the row, laddered by width: both facts stay on it, the detail goes
+    dirty = {
+        "patch": {"outcome": "incomplete", "severity": "bad", "version": "9.9.9",
+                  "at_ms": int(time.time() * 1000) - 60_000, "reason": "no window for x"},
+        "alert": {"kind": "sent", "severity": "ok", "text": "sent ntfy incomplete",
+                  "at_ms": int(time.time() * 1000) - 60_000},
+    }
+    for w in (22, 30, 46, 60, 120):
+        row = module.patch_row(dirty, w)
+        assert row and module._cell_width("  " + module.patch_row_text(row)) <= w, (w, row)
+    assert [p[0] for p in module.patch_row(dirty, 46)] == ["PATCH", "ALERT"], module.patch_row(dirty, 46)
+    assert len(module.patch_row(dirty, 22)) == 1, module.patch_row(dirty, 22)
+    assert module.patch_row({}, 60) == [] and module.patch_row({}, None) == []
+    say("patch row: both facts ride one line, traded down by width instead of by rows: ok")
+    status_fix = STRIP(run("status").stdout)
+    assert "cli patches       : ok · 9.9.9-fixture" in status_fix, status_fix
+    assert "last alert        : sent ntfy freebuff done · fixture" in status_fix, status_fix
+    say("status: the same two facts, in the pane's own words: ok")
+    # a pane too narrow for a frame keeps the plain renderer rather than a broken box
+    assert ansi.sub("", module.render(
+        rich_state, True, width=22, now_ms=SWEEP_NOW
+    )) == ansi.sub("", module.render(rich_state, False, width=22, now_ms=SWEEP_NOW))
+    # without a watcher the top border still has to name the session it is showing —
+    # the right slot carries the short session title, never the raw ISO stamp
+    no_watch = ansi.sub("", module.render(
+        rich_state, True, width=46, height=20, now_ms=SWEEP_NOW,
+    ))
+    top = no_watch.splitlines()[0]
+    assert "watcher" not in top, top
+    assert module._session_label(rich_state) in top, (top, module._session_label(rich_state))
+    assert top.startswith("╭──  FREEBUFF TODOS  ") and top.endswith("╮"), top
+    assert module._cell_width(top) <= 46, top
+    for w in (30, 34, 46, 80):
+        line = ansi.sub("", module.render(
+            rich_state, True, width=w, height=20, now_ms=SWEEP_NOW,
+        )).splitlines()[0]
+        assert module._cell_width(line) <= w, (w, line)
+    # the bar is a gradient where the terminal takes 24-bit colour and a flat green
+    # one where it does not; the glyphs — and so the frame — stay identical
+    os.environ["FBTODO_TRUECOLOR"] = "1"
+    tc = module.render(rich_state, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW)
+    assert "\x1b[38;2;" in tc, "truecolor bar missing its gradient"
+    os.environ["FBTODO_TRUECOLOR"] = "0"
+    flat = module.render(rich_state, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW)
+    assert "\x1b[38;2;" not in flat, flat
+    # ...and the 256-colour fallback is the same bar: the ramp still runs stop to stop
+    # instead of collapsing into one flat accent cell colour
+    flat_stops = [int(n) for n in re.findall(r"\x1b\[38;5;(\d+)m█", flat)]
+    assert flat_stops and len(set(flat_stops)) > 1, repr(flat)
+    del os.environ["FBTODO_TRUECOLOR"]
+    assert ansi.sub("", tc) == ansi.sub("", flat), "the gradient changed the bar's shape"
+    # a third done is not a whole number of cells: the bar must show a partial block.
+    # The list itself has to be a third — the bar counts the steps it is drawing, so a
+    # `done=1, total=3` beside a four-step list is no longer a thing it can be told.
+    third = dict(
+        rich_state,
+        todos=[
+            dict(steps[0], completed=True),
+            dict(steps[1], completed=False),
+            {"task": "A third step, so a third of the bar is not a whole cell",
+             "completed": False},
+        ],
+        done=1, total=3,
+    )
+    bar_row = [
+        line for line in ansi.sub("", module.render(
+            third, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW,
+        )).splitlines() if "PROGRESS" in line
+    ]
+    # the bar is two glyphs at EVERY percentage — a cell that would be a fraction rounds to
+    # the nearer of them, rather than drawing a third glyph in the middle of the ramp. A
+    # third of a 20-cell bar is 6.67 cells, so seven of them are filled.
+    bar_glyphs = bar_row[0].split("[", 1)[1].split("]", 1)[0]
+    # a third of a 20-cell bar is 6.67 cells: six whole ones, the nearest eighth at the
+    # boundary, and the track for the rest. Two glyphs everywhere else.
+    assert bar_glyphs == "█" * 6 + "▋" + "░" * 13, bar_row
+    # character-based rendering that survives any background scheme: every filled cell is
+    # the `█` GLYPH painted with a foreground colour, and nothing on the row is ever a
+    # background-filled block (40-47, 48, 100-107)
+    raw_bar = next(
+        line for line in module.render(
+            third, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW,
+        ).splitlines()
+        if "PROGRESS" in line
+    )
+    filled = re.findall(r"(\x1b\[[0-9;]*m)(?:█|▋)", raw_bar)
+    assert len(filled) == 7, raw_bar  # the assertions below are about THESE cells
+    assert all(esc.startswith("\x1b[38;") for esc in filled), raw_bar
+    # ...and nothing on the row selects a BACKGROUND. A single-parameter escape is the only
+    # place SGR can do that without its number being an operand of `38;2`/`38;5`: a bare
+    # index is a background, so `\x1b[45m█` painted a magenta block instead of a character.
+    assert not re.search(r"\x1b\[(4[0-7]|10[0-7])m", raw_bar), raw_bar
+    assert "\x1b[48" not in raw_bar, raw_bar
+    say("renders the framed colour pane inside its width and height: ok")
+
+    # ---- the pane's own layout rules: a tight checkmark whose wrapped lines hang under
+    #      its own text column, the step's duration against the right wall, no heading row
+    #      when the agent never wrote one, and a footer that says one state, not three
+    lines = rich.splitlines()
+    assert "  ✔  Diagnose the frozen" in rich, rich
+    assert "✔     " not in rich, "the checkmark is still padded out to the box width"
+    for head_word in ("Diagnose the frozen", "Add a liveness"):
+        i = next(n for n, line in enumerate(lines) if head_word in line)
+        first, cont = lines[i][1:], lines[i + 1][1:]  # drop the frame's left border
+        assert first.index(head_word.split()[0]) == len(cont) - len(cont.lstrip()), (
+            lines[i], lines[i + 1],
+        )
+    done_row = next(line for line in lines if "Diagnose the frozen" in line)
+    # the duration is the last thing on the row: against the frame's right wall
+    assert re.search(r"[0-9]+m[0-9]{2}s │$", done_row), repr(done_row)
+    # the empty track is drawn, so the bar's length reads at any percentage
+    nothing_done = dict(
+        rich_state, done=0,
+        todos=[dict(t, completed=False) for t in rich_state["todos"]],
+    )
+    zero = ansi.sub("", module.render(
+        nothing_done, True, width=66, height=20, now_ms=SWEEP_NOW,
+    ))
+    zero_bar = next(line for line in zero.splitlines() if "PROGRESS" in line)
+    assert set(zero_bar.split("[", 1)[1].split("]", 1)[0]) == {"░"}, zero_bar
+    # no heading written means no heading row at all — the old `— none stated` spent one
+    # of a fixed-height strip's rows saying nothing
+    bare = ansi.sub("", module.render(
+        dict(rich_state, goal=None), True, watching=999, width=46, height=20,
+        now_ms=SWEEP_NOW,
+    ))
+    assert "🎯" not in bare and "none stated" not in bare, bare
+    # one state word, with the age in the parentheses the idle counter used to spend —
+    # and the three states a list can be in, at the width the real pane gets
+    def footer_of(state_dict):
+        frame = ansi.sub("", module.render(
+            state_dict, True, watching=999, width=66, height=20, now_ms=SWEEP_NOW,
+        ))
+        return next(line for line in frame.splitlines() if "LIVE:" in line), frame
+
+    # the strip is a badge and then fields: the state chip carries one space of padding,
+    # the age follows it directly, and the separators are ` │ `
+    idle_row, _ = footer_of(
+        dict(rich_state, task_times={}, source_updated_ms=SWEEP_NOW - 143_000)
+    )
+    # With a model named, the strip carries that model's pace and the idle age is what
+    # gives way — the age is only a hint that nothing moved, the pace is what the work
+    # costs. The same state with no model keeps the row it always had.
+    assert " IDLE  │ ~2m · space-bunny-a… │ LIST: #3 │ LIVE: " in idle_row, repr(idle_row)
+    no_model_row, _ = footer_of(
+        dict(rich_state, model=None, task_times={}, source_updated_ms=SWEEP_NOW - 143_000)
+    )
+    assert " IDLE (2m ago) │ LIST: #3 │ LIVE: " in no_model_row, repr(no_model_row)
+    assert "space-bunny" not in no_model_row, repr(no_model_row)
+    # a longer model name is clipped, never wrapped: the row is one line by contract
+    long_row, _ = footer_of(
+        dict(rich_state, model="some-provider/space-bunny-alpha-preview",
+             task_times={}, source_updated_ms=SWEEP_NOW - 143_000)
+    )
+    assert "space-bunny-a…" in long_row and "preview" not in long_row, repr(long_row)
+    # ...and the model is named on the TOP BORDER too, where there is room for it at any
+    # width the strip cannot hold: the pane that quotes a pace says whose pace it is.
+    _, bordered = footer_of(dict(rich_state, model="stealth/space-bunny-alpha"))
+    assert "watcher: pid 999 · space-bunny-a…" in bordered.splitlines()[0], bordered
+    run_row, _ = footer_of(rich_state)
+    # no age while a step is running, so the chip's own padding sits before the separator.
+    # The step has long outrun the pace its list taught (the one finished step took 90s),
+    # so the running clock names the overrun inline, and the chip is flagged red.
+    assert " WORKING 59m59s (+58m29s)  │ LIST: #3 │ LIVE: " in run_row, repr(run_row)
+    raw_run = module.render(rich_state, True, watching=999, width=66, height=20,
+                            now_ms=SWEEP_NOW)
+    assert "\x1b[7;31m" in raw_run, repr(raw_run)
+    assert module.SPINNER[SWEEP_NOW // 1000 % len(module.SPINNER)] in run_row, run_row
+    turned, _ = footer_of(dict(rich_state, now_ms=SWEEP_NOW))
+    later = ansi.sub("", module.render(
+        rich_state, True, watching=999, width=66, height=20, now_ms=SWEEP_NOW + 1000,
+    ))
+    spin_now = next(line for line in turned.splitlines() if "LIVE:" in line)
+    spin_next = next(line for line in later.splitlines() if "LIVE:" in line)
+    assert spin_now != spin_next, (spin_now, spin_next)  # the spinner moves on the tick
+    ended_row, ended = footer_of(dict(
+        rich_state, done=2, total=2, list_version=9, source_updated_ms=SWEEP_NOW - 143_000,
+        todos=[dict(t, completed=True) for t in rich_state["todos"]],
+    ))
+    assert " ALL DONE  │ ~30m · space-bunny-a… │ LIST: #9 │ LIVE: " in ended_row, repr(ended_row)
+    # one state, not two: the chip says it once, and never sighs both "done" and "idle"
+    assert ended.count("ALL DONE") == 1 and "IDLE" not in ended, ended
+    # the chrome is one voice: the state chip and the title are both uppercase
+    assert " FREEBUFF TODOS " in ended and " All done" not in ended, ended
+    # an elided window must word its marker from the steps it stands for: a finished list
+    # read `7 more steps pending` at 100% (8/8), right above a bar saying All done
+    deep = dict(
+        rich_state, list_version=9, task_times={},
+        todos=[{"task": f"step {n}", "completed": n < 8} for n in range(8)],
+        done=8, total=8, source_updated_ms=SWEEP_NOW - 143_000,
+    )
+    ended_frame = ansi.sub("", module.render(
+        deep, True, watching=999, width=46, height=9, now_ms=SWEEP_NOW,
+    ))
+    assert "100% (8/8)" in ended_frame and " ALL DONE" in ended_frame, ended_frame
+    assert "earlier steps completed" in ended_frame, ended_frame
+    assert "pending" not in ended_frame, ended_frame
+    # ...and the collapsed run sits ABOVE the steps it stands for, in list order, so the
+    # window keeps the list's END: the marker used to land under the step it followed
+    ended_lines = ended_frame.splitlines()
+    marked = next(n for n, line in enumerate(ended_lines) if "earlier steps completed" in line)
+    shown = next(n for n, line in enumerate(ended_lines) if "✔" in line)
+    assert marked < shown, ended_frame
+    assert "step 7" in ended_frame and "step 0" not in ended_frame, ended_frame
+    # ...and the bar counts the list it is drawing, not a stale tally beside it: `done` and
+    # `total` here are the OLD list's numbers, and must not paint 100% over four live steps
+    middling = dict(
+        deep, done=4, total=4,
+        todos=[{"task": f"step {n}", "completed": n < 4} for n in range(8)],
+    )
+    mid_frame = ansi.sub("", module.render(
+        middling, True, watching=999, width=46, height=9, now_ms=SWEEP_NOW,
+    ))
+    assert "50% (4/8)" in mid_frame, mid_frame
+    assert "4 earlier steps completed" in mid_frame, mid_frame
+    assert "3 more steps pending" in mid_frame, mid_frame
+    # the bar's total width is defined at a partial percentage: half filled, half track
+    mid_bar = next(line for line in mid_frame.splitlines() if "PROGRESS" in line)
+    glyphs = mid_bar.split("[", 1)[1].split("]", 1)[0]
+    assert glyphs.count("█") == 10 and glyphs.count("░") == 10, mid_bar
+    # the ramp spans the FILLED run, so a quarter-done bar still ends in the gradient's
+    # emerald stop: sampled across the whole bar the fill only reached green at 100%, and
+    # a partial bar read as one flat cyan-teal block
+    os.environ["FBTODO_TRUECOLOR"] = "1"
+    try:
+        quarter = dict(
+            rich_state, task_times={},
+            todos=[{"task": f"step {n}", "completed": n < 1} for n in range(4)],
+        )
+        q_row = next(line for line in module.render(
+            quarter, True, watching=999, width=46, now_ms=SWEEP_NOW,
+        ).splitlines() if "PROGRESS" in line)
+    finally:
+        os.environ.pop("FBTODO_TRUECOLOR", None)
+        module._THEME_CACHE = None
+    q_stops = [tuple(int(v) for v in s) for s in re.findall(
+        r"\x1b\[38;2;(\d+);(\d+);(\d+)m█", q_row
+    )]
+    assert len(q_stops) == 5, q_row  # a quarter of a 20-cell bar
+    assert q_stops[0][2] > 225, q_stops  # cyan at the left edge of the fill...
+    assert q_stops[-1][2] < 190, q_stops  # ...emerald at its leading edge
+    # one symbol per row, no box glued to it, and the three of them put the text in the
+    # same column — a wrapped line then hangs under the words, not under the marker
+    three_kinds = ansi.sub("", module.render(
+        middling, True, watching=999, width=46, now_ms=SWEEP_NOW,
+    ))
+    assert "[ ]" not in three_kinds, three_kinds
+    for mark in ("✔", "➔", "○"):
+        row = next(line for line in three_kinds.splitlines() if mark in line)
+        assert row[1:4] == "   " and row[4] == mark and row[5:7] == "  ", (mark, row)
+        assert row[7] != " ", (mark, row)
+
+    # ---- the pane's projections: a pending row carries the pace the finished steps
+    #      taught, the step in flight its running clock against that pace, the bar the time
+    #      left and the clock it lands on, and a step past twice its estimate is flagged
+    est_state = dict(
+        rich_state,
+        todos=[
+            {"task": "one", "completed": True},
+            {"task": "two", "completed": True},
+            {"task": "three", "completed": True},
+            {"task": "four", "completed": False},
+            {"task": "five", "completed": False},
+        ],
+        done=3, total=5, list_version=4,
+        task_times={
+            "one": {"started_ms": 0, "done_ms": 60_000, "elapsed_ms": 60_000},
+            "two": {"started_ms": 0, "done_ms": 120_000, "elapsed_ms": 120_000},
+            "three": {"started_ms": 0, "done_ms": 180_000, "elapsed_ms": 180_000},
+            "four": {"started_ms": SWEEP_NOW - 30_000, "done_ms": None,
+                     "elapsed_ms": 30_000},
+        },
+    )
+    # the median of 1m/2m/3m finished steps is 2m; the active step is 30s in, so 1m30s of
+    # it is left, plus a full 2m for the one still waiting: 3m30s to run
+    assert module.step_pace_ms(est_state["task_times"], est_state["todos"],
+                               SWEEP_NOW) == 120_000
+    assert module.remaining_estimate_ms(est_state["task_times"], est_state["todos"],
+                                        SWEEP_NOW, 120_000) == 210_000
+    assert module.fmt_estimate(120_000) == "~2m"
+    assert module.fmt_eta(210_000, SWEEP_NOW) == time.strftime(
+        "%H:%M", time.localtime((SWEEP_NOW + 210_000) / 1000))
+    assert module.fmt_variance(-80_000) == "-1m20s" and module.fmt_variance(40_000) == "+40s"
+    est_wide = ansi.sub("", module.render(
+        est_state, True, watching=999, width=80, height=20, now_ms=SWEEP_NOW,
+    ))
+    est_lines = est_wide.splitlines()
+    active_est = next(line for line in est_lines if "➔" in line)
+    assert "30s / ~2m" in active_est and "STUCK" not in active_est, active_est
+    pending_est = next(line for line in est_lines if "○" in line)
+    assert pending_est.rstrip().endswith("~2m │"), pending_est
+    est_bar = next(line for line in est_lines if "PROGRESS" in line)
+    assert "EST REM: 3m30s" in est_bar and " | ETA " in est_bar, est_bar
+    # ---- the overall time to the goal: 30s already spent plus the 3m30s still to run.
+    #      The active step is the only one with a real start (0 means "never seen
+    #      running"), so 30s is what the list can be said to have spent.
+    assert module.elapsed_total_ms(
+        est_state["task_times"], est_state["todos"], SWEEP_NOW) == 30_000
+    assert module.total_estimate_ms(
+        est_state["task_times"], est_state["todos"], SWEEP_NOW, 120_000) == 240_000
+    # no step was ever seen running: there is no start to measure a total from, and a
+    # zero here would read as a list that took no time at all
+    assert module.elapsed_total_ms({}, est_state["todos"], SWEEP_NOW) is None
+    assert module.total_estimate_ms({}, est_state["todos"], SWEEP_NOW, 120_000) is None
+    goal_row = next(line for line in est_lines if "GOAL" in line)
+    assert "4m00s to the goal" in goal_row and "30s in" in goal_row, goal_row
+    assert "3m30s left" in goal_row, goal_row
+    # the row is bought with height the owner gave the pane, never with a step off the
+    # list: a pane too short for one drops the row, and the number moves onto the bar's
+    # own row instead of being lost
+    est_squat = ansi.sub("", module.render(
+        est_state, True, watching=999, width=120, height=8, now_ms=SWEEP_NOW,
+    ))
+    assert not any("GOAL" in line for line in est_squat.splitlines()), est_squat
+    squat_bar = next(line for line in est_squat.splitlines() if "PROGRESS" in line)
+    assert "TOT 4m" in squat_bar, squat_bar
+    # ...and the row is additive height inside the budget, not a step traded for it: the
+    # frame still fits `height`, and all five steps are still on screen
+    assert len(est_wide.splitlines()) <= 20, est_wide
+    step_rows = [ln for ln in est_lines if any(g in ln for g in ("✔", "➔", "○"))]
+    assert len(step_rows) == 5, step_rows
+    # the bar keeps its 20 cells and the projection only uses leftover room: a narrow pane
+    # drops the suffix rather than squeezing the bar
+    est_narrow = ansi.sub("", module.render(
+        est_state, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW,
+    ))
+    narrow_bar = next(line for line in est_narrow.splitlines() if "PROGRESS" in line)
+    assert "EST REM" not in narrow_bar, narrow_bar
+    narrow_cells = narrow_bar.split("[", 1)[1].split("]", 1)[0]
+    assert narrow_cells.count("█") + narrow_cells.count("░") == 20, narrow_bar
+    # a step twice its pace is flagged, but only where the flag still leaves the task room
+    tight_active = next(line for line in rich.splitlines() if "➔" in line)
+    assert "[STUCK?]" not in tight_active, tight_active  # 46 columns is too tight
+    wide_stuck = ansi.sub("", module.render(
+        rich_state, True, watching=999, width=66, height=20, now_ms=SWEEP_NOW,
+    ))
+    stuck_line = next(line for line in wide_stuck.splitlines() if "➔" in line)
+    assert "[STUCK?]" in stuck_line and "59m59s" in stuck_line, stuck_line
+    # a collapsed run of finished work carries its net variance, once there is a
+    # distribution to measure against
+    var_todos = [{"task": f"step {n}", "completed": n < 6} for n in range(8)]
+    var_times = {
+        f"step {n}": {"started_ms": 0, "done_ms": span, "elapsed_ms": span}
+        for n, span in enumerate((60_000, 60_000, 60_000, 60_000, 60_000, 300_000))
+    }
+    assert module.run_variance_ms(var_times, var_todos, SWEEP_NOW, 60_000) == 240_000
+    var_frame = ansi.sub("", module.render(
+        dict(rich_state, todos=var_todos, done=6, total=8, list_version=5,
+             task_times=var_times),
+        True, watching=999, width=46, height=9, now_ms=SWEEP_NOW,
+    ))
+    assert "6 earlier steps completed (+4m00s)" in var_frame, var_frame
+    # a step remembered from an earlier session is projected from its OWN history, not
+    # from this list's pace: `five` is remembered at 5m where the pace says 2m
+    hist_state = dict(est_state, task_history={"five": 300_000})
+    hist_wide = ansi.sub("", module.render(
+        hist_state, True, watching=999, width=80, height=20, now_ms=SWEEP_NOW,
+    ))
+    hist_row = next(line for line in hist_wide.splitlines() if "○" in line)
+    assert hist_row.rstrip().endswith("~5m │"), hist_row
+    hist_bar = next(line for line in hist_wide.splitlines() if "PROGRESS" in line)
+    assert "EST REM: 6m30s" in hist_bar, hist_bar  # 1m30s left of `four` + 5m for `five`
+    # the plain, machine-readable path carries the same projections INLINE: a piped
+    # `snap` is parsed by scripts, so an estimate may never claim a line of its own
+    plain_wide = ansi.sub("", module.render(est_state, False, width=80, now_ms=SWEEP_NOW))
+    assert "· 30s… / ~2m" in plain_wide, plain_wide    # the running step
+    assert "· ~2m" in plain_wide, plain_wide           # the step still waiting
+    assert "EST REM: 3m30s" in plain_wide and "| ETA " in plain_wide, plain_wide
+    assert "TOT 4m" in plain_wide, plain_wide  # the same total, inline as always
+    assert not any(line.strip().startswith("~") for line in plain_wide.splitlines()), plain_wide
+    plain46 = ansi.sub("", module.render(est_state, False, width=46, now_ms=SWEEP_NOW))
+    bare_clocks = ansi.sub("", module.render(
+        dict(est_state, task_times={}), False, width=46, now_ms=SWEEP_NOW,
+    ))
+    # estimates are inline-only, so they cannot change how many lines the strip takes
+    assert len(plain46.splitlines()) == len(bare_clocks.splitlines()), (plain46, bare_clocks)
+    say("projects the pace onto the steps, the bar and the strip: ok")
+
+    # ...and the greys are the theme's, not the terminal's `dim` attribute
+    saved_greys = {k: os.environ.get("FBTODO_" + k) for k in ("MUTED", "TRACK", "TRUECOLOR")}
+    os.environ.update(FBTODO_MUTED="#ff8800", FBTODO_TRACK="#0000ff", FBTODO_TRUECOLOR="1")
+    try:
+        painted = module.render(rich_state, True, watching=999, width=46, height=20,
+                                now_ms=SWEEP_NOW)
+        grey_row = next(line for line in painted.splitlines() if "Diagnose the frozen" in line)
+        assert re.search(
+            r"\x1b\[38;2;255;136;0m[0-9]+m[0-9]{2}s\x1b\[0m "
+            r"\x1b\[38;2;107;107;115m│",  # the duration ends against the frame's own ink
+            grey_row,
+        ), repr(grey_row)
+        # the frame is drawn in the faint role (242 grey), not the `dim` attribute — the
+        # border, the rules and the collapsed-run connectors are all that one ink
+        assert "\x1b[38;2;107;107;115m╭── " in painted, repr(painted.splitlines()[0])
+        assert "\x1b[2m" not in painted, "the pane still rides on the dim attribute"
+        # the tick stays green and loud; the description it belongs to is dimmed grey
+        assert "\x1b[32m  ✔\x1b[0m" in grey_row, repr(grey_row)
+        assert "\x1b[2;38;2;255;136;0mDiagnose" in grey_row, repr(grey_row)
+        assert "\x1b[38;2;255;136;0m🎯 Goal:" in painted, repr(painted)
+        painted_bar = next(line for line in painted.splitlines() if "PROGRESS" in line)
+        assert "\x1b[38;2;0;0;255m░" in painted_bar, repr(painted_bar)
+    finally:
+        for key, value in saved_greys.items():
+            if value is None:
+                os.environ.pop("FBTODO_" + key, None)
+            else:
+                os.environ["FBTODO_" + key] = value
+        module._THEME_CACHE = None
+    say("lays out the steps, the heading and the footer: ok")
+
+    compact = ansi.sub("", module.render(wide_state, False, width=34, now_ms=1000))
+    assert "live " in compact and "list #3" in compact, compact
+    say("renders within the pane width and ticks the footer clock: ok")
+
+    # ---- the frame's palette is themeable, and the sources resolve the tool's usual way:
+    #      the env beats `./.fbtodo-theme.json`, which beats `~/.config/fbtodo/theme.json`
+    saved_env = {k: os.environ.get("FBTODO_" + k.upper()) for k in module.THEME_KEYS}
+    saved_truecolor = os.environ.get("FBTODO_TRUECOLOR")
+    saved_paths = (module.THEME_FILE_GLOBAL, module.THEME_FILE_LOCAL)
+    theme_dir = os.path.join(TEST_HOME, "theme")
+    os.makedirs(theme_dir, exist_ok=True)
+    global_file = os.path.join(theme_dir, "global.json")
+    local_file = os.path.join(theme_dir, "local.json")
+    module.THEME_FILE_GLOBAL, module.THEME_FILE_LOCAL = global_file, local_file
+    try:
+        for key in module.THEME_KEYS:
+            os.environ.pop("FBTODO_" + key.upper(), None)
+        assert module.read_theme() == module.THEME_DEFAULTS, module.read_theme()
+        with open(global_file, "w", encoding="utf-8") as fh:
+            json.dump({"accent": "#ff8800", "gradient_start": "#ff0000"}, fh)
+        theme = module.read_theme()
+        assert theme["accent"] == "#ff8800" and theme["gradient_start"] == "#ff0000", theme
+        assert theme["gradient_end"] == module.THEME_DEFAULTS["gradient_end"], theme
+        with open(local_file, "w", encoding="utf-8") as fh:
+            json.dump({"accent": "3;35", "gradient_end": "#0000ff", "nonsense": "#fff"}, fh)
+        theme = module.read_theme()
+        assert theme["accent"] == "3;35", theme  # the project file wins, per key...
+        assert theme["gradient_start"] == "#ff0000", theme  # ...not all or nothing
+        assert theme["gradient_end"] == "#0000ff", theme
+        assert "nonsense" not in theme, theme
+        os.environ["FBTODO_ACCENT"] = "1;33"
+        assert module.read_theme()["accent"] == "1;33", module.read_theme()  # ...and env wins
+        starts = module._theme_gradient(module.read_theme())
+        assert starts == (module._hex_rgb("#ff0000"), module._hex_rgb("#0000ff")), starts
+        # hex is 24-bit where the terminal takes it and the nearest 256 entry where it does
+        # not; a raw SGR code passes through either way
+        assert module._color_sgr("#ff8800", True) == "38;2;255;136;0"
+        assert module._color_sgr("#ff8800", False) == "38;5;208"
+        assert module._color_sgr("#808080", False) == "38;5;244"  # the grey ramp
+        assert module._color_sgr("#fff", True) == "38;2;255;255;255"  # shorthand
+        assert module._color_sgr("1;33", False) == "1;33"
+        # the frame is what follows the palette: the title and the progress label are
+        # painted in the accent, and the bar ramps from the first stop to the second
+        os.environ["FBTODO_GRADIENT_START"] = "#ff0000"
+        os.environ["FBTODO_GRADIENT_END"] = "#0000ff"
+        os.environ["FBTODO_TRUECOLOR"] = "1"
+        themed = module.render(
+            rich_state, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW,
+        )
+        # the title is the accent as a reverse-video chip, not a plain bold word
+        assert "\x1b[7;1;33m FREEBUFF TODOS " in themed, repr(themed.splitlines()[0])
+        bar_row = next(line for line in themed.splitlines() if "PROGRESS" in line)
+        assert "\x1b[1;33mPROGRESS" in bar_row, repr(bar_row)
+        # the ramp is sampled off the FILLED cells only: the empty track is painted in
+        # its own colour, and counting that as a stop would hide a flat bar
+        stops = [tuple(int(v) for v in s) for s in re.findall(
+            r"\x1b\[38;2;(\d+);(\d+);(\d+)m█", bar_row
+        )]
+        assert len(stops) >= 2, repr(bar_row)
+        first, last = stops[0], stops[-1]
+        assert first[0] > last[0] and last[2] > first[2], (first, last)  # ramps red to blue
+        # a broken theme must not break the pane: a stop that is not a colour falls back to
+        # the default one, and a theme file that is not an object is ignored
+        os.environ.pop("FBTODO_GRADIENT_START", None)
+        os.environ["FBTODO_GRADIENT_END"] = "mauve"
+        assert module._theme_gradient(module.read_theme())[0] == module._hex_rgb("#ff0000")
+        assert module._theme_gradient(module.read_theme())[1] == module._hex_rgb("#34d399")
+        with open(local_file, "w", encoding="utf-8") as fh:
+            fh.write("[1, 2, 3]")
+        assert module.read_theme()["accent"] == "1;33", module.read_theme()
+    finally:
+        for key, value in saved_env.items():
+            var = "FBTODO_" + key.upper()
+            if value is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = value
+        if saved_truecolor is None:
+            os.environ.pop("FBTODO_TRUECOLOR", None)
+        else:
+            os.environ["FBTODO_TRUECOLOR"] = saved_truecolor
+        module.THEME_FILE_GLOBAL, module.THEME_FILE_LOCAL = saved_paths
+        module._THEME_CACHE = None
+    say("the frame palette resolves from the env and the theme files: ok")
+
+    # ---- the framed top border: the right slot names the watcher, or — with no watcher
+    #      serving the pane — the session it is showing, and it never breaks the frame
+    def top_of(state_dict, width, watching=None):
+        line = module._plain(module.render(
+            state_dict, True, watching=watching, width=width, height=20, now_ms=SWEEP_NOW,
+        ).splitlines()[0])
+        assert module._cell_width(line) == width, (width, line)
+        # the title sits on a chip, so its one space of padding shows on each side
+        assert line.startswith("╭──  FREEBUFF TODOS  ") and line.endswith("╮"), line
+        return line
+
+    border_state = dict(
+        rich_state, backend="cli", session="2026-09-24T07-05-26.585Z",
+    )
+    watched = top_of(border_state, 46, watching=999)
+    assert "watcher: pid 999" in watched, watched
+    assert module._session_label(border_state) not in watched, watched
+    # no watcher is serving this pane, so the border says which session it is showing —
+    # and never the raw ISO stamp, which used to be clipped into that slot
+    bare = top_of(border_state, 46)
+    assert "watcher" not in bare, bare
+    assert module._session_label(border_state) in bare, (bare, module._session_label(border_state))
+    assert "2026-09-24T07-05" not in bare, bare
+    for width in (30, 33, 34, 46, 60, 80, 120):
+        line = top_of(border_state, width)
+        if width < 33:  # no room for a readable tag: the slot is dropped, not mangled
+            assert "cli" not in line, (width, line)
+    assert module._session_label({"backend": "cli"}) == "cli"
+    assert module._session_label({"session": "manual-run"}) == "manual-run"
+    assert module._session_label({}) == "no session"
+    longer = top_of(dict(border_state, session="a-session-name-that-will-never-fit"), 46)
+    assert "…" in longer, longer
+    assert module._cell_width(longer) == 46, longer
+    say("the top border carries the watcher, or the session: ok")
+
+    # ---- the frame owns the pane: a frame that already fills every row must not be
+    #      followed by a newline, or each repaint scrolls the top border off the screen
+    draw_rows, draw_cols = 12, 46
+    draw_home = os.path.join(TEST_HOME, "draw-home")
+    os.makedirs(draw_home, exist_ok=True)
+    draw_state_file = os.path.join(draw_home, "fbtodo-state.json")
+
+    def first_paint(todos):
+        """The bytes of one pane's first paint, from a pty exactly `draw_rows` tall."""
+        import pty
+
+        now_ms = int(time.time() * 1000)
+        with open(draw_state_file, "w", encoding="utf-8") as fh:
+            json.dump({
+                "status": "watching", "tool_version": module.VERSION, "backend": "cli",
+                "session": "2026-09-24T07-05-26.585Z", "list_id": "draw",
+                "list_version": 1, "heartbeat_ms": now_ms, "source_updated_ms": now_ms,
+                "goal": "fit the frame in the pane", "now": None, "nudge": None,
+                "todos": todos,
+                "done": sum(1 for t in todos if t["completed"]), "total": len(todos),
+            }, fh)
+        victim = spawn_quiet("sleep", "600")
+        time.sleep(0.2)
+        pid, fd = pty.fork()
+        if pid == 0:
+            # `shutil.get_terminal_size` reads these first, so the pane draws for the size
+            # this check picked rather than for the pty's unset 0x0
+            os.environ["FBTODO_HOME"] = draw_home
+            os.environ["COLUMNS"], os.environ["LINES"] = str(draw_cols), str(draw_rows)
+            os.execv(sys.executable, [sys.executable, PANES, "pane", "--watch-pid",
+                                      str(victim.pid), "--no-daemon", "-i", "0.2"])
+        os.set_blocking(fd, False)
+        time.sleep(1.0)  # the first paint lands immediately; let it finish
+        kill_tree(victim)
+        data, deadline = b"", time.time() + 8
+        while time.time() < deadline:
+            try:
+                chunk = os.read(fd, 65536)
+            except (BlockingIOError, OSError):
+                chunk = b""
+            if chunk:
+                data += chunk
+                continue
+            if os.waitpid(pid, os.WNOHANG)[0]:  # it has painted for the last time
+                break
+            time.sleep(0.05)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        chunks = data.split(b"\x1b[2J")
+        assert len(chunks) >= 2, data
+        return chunks[1]
+
+    short_paint = first_paint([{"task": f"step {i}", "completed": i < 2} for i in range(3)])
+    full_paint = first_paint([{"task": f"step {i}", "completed": i < 2} for i in range(29)])
+    for label, paint in (("short frame", short_paint), ("full frame", full_paint)):
+        # the pty it was drawn into turns newlines into CRLF; strip both the colour and
+        # that, so this reads the frame the pane actually built
+        text = re.sub(rb"\x1b\[[0-9;?]*[a-zA-Z]", b"", paint).replace(b"\r\n", b"\n")
+        frame = text.rstrip(b"\n")
+        tail = text[len(frame):]
+        lines = frame.split(b"\n")
+        assert frame.startswith("╭──  FREEBUFF TODOS".encode()), (label, frame[:80])
+        assert frame.endswith("╯".encode()), (label, frame[-80:])
+        assert sum(1 for line in lines if line.startswith("╭".encode())) == 1, (label, lines)
+        assert len(lines) <= draw_rows, (label, len(lines))
+        assert tail == (b"" if len(lines) >= draw_rows else b"\n"), (label, len(lines), tail)
+    def rows_of(paint):
+        text = re.sub(rb"\x1b\[[0-9;?]*[a-zA-Z]", b"", paint).replace(b"\r\n", b"\n")
+        return text.rstrip(b"\n").split(b"\n")
+
+    full_lines = rows_of(full_paint)
+    assert len(full_lines) == draw_rows, (len(full_lines), full_lines)  # the tight branch ran
+    assert len(rows_of(short_paint)) < draw_rows, short_paint  # ...and so did the roomy one
+    say("a full-height frame is not followed by a newline: ok")
+
+    # ---- per-task timing is measured, so it must behave under observation: the clock
+    #      belongs to the step being worked on, counts up while it runs, freezes when it
+    #      is ticked off, and moves on to the next one
+    import importlib.machinery
+
+    spec0 = importlib.util.spec_from_loader(
+        "fbtodo", importlib.machinery.SourceFileLoader("fbtodo", FB)
+    )
+    mod = importlib.util.module_from_spec(spec0)
+    spec0.loader.exec_module(mod)
+    mod.TASKS_PATH = os.path.join(TEST_HOME, "tasks-unit.json")
+
+    def seq(a, b, c):
+        return [
+            {"task": "a", "completed": a},
+            {"task": "b", "completed": b},
+            {"task": "c", "completed": c},
+        ]
+
+    t0 = 10_000_000
+    S = {"session": "S"}
+    q1 = mod.track_tasks(dict(S, todos=seq(False, False, False)), now_ms=t0)
+    assert q1["task_times"]["a"]["started_ms"] == t0, q1["task_times"]
+    assert q1["task_times"]["a"]["elapsed_ms"] == 0, q1["task_times"]
+    assert q1["task_times"]["b"]["started_ms"] is None, "a waiting step was given a clock"
+    q2 = mod.track_tasks(dict(S, todos=seq(False, False, False)), now_ms=t0 + 90_000)
+    assert q2["task_times"]["a"]["elapsed_ms"] == 90_000, q2["task_times"]
+    assert q2["task_times"]["b"]["elapsed_ms"] is None, "a waiting step billed someone else's time"
+    assert mod.has_running_clock(q2, t0 + 90_000), "a counting clock must make the pane tick"
+    q3 = mod.track_tasks(dict(S, todos=seq(True, False, False)), now_ms=t0 + 120_000)
+    assert q3["task_times"]["a"]["elapsed_ms"] == 120_000, q3["task_times"]
+    assert q3["task_times"]["b"]["started_ms"] == t0 + 120_000, "the clock did not follow the work"
+    q4 = mod.track_tasks(dict(S, todos=seq(True, True, False)), now_ms=t0 + 300_000)
+    assert q4["task_times"]["a"]["elapsed_ms"] == 120_000, "a done task's clock kept running"
+    assert q4["task_times"]["b"]["elapsed_ms"] == 180_000, q4["task_times"]
+    # the pane's own tick moves a running number, between watcher writes
+    assert mod.live_elapsed(q4["task_times"]["c"], t0 + 340_000) == 40_000
+    running = ansi.sub("", module.render(q4, False, width=56, now_ms=t0 + 340_000))
+    # a clock keeps its seconds past the minute, so 2m does not read as "2m"
+    assert "· 2m00s" in running and "· 3m00s" in running and "· 40s…" in running, running
+    assert mod.short_duration(150_000, seconds=True) == "2m30s"
+    assert mod.short_duration(150_000) == "2m", "the coarse form changed for ages and idle"
+    assert mod.short_duration(60_000, seconds=True) == "1m00s"
+    assert mod.short_duration(3_723_000, seconds=True) == "1h02m", "seconds above an hour"
+    q5 = mod.track_tasks(dict(S, todos=seq(True, True, True)), now_ms=t0 + 400_000)
+    assert q5["task_times"]["c"]["elapsed_ms"] == 100_000, q5["task_times"]
+    assert not mod.has_running_clock(q5, t0 + 500_000), "a finished list still ticks"
+    # each step carries its own span, and together they are the list's span
+    assert sum(v["elapsed_ms"] for v in q5["task_times"].values()) == 400_000, q5["task_times"]
+    assert mod.short_duration(0) == "", "a zero duration must not render as empty text"
+    assert "· 1m40s" in ansi.sub("", module.render(q5, False, width=56, now_ms=t0 + 400_000))
+    # a step never seen running has no number at all, rather than a zero
+    never = mod.track_tasks(
+        {"session": "N", "todos": [{"task": "x", "completed": True}]}, now_ms=t0
+    )
+    assert never["task_times"]["x"]["elapsed_ms"] is None, never["task_times"]
+    assert "x · " not in ansi.sub("", module.render(never, False, width=56, now_ms=t0))
+    # a list that momentarily reads as empty is not a reason to throw the clocks away
+    mod.track_tasks({"session": "S", "todos": []}, now_ms=t0 + 401_000)
+    back = mod.track_tasks(dict(S, todos=seq(True, True, True)), now_ms=t0 + 402_000)
+    assert back["task_times"]["a"]["elapsed_ms"] == 120_000, "an empty poll wiped the clocks"
+    # nor is a thread flip: records are keyed per session, so going back restores them
+    mod.track_tasks(dict(S, todos=seq(False, False, False), session="OTHER"), now_ms=t0 + 500_000)
+    restored = mod.track_tasks(dict(S, todos=seq(True, True, True)), now_ms=t0 + 600_000)
+    assert restored["task_times"]["a"]["elapsed_ms"] == 120_000, "a session flip wiped the clocks"
+    assert mod.track_tasks(
+        dict(S, todos=seq(True, True, False), session="OTHER"), now_ms=t0 + 500_000
+    )["task_times"]["a"]["started_ms"] == t0 + 500_000, "another session's clock was adopted"
+    # re-opening a finished step restarts its clock
+    reopened = mod.track_tasks(dict(S, todos=seq(True, True, False)), now_ms=t0 + 700_000)
+    assert reopened["task_times"]["c"]["started_ms"] == t0 + 700_000, reopened["task_times"]
+    # ---- a turn that ENDS with a step still current must stop counting. Reported 2026-09-25:
+    # a finished list sat at 9/10 with the last step unticked, the turn ended, and the pane
+    # kept saying WORKING with a number that grew past the estimate — because the clock was
+    # only ever closed by a tick, and nothing was going to tick it.
+    W = {"session": "W"}
+    w1 = mod.track_tasks(dict(W, todos=seq(True, False, False)), now_ms=t0 + 800_000)
+    assert mod.live_clock(w1["task_times"]["b"]), "the working step has no live clock"
+    w2 = mod.track_tasks(
+        dict(W, todos=seq(True, False, False), turn_ended=True), now_ms=t0 + 900_000
+    )
+    assert not mod.live_clock(w2["task_times"]["b"]), (
+        f"the turn ended and the clock is still counting: {w2['task_times']['b']}"
+    )
+    assert w2["task_times"]["b"]["elapsed_ms"] == 100_000, (
+        f"the span worked before the turn ended was thrown away: {w2['task_times']['b']}"
+    )
+    # ...and it must not resume counting by itself on the next poll
+    w3 = mod.track_tasks(
+        dict(W, todos=seq(True, False, False), turn_ended=True), now_ms=t0 + 1_500_000
+    )
+    assert w3["task_times"]["b"]["elapsed_ms"] == 100_000, (
+        f"an ended turn kept billing the idle gap: {w3['task_times']['b']}"
+    )
+    assert not mod.has_running_clock(w3, t0 + 1_500_000), "an ended turn still ticks at 1Hz"
+    # and the strip says so, in both renderers: the number is a measurement, not work
+    ended_state = dict(w3, source_updated_ms=t0 + 900_000, list_version=7)
+    framed = ansi.sub("", mod.render(ended_state, True, width=80, now_ms=t0 + 1_500_000))
+    plain = ansi.sub("", mod.render(ended_state, False, width=80, now_ms=t0 + 1_500_000))
+    assert "WORKING" not in framed, f"the framed pane still says WORKING: {framed}"
+    assert "IDLE" in framed, framed
+    assert "working" not in plain, f"the plain render still says working: {plain}"
+    # the agent coming back to that step restarts its clock — from then, not from before
+    w4 = mod.track_tasks(dict(W, todos=seq(True, False, False)), now_ms=t0 + 1_600_000)
+    assert mod.live_clock(w4["task_times"]["b"]), "a resumed turn did not restart the clock"
+    assert w4["task_times"]["b"]["started_ms"] == t0 + 1_600_000, (
+        f"the resumed clock inherited the idle gap: {w4['task_times']['b']}"
+    )
+    say("a turn that ends mid-list stops the clock, keeps the span, and restarts on resume: ok")
+    # A record the OLD rule left behind — started, never done, on a list whose turn has
+    # ended — is what every state file on disk held when this was fixed. The pane's next
+    # paint has to call that idle on its own, before any watcher pass has rewritten the log.
+    stale = {
+        "session": "S", "todos": seq(True, False, False), "turn_ended": True,
+        "list_version": 8, "source_updated_ms": t0 + 100_000,
+        "task_times": {"a": {"started_ms": t0, "done_ms": t0 + 40_000, "elapsed_ms": 40_000},
+                       "b": {"started_ms": t0 + 100_000, "done_ms": None, "elapsed_ms": None}},
+    }
+    stale_framed = ansi.sub("", mod.render(stale, True, width=80, now_ms=t0 + 3_000_000))
+    assert "WORKING" not in stale_framed, (
+        f"a clock left open by the old rule still reads as working: {stale_framed}"
+    )
+    assert "IDLE" in stale_framed, stale_framed
+    say("a clock left open on disk by the old rule renders as idle, not working: ok")
+    # what a step took is remembered under its own text, ACROSS sessions: a later list
+    # projects it from that rather than from the average of an unrelated list
+    assert reopened["task_history"]["a"] == 120_000, reopened["task_history"]
+    assert reopened["task_history"]["b"] == 180_000, reopened["task_history"]
+    assert mod.task_estimate_ms("a", 90_000, reopened["task_history"]) == 120_000
+    assert mod.task_estimate_ms("never seen", 90_000, reopened["task_history"]) == 90_000
+    # with nothing finished in this list the remembered pace stands in for the default
+    assert mod.step_pace_ms(
+        {}, [{"task": "z", "completed": False}], t0, reopened["task_history"]
+    ) == 150_000  # median(120s, 180s)
+    assert mod.step_pace_ms({}, [{"task": "z", "completed": False}], t0) == \
+        mod.DEFAULT_PACE_MS, "a session with no past lost its default pace"
+    # a stale wording falls out of the memory instead of skewing a pace it is never asked
+    # about: a record outside the retention window contributes nothing
+    day = 86400 * 1000
+    later = t0 + 8 * day
+    aged = mod.task_history_from_log(
+        {
+            mod.task_key("S", "ancient"): {"started_ms": t0, "done_ms": t0 + 600_000},
+            mod.task_key("S", "fresh"): {"started_ms": later - 1000, "done_ms": later},
+        },
+        later,
+    )
+    assert "ancient" not in aged and aged.get("fresh") == 1000, aged
+    # ...and the map is capped to the most recently seen names, so the fallback median is
+    # not diluted by a long tail of one-off titles
+    many = mod.task_history_from_log(
+        {
+            mod.task_key("S", f"step {n}"): {
+                "started_ms": later - 1000, "done_ms": later - 1000 + (n + 1),
+            }
+            for n in range(mod.HISTORY_MAX_ENTRIES + 5)
+        },
+        later,
+    )
+    assert len(many) == mod.HISTORY_MAX_ENTRIES, len(many)
+    # a log written before the (session, task) change still resolves its records
+    flat = os.path.join(TEST_HOME, "tasks-flat.json")
+    mod.TASKS_PATH = flat
+    json.dump(
+        {"schema": 1, "session": "S", "tasks": {"a": {"started_ms": t0, "done_ms": t0 + 5000}}},
+        open(flat, "w"),
+    )
+    legacy = mod.track_tasks(dict(S, todos=[{"task": "a", "completed": True}]), now_ms=t0 + 60_000)
+    assert legacy["task_times"]["a"]["elapsed_ms"] == 5000, "an upgrade threw the clocks away"
+    assert mod.task_key(None, "a") != mod.task_key("S", "a"), "records are not session-scoped"
+    say("per-task timing: one clock per step, counting up then freezing: ok")
+
+    # ---- the CLI process must be identified by argv, not by stray text
+    assert mod.is_freebuff_cmd("node /usr/bin/bin/freebuff")
+    assert not mod.is_freebuff_cmd('python3 -c "x bin/freebuff y"')
+    assert not mod.is_freebuff_cmd("/usr/bin/grep bin/freebuff")
+    assert mod.parse_etime("09:17:21") == 33_441
+    assert mod.parse_etime("2-03:34:49") == 185_689
+    say("instance detection matches argv tokens and parses ps etime: ok")
+
+    # ---- the NAS session's pane: an ssh, told apart from the things that look like one.
+    #      A tunnel, a control master and a `docker exec` over ssh all name the same host
+    #      and all sit in a pane; none of them is a login shell with a freebuff prompt in it.
+    for good in (
+        "ssh -t remote@nas.local cd / && exec $SHELL -l",
+        "/usr/bin/ssh remote@nas.local",
+        "/bin/sh /tmp/fixture/bin/ssh -t remote@nas.local x",
+    ):
+        assert mod.is_ssh_cmd(good), good
+    for bad in ("/usr/bin/ssh-agent -l", "python3 -c 'x ssh y'", "scp a b"):
+        assert not mod.is_ssh_cmd(bad), bad
+    assert mod.nas_host_tokens("remote@nas.local") == {
+        "remote@nas.local", "nas.local"
+    }
+    assert mod.nas_host_tokens("/tmp/fixture/fake-ssh") == set(), "a path is not a host"
+
+    table = {
+        500: (1, "-zsh"),
+        501: (500, "ssh -t remote@nas.local cd / && exec $SHELL -l"),
+        900: (1, "-zsh"),
+        901: (900, "ssh -N -L 8080:localhost:8080 remote@nas.local"),
+        902: (900, "ssh -t remote@nas.local cd / && docker exec -w / -it dsh x"),
+    }
+    rows = [
+        {"pane": "%7", "window": "@1", "pid": 500, "start": ""},
+        {"pane": "%9", "window": "@1", "pid": 900, "start": ""},
+    ]
+    cands = mod.ssh_session_candidates("remote@nas.local", rows, table)
+    assert [c["pane"] for c in cands] == ["%7"], cands
+    # a fingerprint of another box is nobody's NAS session
+    foreign = {1: (0, "-zsh"), 2: (1, "ssh other@example.com")}
+    one_row = [{"pane": "%9", "window": "@1", "pid": 1, "start": ""}]
+    assert mod.ssh_session_candidates("remote@nas.local", one_row, foreign) == []
+    # ...while a stand-in that names a *program* (a fixture's fake transport) leaves no
+    # host to match, and then a session-like ssh is accepted instead of refusing to place
+    assert len(mod.ssh_session_candidates("/tmp/fixture/fake-ssh", one_row, foreign)) == 1
+
+    # several logins open: the session's own start time decides (an ssh cannot host a
+    # session that was already running when it logged in)
+    began = {"%7": 0.0, "%8": 6000.0}
+    assert mod.pick_ssh_pane(began, 6500.0) == "%8", "the newest login before the session"
+    assert mod.pick_ssh_pane(began, 900.0) == "%7", "only the older one was open in time"
+    assert mod.pick_ssh_pane(began, -9000.0) == "%7", "every login is after it: the earliest"
+    assert mod.pick_ssh_pane(began, None) == "%8", "no timestamp at all: the newest"
+    assert mod.pick_ssh_pane({}, 6500.0) is None
+    say("nas: the ssh a session runs in is found by ancestry, flags and start time: ok")
+
+    # ---- --instance-of finds the CLI launched by a given shell
+    # A copy of /bin/sleep is SIGKILLed on macOS (AMFI: the copy loses its
+    # signature), so the stand-in has to be a script — whose command line is
+    # "/bin/sh …/bin/freebuff", i.e. a token ending in bin/freebuff.
+    bin_dir = os.path.join(TEST_HOME, "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    fake = os.path.join(bin_dir, "freebuff")
+    with open(fake, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\nsleep 600 & wait\n")
+    os.chmod(fake, 0o755)
+    fake_proc = spawn_quiet(fake)
+    time.sleep(0.4)
+    assert fake_proc.poll() is None, "stand-in freebuff exited immediately"
+    resolved = mod.instance_of_parent(os.getpid())
+    assert resolved == fake_proc.pid, (resolved, fake_proc.pid)
+    snap_of = json.loads(run("json", "--instance-of", str(os.getpid())).stdout)
+    assert snap_of.get("instance_pid") == fake_proc.pid, snap_of.get("instance_pid")
+    kill_tree(fake_proc)
+    say("resolves the freebuff launched by a given shell pid: ok")
+
+    # ---- a frozen list closes the pane instead of lingering
+    frozen = os.path.join(TEST_HOME, "frozen-chat")
+    os.makedirs(frozen, exist_ok=True)
+    line = {
+        "level": "DEBUG",
+        "timestamp": "2026-09-21T06:44:29.043Z",
+        "pid": 1,
+        "data": {
+            "iteration": 7,
+            "toolCalls": [
+                {
+                    "toolName": "write_todos",
+                    "input": {"todos": [{"task": "old step", "completed": False}]},
+                }
+            ],
+        },
+    }
+    with open(os.path.join(frozen, "log.jsonl"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(line) + "\n")
+    json.dump({"messageCount": 1, "firstPrompt": "frozen"},
+              open(os.path.join(frozen, "chat-meta.json"), "w"))
+
+    pid_s, fd_s = pty.fork()
+    if pid_s == 0:
+        os.environ["FBTODO_HOME"] = TEST_HOME
+        os.execv(
+            sys.executable,
+            [sys.executable, FB, "pane", "--no-daemon", "--chat", frozen,
+             "--stale-after", "0.05", "-i", "0.2"],
+        )
+    out_s, deadline = b"", time.time() + 25
+    os.set_blocking(fd_s, False)
+    status_s = None
+    while time.time() < deadline:
+        try:
+            out_s += os.read(fd_s, 65536)
+        except (BlockingIOError, OSError):
+            pass
+        wpid, st_s = os.waitpid(pid_s, os.WNOHANG)
+        if wpid:
+            status_s = st_s
+            break
+        time.sleep(0.2)
+    assert status_s is not None, "pane did not exit on a stale list"
+    text_s = STRIP(out_s.decode("utf-8", "replace"))
+    assert "idle" in text_s and "closing" in text_s, text_s
+    assert os.waitstatus_to_exitcode(status_s) == 0, os.waitstatus_to_exitcode(status_s)
+    say("a stale list closes the pane: ok (exit 0, 'idle … closing')")
+
+    # ---- shell integration: PATH alias-free command + watcher autostart hook
+    ptypid, ptyfd = pty.fork()
+    if ptypid == 0:
+        os.environ["FBTODO_HOME"] = TEST_HOME
+        os.execv("/bin/zsh", ["/bin/zsh", "-i", "-c", "command -v fbtodo && fbtodo bar"])
+    out = b""
+    os.set_blocking(ptyfd, False)
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        try:
+            chunk = os.read(ptyfd, 65536)
+            if chunk:
+                out += chunk
+        except (BlockingIOError, OSError):
+            pass
+        if b"todos " in out:
+            break
+        time.sleep(0.2)
+    try:
+        os.waitpid(ptypid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+    text = out.decode("utf-8", "replace")
+    assert os.path.basename(FB) in text, text
+    assert "todos " in text, text
+    say("interactive zsh resolves `fbtodo` and prints `fbtodo bar`: ok")
+
+    # the hook spawns asynchronously, so wait for its lock rather than racing it
+    deadline = time.time() + 15
+    while time.time() < deadline and not os.path.exists(lock_path):
+        time.sleep(0.2)
+    assert os.path.exists(lock_path), "zshrc hook did not ensure a watcher"
+    lock = json.load(open(lock_path))
+    assert lock.get("instance_pid"), lock
+    run("stop")
+    say("zshrc hook auto-starts a watcher for the live instance: ok")
+
+    # ---- retention: old records, the count cap, temp files, the log cap
+    saved_home = os.environ.get("FBTODO_HOME")
+    os.environ["FBTODO_HOME"] = TEST_HOME
+    try:
+        spec_p = importlib.util.spec_from_loader(
+            "fbtodo_prune", importlib.machinery.SourceFileLoader("fbtodo_prune", FB)
+        )
+        mp = importlib.util.module_from_spec(spec_p)
+        spec_p.loader.exec_module(mp)
+        assert mp.SCRATCH == TEST_HOME, mp.SCRATCH
+
+        now = int(time.time() * 1000)
+        day = 86400 * 1000
+        log = {
+            "schema": 1,
+            "session": "S",
+            "tasks": {
+                "ancient": {"started_ms": now - 30 * day, "done_ms": now - 30 * day},
+                "stale": {"started_ms": now - 8 * day, "done_ms": None},
+                "a": {"started_ms": now - 3000, "done_ms": now - 2000},
+                "b": {"started_ms": now - 2000, "done_ms": None},
+                "c": {"started_ms": now - 1000, "done_ms": None},
+            },
+        }
+        mp.atomic_write_json(mp.TASKS_PATH, log)
+
+        rep = mp.prune_scratch(force=True)
+        assert rep["records_removed"] == 2, rep
+        kept = json.load(open(mp.TASKS_PATH))["tasks"]
+        # a log from before the (session, task) change: prune keeps the same records,
+        # re-keyed under the session they were recorded for
+        assert set(kept) == {mp.task_key("S", k) for k in ("a", "b", "c")}, kept
+        assert mp.prune_scratch()["skipped"] is True, "prune ignored its own interval"
+        rep_cap = mp.prune_scratch(force=True, max_records=1)
+        assert rep_cap["records_kept"] == 1, rep_cap
+        assert os.path.getsize(mp.TASKS_PATH) < 512, "record cap did not shrink the file"
+        say("retention drops aged and over-cap task records: ok")
+
+        stale_tmp = os.path.join(mp.SCRATCH, ".fbtodo.stale.tmp")
+        fresh_tmp = os.path.join(mp.SCRATCH, ".fbtodo.fresh.tmp")
+        for p in (stale_tmp, fresh_tmp):
+            open(p, "w").write("x")
+        old = time.time() - 7200
+        os.utime(stale_tmp, (old, old))
+        with open(mp.LOG_PATH, "wb") as fh:
+            fh.write(b"x" * 2_000_000)
+        rep2 = mp.prune_scratch(force=True, log_cap=1024)
+        assert rep2["temp_removed"] == 1 and not os.path.exists(stale_tmp), rep2
+        assert os.path.exists(fresh_tmp), "a fresh temp file was swept"
+        assert rep2["log_truncated_bytes"] > 0, rep2
+        assert os.path.getsize(mp.LOG_PATH) == 0, "log cap did not truncate"
+        os.unlink(fresh_tmp)
+        say("retention sweeps killed temp files and caps the daemon log: ok")
+
+        out = run("prune", "--json").stdout
+        assert json.loads(out)["scratch"].startswith(TEST_HOME), out
+        assert "task records" in run("status").stdout
+        say("prune subcommand and status footprint line: ok")
+    finally:
+        if saved_home is None:
+            os.environ.pop("FBTODO_HOME", None)
+        else:
+            os.environ["FBTODO_HOME"] = saved_home
+
+    # ---- NAS backend: the remote protocol, against a fixture store
+    # FBTODO_NAS may hold a whole command, so the stand-in runs the very script the
+    # `--source nas` path would ssh. Only the transport is faked — the header protocol,
+    # the quoting of the extractor program, its argv contract and the mtime skip all
+    # execute for real.
+    stub = os.path.join(TEST_HOME, "fake-ssh")
+    with open(stub, "w") as fh:
+        fh.write('#!/bin/sh\nexec /bin/sh -c "$1"\n')
+    os.chmod(stub, 0o755)
+    # A second name for it: `stub` is reused further down for the stand-in freebuff
+    # binary, and pointing FBTODO_NAS at THAT made every probe a six-second sleep.
+    fake_ssh = stub
+    store = os.path.join(TEST_HOME, "nasstore")
+    chats = os.path.join(store, "demo", "chats")
+    nas_args = ["--nas-root", store, "--nas-project", "demo"]
+    # `env` (the copy run() hands to the child), not os.environ: mutating os.environ
+    # alone left the real ssh target in place and the checks quietly tested the NAS.
+    saved_nas = env.get("FBTODO_NAS")
+    env["FBTODO_NAS"] = stub
+    try:
+        def nas_snapshot(*extra):
+            # the `json` subcommand, not `snap --json` (that flag only means anything
+            # to `status`), and NOT the state file: `-s nas` must never be answered
+            # from a cached local-CLI state, which is exactly what it used to do.
+            p = run("-s", "nas", *nas_args, *extra, "json", check=True)
+            return json.loads(p.stdout)
+
+        def write_session(name, blocks, age_s):
+            """A session directory whose mtime decides whether it is 'the newest'.
+
+            Content writes bump the directory's own mtime, so the age is stamped last:
+            relying on creation order made these checks depend on how fast the loop ran.
+            """
+            d = os.path.join(chats, name)
+            os.makedirs(d, exist_ok=True)
+            open(os.path.join(d, "log.jsonl"), "w").write("{}\n")
+            if blocks is not None:
+                with open(os.path.join(d, "chat-messages.json"), "w") as fh:
+                    if isinstance(blocks, str):
+                        fh.write(blocks)
+                    else:
+                        json.dump([{"id": "m1", "variant": "ai", "content": "", "blocks": blocks}], fh)
+            stamp = time.time() - age_s
+            os.utime(d, (stamp, stamp))
+            return d
+
+        def tool(name, todos=None):
+            return {
+                "type": "tool", "toolCallId": "t", "toolName": name,
+                "input": {"todos": todos} if todos is not None else {"pattern": "x"},
+                "agentId": "main-agent", "includeToolCall": True, "output": "...",
+            }
+
+        # an older session that DID write a list...
+        write_session(
+            "2026-01-01T00-00-01.000Z",
+            [tool("code_search"), tool("write_todos", [{"task": "old", "completed": True}])],
+            300,
+        )
+        # ...and a newer one with no transcript yet (it appears per completed turn).
+        # The newer session is what gets described: showing the old list as if it were
+        # current would be worse than showing nothing.
+        write_session("2026-01-01T00-00-02.000Z", None, 60)
+        st = nas_snapshot()
+        assert st["backend"] == "nas", st
+        assert st["nas"]["has_transcript"] is False, st
+        assert st["todos"] == [] and not st.get("error"), st
+        assert st["target"].endswith("2026-01-01T00-00-02.000Z/"), st["target"]
+        say("nas: the newest session wins; one with no transcript is named, not missing: ok")
+
+        # a real list arrives, in the shape the NAS store actually uses
+        write_session(
+            "2026-01-01T00-00-02.000Z",
+            [
+                tool("run_terminal_command"),
+                tool("write_todos", [{"task": "do a", "completed": True}, {"task": "do b", "completed": False}]),
+                tool("write_todos", [{"task": "do a", "completed": True}, {"task": "do b", "completed": True}]),
+            ],
+            60,
+        )
+        st = nas_snapshot()
+        assert [t["task"] for t in st["todos"]] == ["do a", "do b"], st["todos"]
+        assert st["todos"][1]["completed"] is True, st["todos"]
+        assert st["source_updated_ms"], st
+        say("nas: the newest write_todos wins, extracted from the store: ok")
+
+        # `-s nas status` has to describe the NAS. It read the local watcher's state file
+        # and printed the Mac's own list beside "nas session: — no session found" — about a
+        # box that was running a freebuff at the time.
+        status_nas = STRIP(run("-s", "nas", *nas_args, "status").stdout)
+        assert "nas session       : 2026-01-01T00-00-02.000Z/" in status_nas, status_nas
+        assert "todos             : 2/2 done" in status_nas, status_nas
+        # the state-file line still describes the local file (that is honest); the NAS
+        # lines must not borrow its session or its list
+        local_sess = (json.load(open(state_path)) if os.path.exists(state_path) else {}).get("session")
+        nas_line = next(
+            line for line in status_nas.splitlines() if line.strip().startswith("nas session")
+        )
+        assert local_sess and local_sess not in nas_line, (local_sess, nas_line)
+        say("nas: `-s nas status` reports the NAS session, not the local list: ok")
+
+        # unchanged transcript => the remote parse is skipped (the pane's idle poll is a stat)
+        st2 = nas_snapshot()
+        assert st2["nas"]["unchanged"] is True, st2["nas"]
+        assert [t["task"] for t in st2["todos"]] == ["do a", "do b"], st2["todos"]
+        say("nas: an unmoved transcript skips the parse instead of re-reading it: ok")
+
+        # The patch row's two facts come back in the SAME poll: the hook's patch log and
+        # its notifier's, gathered at the far end of the ssh the pane already makes. The
+        # real paths are the NAS's own, so both are pointed at fixtures — and asserted
+        # through the `-s nas` path a pane uses rather than by calling the readers here.
+        env["FBTODO_NAS_PATCH_LOG"] = NAS_PATCH_FIXTURE
+        env["FBTODO_NAS_ALERT_LOG"] = NAS_ALERT_FIXTURE
+        st3 = nas_snapshot()
+        assert st3["patch"]["outcome"] == "incomplete", st3.get("patch")
+        assert st3["patch"]["version"] == "9.9.9-nas", st3.get("patch")
+        assert "no window for fixture-window" in st3["patch"]["reason"], st3.get("patch")
+        assert st3["patch"]["severity"] == "bad", st3.get("patch")
+        assert st3["alert"]["kind"] == "sent", st3.get("alert")
+        assert st3["alert"]["text"] == "sent ntfy incomplete", st3.get("alert")
+        say("nas: the patch log and the alert log ride the poll the pane already makes: ok")
+        # ...and a NAS pane that has no session yet still answers the question, because the
+        # strip is drawn from the state and the state carries the two facts either way
+        nas_status = STRIP(run("-s", "nas", *nas_args, "status").stdout)
+        assert "cli patches       : incomplete · 9.9.9-nas" in nas_status, nas_status
+        assert "last alert        : sent ntfy incomplete" in nas_status, nas_status
+        say("nas: `-s nas status` answers for the NAS's patches, not this Mac's: ok")
+
+        # the goal of a NAS list comes from the AGENT's line too — the transcript keeps
+        # user requests, and those are never the heading. Two fixtures: one where the ai
+        # message carries prose (the rule followed), one like the real store, where it
+        # carries none at all (measured: content length 0, tool blocks only).
+        dg = os.path.join(store, "goalproj", "chats", "2026-04-04T00-00-00.000Z")
+        os.makedirs(dg, exist_ok=True)
+        open(os.path.join(dg, "log.jsonl"), "w").write("{}\n")
+        with open(os.path.join(dg, "chat-messages.json"), "w") as fh:
+            json.dump(
+                [
+                    {"id": "m0", "variant": "user", "content": "wire voicevox to wake on demand"},
+                    {"id": "m1", "variant": "ai", "content": "Goal: wake voicevox on demand",
+                     "blocks": [tool("write_todos", [{"task": "deploy", "completed": True}])]},
+                    {"id": "m2", "variant": "user", "content": "and also fix the pane timeout"},
+                    {"id": "m3", "variant": "ai", "content": "Goal: fix the pane timeout",
+                     "blocks": []},
+                ],
+                fh,
+            )
+        stg = nas_snapshot("--nas-project", "goalproj")
+        assert [t["task"] for t in stg["todos"]] == ["deploy"], stg["todos"]
+        assert stg["goal"] == "wake voicevox on demand", stg
+        assert stg["now"] == "fix the pane timeout", stg
+        say("nas: an agent Goal: line heads the list, and a newer one is `now`: ok")
+
+        with open(os.path.join(dg, "chat-messages.json"), "w") as fh:
+            json.dump(
+                [
+                    {"id": "m0", "variant": "user", "content": "wire voicevox to wake on demand"},
+                    {"id": "m1", "variant": "ai", "content": "",
+                     "blocks": [tool("write_todos", [{"task": "deploy", "completed": True}])]},
+                ],
+                fh,
+            )
+        # The far side skips its parse while the transcript's mtime is unchanged, and that
+        # mtime has one-second resolution — so a rewrite in the same second needs a nudge
+        # for the new content to be read at all.
+        path_g = os.path.join(dg, "chat-messages.json")
+        os.utime(path_g, (time.time() + 2, time.time() + 2))
+        stg = nas_snapshot("--nas-project", "goalproj")
+        assert stg["goal"] is None, stg
+        assert stg["now"] is None, stg
+        say("nas: a transcript with no agent prose yields no heading, as measured: ok")
+
+        # ...and the `fb` marker, which is the sharper "which session is live" answer
+        shim = os.path.join(TEST_HOME, "shim")
+        os.makedirs(shim, exist_ok=True)
+        with open(os.path.join(shim, "pgrep"), "w") as fh:
+            fh.write("#!/bin/sh\nexit 1\n")  # no freebuff process, so only the marker can say live
+        os.chmod(os.path.join(shim, "pgrep"), 0o755)
+        saved_path = env.get("PATH", "")
+        env["PATH"] = shim + os.pathsep + saved_path
+        marker = os.path.join(TEST_HOME, "fb-session")
+        # a second project, as `fb` run from another directory would have: the marker's
+        # dir must select THAT store, or the pane shows a different project's list
+        other = "otherproj"
+        d2 = os.path.join(store, other, "chats", "2026-02-02T00-00-00.000Z")
+        os.makedirs(d2, exist_ok=True)
+        with open(os.path.join(d2, "chat-messages.json"), "w") as fh:
+            json.dump(
+                [{"id": "m", "variant": "ai", "content": "", "blocks": [
+                    tool("write_todos", [{"task": "from otherproj", "completed": False}])]}],
+                fh,
+            )
+
+        live_pid = subprocess.Popen(["sleep", "30"]).pid
+        with open(marker, "w") as fh:
+            fh.write(f"{live_pid} 2026-01-01T00:00:00Z {store}/{other}\n")
+        st4 = nas_snapshot("--fb-marker", marker)
+        assert st4["nas"]["fb"] == "1" and st4["instance_alive"], st4["nas"]
+        assert st4["nas"]["fb_project"] == other, st4["nas"]
+        assert st4["target"].endswith("2026-02-02T00-00-00.000Z/"), st4["target"]
+        assert [t["task"] for t in st4["todos"]] == ["from otherproj"], st4["todos"]
+        say("nas: a live fb marker names the session, and reads ITS project's store: ok")
+
+        # ...but the marker's dir is where the session STARTED, which is not always where
+        # its store lands (measured: `fb` maps a cwd the container cannot see, and a
+        # container cwd of `/` makes the project nameless — `projects/chats/<thread>`, not
+        # `projects/host`). Trusting the marker then read a two-day-old session and the
+        # pane could never show the live one, however often it was re-listed. A live
+        # session is followed by the store it writes.
+        host_store = os.path.join(store, "host", "chats", "2026-09-19T09-01-35.987Z")
+        os.makedirs(host_store, exist_ok=True)
+        with open(os.path.join(host_store, "chat-messages.json"), "w") as fh:
+            json.dump(
+                [{"id": "m", "variant": "ai", "content": "", "blocks": [
+                    tool("write_todos", [{"task": "two days old", "completed": True}])]}],
+                fh,
+            )
+        stale = time.time() - 3600 * 48
+        os.utime(host_store, (stale, stale))
+        live_store = os.path.join(store, "chats", "2026-09-21T19-40-05.908Z")
+        os.makedirs(live_store, exist_ok=True)
+        with open(os.path.join(live_store, "chat-messages.json"), "w") as fh:
+            json.dump(
+                [{"id": "m", "variant": "ai", "content": "", "blocks": [
+                    tool("write_todos", [{"task": "the session you are in", "completed": False}])]}],
+                fh,
+            )
+        with open(marker, "w") as fh:
+            fh.write(f"{live_pid} 2026-09-21T19:40:01Z {store}/host/\n")
+        st5 = nas_snapshot("--nas-project", "host", "--fb-marker", marker)
+        assert st5["target"].endswith("2026-09-21T19-40-05.908Z/"), st5["target"]
+        assert st5["nas"]["fb_project"] == "", st5["nas"]
+        assert [t["task"] for t in st5["todos"]] == ["the session you are in"], st5["todos"]
+        say("nas: a live session is followed by the store it writes, not the marker's guess: ok")
+
+        # ---- a `continue` on the NAS: the transcript carries user messages, so the same
+        #      continuation rule applies there — 
+        nudge_proj = os.path.join(store, "nudgeproj", "chats", "2026-03-03T00-00-00.000Z")
+        os.makedirs(nudge_proj, exist_ok=True)
+        open(os.path.join(nudge_proj, "log.jsonl"), "w").write("{}\n")
+
+        def write_transcript(prompt):
+            with open(os.path.join(nudge_proj, "chat-messages.json"), "w") as fh:
+                json.dump(
+                    [
+                        {"id": "m0", "variant": "user", "content": "track the deploy"},
+                        {"id": "m1", "variant": "ai", "content": "", "blocks": [
+                            tool("write_todos", [{"task": "deploy", "completed": True}])]},
+                        {"id": "m2", "variant": "user", "content": prompt},
+                    ],
+                    fh,
+                )
+
+        for i, (phrase, is_cont) in enumerate((
+            ("continue", True),
+            ("ok, keep going with it", True),
+            ("continue with the NAS work", False),
+        )):
+            write_transcript(phrase)
+            # One-second mtime resolution: the far side skips its parse while the
+            # transcript has not moved, so each rewrite needs a DISTINCT second — a
+            # shared `+2` made the loop read the first phrase three times.
+            path_n = os.path.join(nudge_proj, "chat-messages.json")
+            stamp = time.time() + 3 + 2 * i
+            os.utime(path_n, (stamp, stamp))
+            stn = nas_snapshot("--nas-project", "nudgeproj")
+            assert bool(stn["nudge"]) == is_cont, (phrase, stn.get("nudge"), stn.get("now"))
+            if is_cont:
+                assert stn["nudge"] == phrase and stn["now"] is None, stn
+                rendered_n = STRIP(module.render(dict(stn, done=1, total=1), False, width=60))
+                assert "nudge · " in rendered_n and "rewrite the list" in rendered_n, rendered_n
+            else:
+                assert stn["now"] == phrase, stn
+        say("nas: a `continue` in the transcript is a nudge, and real work is still `now`: ok")
+
+        # the far side has no fbtodo to import, so the word list is injected into its
+        # source — this is the check that the injection happened and carries the same words
+        injected = repr(tuple(sorted(module.NUDGE_WORDS)))
+        assert injected in module.NAS_EXTRACT, "the NAS extractor did not get the nudge words"
+        assert str(module.NUDGE_MAX_CHARS) in module.NAS_EXTRACT, module.NUDGE_MAX_CHARS
+        say("nas: the extractor carries the same continuation rule, injected not guessed: ok")
+
+        # ---- why a NAS list looks plainer than the local one, said out loud.
+        # Measured 2026-09-26: a NAS session that called write_todos ONCE, at the end, with
+        # every todo already completed. The pane could show the list and nothing else — no row
+        # clock, no pace, no EST REM — because a clock is only ever started for a step seen
+        # unfinished. A silent gap reads as a broken pane; the pane now names the reason, and a
+        # list-less one names the tools the session did call.
+        def tool2(name, todos=None, pattern="x"):
+            return {
+                "type": "tool", "toolCallId": "t", "toolName": name,
+                "input": {"todos": todos} if todos is not None else {"pattern": pattern},
+                "agentId": "main-agent", "includeToolCall": True, "output": "...",
+            }
+
+        # its OWN project, not `demo`: a fixture left in the project every later
+        # check probes becomes "the newest session" for them, and the unreadable-store
+        # check then reads this list instead of the broken file it means to read
+        census = os.path.join(store, "censusproj", "chats", "2026-09-21T20-00-04.000Z")
+        os.makedirs(census, exist_ok=True)
+        open(os.path.join(census, "log.jsonl"), "w").write("{}\n")
+        with open(os.path.join(census, "chat-messages.json"), "w") as fh:
+            json.dump([{"id": "m", "variant": "ai", "content": "", "blocks": [
+                tool2("run_terminal_command"), tool2("run_terminal_command"),
+                tool2("code_search"),
+                tool2("write_todos", [
+                    {"task": "one", "completed": True},
+                    {"task": "two", "completed": True}])]}], fh)
+        # the census survives the round trip: it is the only thing there is to say about a
+        # session that has written no list at all
+        # an explicit marker path that does not exist: a live marker left by an earlier check
+        # would send the probe to THAT project, and this fixture is not in it
+        st6 = nas_snapshot(
+            "--nas-project", "censusproj",
+            "--fb-marker", os.path.join(TEST_HOME, "no-marker-for-census"),
+        )
+        assert st6["tool_calls"].get("run_terminal_command") == 2, json.dumps(
+            {k: v for k, v in st6.items() if k not in ("todos",)}, default=str)[:500]
+        assert st6["tool_calls"].get("code_search") == 1, st6["tool_calls"]
+        say("nas: the transcript's tool census reaches the state, counts and all: ok")
+
+        ticked_state = dict(st6, task_times={})
+        frame = ansi.sub("", module.render(
+            ticked_state, True, watching=999, width=68, height=12, now_ms=SWEEP_NOW,
+        ))
+        assert "no per-step times" in frame, frame
+        # the reason is longer than a 68-column frame, so assert the part that fits
+        assert "arrived with every step" in frame, frame
+        # ...and a list that DID get a clock is not told it has none
+        timed = dict(ticked_state, task_times={
+            "one": {"started_ms": SWEEP_NOW - 60_000, "done_ms": SWEEP_NOW - 30_000,
+                    "elapsed_ms": 30_000}})
+        assert "no per-step times" not in ansi.sub("", module.render(
+            timed, True, watching=999, width=68, height=12, now_ms=SWEEP_NOW)), timed
+        say("nas: a list with no clocks says why, and one with clocks is left alone: ok")
+
+        empty_proj = os.path.join(store, "censusproj", "chats", "2026-09-21T20-00-05.000Z")
+        os.makedirs(empty_proj, exist_ok=True)
+        open(os.path.join(empty_proj, "log.jsonl"), "w").write("{}\n")
+        with open(os.path.join(empty_proj, "chat-messages.json"), "w") as fh:
+            json.dump(
+                [{"id": "m", "variant": "ai", "content": "", "blocks": [
+                    tool2("run_terminal_command"), tool2("read_url", pattern="y"),
+                    tool2("run_terminal_command")]}],
+                fh,
+            )
+        # The census reached the state over the wire (the check above); this one is about
+        # the pane's sentence, so it renders a state directly rather than negotiating the
+        # probe's liveness a second time.
+        st7 = {"backend": "nas", "instance_alive": True, "todos": [], "task_times": {},
+               "tool_calls": {"run_terminal_command": 2, "read_url": 1, "skill": 1},
+               "source": "nas-journal", "session": "x"}
+        frame7 = ansi.sub("", module.render(
+            st7, True, watching=999, width=68, height=12, now_ms=SWEEP_NOW))
+        assert "no write_todos call yet" in frame7, frame7
+        assert "called so far: run_terminal_command 2, read_url 1, skill 1" in frame7, frame7
+        # and with nothing called, there is nothing to add: the pane keeps its old shape
+        st7["tool_calls"] = {}
+        frame7b = ansi.sub("", module.render(
+            st7, True, watching=999, width=68, height=12, now_ms=SWEEP_NOW))
+        assert "called so far" not in frame7b, frame7b
+        say("nas: a session with no list is told which tools it has called: ok")
+
+
+
+        # the same marker with a dead pid: a stale marker must not pin a phantom session,
+        # and a pane with nothing to show says it is waiting for `fb`
+        os.kill(live_pid, signal.SIGKILL)
+        time.sleep(0.2)
+        waitproj = "waitproj"
+        write_session_at_project = os.path.join(store, waitproj, "chats", "2026-03-03T00-00-00.000Z")
+        os.makedirs(write_session_at_project, exist_ok=True)
+        open(os.path.join(write_session_at_project, "log.jsonl"), "w").write("{}\n")
+        with open(marker, "w") as fh:
+            fh.write(f"{live_pid} 2026-01-01T00:00:00Z {store}/{waitproj}\n")
+        st5 = nas_snapshot("--fb-marker", marker)
+        assert st5["nas"]["fb"] == "0", st5["nas"]
+        assert not st5["instance_alive"], st5["nas"]
+        assert st5["nas"]["fb_project"] == waitproj, st5["nas"]
+        assert st5["todos"] == [], st5["todos"]
+        text = STRIP(run("-s", "nas", *nas_args, "--fb-marker", marker, "snap").stdout)
+        assert "waiting for a NAS freebuff session" in text, text
+        say("nas: a stale marker is not a live session, and the pane says it is waiting: ok")
+        os.unlink(marker)
+
+        # a store the far side cannot read is an error, not an empty list
+        write_session("2026-01-01T00-00-03.000Z", "not json", 10)
+        st3 = nas_snapshot()
+        assert st3["todos"] == [] and st3["nas"].get("error"), st3
+        assert "JSONDecodeError" in st3["nas"]["error"], st3
+        say("nas: an unreadable store reports an error instead of a zero: ok")
+    finally:
+        if saved_nas is None:
+            env.pop("FBTODO_NAS", None)
+        else:
+            env["FBTODO_NAS"] = saved_nas
+
+        # ---- a NAS pane's lifetime: --wait keeps it for the shell that owns it, so a
+    #      remote pane can outlive one freebuff run (and is killed when the ssh returns)
+    #@phase nas-pane-wait
+    if shutil.which("tmux"):
+        sess2 = "fbtwait"
+        sock2 = "fbtchecksockwait"
+        tmux2 = ["tmux", "-L", sock2]
+        # the NAS block restored FBTODO_NAS on its way out; this pane needs it again
+        env["FBTODO_NAS"] = fake_ssh
+        short = subprocess.Popen(["sleep", "2"])
+        marker2 = os.path.join(TEST_HOME, "fb-session-2")
+        with open(marker2, "w") as fh:
+            fh.write(f"{short.pid} 2026-01-01T00:00:00Z {store}/otherproj\n")
+        base = (
+            f"FBTODO_HOME={TEST_HOME} FBTODO_NAS={env['FBTODO_NAS']} "
+            f"PATH={shim}:{saved_path} "
+            f"{sys.executable} {FB} -s nas --nas-root {store} --nas-project demo "
+            f"--fb-marker {marker2} -i 2.5 --stale-after 0 --tick 2"
+        )
+        for name, extra in (("wait", " --wait"), ("nowait", "")):
+            subprocess.run(
+                tmux2 + ["new-session", "-d", "-s", name, "-x", "70", "-y", "12", f"{base}{extra}"],
+                capture_output=True,
+            )
+        time.sleep(6)  # the marker's pid is dead by now
+
+        def alive(sess) -> bool:
+            p = subprocess.run(tmux2 + ["list-panes", "-t", sess], capture_output=True)
+            return p.returncode == 0
+
+        assert alive("wait"), "--wait pane closed when its session ended"
+        assert not alive("nowait"), "a plain nas pane lingered after its session ended"
+        shot = subprocess.run(tmux2 + ["capture-pane", "-p", "-t", "wait"], capture_output=True, text=True)
+        assert "waiting for a NAS freebuff session" in STRIP(shot.stdout), shot.stdout
+        subprocess.run(tmux2 + ["kill-server"], capture_output=True)
+        short.kill()
+        os.unlink(marker2)
+        env.pop("FBTODO_NAS", None)
+        say("nas pane: --wait outlives one fb run, a plain pane closes with it: ok")
+        env["PATH"] = saved_path
+
+    # ---- painting is not tied to polling: the clock moves every second while the
+    #      store is only reached once per `-i` (on the NAS every poll is an ssh)
+    #@phase nas-pane-repaint
+    if shutil.which("tmux"):
+        sock3, sess3 = "fbtchecksockcad", "fbtcad"
+        tmux3 = ["tmux", "-L", sock3]
+        subprocess.run(tmux3 + ["kill-server"], capture_output=True)
+        # a list that is MID-flight: step 1 ticked off, step 2 running
+        write_session(
+            "2026-01-01T00-00-09.000Z",
+            [
+                tool(
+                    "write_todos",
+                    [
+                        {"task": "tick me", "completed": True},
+                        {"task": "still running", "completed": False},
+                        {"task": "later", "completed": False},
+                    ],
+                )
+            ],
+            # a FUTURE directory mtime: the earlier blocks leave sessions age-0 seconds
+            # old, and `ls -1dt` would otherwise make one of those the newest
+            -5,
+        )
+        alive = subprocess.Popen(["sleep", "60"])
+        marker3 = os.path.join(TEST_HOME, "fb-session-3")
+        with open(marker3, "w") as fh:
+            fh.write(f"{alive.pid} 2026-01-01T00:00:00Z {store}/demo\n")
+        # the transport, wrapped so every poll is counted: one ssh per poll is the
+        # cost the slow interval exists to pay for
+        calls = os.path.join(TEST_HOME, "nas-calls.log")
+        spliced = os.path.join(TEST_HOME, "counting-ssh")
+        with open(spliced, "w") as fh:
+            fh.write(f'#!/bin/sh\necho x >> {calls}\nexec /bin/sh -c "$1"\n')
+        os.chmod(spliced, 0o755)
+        env["FBTODO_NAS"] = spliced
+        # `--no-daemon` because that is what the watcher opens, and a scratch home of its
+        # own because a nas daemon left running by an earlier block writes a state file
+        # this pane would be right to trust — and that state describes the dead marker.
+        cad_home = os.path.join(TEST_HOME, "cad-home")
+        os.makedirs(cad_home, exist_ok=True)
+        cmd = (
+            f"FBTODO_HOME={cad_home} FBTODO_NAS={spliced} PATH={shim}:{saved_path} "
+            f"{sys.executable} {FB} -s nas --no-daemon --nas-root {store} "
+            f"--nas-project demo --fb-marker {marker3} -i 5 --stale-after 0 --tick 5"
+        )
+        subprocess.run(
+            tmux3 + ["new-session", "-d", "-s", sess3, "-x", "60", "-y", "12", cmd],
+            capture_output=True,
+        )
+        time.sleep(2.5)  # the first poll lands immediately; the next is 5s out
+
+        def cad_shot() -> str:
+            return STRIP(
+                subprocess.run(
+                    tmux3 + ["capture-pane", "-p", "-t", sess3], capture_output=True, text=True
+                ).stdout
+            )
+
+        shots = [cad_shot()]
+        for _ in range(4):  # ~2.4s of watching, well inside one poll
+            time.sleep(0.6)
+            shots.append(cad_shot())
+        polls = len(open(calls).read().split()) if os.path.exists(calls) else 0
+        assert "still running" in shots[0], shots[0]
+        # One poll costs one ssh (the extractor's mtime skip needs no second), and the
+        # window is shorter than the interval — so a pane that painted only when it
+        # polled would have exactly one shot here, not three.
+        assert len(set(shots)) >= 3, f"the pane did not repaint between polls: {shots}"
+        assert polls <= 2, f"the pane polled {polls} times in ~2.4s at -i 5: {shots}"
+        say("nas pane: 1Hz repaint while polling the store once per -i: ok")
+        subprocess.run(tmux3 + ["kill-server"], capture_output=True)
+        alive.kill()
+        os.unlink(marker3)
+        env["FBTODO_NAS"] = fake_ssh
+
+    # ---- the freebuff() wrapper opens a todo pane with the session and closes it
+    #@phase local-session
+    if shutil.which("tmux"):
+        # A private server on its own socket: the pane then inherits THIS process's
+        # PATH (a shared server would overwrite PATH from the attaching client via
+        # update-environment, and the stub freebuff would never be found), and the
+        # user's real server is never touched.
+        sock = "fbtchecksock"
+        sess = "fbtcheck"
+        tmux = ["tmux", "-L", sock]
+        subprocess.run(tmux + ["kill-server"], capture_output=True)
+        stub_bin = os.path.join(TEST_HOME, "session", "bin")
+        os.makedirs(stub_bin, exist_ok=True)
+        stub = os.path.join(stub_bin, "freebuff")
+        # The stand-in session ends when THIS script says so, not on a clock: the checks
+        # below (a killed pane that has to come back, one pushed out of place, a pin that
+        # moves and resizes it) have to finish before the session ends, and a fixed
+        # `sleep 40` made the suite wait out whatever was left of it — 34.7 s of the
+        # 107 s run, measured 2026-09-23 with FBTODO_SELFCHECK_TIME=1. A release file is
+        # both faster (the close check starts the moment the checks are done) and more
+        # deterministic (no "long enough for a slow machine" guess to get wrong).
+        release = os.path.join(TEST_HOME, "end-session")
+        if os.path.exists(release):
+            os.unlink(release)
+        with open(stub, "w", encoding="utf-8") as fh:
+            # a script (not a copy of /bin/sleep, which macOS SIGKILLs) so `ps` shows a
+            # path ending in bin/freebuff
+            fh.write(f"#!/bin/sh\nwhile [ ! -e {release} ]; do sleep 0.2; done\n")
+        os.chmod(stub, 0o755)
+        path = stub_bin + os.pathsep + os.environ.get("PATH", "")
+        # The stall watch is asked about a LOCAL session (the NAS build writes no
+        # end-of-turn record), so its stub — and the check for it below — live here
+        # rather than in the NAS block. A stub, not the real notifier: this run must
+        # not push the fixture's lists to the owner's phone.
+        pause_log = os.path.join(TEST_HOME, "pause-calls.log")
+        pause_stub = os.path.join(TEST_HOME, "pause-stub.sh")
+        with open(pause_stub, "w", encoding="utf-8") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                f'printf "%s\\n" "$*" >> "{pause_log}"\n'
+                "exit 0\n"
+            )
+        os.chmod(pause_stub, 0o755)
+        # The pane watch, same reason and same shape: it reports whether the keeper is
+        # doing its job, and the real one reads THIS Mac's tmux — so an unstubbed run
+        # would scan the owner's own panes and, on a pane it judged missing, push.
+        pane_bell_log = os.path.join(TEST_HOME, "pane-bell-calls.log")
+        pane_bell_stub = os.path.join(TEST_HOME, "pane-bell-stub.sh")
+        with open(pane_bell_stub, "w", encoding="utf-8") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                f'printf "%s\\n" "$*" >> "{pane_bell_log}"\n'
+                "echo 'silent: every session that wants a pane has one'\n"
+                "exit 0\n"
+            )
+        os.chmod(pane_bell_stub, 0o755)
+        # The wrapper's own notifications, moved into the fixture: `freebuff()` reads
+        # FREEBUFF_NOTIFY_DIR for its drop watch, its session timer and its stderr log.
+        # Without this the stand-in session ending looks like a death to the REAL drop
+        # watch and pushes "freebuff dropped" to the owner's phone — measured
+        # 2026-09-22, one push per run until this line existed.
+        fake_notify = os.path.join(TEST_HOME, ".config", "freebuff-notify")
+        os.makedirs(fake_notify, exist_ok=True)
+        for name, body in (
+            ("drop-bell.py", "#!/bin/sh\nexit 0\n"),
+            ("bell.sh", "#!/bin/sh\nexit 0\n"),
+            ("session-timer.sh", "#!/bin/sh\nexit 0\n"),
+        ):
+            with open(os.path.join(fake_notify, name), "w", encoding="utf-8") as fh:
+                fh.write(body)
+            os.chmod(os.path.join(fake_notify, name), 0o755)
+        # A watcher left over from an earlier phase would be ADOPTED by the pane below
+        # (same version, so not replaced), and it carries THAT phase's environment: no
+        # stall-watch stub, so the check below would ask a process that cannot answer.
+        # Stop it first — the session opened here has to start its own watcher.
+        run("stop")
+        created = subprocess.run(
+            tmux
+            + [
+                "new-session", "-d", "-s", sess, "-x", "100", "-y", "30",                "-e", f"FBTODO_HOME={TEST_HOME}",
+                "-e", f"PATH={path}",
+                # ...and no autostart daemon left behind either (see the NAS block)
+                "-e", "FBTODO_NO_AUTOSTART=1",
+                # notice a killed pane quickly: the shipped default is deliberately calm
+                "-e", "FBTODO_PANE_SECONDS=1",
+                "-e", f"FREEBUFF_NOTIFY_DIR={fake_notify}",
+                "-e", f"FBTODO_PAUSE={pause_stub}",
+                "-e", "FBTODO_PAUSE_SECONDS=1",
+                "-e", f"FBTODO_PANE_BELL={pane_bell_stub}",
+                "-e", "FBTODO_PANE_BELL_SECONDS=1",
+                # ONE command string, so tmux runs it through a shell: given
+                # separate argv elements tmux execs them directly, the quotes land
+                # in zsh's command text, and the pane dies without a word.
+                # PATH is prepended inside zsh, after the .zshrc that prepends
+                # nvm's node bin (where the real freebuff lives) — otherwise the
+                # real CLI runs and the stand-in 'session' never ends.
+                f"zsh -i -c 'export PATH={stub_bin}:$PATH; freebuff'",
+            ],
+            capture_output=True,
+        )
+
+        def pane_cmds() -> list[str]:
+            p = subprocess.run(
+                tmux + ["list-panes", "-t", sess, "-F", "#{pane_current_command}"],
+                capture_output=True, text=True,
+            )
+            return p.stdout.split() if p.returncode == 0 else []
+
+        def panes_detail() -> str:
+            s = subprocess.run(tmux + ["list-sessions"], capture_output=True, text=True)
+            p = subprocess.run(
+                tmux + ["list-panes", "-a", "-F", "#{session_name} #{pane_current_command}"],
+                capture_output=True, text=True,
+            )
+            return (
+                f"new-session rc={created.returncode} err={created.stderr.strip()!r}; "
+                f"sessions={s.stdout.strip()!r}/{s.stderr.strip()!r}; "
+                f"panes={p.stdout.strip()!r}/{p.stderr.strip()!r}"
+            )
+
+        deadline = time.time() + 20
+        while time.time() < deadline and not (
+            len(pane_cmds()) >= 2 and any(c.startswith("Python") for c in pane_cmds())
+        ):
+            time.sleep(0.3)
+        assert any(c.startswith("Python") for c in pane_cmds()), (
+            f"freebuff() did not open a todo pane: {pane_cmds()} | {panes_detail()}"
+        )
+        say("freebuff() opens a fbtodo pane alongside the session: ok")
+
+        # The stall watch is asked on its own clock while a LOCAL session runs: it is the
+        # one notifier that needs `shouldEndTurn`, which only this build writes.
+        def pause_calls() -> int:
+            try:
+                with open(pause_log) as handle:
+                    return len([ln for ln in handle if ln.strip()])
+            except OSError:
+                return 0
+
+        def pause_diag() -> str:
+            bits = [f"stub={pause_stub} exec={os.access(pause_stub, os.X_OK)}"]
+            for name in ("fbtodo-daemon.log", "fbtodo-pane.log", "fbtodo-state.json"):
+                p = os.path.join(TEST_HOME, name)
+                try:
+                    with open(p) as fh:
+                        bits.append(f"{name}=" + fh.read()[-400:].replace("\n", " | "))
+                except OSError as exc:
+                    bits.append(f"{name}={exc.__class__.__name__}")
+            return " ".join(bits)
+
+        deadline = time.time() + 15
+        while time.time() < deadline and pause_calls() < 1:
+            time.sleep(0.3)
+        assert pause_calls() >= 1, (
+            f"the watcher never asked the stall watch: {pane_cmds()} | {panes_detail()}"
+            f" | {pause_diag()}"
+        )
+        asked = open(pause_log).read()
+        assert "--watch-pid" in asked, (
+            f"the stall watch was not given the session: {asked!r}"
+        )
+        say("the stall watch is asked, with the session, while it runs: ok")
+
+        # The pane watch is asked on its own clock too, and about something else again: a
+        # session with no todo pane, or no keeper to put one back. It is given NO session,
+        # because the failure it reports is often one this daemon cannot see from inside.
+        def pane_bell_calls() -> int:
+            try:
+                with open(pane_bell_log) as handle:
+                    return len([ln for ln in handle if ln.strip()])
+            except OSError:
+                return 0
+
+        deadline = time.time() + 15
+        while time.time() < deadline and pane_bell_calls() < 1:
+            time.sleep(0.3)
+        assert pane_bell_calls() >= 1, (
+            f"the watcher never asked the pane watch: {pane_cmds()} | {panes_detail()}"
+        )
+        asked = open(pane_bell_log).read()
+        assert "--keeper" in asked, (
+            f"the pane watch was not told where the keeper's record is: {asked!r}"
+        )
+        keeper_rec = os.path.join(TEST_HOME, "fbtodo-pane-keeper.pid")
+        assert os.path.basename(keeper_rec) in asked, (
+            f"the pane watch was pointed at the wrong keeper record: {asked!r} (want {keeper_rec})"
+        )
+        say("the pane watch is asked, with the keeper's record, while it runs: ok")
+
+        # ...and `status` says which of the three states it is in, like the other three.
+        # "Is the pane watcher working" was otherwise only answerable by killing a pane and
+        # waiting to see whether it came back.
+        assert "pane watch        : on" in run("status").stdout, run("status").stdout
+        assert "pane watch        : off" in run("status", "--pane-bell-seconds", "0").stdout, (
+            "--pane-bell-seconds 0 did not turn the pane watch off"
+        )
+        env_no_bell = dict(env, FBTODO_PANE_BELL=os.path.join(TEST_HOME, "nope-bell.py"))
+        gone = subprocess.run(
+            [sys.executable, FB, "status"], capture_output=True, text=True,
+            env=env_no_bell, cwd=CWD, timeout=30,
+        )
+        assert "pane watch        : none installed" in gone.stdout, gone.stdout
+        say("status says whether the pane watch is installed, on, or off: ok")
+
+        # Kill that pane while the session lives. The wrapper cannot put it back — it is
+        # inside the CLI by now — so the watcher does, which is the only process here that
+        # both outlives the pane and follows the instance.
+        def pane_ids() -> list[str]:
+            p = subprocess.run(
+                tmux + ["list-panes", "-t", sess, "-F", "#{pane_id} #{pane_current_command}"],
+                capture_output=True, text=True,
+            )
+            out = []
+            for line in (p.stdout or "").splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1].startswith("Python"):
+                    out.append(parts[0])
+            return out
+
+        def pane_geometry() -> dict:
+            return tmux_geometry(tmux)
+
+        def daemon_diag() -> str:
+            pid_file = os.path.join(TEST_HOME, "fbtodo-daemon.pid")
+            log = os.path.join(TEST_HOME, "fbtodo-daemon.log")
+            bits = []
+            try:
+                with open(pid_file) as fh:
+                    bits.append("pid=" + fh.read().strip()[:140])
+            except OSError as exc:
+                bits.append(f"pid file: {exc.__class__.__name__}")
+            try:
+                with open(log) as fh:
+                    bits.append("log=" + fh.read()[-300:].replace("\n", " | "))
+            except OSError:
+                bits.append("no log")
+            keeper = os.path.join(TEST_HOME, "fbtodo-pane-keeper.pid")
+            try:
+                with open(keeper) as fh:
+                    bits.append("keeper=" + fh.read().strip()[:120])
+            except OSError as exc:
+                bits.append(f"keeper file: {exc.__class__.__name__}")
+            try:
+                with open(keeper) as fh:
+                    recorded = json.load(fh)
+                alived = subprocess.run(
+                    ["ps", "-o", "pid=", "-p", str(recorded.get("pid"))],
+                    capture_output=True, text=True,
+                ).stdout.strip()
+                bits.append(f"keeper alive={bool(alived)} {alived}")
+            except Exception as exc:  # noqa: BLE001 - diagnostics only
+                bits.append(f"keeper alive: {exc.__class__.__name__}")
+            try:
+                with open(os.path.join(TEST_HOME, "fbtodo-pane.log")) as fh:
+                    bits.append("pane log=" + fh.read()[-1500:].replace("\n", " | "))
+            except OSError:
+                bits.append("no pane log")
+            return " ".join(bits)
+
+        first = pane_ids()
+        assert first, f"no todo pane to kill: {pane_cmds()} | {panes_detail()} | {daemon_diag()}"
+        subprocess.run(tmux + ["kill-pane", "-t", first[0]], capture_output=True)
+        deadline = time.time() + 12
+        back: list[str] = []
+        while time.time() < deadline and not back:
+            back = [p for p in pane_ids() if p != first[0]]
+            time.sleep(0.3)
+        assert back, (
+            f"the todo pane was killed and never came back: {pane_cmds()} | {panes_detail()}"
+            f" | {daemon_diag()}"
+        )
+        say("a killed todo pane is put back while the session runs: ok")
+
+        # ...and it comes back in the right PLACE, directly under the pane its own session
+        # is drawn in. Asked for 2026-09-22, after a live window showed the list a column
+        # over and three rows down, under a NAS pane: the wrapper had split a WINDOW, and
+        # tmux answered that with the window's active pane, which is not necessarily the
+        # one running freebuff.
+        import importlib.machinery
+
+        spec_p = importlib.util.spec_from_loader(
+            "fbtodo_panes", importlib.machinery.SourceFileLoader("fbtodo_panes", FB)
+        )
+        panes_mod = importlib.util.module_from_spec(spec_p)
+        spec_p.loader.exec_module(panes_mod)
+        panes_mod.TMUX_BIN = list(tmux)  # the private server, as the keeper has it
+        panes_mod.TASKS_PATH = os.path.join(TEST_HOME, "tasks-unit.json")
+
+        def todo_pane_and_instance() -> tuple:
+            """(pane id, instance pid) of the list pane, read from its own start command."""
+            p = subprocess.run(
+                tmux + ["list-panes", "-t", sess, "-F", "#{pane_id} #{pane_start_command}"],
+                capture_output=True, text=True,
+            )
+            for line in (p.stdout or "").splitlines():
+                parts = line.split(None, 1)
+                if len(parts) != 2:
+                    continue
+                match = re.search(r"--watch-pid\s+(\d+)", parts[1])
+                if match:
+                    return parts[0], int(match.group(1))
+                match = re.search(r"--instance-of\s+(\d+)", parts[1])
+                if match:
+                    inst = panes_mod.descendant_instance(
+                        panes_mod.process_table(), int(match.group(1))
+                    )
+                    if inst:
+                        return parts[0], inst
+            return "", 0
+
+        def placement() -> str:
+            pane_now, inst_now = todo_pane_and_instance()
+            if not pane_now:
+                return "no list pane"
+            inst_now_pane = panes_mod.freebuff_pane_id(inst_now)
+            rects_now = panes_mod.pane_rects()
+            where = (
+                "under"
+                if inst_now_pane
+                and panes_mod.placed_beside(inst_now_pane, pane_now, rects_now, "v")
+                else "NOT under"
+            )
+            return f"{pane_now} {where} {inst_now_pane}: {rects_now}"
+
+        pane, inst = todo_pane_and_instance()
+        assert pane and inst, f"no list pane with an instance: {panes_detail()}"
+        inst_pane = panes_mod.freebuff_pane_id(inst)
+        assert inst_pane, f"the pane the session is drawn in was not found: {placement()}"
+        assert panes_mod.placed_beside(inst_pane, pane, panes_mod.pane_rects(), "v"), (
+            f"the list pane is not under its session's pane: {placement()}"
+        )
+        say("the todo pane sits under the pane its session is drawn in: ok")
+
+        # Drift it for real: a third pane split into the session's own pane pushes the list
+        # a row further down, which is the shape the geometry check has to notice. `sleep`
+        # on purpose — a shell here would inherit this fixture and could start a watcher.
+        drifted = subprocess.run(
+            tmux + ["split-window", "-v", "-l", "4", "-d", "-t", inst_pane, "sleep 60"],
+            capture_output=True,
+        )
+        assert drifted.returncode == 0, f"could not create the drifting pane: {drifted.stderr}"
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if panes_mod.placed_beside(inst_pane, pane, panes_mod.pane_rects(), "v"):
+                break
+            time.sleep(0.3)
+        assert panes_mod.placed_beside(inst_pane, pane, panes_mod.pane_rects(), "v"), (
+            f"the keeper did not put the drifted list pane back under its session: {placement()}"
+        )
+        say("a list pane pushed out of place is moved back under its session: ok")
+
+        # ---- a per-window pin (`fbtodo pin`): the side it opens on and the size it keeps,
+        #      filed by session:index and enforced by the keeper like placement is.
+        #      FBTODO_TMUX is set for these: run() is a child of THIS shell, whose $TMUX is
+        #      the owner's server, and the pin has to land on the private one.
+        env["FBTODO_TMUX"] = f"tmux -L {sock}"
+        # The window's own name, asked of tmux rather than assumed: `base-index` is a user
+        # setting, and the pin is filed under what the window actually is.
+        window_target = subprocess.run(
+            tmux + ["display-message", "-t", sess, "-p", "#{session_name}:#{window_index}"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        assert window_target, panes_detail()
+
+        def pinned_ok(side: str, size: int) -> bool:
+            inst_pane_now = panes_mod.freebuff_pane_id(inst)
+            rects = pane_geometry()
+            a, b = rects.get(inst_pane_now), rects.get(pane)
+            if not a or not b:
+                return False
+            if side == "h":
+                return b[0] == a[0] + a[2] + 1 and b[2] == size
+            return b[1] == a[1] + a[3] + 1 and b[3] == size
+
+        set_pin = run("pin", "--window", window_target, "--side", "h", "--size", "10", "--json")
+        assert set_pin.returncode == 0, (set_pin.returncode, set_pin.stderr)
+        assert json.loads(set_pin.stdout)["pin"] == {"side": "h", "size": 10}, set_pin.stdout
+        deadline = time.time() + 12
+        while time.time() < deadline and not pinned_ok("h", 10):
+            time.sleep(0.3)
+        assert pinned_ok("h", 10), (
+            f"a pinned side/size was not applied to the list pane: {pane_geometry()}"
+            f" pin={set_pin.stdout.strip()!r}"
+        )
+        say("a window pin puts the list pane where it says, at the size it says: ok")
+
+        assert json.loads(run("pin", "--list", "--json").stdout) == {
+            window_target: {"side": "h", "size": 10}
+        }, "pin --list does not show what was pinned"
+        assert run("pin", "--window", window_target, "--clear").returncode == 0
+        assert json.loads(run("pin", "--list", "--json").stdout) == {}, (
+            "--clear dropped the pin but --list still shows one"
+        )
+        assert run("pin", "--side", "sideways").returncode != 0, "a bad --side was accepted"
+        say("pin --list shows the pin, --clear drops it, a bad side is refused: ok")
+
+        # ---- one pin, two roles. A pin written without `--role` is the window's SHARED
+        #      answer; a role's own half outranks it for that role only, which is what lets
+        #      a window holding a session AND a NAS ssh size its two lists differently.
+        #      Asserted against the module's own lookup, not through tmux: it is a rule.
+        panes_mod.PINS_PATH = os.path.join(TEST_HOME, "pins-unit.json")
+        panes_mod.LAST_PATH = os.path.join(TEST_HOME, "last-unit.json")
+        with open(panes_mod.PINS_PATH, "w") as fh:
+            json.dump({window_target: {"side": "h", "size": 10, "nas": {"size": 6}}}, fh)
+        shared = panes_mod.pane_layout(window_target, "local")
+        assert (shared["side"], shared["side_source"]) == ("h", "pin"), shared
+        assert (shared["size"], shared["size_source"]) == (10, "pin"), shared
+        theirs = panes_mod.pane_layout(window_target, "nas")
+        assert (theirs["side"], theirs["side_source"]) == ("h", "pin"), theirs
+        assert (theirs["size"], theirs["size_source"]) == (6, "pin:nas"), theirs
+        say("a pin without a role is shared; a role's own half outranks it for that role: ok")
+
+        # ---- and that role half works through the live path: filed under the role, applied
+        #      to the pane, which has to be moved AND resized by it.
+        scoped = run("pin", "--window", window_target, "--role", "local", "--side", "v",
+                     "--size", "8", "--json")
+        assert scoped.returncode == 0, (scoped.returncode, scoped.stderr)
+        doc = json.loads(scoped.stdout)
+        assert doc["pin"] == {"local": {"side": "v", "size": 8}}, doc
+        assert doc["layouts"]["local"]["side_source"] == "pin:local", doc
+        deadline = time.time() + 12
+        while time.time() < deadline and not pinned_ok("v", 8):
+            time.sleep(0.3)
+        assert pinned_ok("v", 8), (
+            f"a pin filed for one role did not move/resize the pane: {pane_geometry()}"
+            f" pin={scoped.stdout.strip()!r}"
+        )
+        say("a pin for one role is filed under it and moves that pane only: ok")
+
+        # ---- `fbtodo why`: the side and size in force WITH the source that supplied them,
+        #      the pane it is placed against, and whether it is actually there.
+        why = json.loads(run("why", "--json", "--window", window_target).stdout)
+        mine = [rec for rec in why["panes"] if rec["pane"] == pane]
+        assert mine, why
+        mine = mine[0]
+        assert mine["role"] == "local" and mine["window"] == window_target, mine
+        assert mine["side_source"] == "pin:local" and mine["size_source"] == "pin:local", mine
+        assert mine["anchor"] == inst_pane and mine["placed"] is True, mine
+        why_text = run("why", "--window", window_target).stdout
+        assert f"pin ({window_target} local)" in why_text, why_text
+        assert "placed" in why_text and str(mine["size"]) in why_text, why_text
+        say("why names the source that decided each half, and whether the pane is placed: ok")
+        assert run("why", "--window", "nosuch:99").returncode != 0, "a bad --window was accepted"
+        run("pin", "--window", window_target, "--clear")
+        assert json.loads(run("pin", "--list", "--json").stdout) == {}, (
+            "a role's half survived --clear"
+        )
+        say("why refuses a window that does not exist; --clear drops a role's half too: ok")
+        env.pop("FBTODO_TMUX", None)
+
+        # ...and now the session may end (see the release file at `stub`): the keeper has
+        # to notice and take the pane away on its own, FBTODO_PANE_SECONDS=1 apart.
+        with open(release, "w"):
+            pass
+        deadline = time.time() + 20
+        while time.time() < deadline and pane_cmds() and any(
+            c.startswith("Python") for c in pane_cmds()
+        ):
+            time.sleep(0.3)
+        assert not any(c.startswith("Python") for c in pane_cmds()), (
+            f"todo pane outlived the session: {pane_cmds()}"
+        )
+        say("the pane closes when the session ends: ok")
+        subprocess.run(tmux + ["kill-server"], capture_output=True)
+
+    # ---- the `nas` subcommand itself: reachable, and honest when nothing runs
+    #@phase nas-live
+    if shutil.which("tmux"):
+        sock3, sess3 = "fbtchecksockremote", "fbtremote"
+        tmux3 = ["tmux", "-L", sock3]
+        subprocess.run(tmux3 + ["kill-server"], capture_output=True)
+        # ...and this process looks at THAT server too, so the answer cannot depend on
+        # whatever the owner happens to have open (a live NAS pane would break it)
+        env["FBTODO_TMUX"] = f"tmux -L {sock3}"
+        run("nas", "--stop")
+        p = run("nas", "--status", "--json")
+        st = json.loads(p.stdout)
+        assert p.returncode == 0 and st["watcher_pid"] is None, (p.returncode, st)
+        assert st["panes"] == [] and st["state"] == {}, st
+        assert "not running" in run("nas", "--stop").stderr
+        say("nas: the subcommand answers (status / stop / json) instead of a usage error: ok")
+        nas_bin = os.path.join(TEST_HOME, "nas", "bin")
+        os.makedirs(nas_bin, exist_ok=True)
+        with open(os.path.join(nas_bin, "ssh"), "w") as fh:
+            # stands in for the login: long enough to type freebuff inside
+            fh.write("#!/bin/sh\nsleep 60 & wait\n")
+        os.chmod(os.path.join(nas_bin, "ssh"), 0o755)
+        # The fake ssh runs the probe HERE, so its `pgrep` looks at this Mac's process
+        # table — where a stray argv could make a session out of nothing. A shim keeps
+        # liveness a fact about the marker, which is what these checks are about.
+        with open(os.path.join(nas_bin, "pgrep"), "w") as fh:
+            fh.write("#!/bin/sh\nexit 1\n")
+        os.chmod(os.path.join(nas_bin, "pgrep"), 0o755)
+        path3 = os.pathsep.join([nas_bin, shim, saved_path])
+        marker3 = os.path.join(TEST_HOME, "fb-session-3")
+        # The phone notifier this build asks about, as a stub: what is under test here is
+        # that the watcher asks it while a session runs and stops when it goes.
+        notify_log = os.path.join(TEST_HOME, "notify-calls.log")
+        notify_dir = os.path.join(TEST_HOME, ".config", "freebuff-notify")
+        os.makedirs(notify_dir, exist_ok=True)
+        with open(os.path.join(notify_dir, "todo-bell.py"), "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                f'printf "%s\\n" "$*" >> "{notify_log}"\n'
+                "exit 0\n"
+            )
+        os.chmod(os.path.join(notify_dir, "todo-bell.py"), 0o755)
+        # ...and the drop watch it asks when a session STOPS instead of ending. Also a
+        # stub: a real one would push the fixture's death to the owner's phone.
+        drop_log = os.path.join(TEST_HOME, "drop-calls.log")
+        with open(os.path.join(notify_dir, "drop-bell.py"), "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                f'printf "%s\\n" "$*" >> "{drop_log}"\n'
+                "exit 10\n"
+            )
+        os.chmod(os.path.join(notify_dir, "drop-bell.py"), 0o755)
+        # ...and the ask watch, which reads this Mac's PANES — asked on its own clock
+        # while a session runs. A stub for the same reason as the two above, and one that
+        # says "nobody is asking", because a real one here would be scanning the owner's
+        # own tmux server.
+        ask_log = os.path.join(TEST_HOME, "ask-calls.log")
+        with open(os.path.join(notify_dir, "ask-bell.py"), "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                f'printf "%s\\n" "$*" >> "{ask_log}"\n'
+                "echo silent: nobody is asking\n"
+                "exit 0\n"
+            )
+        os.chmod(os.path.join(notify_dir, "ask-bell.py"), 0o755)
+        # ...and the stall watch, which asks the real fbtodo about this session's own
+        # store: also a stub, and one that stays silent.
+        pause_log = os.path.join(TEST_HOME, "pause-calls.log")
+        with open(os.path.join(notify_dir, "pause-bell.py"), "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                f'printf "%s\\n" "$*" >> "{pause_log}"\n'
+                "echo silent: nothing to report\n"
+                "exit 0\n"
+            )
+        os.chmod(os.path.join(notify_dir, "pause-bell.py"), 0o755)
+        # HOME is the real one even here (only the scratch dir is redirected), so the
+        # notifier path has to be pointed at the stub explicitly — otherwise this run
+        # would push the fixture's lists to the owner's phone.
+        env["FBTODO_NOTIFY"] = os.path.join(notify_dir, "todo-bell.py")
+        env["FBTODO_DROP"] = os.path.join(notify_dir, "drop-bell.py")
+        env["FBTODO_ASK"] = os.path.join(notify_dir, "ask-bell.py")
+        env["FBTODO_PAUSE"] = os.path.join(notify_dir, "pause-bell.py")
+        env["FBTODO_NAS"] = fake_ssh
+        env["FBTODO_FB_MARKER"] = marker3
+        created3 = subprocess.run(
+            tmux3
+            + [
+                "new-session", "-d", "-s", sess3, "-x", "100", "-y", "30",
+                "-e", f"FBTODO_HOME={TEST_HOME}",
+                # FBTODO_NAS* point the watcher and its pane at the fixture store, so this
+                # asserts what the pane RENDERS, not what the real NAS happens to hold.
+                "-e", f"FBTODO_NAS={fake_ssh}",
+                "-e", f"FBTODO_NAS_ROOT={store}",
+                "-e", "FBTODO_NAS_PROJECT=demo",
+                "-e", f"FBTODO_FB_MARKER={marker3}",
+                # the private server, or the watcher would split a pane in the owner's
+                "-e", f"FBTODO_TMUX=tmux -L {sock3}",
+                # no .zshrc autostart daemon: it is detached, survives the server being
+                # killed below, and then writes stale lists into the NEXT run's home
+                "-e", "FBTODO_NO_AUTOSTART=1",
+                # poll fast — the shipped default is deliberately gentle
+                "-e", "FBTODO_NAS_POLL=1",
+                "-e", "FBTODO_NAS_POLL_IDLE=1",
+                "-e", "FBTODO_NAS_POLL_LIVE=1",
+                "-e", "FBTODO_NOTIFY_SECONDS=1",
+                "-e", f"FBTODO_NOTIFY={os.path.join(notify_dir, 'todo-bell.py')}",
+                "-e", f"FBTODO_DROP={os.path.join(notify_dir, 'drop-bell.py')}",
+                "-e", f"FBTODO_ASK={os.path.join(notify_dir, 'ask-bell.py')}",
+                "-e", "FBTODO_ASK_SECONDS=1",
+                "-e", f"FBTODO_PAUSE={os.path.join(notify_dir, 'pause-bell.py')}",
+                "-e", "FBTODO_PAUSE_SECONDS=1",
+                # PATH inside zsh, not via -e: tmux's own env handling and .zshrc's
+                # prepends both fight it, and the real ssh would then be used
+                # The fixture's stand-in for whatever function a user wraps a remote login in:
+            # it asks fbtodo for the pane watcher, then execs an ssh. The argv has to LOOK
+            # like an ssh on the process table, because that is what placement anchors on.
+            rf"zsh -i -c 'export PATH={path3}:\$PATH; "
+            rf"remote() {{ fbtodo nas --quiet >/dev/null 2>&1 &!; "
+            rf"exec ssh -t remote@nas.local \"cd / && exec \$SHELL -l\"; }}; remote'",
+            ],
+            capture_output=True,
+        )
+        nas_state = os.path.join(TEST_HOME, "fbtodo-nas-pane.json")
+        NAS_LOG = os.path.join(TEST_HOME, "fbtodo-nas-pane.log")
+
+        def nas_listing() -> str:
+            p = subprocess.run(
+                tmux3 + ["list-panes", "-a", "-F", "#{pane_id} #{pane_start_command}"],
+                capture_output=True, text=True,
+            )
+            return p.stdout if p.returncode == 0 else ""
+
+        def nas_panes() -> list[str]:
+            return [ln.split()[0] for ln in nas_listing().splitlines() if "-s nas" in ln]
+
+        # the wrapper on its own must NOT open one: the pane belongs to the session over there
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            assert not nas_panes(), f"the remote shell opened a pane with no NAS session: {nas_listing()}"
+            time.sleep(0.3)
+        assert json.loads(run("nas", "--status", "--json").stdout)["watcher_pid"], (
+            f"the remote shell did not start the NAS watcher: rc={created3.returncode} "
+            f"err={created3.stderr.strip()!r}"
+        )
+        say("a remote shell carries you over and starts the watcher, without opening a pane: ok")
+
+        # the liveness probe asked about the NAS and counted ITSELF as a match, so a NAS
+        # with no session read as live forever. This is the lie that decided the pane.
+        stt = {}
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            try:
+                stt = json.load(open(nas_state))
+            except (OSError, ValueError):
+                stt = {}
+            if stt.get("polls"):
+                break
+            time.sleep(0.3)
+        assert stt.get("alive") is False, stt
+        say("nas: no session, no marker reads idle — the probe cannot match itself: ok")
+
+        def nas_diag() -> str:
+            st = json.load(open(nas_state)) if os.path.exists(nas_state) else {}
+            try:
+                os.kill(st.get("watcher_pid") or 0, 0)
+                alive = True
+            except Exception:
+                alive = False
+            log = open(NAS_LOG).read()[-400:] if os.path.exists(NAS_LOG) else ""
+            return f"watcher_alive={alive} state={st} panes={nas_listing()!r} log={log!r}"
+
+        # `fb` starts over there -> the pane appears here, showing THAT session's list.
+        # A fresh fixture session, because the newest one is what the pane must surface
+        # (and the earlier checks deliberately left a readable-and-newest one behind).
+        write_session(
+            "2026-01-01T00-00-09.000Z",
+            [tool("write_todos", [{"task": "pane check", "completed": False}])],
+            1,
+        )
+        # Where the list belongs: the pane the session's ssh runs in. The fixture's ssh
+        # is in the session's own pane, and a DECOY pane is split into it and made active
+        # first — which is exactly the shape that used to misplace a pane, because a window
+        # target makes tmux split whichever pane is active in it.
+        def pane_geometry() -> dict:
+            return tmux_geometry(tmux3)
+
+        def directly_below(upper: str, lower: str) -> bool:
+            """The rule fbtodo places by, restated from raw tmux geometry."""
+            rects = pane_geometry()
+            a, b = rects.get(upper), rects.get(lower)
+            if not a or not b:
+                return False
+            return b[0] == a[0] and b[2] == a[2] and b[1] == a[1] + a[3] + 1
+
+        ssh_pane = subprocess.run(
+            tmux3 + ["list-panes", "-t", sess3, "-F", "#{pane_id}"],
+            capture_output=True, text=True,
+        ).stdout.split()
+        assert ssh_pane, nas_diag()
+        ssh_pane = ssh_pane[0]
+        decoy = subprocess.run(
+            tmux3 + ["split-window", "-v", "-l", "4", "-d", "-P", "-F", "#{pane_id}",
+                     "-t", ssh_pane, "sleep 120"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        assert decoy, nas_diag()
+        subprocess.run(tmux3 + ["select-pane", "-t", decoy], capture_output=True)
+
+        fb_proc = spawn_quiet("sleep", "60")
+        with open(marker3, "w") as fh:
+            fh.write(f"{fb_proc.pid} 2026-01-01T00:00:00Z {store}/demo\n")
+        shot, shots = None, []
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            opened = nas_panes()
+            if opened:
+                frame = subprocess.run(
+                    tmux3 + ["capture-pane", "-p", "-t", opened[0]], capture_output=True, text=True
+                )
+                shots.append((opened[0], frame.returncode, len(frame.stdout),
+                              frame.stderr.strip()[:60], STRIP(frame.stdout)[:60]))
+                if "pane check" in STRIP(frame.stdout):
+                    shot = frame
+                    break
+            time.sleep(0.3)
+        assert shot, (
+            "a NAS session starting did not open a pane with its list: " + nas_diag()
+            + f" frames={shots[-4:]!r}"
+        )
+        say("nas: `fb` starting opens the pane, showing that session's own list: ok")
+
+        # ...and it opens UNDER the pane that session runs in, not under the pane that
+        # happened to be active (the decoy), which is what a window target would have done.
+        assert directly_below(ssh_pane, opened[0]), (
+            f"the NAS pane did not open under the pane its ssh runs in: {pane_geometry()}"
+            f"  ssh={ssh_pane} decoy={decoy}"
+        )
+        say("nas: the pane opens under the session's own pane, not the active one: ok")
+
+        # ...and it is put back there when it drifts: a third pane split into the ssh
+        # pushes the list a row down, the shape the placement pass has to notice.
+        subprocess.run(
+            tmux3 + ["split-window", "-v", "-l", "3", "-d", "-t", ssh_pane, "sleep 60"],
+            capture_output=True,
+        )
+        deadline = time.time() + 15
+        while time.time() < deadline and not directly_below(ssh_pane, opened[0]):
+            time.sleep(0.3)
+        assert directly_below(ssh_pane, opened[0]), (
+            f"the drifted NAS pane was not moved back under its ssh: {pane_geometry()}"
+        )
+        say("nas: a NAS pane that drifted is moved back under its ssh: ok")
+
+        # `nas --status` names the pane it placed against, so a wrong one is visible
+        status_text = run("nas", "--status").stdout
+        assert "ssh pane" in status_text and ssh_pane in status_text.split("ssh pane", 1)[1], (
+            status_text
+        )
+        say("nas: --status names the ssh pane the list is placed against: ok")
+
+        # ---- the NAS pane gets the same pin support, filed per window AND per role: this
+        #      window holds the ssh, and a pin for `nas` is that pane's own answer.
+        nas_window = subprocess.run(
+            tmux3 + ["display-message", "-t", sess3, "-p", "#{session_name}:#{window_index}"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        assert nas_window, nas_diag()
+        nas_pin = run("pin", "--window", nas_window, "--role", "nas", "--size", "7", "--json")
+        assert nas_pin.returncode == 0, (nas_pin.returncode, nas_pin.stderr)
+        assert json.loads(nas_pin.stdout)["pin"] == {"nas": {"size": 7}}, nas_pin.stdout
+        deadline = time.time() + 15
+        while time.time() < deadline and pane_geometry().get(opened[0], [0, 0, 0, 0])[3] != 7:
+            time.sleep(0.3)
+        assert pane_geometry().get(opened[0], [0, 0, 0, 0])[3] == 7, (
+            f"a pin for the nas role did not hold the NAS pane at that size: {pane_geometry()}"
+            + nas_diag()
+        )
+        assert directly_below(ssh_pane, opened[0]), (
+            f"resizing the NAS pane to its pinned size moved it off the ssh: {pane_geometry()}"
+        )
+        say("nas: a pin for the nas role holds the NAS pane at that size, still under its ssh: ok")
+
+        nas_why = json.loads(run("why", "--json", "--window", nas_window).stdout)["panes"]
+        mine = [rec for rec in nas_why if rec["pane"] == opened[0]]
+        assert mine, nas_why
+        mine = mine[0]
+        assert mine["role"] == "nas" and mine["size_source"] == "pin:nas", mine
+        assert mine["size"] == 7 and mine["anchor"] == ssh_pane, mine
+        assert mine["placed"] is True, mine
+        assert mine["anchor_note"], mine
+        say("nas: why says which ssh the NAS pane is placed against, and its pinned size: ok")
+        run("pin", "--window", nas_window, "--clear")
+        assert json.loads(run("pin", "--list", "--json").stdout) == {}, "the NAS pin survived --clear"
+        say("nas: the NAS pin clears like the local one: ok")
+
+        # the phone notifier is asked on its own clock while a session is live: the push
+        # must not depend on the pane being open, which is the whole point of it.
+        def notify_calls() -> int:
+            try:
+                with open(notify_log) as handle:
+                    return len([ln for ln in handle if ln.strip()])
+            except OSError:
+                return 0
+
+        deadline = time.time() + 15
+        while time.time() < deadline and notify_calls() < 1:
+            time.sleep(0.3)
+        assert notify_calls() >= 1, (
+            "the watcher never asked the phone notifier while a session was live: " + nas_diag()
+        )
+        say("nas: the phone notifier is asked while the session runs: ok")
+
+        # The ask watch is asked on its own clock too, and for a different question: a
+        # question on screen stops the session, wherever the pane is being drawn.
+        def ask_calls() -> int:
+            try:
+                with open(ask_log) as handle:
+                    return len([ln for ln in handle if ln.strip()])
+            except OSError:
+                return 0
+
+        deadline = time.time() + 15
+        while time.time() < deadline and ask_calls() < 1:
+            time.sleep(0.3)
+        assert ask_calls() >= 1, (
+            "the watcher never asked the ask watch while a session was live: " + nas_diag()
+        )
+        say("nas: the ask watch is asked while the session runs: ok")
+
+        kill_tree(fb_proc)
+        deadline = time.time() + 30
+        while time.time() < deadline and nas_panes():
+            time.sleep(0.3)
+        assert not nas_panes(), f"the pane outlived the NAS session: {nas_listing()}"
+        say("nas: the pane goes when the session goes (and no ssh close was involved): ok")
+
+        # A session that STOPS is not a session that ended: the fixture's pid was killed, so
+        # nothing removed the marker and it is still there with a dead pid — the witness the
+        # drop watch is asked about, ONCE, after a second pass agrees the death is real.
+        def drop_calls() -> list[str]:
+            try:
+                with open(drop_log) as handle:
+                    return [ln.strip() for ln in handle if ln.strip()]
+            except OSError:
+                return []
+
+        deadline = time.time() + 15
+        while time.time() < deadline and not drop_calls():
+            time.sleep(0.3)
+        assert drop_calls(), (
+            "the watcher never asked the drop watch after the session stopped: " + nas_diag()
+        )
+        assert "--fb 0" in drop_calls()[0] and "--live 0" in drop_calls()[0], (
+            f"the drop was described with the wrong witness: {drop_calls()}"
+        )
+        time.sleep(2)
+        assert len(drop_calls()) == 1, f"one death was asked about more than once: {drop_calls()}"
+        say("nas: a session that stops (not ends) is asked about once, with its marker: ok")
+
+        # ...and it stops being asked once the session goes: a finished session must not
+        # keep paying an ssh every interval for a list nobody is producing.
+        quiet_at, ask_at = notify_calls(), ask_calls()
+        time.sleep(4)
+        assert notify_calls() == quiet_at, (
+            f"the notifier was still asked after the session went: "
+            f"{notify_calls()} calls vs {quiet_at}"
+        )
+        assert ask_calls() == ask_at, (
+            f"the ask watch was still asked after the session went: "
+            f"{ask_calls()} calls vs {ask_at}"
+        )
+        say("nas: and not after it — a gone session stops asking: ok")
+
+        run("nas", "--stop")
+        assert json.loads(run("nas", "--status", "--json").stdout)["watcher_pid"] is None
+        say("nas: the watcher stops on request and leaves no lock behind: ok")
+        subprocess.run(tmux3 + ["kill-server"], capture_output=True)
+        for k in ("FBTODO_NAS", "FBTODO_FB_MARKER", "FBTODO_TMUX", "FBTODO_NOTIFY", "FBTODO_DROP", "FBTODO_ASK", "FBTODO_PAUSE", "FBTODO_PANE_BELL", "FBTODO_PANE_BELL_SECONDS"):
+            env.pop(k, None)
+
+    # ---- the liveness pattern: it must match a real session and never its own probe.
+    #      `pgrep -f` saw the probe's own script line, which carried the pattern, so a NAS
+    #      with no session at all read as live — and the pane never closed.
+    import importlib.machinery as _im
+    import importlib.util as _iu
+
+    # `fbtodo` has no .py extension, so it needs a loader named explicitly
+    _loader = _im.SourceFileLoader("fbtodo_mod", FB)
+    _mod = _iu.module_from_spec(_iu.spec_from_loader("fbtodo_mod", _loader))
+    _loader.exec_module(_mod)
+    pat = _mod.nas_pgrep("manicode/freebuff")
+    assert not re.search(pat, f"sh -c \"pgrep -f {pat} >/dev/null && echo 1\""), pat
+    assert re.search(pat, "node /root/.config/manicode/freebuff/index.js"), pat
+    say("nas: the liveness pattern matches a real session and never its own probe: ok")
+
+
+
+    print(f"\n{len(ok)} checks passed")
+finally:
+    # stop any watcher this script started (never leave one behind following the
+    # user's real freebuff process), then delete only our own directory
+    try:
+        subprocess.run(
+            [sys.executable, FB, "stop", "--quiet"], env=env, cwd=CWD, timeout=15,
+            capture_output=True,
+        )
+    except Exception:
+        pass
+    subprocess.run(["tmux", "-L", "fbtchecksock", "kill-server"], capture_output=True)
+    subprocess.run(["tmux", "-L", "fbtchecksockremote", "kill-server"], capture_output=True)
+    subprocess.run(["tmux", "-L", "fbtchecksockwait", "kill-server"], capture_output=True)
+    # the NAS watcher is detached and outlives this script's tmux panes: it is killed by
+    # its own lock, which is also the only handle on it
+    try:
+        with open(os.path.join(TEST_HOME, "fbtodo-nas-pane.pid")) as fh:
+            os.kill(int(json.load(fh)["pid"]), signal.SIGTERM)
+    except Exception:
+        pass
+    if os.path.realpath(TEST_HOME).startswith(os.path.realpath(REAL_HOME) + os.sep):
+        shutil.rmtree(TEST_HOME, ignore_errors=True)

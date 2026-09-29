@@ -1,0 +1,20 @@
+# Runtime state — the tree should stay source-only.
+__pycache__/
+*.pyc
+*.pyo
+
+# fbtodo's scratch dir, if FBTODO_HOME is pointed inside the repo
+.freebuff/
+fbtodo-*.json
+fbtodo-*.pid
+fbtodo-*.log
+
+# The notifier kit's state and config
+notify/phone.conf
+notify/*.state
+notify/*.state.lock
+notify/*.log
+
+# Editor / OS noise
+.DS_Store
+*.swp

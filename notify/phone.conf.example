@@ -1,0 +1,26 @@
+# Where the freebuff notifications go — copy to phone.conf (chmod 600) and edit.
+#
+# `phone.sh --init` writes this file for you, with a freshly generated topic and,
+# on a Mac signed into iMessage, your own handle as the target. This example is
+# the same file with the values left as placeholders.
+#
+# Shell syntax: it is sourced by phone.sh, so no spaces around `=` and quote
+# anything with a space in it.
+
+# auto = iMessage first, ntfy when Messages cannot send.
+# both = send down both pipes every time (belt and braces).
+# imessage | ntfy = one transport, and a config error if it is not configured.
+FREEBUFF_PHONE_TRANSPORT=auto
+
+# The iMessage target. Your own handle means a note-to-self thread, which every
+# device already notifies about. Only used by the imessage/both transports.
+# IMESSAGE_TO=you@icloud.com
+
+# ntfy, the fallback: subscribe to this topic in the ntfy app (iOS/Android).
+# The topic IS the secret — anyone who knows it can read the pushes, so let
+# `phone.sh --init` generate one instead of typing a guessable word.
+NTFY_URL=https://ntfy.sh
+NTFY_TOPIC=freebuff-0123456789abcdef
+
+# Only for a self-hosted ntfy with access control.
+# NTFY_TOKEN=tk_...
