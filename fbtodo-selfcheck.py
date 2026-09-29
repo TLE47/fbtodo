@@ -511,6 +511,44 @@ try:
     assert not [n for n in os.listdir(TEST_HOME) if n.startswith(".fbtodo.")], "temp left"
     say("atomic writes: a no-flush write is still atomic and leaves nothing behind: ok")
 
+    # ---- the journal scan is remembered by the file's identity, size and mtime. The watcher
+    #      asks once a second while the agent iterates every few seconds, so most polls are
+    #      the same question; the cache must never answer a DIFFERENT one, and must never hand
+    #      out the dict it is holding.
+    scan_dir = os.path.join(TEST_HOME, "scan-cache")
+    shutil.rmtree(scan_dir, ignore_errors=True)
+    os.makedirs(scan_dir)
+    scan_log = os.path.join(scan_dir, "log.jsonl")
+
+    def scan_line(iteration: int, task: str) -> str:
+        return json.dumps({
+            "level": "DEBUG",
+            "timestamp": f"2026-01-01T00:00:{iteration:02d}.000Z",
+            "data": {"iteration": iteration, "prompt": "do the thing", "toolCalls": [
+                {"toolName": "write_todos", "input": {"todos": [
+                    {"task": task, "completed": False}]}}]},
+        }) + "\n"
+
+    with open(scan_log, "w") as fh:
+        fh.write(scan_line(1, "one"))
+    first = module.scan_live_log(scan_dir)
+    assert "one" in json.dumps(first.get("hit")), first
+    hits = module._SCAN_HITS[0]
+    again = module.scan_live_log(scan_dir)
+    assert module._SCAN_HITS[0] == hits + 1, "an unchanged journal was re-walked"
+    assert again == first, (again, first)
+    # the caller decorates what it gets: a mutation of the answer must not reach the cache
+    again["observed"].append({"verb": "x", "what": "y", "ts_ms": 0})
+    assert not module.scan_live_log(scan_dir)["observed"], "the cache handed out its own dict"
+    # ...and a journal that HAS changed is not answered from it
+    before = module._SCAN_HITS[0]
+    with open(scan_log, "a") as fh:
+        fh.write(scan_line(2, "two"))
+    moved = module.scan_live_log(scan_dir)
+    assert "two" in json.dumps(moved.get("hit")), moved
+    assert module._SCAN_HITS[0] == before, "a changed journal was answered from the cache"
+    say("journal scan: the same question is answered once, and a changed journal is not: ok")
+
     # ---- the claim is a REAL one: the kernel holds it. A record naming a live process
     #      that never took it (a leftover from a crash, or a pid that came round again) is
     #      not a watcher, and a bystander cannot give away a live watcher's claim by
