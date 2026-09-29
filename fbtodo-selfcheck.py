@@ -93,6 +93,19 @@ def run(*args, timeout=30, check=False):
     return p
 
 
+def put_tasklog(mod, log):
+    """Install a task log by hand: the memo AND an empty stream beside it.
+
+    The JSON beside the stream is a memo of it, and the stream is the one that is believed,
+    so writing the memo alone would leave the previous test's events to be folded back into
+    the records on the next read. A hand-installed log has no past, on purpose.
+    """
+    stream = mod.events_path()
+    if os.path.exists(stream):
+        os.unlink(stream)
+    mod.atomic_write_json(mod.TASKS_PATH, log)
+
+
 def say(msg):
     """Report a passing check, and — with FBTODO_SELFCHECK_TIME=1 — what it cost.
 
@@ -548,6 +561,95 @@ try:
     assert "two" in json.dumps(moved.get("hit")), moved
     assert module._SCAN_HITS[0] == before, "a changed journal was answered from the cache"
     say("journal scan: the same question is answered once, and a changed journal is not: ok")
+
+    # ---- a journal that only GREW is folded from its cursor instead of being walked again.
+    #      The chunks of an append-only file never change once they are full, so the cursor
+    #      is the end of the last full chunk the walk read: what is re-parsed is the bytes
+    #      after it — one chunk per poll — not the window. The bytes are CHECKED, not
+    #      trusted, so a journal rewritten in place and grown past the old size is not
+    #      answered from what the cursor remembered.
+    saved_chunk = module.CHUNK
+    module.CHUNK = 4096  # so a fixture a few KiB long spans the several chunks a fold needs
+    try:
+        grow_dir = os.path.join(TEST_HOME, "scan-grow")
+        shutil.rmtree(grow_dir, ignore_errors=True)
+        os.makedirs(grow_dir)
+        grow_log = os.path.join(grow_dir, "log.jsonl")
+        pad = "x" * 200
+
+        def grow_line(n, task=None, prompt=None):
+            data = {"iteration": n, "filler": pad}
+            if prompt:
+                data["prompt"] = prompt
+            if task:
+                data["toolCalls"] = [{"toolName": "write_todos", "input": {"todos": [
+                    {"task": task, "completed": False}]}}]
+            return json.dumps({
+                "level": "DEBUG",
+                "timestamp": f"2026-01-01T00:{n // 60:02d}:{n % 60:02d}.000Z",
+                "data": data}) + "\n"
+
+        with open(grow_log, "w") as fh:
+            for n in range(120):
+                fh.write(grow_line(n))
+            # the list, then prose after it: the walk has to look BACK for the hit, which is
+            # what makes a cold scan read several chunks rather than one
+            fh.write(grow_line(200, task="one", prompt="do the thing"))
+            for n in range(201, 261):
+                fh.write(grow_line(n))
+        size0 = os.path.getsize(grow_log)
+        assert size0 > 8 * module.CHUNK, size0
+        module._SCAN_CACHE.clear()
+        module._SCAN_PARSED[0] = 0
+        module._SCAN_REUSED[0] = 0
+        cold = module.scan_live_log(grow_dir)
+        cold_parsed = module._SCAN_PARSED[0]
+        assert "one" in json.dumps(cold.get("hit")), cold
+        assert cold_parsed >= 4 * module.CHUNK, cold_parsed
+        assert module._SCAN_REUSED[0] == 0, "a cold walk answered itself from a cache"
+        # the journal only grows: one poll's worth of prose arrives
+        with open(grow_log, "a") as fh:
+            fh.write(grow_line(300))
+            fh.write(grow_line(301))
+        module._SCAN_PARSED[0] = 0
+        module._SCAN_REUSED[0] = 0
+        grown = module.scan_live_log(grow_dir)
+        grown_parsed = module._SCAN_PARSED[0]
+        assert "one" in json.dumps(grown["hit"]), grown
+        assert module._SCAN_REUSED[0] >= 2, (
+            f"a grown journal re-walked instead of folding from its cursor: {grown_parsed} bytes")
+        assert grown_parsed * 3 < cold_parsed, (grown_parsed, cold_parsed)
+        # ...and the fold says exactly what walking the whole thing says
+        module._SCAN_CACHE.clear()
+        assert grown == module.scan_live_log(grow_dir), "the folded answer is not the walked one"
+        # rewritten in place and grown past the old size: the bytes behind the cursor are
+        # checked, so the list that changed inside them is not answered from the old parse
+        body = open(grow_log, "rb").read()
+        with open(grow_log, "wb") as fh:
+            fh.write(body.replace(b'"task": "one"', b'"task": "ONE"'))
+            fh.write(grow_line(400).encode("utf-8"))
+        rewritten = module.scan_live_log(grow_dir)
+        module._SCAN_CACHE.clear()
+        assert rewritten == module.scan_live_log(grow_dir), "a rewritten journal was folded stale"
+        assert "ONE" in json.dumps(rewritten["hit"]), rewritten
+        # truncated in place: shorter than the cursor, so it is walked from scratch
+        with open(grow_log, "wb") as fh:
+            fh.write(body[: max(1, len(body) // 3)])
+        cut = module.scan_live_log(grow_dir)
+        module._SCAN_CACHE.clear()
+        assert cut == module.scan_live_log(grow_dir), "a truncated journal was folded"
+        # rotated onto the same path: a new inode, so nothing of the old walk applies
+        with open(grow_log + ".new", "w") as fh:
+            fh.write(grow_line(1, task="rotated", prompt="rotate me") * 40)
+        os.replace(grow_log + ".new", grow_log)
+        rot = module.scan_live_log(grow_dir)
+        module._SCAN_CACHE.clear()
+        assert rot == module.scan_live_log(grow_dir), "a rotated journal was folded"
+        assert "rotated" in json.dumps(rot.get("hit")), rot
+        say("journal cursor: a grown journal is folded, a rewritten one is not: ok")
+    finally:
+        module.CHUNK = saved_chunk
+        shutil.rmtree(os.path.join(TEST_HOME, "scan-grow"), ignore_errors=True)
 
     # ---- the claim is a REAL one: the kernel holds it. A record naming a live process
     #      that never took it (a leftover from a crash, or a pid that came round again) is
@@ -2805,7 +2907,7 @@ try:
         "fc": {"at": t0, "v": "0", "pace": 60_000}}
     keep["tasks"][mod.task_key("KEEP", "gone and unfinished")] = {
         "started_ms": t0, "model": "m/e"}
-    mod.atomic_write_json(mod.TASKS_PATH, keep)
+    put_tasklog(mod, keep)
     mod.track_tasks(
         {"session": "KEEP", "todos": [{"task": "now", "completed": False}]},
         now_ms=t0 + 120_000)
@@ -2909,10 +3011,9 @@ try:
     # a log written before the (session, task) change still resolves its records
     flat = os.path.join(TEST_HOME, "tasks-flat.json")
     mod.TASKS_PATH = flat
-    json.dump(
-        {"schema": 1, "session": "S", "tasks": {"a": {"started_ms": t0, "done_ms": t0 + 5000}}},
-        open(flat, "w"),
-    )
+    put_tasklog(mod, {
+        "schema": 1, "session": "S", "tasks": {"a": {"started_ms": t0, "done_ms": t0 + 5000}},
+    })
     legacy = mod.track_tasks(dict(S, todos=[{"task": "a", "completed": True}]), now_ms=t0 + 60_000)
     assert legacy["task_times"]["a"]["elapsed_ms"] == 5000, "an upgrade threw the clocks away"
     assert mod.task_key(None, "a") != mod.task_key("S", "a"), "records are not session-scoped"
@@ -2995,7 +3096,7 @@ try:
         e_log["tasks"][mod.task_key("SEED", f"seed {n}")] = {
             "started_ms": t0, "done_ms": t0 + span, "model": "m/e", "shape": {"edited": 16},
         }
-    mod.atomic_write_json(mod.TASKS_PATH, e_log)
+    put_tasklog(mod, e_log)
     e_state = mod.track_tasks(
         dict(E, todos=[{"task": "e-one", "completed": False}], **hturn({"edited": 17}, t0)),
         now_ms=t0 + 300_000)
@@ -3062,7 +3163,7 @@ try:
     # rung happens to read elapsed with the answer's own clock. Recorded, flagged, left out.
     late_log = mod.load_tasklog()
     late_log["tasks"][mod.task_key("E", "late-one")] = {"started_ms": t0, "model": "m/e"}
-    mod.atomic_write_json(mod.TASKS_PATH, late_log)
+    put_tasklog(mod, late_log)
     mod.track_tasks(
         dict(E, todos=[{"task": "late-one", "completed": False}], **hturn({"edited": 5}, t0)),
         now_ms=t0 + 300_000)
@@ -3409,7 +3510,7 @@ try:
                 "c": {"started_ms": now - 1000, "done_ms": None},
             },
         }
-        mp.atomic_write_json(mp.TASKS_PATH, log)
+        put_tasklog(mp, log)
 
         rep = mp.prune_scratch(force=True)
         assert rep["records_removed"] == 2, rep
@@ -3443,6 +3544,88 @@ try:
         assert json.loads(out)["scratch"].startswith(TEST_HOME), out
         assert "task records" in run("status").stdout
         say("prune subcommand and status footprint line: ok")
+
+        # ---- the task log is an append-only event stream, and the JSON beside it is a memo
+        #      of that stream. A poll appends the records it CHANGED rather than rewriting
+        #      every record it did not, and a crash between the two costs a re-read of the
+        #      bytes after the memo's own cursor — never a step.
+        view_path = mp.TASKS_PATH
+        ev_path = mp.events_path()
+        assert ev_path == view_path + "l", ev_path
+        for p in (ev_path, view_path):
+            if os.path.exists(p):
+                os.unlink(p)
+        evt0 = int(time.time() * 1000)
+
+        def ev_poll(tasks, at_ms, session="EV"):
+            return mp.track_tasks(
+                {"session": session,
+                 "todos": [{"task": t, "completed": c} for t, c in tasks]},
+                now_ms=at_ms)
+
+        ev_poll([("one", False), ("two", False)], evt0)
+        with open(ev_path, "rb") as fh:
+            stream = fh.read()
+        events = [json.loads(ln) for ln in stream.splitlines() if ln.strip()]
+        assert events, "a new task record was not written as an event"
+        keys = {e.get("k") for e in events}
+        assert mp.task_key("EV", "one") in keys and mp.task_key("EV", "two") in keys, events
+        view = json.load(open(view_path))
+        assert int(view["events"]["off"]) == len(stream), view.get("events")
+        # the memo does not lie: folding the stream from scratch gives the same records
+        folded = mp.fold_task_events({"schema": mp.TASKLOG_SCHEMA, "session": None, "tasks": {}})
+        assert folded["tasks"] == view["tasks"], (folded["tasks"], view["tasks"])
+        # a poll that changed nothing appends nothing and rewrites nothing
+        ev_poll([("one", False), ("two", False)], evt0 + 1000)
+        with open(ev_path, "rb") as fh:
+            assert fh.read() == stream, "a no-op poll touched the stream"
+        # ...and a poll that DID change something appends to it, prefix intact
+        ev_poll([("one", True), ("two", False)], evt0 + 5000)
+        with open(ev_path, "rb") as fh:
+            grown = fh.read()
+        assert grown.startswith(stream) and len(grown) > len(stream), "the stream was rewritten"
+        # ONE event per record the poll touched — two steps moved, so two events: the second
+        # step's clock started when the first was ticked, which is a change to its record
+        one, two = mp.task_key("EV", "one"), mp.task_key("EV", "two")
+        added = [json.loads(ln) for ln in grown[len(stream):].splitlines() if ln.strip()]
+        assert added, "a change was not appended as an event"
+        for row in added:
+            assert set(row) & {"k", "session", "drop", "pruned_ms"}, row
+            assert row.get("k", one) in (one, two), row
+        assert any(row.get("k") == one and row.get("r", {}).get("done_ms") for row in added), added
+        # the crash window: an event that landed while the memo did not is not lost
+        mp.append_task_events([{"v": mp.TASKLOG_SCHEMA, "k": one,
+                                "r": {"started_ms": evt0, "done_ms": evt0 + 4242,
+                                      "model": "m/e"}}])
+        assert mp.load_tasklog()["tasks"][one]["done_ms"] == evt0 + 4242, (
+            "an event that landed after the memo was thrown away")
+        # retention applies to the stream too: a prune folds it down to the records it kept
+        before = os.path.getsize(ev_path)
+        mp.prune_scratch(force=True)
+        kept = mp.load_tasklog()["tasks"]
+        assert os.path.getsize(ev_path) < before, "prune did not compact the event stream"
+        assert mp.load_tasklog()["tasks"] == kept, "compaction changed the records"
+        assert json.load(open(view_path))["tasks"] == kept, "the memo and the stream disagree"
+        # a drop is an event too: a step that leaves the list with no span to keep goes
+        ev_poll([("two", True), ("three", False)], evt0 + 9000)
+        ev_poll([("two", True)], evt0 + 10_000)
+        three = mp.task_key("EV", "three")
+        rows = [json.loads(ln) for ln in open(ev_path, "rb").read().splitlines() if ln.strip()]
+        assert any(three in (r.get("drop") or []) for r in rows), rows
+        assert three not in mp.load_tasklog()["tasks"], "a dropped record came back"
+        # a torn tail — a crash mid-append — is not read as a record, and does not hide the
+        # whole lines before it. This is the last check on the file because the half line
+        # stays where it is: the stream is appended to and never rewritten.
+        intact = mp.load_tasklog()["tasks"]
+        with open(ev_path, "ab") as fh:
+            fh.write(b'{"v":2,"k":"torn","r":{"started_ms":1')
+        after = mp.load_tasklog()
+        assert "torn" not in after["tasks"], "a half-written event was folded"
+        assert after["tasks"] == intact, "a torn tail hid the events before it"
+        for p in (ev_path, view_path):
+            if os.path.exists(p):
+                os.unlink(p)
+        say("task events: appended per change, folded from a cursor, torn tail ignored: ok")
     finally:
         if saved_home is None:
             os.environ.pop("FBTODO_HOME", None)
