@@ -185,6 +185,7 @@ SPREAD_HI_PCT = 90              # ...and its high end
 # the resampled share has to be before the gap is called rather than reported.
 DUEL_RESAMPLES = 4_000          # session-level bootstrap draws
 DUEL_RESOLVED = 0.95            # share of draws one side must take to be the winner
+DUEL_MIN_SESSIONS = 4           # below this there is nothing to resample: every draw is the sample
 
 
 def step_spans_ms(times: dict, todos: list, now_ms: int) -> list[int]:
@@ -830,9 +831,10 @@ def rung_duel(
 
     `share_steps` is the raw share of paired steps `a` won; `share_resamples` is the share of
     bootstrap draws it won, and that is the number that decides. `winner` is None unless the
-    draws are lopsided past `DUEL_RESOLVED`, which is the whole point: a duel that does not
-    resolve says the log is too small, rather than crowning the rung that leads today. A
-    rung with nothing to score it against is not a winner by default — no pairing, no verdict.
+    draws are lopsided past `DUEL_RESOLVED` over at least `DUEL_MIN_SESSIONS` sessions, which
+    is the whole point: a duel that does not resolve says the log is too small, rather than
+    crowning the rung that leads today. A rung with nothing to score it against is not a
+    winner by default — no pairing, no verdict.
 
     The draws are seeded from the two rung names and the sample shape, so the same log
     reports the same verdict twice in a row (`--twice` and the goldens depend on it) without
@@ -868,11 +870,15 @@ def rung_duel(
         if took * 2 >= drew:  # a draw won by a half or better goes to `a`
             wins += 1
     share_resamples = wins / resamples
+    # A bootstrap over ONE session cannot resample anything: every draw is the sample it
+    # started from, so the share comes back at 1.0 and would crown whichever rung happened to
+    # lead in that one session. Below the floor the duel reports the sample instead.
     winner = None
-    if share_resamples >= DUEL_RESOLVED:
-        winner = a
-    elif share_resamples <= 1 - DUEL_RESOLVED:
-        winner = b
+    if len(sessions) >= DUEL_MIN_SESSIONS:
+        if share_resamples >= DUEL_RESOLVED:
+            winner = a
+        elif share_resamples <= 1 - DUEL_RESOLVED:
+            winner = b
     return {
         "steps": steps,
         "sessions": len(sessions),
@@ -881,6 +887,29 @@ def rung_duel(
         "winner": winner,
         "resamples": resamples,
     }
+
+
+def duel_note(a: str, b: str, verdict: dict) -> str:
+    """One duel's verdict in words — who won, how lopsided the draws were, on what sample.
+
+    The share printed is the WINNER's, not `a`'s: a pair read right-to-left should not turn
+    a 0.03 into a 0.03-in-favour-of-the-other-one. An unresolved duel says so and keeps the
+    numbers, because "these two are equivalent" and "this log cannot tell them apart" are
+    different claims and only the second one is true of a small sample.
+    """
+    steps = verdict.get("steps") or 0
+    sessions = verdict.get("sessions") or 0
+    resamples = verdict.get("resamples") or 0
+    share = verdict.get("share_resamples") or 0.0
+    where = f"{steps} step(s) in {sessions} session(s)"
+    if sessions < DUEL_MIN_SESSIONS:
+        return f"{a} vs {b} — unresolved, {where}, needs {DUEL_MIN_SESSIONS} session(s)"
+    winner = verdict.get("winner")
+    if winner:
+        loser = b if winner == a else a
+        won = share if winner == a else 1 - share
+        return f"{winner} beats {loser} — {won:.2f} of {resamples:,} draws over {where}"
+    return f"{a} vs {b} — unresolved, {share:.2f} of {resamples:,} draws over {where}"
 
 
 def refit_readiness(
@@ -1633,7 +1662,8 @@ __all__ = [
     "step_pace_ms", "estimate_for", "pick_estimate", "task_estimate_ms", "_spread_ms",
     "fmt_range", "is_wide", "fmt_estimate_spread", "pace_spread_ms", "entry_spread",
     "forecast_error", "rung_duel", "DUEL_RESAMPLES", "DUEL_RESOLVED", "rank_quantile",
-    "SPREAD_LO_PCT", "SPREAD_HI_PCT", "refit_readiness", "estimate_error", "estimate_spread_ms",
+    "SPREAD_LO_PCT", "SPREAD_HI_PCT", "DUEL_MIN_SESSIONS", "duel_note", "refit_readiness",
+    "estimate_error", "estimate_spread_ms",
     "remaining_estimate_ms", "elapsed_total_ms", "total_estimate_ms", "run_variance_ms",
     "fmt_estimate", "fmt_variance", "fmt_eta", "task_key", "_task_event", "_events_size",
     "_stamp_events_cursor", "append_task_events", "fold_task_events", "compact_task_events",

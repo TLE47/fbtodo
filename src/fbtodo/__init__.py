@@ -963,11 +963,18 @@ def cmd_status(args) -> int:
     # number the pane was showing as the step closed, whose size key is built from calls the
     # step had already made; this one cannot flatter a rung that recognises.
     ferr = forecast_error(log.get("tasks") or {}, model=model)
-    fparts = [
-        f"{src} {ferr[src]['med']:.2f}x over {ferr[src]['n']}"
-        for src in ("shape", "blend", "pace")
-        if ferr.get(src)
-    ]
+    fparts = []
+    for src in ("shape", "blend", "pace"):
+        stat = ferr.get(src)
+        if not stat:
+            continue
+        # The interval rides beside the median, because the median alone cannot tell a rung
+        # that misses by a tenth every time from one that misses by a tenth on average. A
+        # rung whose spread is one sample prints no bracket: a range of one value is not one.
+        text = f"{src} {stat['med']:.2f}x"
+        if stat.get("hi") != stat.get("lo"):
+            text += f" [{stat['lo']:.2f}–{stat['hi']:.2f}]"
+        fparts.append(f"{text} over {stat['n']}")
     skipped = (ferr.get("late") or {}).get("n") or 0
     tail = f" · {skipped} stamped late, not scored" if skipped else ""
     if fparts:
@@ -979,6 +986,15 @@ def cmd_status(args) -> int:
         print(f"  forecast error    : — {skipped} step(s) stamped late, not scored")
     else:
         print("  forecast error    : — no step has started since the ledger was added")
+    # ...and whether a gap between two of those rungs is the rung or the sample. Only pairs
+    # the log can actually judge are printed: a duel nobody has the steps for is not a draw,
+    # and showing it as one would read as "these two rungs are equivalent".
+    verdicts = duel_summaries(ledger_rows(log.get("tasks") or {}, now_est, model=model))
+    if verdicts:
+        for a_rung, b_rung, verdict in verdicts:
+            print(f"  rung duel         : {duel_note(a_rung, b_rung, verdict)}")
+    else:
+        print("  rung duel         : — no pair of rungs has been scored on the same steps yet")
     # ...and whether there is yet enough of that to re-choose the constants from the log
     # rather than from a replay of the journals. Both counts are what the constants' own
     # comments say they need; the second is the one that governs the pace bound, because the
@@ -1063,6 +1079,12 @@ def cmd_prune(args) -> int:
     return 0
 
 
+# Which rungs are worth judging against each other, in the order a reader reads them. The
+# three the pane can pick between, paired: the question "is this one better" only has a
+# meaning between two rungs that were both asked the same steps.
+DUEL_PAIRS = (("pace", "blend"), ("pace", "shape"), ("blend", "shape"))
+
+
 def ledger_rows(
     tasks: dict,
     now_ms: int | None = None,
@@ -1142,6 +1164,22 @@ def ledger_rows(
     return rows
 
 
+def duel_summaries(rows: list[dict]) -> list[tuple]:
+    """The rung pairs this set of ledger rows can actually judge, with their verdicts.
+
+    Returned rather than printed so `doctor` and `fbtodo ledger` say the same sentence over
+    the same evidence — and so the pair nobody has the steps for is left out of both instead
+    of being reported as a draw. The rows are the whole window, not the page a `--limit`
+    shows: the verdict is about the log, and truncating the display must not change it.
+    """
+    out = []
+    for a_rung, b_rung in DUEL_PAIRS:
+        verdict = rung_duel(rows, a_rung, b_rung)
+        if verdict["steps"]:
+            out.append((a_rung, b_rung, verdict))
+    return out
+
+
 def fmt_ledger(
     rows: list[dict],
     now_ms: int,
@@ -1166,6 +1204,10 @@ def fmt_ledger(
     out.append(f"  {len(rows)} step(s) with a forecast · {scored} scored · {late} stamped "
                f"late (not scored) · evidence floor {short_duration(label_floor_ms())} · "
                f"last {days:g}d")
+    # ...and the verdict on the rungs those rows are evidence for, above them: the rows say
+    # what each step predicted, and this says what the difference between two of them is worth
+    for a_rung, b_rung, verdict in duel_summaries(rows):
+        out.append(f"  rung duel: {duel_note(a_rung, b_rung, verdict)}")
     shown = rows if not limit else rows[:limit]
     for r in shown:
         span = short_duration(r["span_ms"], seconds=True) if r["span_ms"] else "—"
