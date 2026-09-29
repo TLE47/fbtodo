@@ -669,6 +669,34 @@ MIN_LABEL_MS = max(0, int(LABEL_FLOOR_S * 1000))
 # curve would be picking the one this particular sample happened to favour.
 # Tunable with `--blend-weight W` / `FBTODO_BLEND_WEIGHT`.
 BLEND_WEIGHT = min(1.0, max(0.0, float(os.environ.get("FBTODO_BLEND_WEIGHT") or 0.5)))
+# The two knobs above are what the environment said at import; this is what the run uses.
+# They are asked for rather than read as constants because `--label-floor`/`--blend-weight` are
+# applied once `main` starts, and the readers are spread over the program: a name imported into
+# another module is a COPY, and a flag that moved only this module's would leave the copy — the
+# one the estimator actually consults — at the old value. A dict is one object that every
+# reader holds, so a write to it is visible from everywhere.
+ESTIMATE_KNOBS = {"label_floor_ms": MIN_LABEL_MS, "blend_weight": BLEND_WEIGHT}
+
+
+def label_floor_ms() -> int:
+    """The shortest span that counts as evidence, asked for at the point of use."""
+    return ESTIMATE_KNOBS["label_floor_ms"]
+
+
+def blend_weight() -> float:
+    """How much of a waiting step's number is its wording rather than the list's pace."""
+    return ESTIMATE_KNOBS["blend_weight"]
+
+
+def set_estimate_knobs(label_floor=None, blend_weight=None) -> None:
+    """`--label-floor` / `--blend-weight`: one write here, every reader moves (see the table).
+
+    None means "this flag was not given", so a caller cannot accidentally reset the other one.
+    """
+    if label_floor is not None:
+        ESTIMATE_KNOBS["label_floor_ms"] = max(0, int(label_floor * 1000))
+    if blend_weight is not None:
+        ESTIMATE_KNOBS["blend_weight"] = min(1.0, max(0.0, blend_weight))
 # The forecast ledger is only a forecast if it was written before the step had run. A watcher
 # that starts (or restarts) with a step already in flight sees it running for the first time
 # minutes in, so its vector would carry the answer's clock, not a prediction of it. Such a
@@ -4489,8 +4517,8 @@ def step_spans_ms(times: dict, todos: list, now_ms: int) -> list[int]:
         rec = (times or {}).get(str(t.get("task", ""))) or {}
         span = live_elapsed(rec, now_ms)
         # A sub-10s span is a list flip, not a measurement: it is shown on its row but it
-        # must not set the pace for everything after it (see MIN_LABEL_MS).
-        if span and span >= MIN_LABEL_MS:
+        # must not set the pace for everything after it (see `label_floor_ms`).
+        if span and span >= label_floor_ms():
             spans.append(min(span, EST_CAP_MS))
     return spans
 
@@ -4620,8 +4648,8 @@ def _history_gather(tasks: dict, now_ms: int | None, model: str | None, key_of):
         if not started or not stopped or stopped <= started:
             continue
         span = min(stopped - started, EST_CAP_MS)
-        if span < MIN_LABEL_MS:
-            continue  # a list flip is shown, not remembered (see MIN_LABEL_MS)
+        if span < label_floor_ms():
+            continue  # a list flip is shown, not remembered (see `label_floor_ms`)
         every.setdefault(bucket, []).append(span)
         if model and rec.get("model") == model:
             mine.setdefault(bucket, []).append(span)
@@ -4739,7 +4767,7 @@ def call_memory_from_log(tasks: dict, now_ms: int | None = None, model: str | No
         if not started or not stopped or stopped <= started or stopped < cutoff:
             continue
         span = min(stopped - started, EST_CAP_MS)
-        if span < MIN_LABEL_MS:
+        if span < label_floor_ms():
             continue
         total = 0
         for n in (rec.get("shape") or {}).values():
@@ -4774,11 +4802,11 @@ def pending_blend_ms(
     Blended in log space, `w` on the label model and `1 - w` on the pace (0.5 by default,
     which is the geometric mean). `w` was not fitted — it is the midpoint, and the honest
     reading of the replay is that the blend smooths the tail rather than beating the pace on
-    the typical step (see BLEND_WEIGHT for the numbers). None when there is nothing to blend
+    the typical step (see `blend_weight` for the numbers). None when there is nothing to blend
     with, and then the pace stands alone exactly as it did before, so a fresh log cannot
     regress.
     """
-    w = BLEND_WEIGHT if weight is None else weight
+    w = blend_weight() if weight is None else weight
     if not calls_mem or not pace_ms or w <= 0:
         return None
     calls = (calls_mem.get("classes") or {}).get(label_class(task)) or calls_mem.get("calls")
@@ -5043,7 +5071,7 @@ def forecast_error(
         if model and rec.get("model") and rec.get("model") != model:
             continue
         actual = stopped - started
-        if actual < MIN_LABEL_MS:
+        if actual < label_floor_ms():
             continue
         fc = rec.get("fc") or {}
         if not fc:
@@ -5127,10 +5155,10 @@ def refit_readiness(
         prior = [
             sp
             for st, sp in by_list.get(group, [])
-            if st < started and sp >= MIN_LABEL_MS
+            if st < started and sp >= label_floor_ms()
         ]
         by_list.setdefault(group, []).append((started, span))
-        if span < MIN_LABEL_MS:
+        if span < label_floor_ms():
             continue
         scored += 1
         unclipped = _median_ms([min(sp, EST_CAP_MS) for sp in prior])
@@ -5184,7 +5212,7 @@ def estimate_error(
         if pred <= 0:
             continue
         actual = stopped - started
-        if actual < MIN_LABEL_MS:
+        if actual < label_floor_ms():
             continue  # a list flip is not a step, and scoring it only adds noise
         factors.setdefault(str(rec.get("est_src") or "pace"), []).append(
             max(pred / actual, actual / pred)
@@ -8500,8 +8528,8 @@ def ledger_rows(
             why = f"stamped {short_duration(late, seconds=True)} in — late, not scored"
         elif span is None:
             why = "no outcome yet"
-        elif span < MIN_LABEL_MS:
-            why = f"span under the {short_duration(MIN_LABEL_MS)} floor — not scored"
+        elif span < label_floor_ms():
+            why = f"span under the {short_duration(label_floor_ms())} floor — not scored"
         else:
             errs = {r: round(max(p / span, span / p), 2) for r, p in preds.items()}
         ver = f"v{fc.get('v')}" if fc.get("v") else ""
@@ -8549,7 +8577,7 @@ def fmt_ledger(
     scored = sum(1 for r in rows if r["scored"])
     late = sum(1 for r in rows if r["late_ms"])
     out.append(f"  {len(rows)} step(s) with a forecast · {scored} scored · {late} stamped "
-               f"late (not scored) · evidence floor {short_duration(MIN_LABEL_MS)} · "
+               f"late (not scored) · evidence floor {short_duration(label_floor_ms())} · "
                f"last {days:g}d")
     shown = rows if not limit else rows[:limit]
     for r in shown:
@@ -9296,13 +9324,10 @@ def main(argv=None) -> int:
     if args.version:
         print(VERSION)
         return 0
-    # The two estimate knobs, applied to the module constants so every caller sees them:
-    # the env vars are read at import, and a flag beats them, as the precedence promises.
-    global MIN_LABEL_MS, BLEND_WEIGHT
-    if args.label_floor is not None:
-        MIN_LABEL_MS = max(0, int(args.label_floor * 1000))
-    if args.blend_weight is not None:
-        BLEND_WEIGHT = min(1.0, max(0.0, args.blend_weight))
+    # The two estimate knobs, applied through the one table every reader asks (see
+    # `set_estimate_knobs`): the env vars are read at import, and a flag beats them, as the
+    # precedence promises.
+    set_estimate_knobs(args.label_floor, args.blend_weight)
     if args.source == "nas" and args.interval <= 1.0:
         # One ssh per poll, and the pane no longer needs a poll to move its own numbers:
         # the clock and the "N ago" repaint locally (see the pane loop), so the store is

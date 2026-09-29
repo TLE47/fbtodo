@@ -1668,6 +1668,27 @@ try:
         [{"task": "s", "completed": True}], 12_000) == [12_000]
     say("estimates: a waiting step is priced from its wording, blended with the pace: ok")
 
+    # Both knobs are ASKED FOR rather than held: `--label-floor`/`--blend-weight` are applied
+    # while `main` starts, and the readers are spread over the module (soon: over more than one
+    # module, where an imported name is a copy the flag could not reach). So one write has to
+    # move every reader, which is what this pins.
+    assert module.label_floor_ms() == module.MIN_LABEL_MS == int(module.LABEL_FLOOR_S * 1000)
+    module.set_estimate_knobs(label_floor=0, blend_weight=1.0)
+    try:
+        assert module.label_floor_ms() == 0 and module.blend_weight() == 1.0
+        assert module.step_spans_ms(
+            {"s": {"started_ms": 0, "done_ms": 2_000, "elapsed_ms": 2_000}},
+            [{"task": "s", "completed": True}], 2_000) == [2_000], "the floor did not move"
+        assert module.pending_blend_ms("Run the tests", 480_000, cm) == 120_000, \
+            "the blend did not move"
+    finally:
+        module.set_estimate_knobs(label_floor=module.LABEL_FLOOR_S,
+                                  blend_weight=module.BLEND_WEIGHT)
+    assert module.step_spans_ms(
+        {"s": {"started_ms": 0, "done_ms": 2_000, "elapsed_ms": 2_000}},
+        [{"task": "s", "completed": True}], 2_000) == []
+    say("estimates: both knobs are one write and every reader moves with it: ok")
+
     # ...which the pane's journal reader has to know in the first place: the model comes
     # out of the same backward pass that finds the list, with no json parse per line.
     model_home = os.path.join(TEST_HOME, "model-home")
