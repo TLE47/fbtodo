@@ -5,6 +5,7 @@ is the layer underneath it.
 
 - [Files under `FBTODO_HOME`](#files-under-fbtodo_home)
 - [The state file](#the-state-file)
+- [The sources](#the-sources)
 - [Notifier contracts](#notifier-contracts)
 - [The pane lifecycle](#the-pane-lifecycle)
 - [Conventions worth keeping](#conventions-worth-keeping)
@@ -73,6 +74,32 @@ fields that matter:
 and an explicit `-s cli|desktop` is never answered from it unless the state describes
 that backend.
 
+## The sources
+
+Every reader downstream — the pane, `snap`, `json`, the estimates — reads **one** state,
+and a list can come from three different machines' worth of transcript. That seam is
+`Source`: each one answers "is there anything of this kind here?" in its own vocabulary and
+then translates what it found into the state's fields, so `_snapshot` is a loop rather than
+three branches.
+
+| Class | `-s` / `backend` | `find()` reads | `miss()` says |
+|---|---|---|---|
+| `CliSource` | `cli` | this directory's chat journal (`log.jsonl`) | `no CLI chat for this directory` |
+| `DesktopSource` | `desktop` | one thread of the desktop app's sqlite store | `no conversation DB found` |
+| `NasSource` | `nas` | a session on the NAS, over ssh | `no NAS session` (a probe never misses) |
+
+The contract is three methods: `find(args, cwd)` fetches and returns the raw observation
+or `None`; `describe(args, cwd, ob)` maps that observation onto the state; `miss()` is that
+source's own answer when it was the one asked and found nothing. `name` is the `-s` flag's
+word for a source, `backend` is the state's.
+
+`-s auto` asks `cli` then `desktop`; every other value asks exactly one source, and the
+**last source asked** speaks for the chain when none found anything (`-s cli` in a
+directory with no journal is an error, never a fall-through into the desktop store). Where
+this is going: the same seam is the boundary the package split moves — the classes and the
+registry are already the only thing that knows the differences, and `read_cli` /
+`read_desktop` / `read_nas` are the only functions they call to fetch.
+
 ## Notifier contracts
 
 `fbtodo` invokes each watch as a subprocess and reads **nothing** back — the notifier owns
@@ -129,6 +156,12 @@ back.
   because a state file an older build wrote is still on disk. H1 measured all of it reaching
   the terminal verbatim before (OSC 52, OSC 0, CSI moves, U+202E) in the rich pane, in
   `snap` and in `json`.
+- **A source reads, `describe` translates.** Nothing that fetches (an ssh, a DB open, a
+  file stat) may happen inside `describe`, and nothing that knows the state's field names
+  may happen inside `find`: that split is what makes a source's cost visible at the call
+  site and keeps the three mappings comparable. Adding a field means adding it to the
+  source that can supply it — the others leave it unset on purpose, which is the contract
+  (`turn_ended` is false for NAS because the NAS build records no end-of-turn).
 - **A theme value is validated where it is read.** `THEME_VALUE_RE` accepts a `#rrggbb`
   colour or a raw SGR parameter list and nothing else, because the value is interpolated into
   an escape sequence. A refused value leaves the role at whatever the next source down gave
