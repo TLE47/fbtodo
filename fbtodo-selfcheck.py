@@ -157,6 +157,22 @@ def load_fbtodo(home: str | None = None) -> object:
     return importlib.import_module("fbtodo")
 
 
+def set_knob(mod, name, value):
+    """Set one of the program's knobs by name, in every module that holds it.
+
+    The program is one package in several modules, and a name taken in with `import *` is a
+    COPY: patching it on the package would leave the owner's own copy — the one its code reads
+    — at the old value, and the test would pass while testing nothing. So the write goes to
+    every loaded module of this package that holds the name, which is what "the module's
+    global" meant when all of it was one file.
+    """
+    owners = [m for n, m in list(sys.modules.items())
+              if (n == mod.__name__ or n.startswith(mod.__name__ + ".")) and name in vars(m)]
+    assert owners, f"no module under {mod.__name__} owns {name!r}"
+    for owner in owners:
+        setattr(owner, name, value)
+
+
 def spawn_quiet(*args):
     """Detached from this process's stdio, in its own group.
 
@@ -591,7 +607,7 @@ try:
     #      trusted, so a journal rewritten in place and grown past the old size is not
     #      answered from what the cursor remembered.
     saved_chunk = module.CHUNK
-    module.CHUNK = 4096  # so a fixture a few KiB long spans the several chunks a fold needs
+    set_knob(module, "CHUNK", 4096)  # so a fixture a few KiB spans the several chunks a fold needs
     try:
         grow_dir = os.path.join(TEST_HOME, "scan-grow")
         shutil.rmtree(grow_dir, ignore_errors=True)
@@ -670,7 +686,7 @@ try:
         assert "rotated" in json.dumps(rot.get("hit")), rot
         say("journal cursor: a grown journal is folded, a rewritten one is not: ok")
     finally:
-        module.CHUNK = saved_chunk
+        set_knob(module, "CHUNK", saved_chunk)
         shutil.rmtree(os.path.join(TEST_HOME, "scan-grow"), ignore_errors=True)
 
     # ---- the claim is a REAL one: the kernel holds it. A record naming a live process
@@ -728,14 +744,14 @@ try:
     os.makedirs(os.path.join(proc_fixture, "4242"), exist_ok=True)
     os.symlink(victim_cwd, os.path.join(proc_fixture, "4242", "cwd"))
     saved_proc = module.PROC_ROOT
-    module.PROC_ROOT = proc_fixture
+    set_knob(module, "PROC_ROOT", proc_fixture)
     try:
         assert module.cwds_for([4242]) == {4242: victim_cwd}, module.cwds_for([4242])
         assert module.pid_cwd(4242) == victim_cwd
         # a pid /proc cannot answer for is left to the fallback, not guessed at
         assert module.cwds_for([4242, 999_999]).get(4242) == victim_cwd
     finally:
-        module.PROC_ROOT = saved_proc
+        set_knob(module, "PROC_ROOT", saved_proc)
     me = os.path.realpath(module.pid_cwd(os.getpid()) or "")
     assert me == os.path.realpath(os.getcwd()), (me, os.getcwd())
     say("discovery: /proc answers first, and the real root still resolves this process: ok")
@@ -2316,7 +2332,7 @@ try:
         ))
     finally:
         os.environ.pop("FBTODO_TRUECOLOR", None)
-        module._THEME_CACHE = None
+        set_knob(module, "_THEME_CACHE", None)
     q_stops = [tuple(int(v) for v in s) for s in re.findall(
         r"\x1b\[38;2;(\d+);(\d+);(\d+)m█", q_row
     )]
@@ -2579,7 +2595,7 @@ try:
                 os.environ.pop("FBTODO_" + key, None)
             else:
                 os.environ["FBTODO_" + key] = value
-        module._THEME_CACHE = None
+        set_knob(module, "_THEME_CACHE", None)
     say("lays out the steps, the heading and the footer: ok")
 
     compact = ansi.sub("", module.render(wide_state, False, width=34, now_ms=1000))
@@ -2595,7 +2611,8 @@ try:
     os.makedirs(theme_dir, exist_ok=True)
     global_file = os.path.join(theme_dir, "global.json")
     local_file = os.path.join(theme_dir, "local.json")
-    module.THEME_FILE_GLOBAL, module.THEME_FILE_LOCAL = global_file, local_file
+    set_knob(module, "THEME_FILE_GLOBAL", global_file)
+    set_knob(module, "THEME_FILE_LOCAL", local_file)
     try:
         for key in module.THEME_KEYS:
             os.environ.pop("FBTODO_" + key.upper(), None)
@@ -2814,8 +2831,9 @@ try:
             os.environ.pop("FBTODO_TRUECOLOR", None)
         else:
             os.environ["FBTODO_TRUECOLOR"] = saved_truecolor
-        module.THEME_FILE_GLOBAL, module.THEME_FILE_LOCAL = saved_paths
-        module._THEME_CACHE = None
+        set_knob(module, "THEME_FILE_GLOBAL", saved_paths[0])
+        set_knob(module, "THEME_FILE_LOCAL", saved_paths[1])
+        set_knob(module, "_THEME_CACHE", None)
     say("the frame palette resolves from the env and the theme files: ok")
 
     # ---- the framed top border: the right slot names the watcher, or — with no watcher
@@ -2934,7 +2952,7 @@ try:
     #      belongs to the step being worked on, counts up while it runs, freezes when it
     #      is ticked off, and moves on to the next one
     mod = load_fbtodo()
-    mod.TASKS_PATH = os.path.join(TEST_HOME, "tasks-unit.json")
+    set_knob(mod, "TASKS_PATH", os.path.join(TEST_HOME, "tasks-unit.json"))
 
     def seq(a, b, c):
         return [
@@ -3109,7 +3127,7 @@ try:
     assert len(many) == mod.HISTORY_MAX_ENTRIES, len(many)
     # a log written before the (session, task) change still resolves its records
     flat = os.path.join(TEST_HOME, "tasks-flat.json")
-    mod.TASKS_PATH = flat
+    set_knob(mod, "TASKS_PATH", flat)
     put_tasklog(mod, {
         "schema": 1, "session": "S", "tasks": {"a": {"started_ms": t0, "done_ms": t0 + 5000}},
     })
@@ -4543,8 +4561,8 @@ try:
         # tmux answered that with the window's active pane, which is not necessarily the
         # one running freebuff.
         panes_mod = load_fbtodo()
-        panes_mod.TMUX_BIN = list(tmux)  # the private server, as the keeper has it
-        panes_mod.TASKS_PATH = os.path.join(TEST_HOME, "tasks-unit.json")
+        set_knob(panes_mod, "TMUX_BIN", list(tmux))  # the private server, as the keeper has it
+        set_knob(panes_mod, "TASKS_PATH", os.path.join(TEST_HOME, "tasks-unit.json"))
 
         def todo_pane_and_instance() -> tuple:
             """(pane id, instance pid) of the list pane, read from its own start command."""
