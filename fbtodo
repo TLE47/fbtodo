@@ -4229,6 +4229,20 @@ def _window_anchor(cur_index: int | None, count: int) -> int:
     return max(0, count - 1)
 
 
+# In plain words: "there is no list, and here is why" — one sentence, in the words the pane
+# shows. Three situations produce no list at all: a session that has not written one yet, a
+# session that changed (so the old list was dropped rather than left up as if it were
+# current), and a remote session whose pane is open before the session is. Both renderers and
+# `fbtodo status` ask this one function, so the three can never disagree about it.
+def no_list_reason(state: dict) -> str:
+    """Why there is no list to draw, in the pane's own words."""
+    if state.get("backend") == "nas" and not state.get("instance_alive"):
+        return "waiting for a NAS freebuff session (run `fb` there)"
+    if state.get("cleared"):
+        return "new session — old list dropped, waiting for a new one"
+    return "no write_todos call yet in this session"
+
+
 # In plain words: a pane with no list should not just shrug at you. This lists the tools the
 # session has actually called — "called so far: run_terminal_command 20, skill 3" — which turns
 # "no list yet" from a mystery into a diagnosis: it is working, and it is not planning out loud.
@@ -4413,13 +4427,7 @@ def _render_plain(
     if not todos:
         if state.get("first_prompt") and not goal:
             lines += [c(dim, seg) for seg in _wrap(str(state["first_prompt"]), width, 2)]
-        why = (
-            "waiting for a NAS freebuff session (run `fb` there)"
-            if backend == "nas" and not state.get("instance_alive")
-            else "new session — old list dropped, waiting for a new one"
-            if state.get("cleared")
-            else "no write_todos call yet in this session"
-        )
+        why = no_list_reason(state)
         lines += [c(dim, seg) for seg in _wrap(why, width, 2)]
         lines.append(c(dim, f"  live {time.strftime('%H:%M:%S', time.localtime(now_ms / 1000))}"))
         return "\n".join(lines)
@@ -4988,13 +4996,7 @@ def _render_rich(
     if not todos:
         rows += [_frame_row(h, width, frame) for h in head]
         rows.append(_divider_row(width, frame))
-        why = (
-            "waiting for a NAS freebuff session (run `fb` there)"
-            if state.get("backend") == "nas" and not state.get("instance_alive")
-            else "new session — old list dropped, waiting for a new one"
-            if state.get("cleared")
-            else "no write_todos call yet in this session"
-        )
+        why = no_list_reason(state)
         for seg in _wrap(why, inner, 0):
             rows.append(_frame_row(c(muted, seg), width, frame))
         note = tools_note(state.get("tool_calls") or {})
@@ -5748,6 +5750,12 @@ def cmd_status(args) -> int:
         if nas.get("fb") and nas.get("fb") != "-":
             marker = "live" if nas.get("fb") == "1" else "stale"
             print(f"  fb marker         : {marker}  {nas.get('fb_project') or '-'}")
+    if view and not view.get("todos"):
+        # Said out loud, in the pane's own words. Until this line existed a session with no
+        # list had no `todos` row at all, and a missing row reads as a broken command rather
+        # than as "the agent has not written one yet" — which is the whole question this
+        # answers. Same sentence as the pane, from the same function.
+        print(f"  todos             : — none yet  ({no_list_reason(view)})")
     if view and view.get("todos"):
         counts = f"{view.get('done', 0)}/{view.get('total', len(view['todos']))} done"
         if view.get("list_version"):

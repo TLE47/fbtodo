@@ -321,7 +321,7 @@ brew install vhs && docs/demo/record.sh     # → docs/demo/demo.gif
 fbtodo                 # the live pane (default) — starts the watcher, exits with the session
 fbtodo snap            # one snapshot, plain text
 fbtodo json            # one snapshot, clean JSON
-fbtodo bar             # "todos 3/5" — for a tmux status bar
+fbtodo bar             # "todos 3/5", or "todos -" with no list — a tmux status bar
 fbtodo status          # instance, watcher, state file, scratch footprint, pace
 fbtodo why             # why each pane is where it is
 fbtodo pin --size 9    # pin this window's list pane
@@ -333,8 +333,8 @@ fbtodo prune           # enforce retention now
 |---|---|
 | *(no argument)* | the live pane; also starts the watcher for you |
 | `snap` / `json` | the list as text or JSON — script it, or read it once |
-| `bar` | a `todos 3/5` string for your tmux status line (`FBTODO_NO_PANE=1` if you only want this) |
-| `status` | everything the tool thinks: which instance, which watcher, which state file, remembered pace |
+| `bar` | a `todos 3/5` string for your tmux status line, and `todos -` when there is no list yet (`FBTODO_NO_PANE=1` if you only want this) |
+| `status` | everything the tool thinks: which instance, which watcher, which state file, remembered pace — and why there is no list, when there is none |
 | `why` | the first thing to run when a pane is somewhere unexpected |
 | `pin` | force a pane's side or size, per window |
 | `daemon` / `pane-watch` | the two background processes, usually started for you (`-f` keeps one in the foreground) |
@@ -469,6 +469,18 @@ there means every session keeps a list without being asked:
 
 [`examples/AGENTS.md`](examples/AGENTS.md) is that snippet on its own, plus the two smaller
 conventions that make a list worth watching.
+
+**How to tell whether there is a list at all** — four checks, none of which needs the pane:
+
+| Ask | No list yet | With a list |
+|---|---|---|
+| `fbtodo bar` | `todos -` | `todos 3/5` |
+| `fbtodo status` | `todos : — none yet (no write_todos call yet in this session)` | `todos : 3/6 done, list #6` |
+| `fbtodo snap` | the reason, in words | the list itself |
+| the pane | the same sentence | the list itself |
+
+`bar` is the one built for a status line, and the dash is deliberate: `todos -` is something
+you can read at a glance, where an empty string would look like the command failed.
 
 **When a session has no list**, the pane says so in words rather than drawing an empty frame,
 and the words differ by cause:
@@ -668,7 +680,7 @@ store · `75` the watcher failed to start.
 
 | Symptom | First thing to try |
 |---|---|
-| Pane is empty | `fbtodo status`. A `cli` session with no list means the agent has not called `write_todos` yet — [ask it for one](#getting-a-list-in-the-first-place), or add the line to your `AGENTS.md` so it never needs asking. |
+| Pane is empty | `fbtodo bar` prints `todos -` when there is no list at all, and `fbtodo status` says why. If that is the answer, [ask the agent for one](#getting-a-list-in-the-first-place), or add the line to your `AGENTS.md` so it never needs asking — otherwise the pane is bound to the wrong session, and `fbtodo why` is next. |
 | Pane exits immediately | exit `66`: no running instance, or no store found for the cwd. Try `--instance-of PID` or `-p`. |
 | Pane gone after a while | `--stale-after` (default: 60 min of store silence). `0` = never. |
 | Pane not where you want it | `fbtodo why` — read the `source` on the line, it is usually the answer. Then `fbtodo pin`. |
