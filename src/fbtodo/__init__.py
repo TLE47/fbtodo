@@ -1234,12 +1234,16 @@ def _record_goal(rec: dict):
     return None
 
 
-def _plain(line: str) -> str:
+def prose_text(line: str) -> str:
     """One line of the agent's prose as the phone can show it: markdown out, wrapped in.
 
     Emphasis and code markers are dropped, but underscores are left alone — they are how
     this store spells its own tool names (`write_todos`), and eating them would turn a
     summary into nonsense.
+
+    Not to be confused with `_plain`, which is the renderer's: that one takes the colour off a
+    styled line and leaves the words exactly as they are. The two were once the same name, and
+    the renderer's — defined later in the file — quietly won every call.
     """
     line = re.sub(r"`([^`]*)`", r"\1", line)
     line = re.sub(r"`", "", line)
@@ -1267,7 +1271,7 @@ def _record_summary(rec: dict):
     if not isinstance(text, str) or not text.strip():
         return None
     for line in text.splitlines():
-        plain = _plain(line)
+        plain = prose_text(line)
         if not plain or GOAL_LINE_RE.match(line):
             continue
         return plain if len(plain) <= SUMMARY_MAX_CHARS else plain[: SUMMARY_MAX_CHARS - 1].rstrip() + "…"
@@ -5841,6 +5845,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
 
 def _plain(text: str) -> str:
+    """The words of a styled line, with the colour taken out (see `prose_text`)."""
     return _ANSI_RE.sub("", str(text))
 
 
