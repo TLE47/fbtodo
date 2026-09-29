@@ -711,7 +711,9 @@ Which is where most of the care in this tool has gone.
   is a tail-smoother rather than a clear win — measured on your own replay it is a coin flip
   on the typical step and only plainly better on the worst ones — so `FBTODO_BLEND_WEIGHT`
   turns it down if you would rather have the pace alone. All of it
-  lives in `fbtodo-tasks.json` beside it. A step that has made no calls *and* has nothing
+  lives in the task log beside it: `fbtodo-tasks.jsonl`, an append-only stream of events,
+  and `fbtodo-tasks.json` as its fold — the JSON is what is read, the stream is what is
+  believed. A step that has made no calls *and* has nothing
   to blend still falls back to the pace, so a fresh log behaves exactly as it always did.
 - **A step under 10 s is a list flip, not work.** It is shown on its row, but it sets no pace
   and enters no memory: measured 2026-09-29, a 2 s flip had once projected a whole list at

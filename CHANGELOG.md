@@ -3,6 +3,30 @@
 Versions are the `VERSION` constant in `fbtodo` and the git tag of the same name.
 Entries start at the newest release; each one is a contract change, not a diff.
 
+## Unreleased
+
+### Changed
+- The task log is an **append-only stream** (`fbtodo-tasks.jsonl`); `fbtodo-tasks.json` is a
+  fold of it carrying the offset it was folded to (`events`). A poll appends the records it
+  actually changed instead of rewriting the log, and an append that lands without the rewrite
+  is recovered by the next read rather than lost. `prune` folds the stream down to the records
+  it kept. The stream's name is derived from the view's, so the two cannot be mismatched.
+- The watcher writes `fbtodo-state.json` only when the **evidence** changes or the heartbeat
+  is due, and skips the fsyncs on a rewrite whose only change is the clock (live: 0.96 → 0.50
+  writes/s, 26.8 → 14.9 MB/h).
+- A journal scan remembers its chunks by content, so a journal that only **grew** is folded
+  from its cursor instead of re-walked: the poll after an append re-parses the tail chunk
+  (live 112 MB journal: 35.5 ms → 5.5 ms, 6.9 MB → 0.6 MB of parsed JSON), and the folded
+  answer is the walked one. A rewrite that also grew, a rotation and a truncation are all
+  misses, because the remembered bytes are checked rather than trusted.
+- Scan keys are `(chunk, -line index)` with chunks numbered from the **start** of the journal
+  (`journal_scan`), because an append moves every boundary counted back from the end.
+
+### Added
+- `tests/golden.py` plus recorded `json` / `bar` / `snap` / frame output: the display
+  contract, checked against fixtures with a frozen clock, and the checker itself checked by
+  the suite pointing it at a mutated copy.
+
 ## 4.29.0
 
 ### Added

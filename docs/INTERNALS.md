@@ -21,7 +21,8 @@ updates it would leave the pane reading a file nobody writes. `FBTODO_HOME` is n
 | File | Written by | What it is |
 |---|---|---|
 | `fbtodo-state.json` | watcher | the current rendered state (below) |
-| `fbtodo-tasks.json` | watcher | the task log: every step it saw run, by `(session, task)`, with the model that ran it |
+| `fbtodo-tasks.jsonl` | watcher | the task log's evidence: **one event per line, appended and never edited** |
+| `fbtodo-tasks.json` | watcher | the fold of that stream — every step it saw run, by `(session, task)`, with the model that ran it, and the offset it was folded to (`events`) |
 | `fbtodo-daemon.pid` / `.log` | watcher | the watcher's lock record and its log |
 | `fbtodo-pane-keeper.pid` | keeper | the keeper's claim, carrying the tmux server it belongs to |
 | `fbtodo-pane.log` | keeper | one line per pane that came **back** — never one that did not |
@@ -152,6 +153,29 @@ back.
   resolves, a path-like token ending in `bin/freebuff` (the original rule, still a subset),
   or a path-like token that mentions `freebuff` and resolves to one. A `grep` or a `python3
   -c` whose argument names the path is not the CLI, however it is worded.
+- **The task log is a stream; the JSON beside it is a memo.** One JSON object per line in
+  `fbtodo-tasks.jsonl` — a record set by `k`, records removed by `drop`, the session and the
+  prune marker as rows of their own — appended and never edited. `fbtodo-tasks.json` is a
+  fold of that stream and carries the byte offset it was folded to (`events`), so the fold is
+  last-write-wins per key and running it again says the same thing as running it once. That
+  is what makes the window between an append and the memo's rewrite harmless: the next
+  reader folds the events the memo missed rather than losing the step. Only the records a
+  poll actually touched are appended — a list is a handful of steps and the log is a history,
+  so rewriting it to change one record was the largest write the watcher made. `prune` is the
+  stream's fold point (one event per record it kept), which is how it stays bounded behind
+  the caps below. The stream's name is *derived* from the view's (`events_path()`), so a
+  caller that points the view elsewhere (the self-check's unit blocks, a restore from a
+  backup) gets its own stream by construction.
+- **A journal that only grew is folded, not re-walked.** `scan_live_log` numbers its 1 MiB
+  chunks from the START of the file — an append shifts nothing there, where counting back
+  from the end shifts every boundary — and remembers each full chunk's parse against its
+  bytes' CRC (checked, not trusted, so a rewrite that also grew is a miss, and a rotated or
+  truncated file is a fresh walk). A poll re-reads its window, which the OS has in cache, and
+  re-PARSES only the chunk at the end that moved: measured on the live 112 MB journal, the
+  poll after an append went 35.5 ms → 5.5 ms and 6.9 MB → 0.6 MB of parsed JSON, with the
+  folded answer identical to the walked one. The scan's keys are `(chunk, -line index)` — one
+  tuple comparison is a time comparison — which is why the chunk numbering has to survive the
+  next append.
 - **Nothing grows without a cap.** Retention is enforced about hourly as well as on demand.
   Task records are the one thing kept deliberately long — 2000 records / 60 days, roughly
   365 KB — because the estimate memory is the only part of the tool that is supposed to get
