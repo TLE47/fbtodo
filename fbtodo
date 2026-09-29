@@ -756,6 +756,11 @@ ACTION_TOOLS = {
 }
 ACTION_KEEP = 12  # the newest calls carried in the state; the pane draws the first few
 ACTION_ROWS = 3   # rows the framed pane gives the feed
+ACTION_SCAN_KEEP = 240  # calls counted into the turn's tally; a runaway scan stops here
+FILE_KEEP = 12    # distinct files named by a turn's tally
+EDIT_VERBS = ("edited", "wrote", "patched")  # verbs that mean a file was touched
+TURN_CHASE_CHUNKS = 6   # extra 1 MiB chunks read back while a turn's start is still unfound
+QUIET_MS = 3 * 60_000   # no new transcript record for this long is worth naming, not judging
 
 
 def _action_what(name: str, inp) -> str:
@@ -943,8 +948,31 @@ def _newest(entries):
 # are brushed off by a plain text search — "this line cannot contain a to-do list" — and
 # only the few that might are decoded as data. That is the difference between a pane you
 # can leave open all day and one that heats the laptop.
+def _turn_extend(newer: dict, older: dict) -> dict:
+    """Prepend an older chunk's turn onto the newer one's, because both walk newest-first.
+
+    A turn is often longer than the 1 MiB window the scan reads at a time, and a chunk
+    boundary is not a turn boundary: while the request that opened the turn has not been
+    seen, every older chunk is still part of it.
+    """
+    counts = dict(newer.get("verbs") or {})
+    for verb, n in (older.get("verbs") or {}).items():
+        counts[verb] = counts.get(verb, 0) + n
+    files = list(newer.get("files") or [])
+    for name in older.get("files") or []:
+        if name not in files:
+            files.append(name)
+    return {
+        "start_ms": older.get("start_ms") or newer.get("start_ms"),
+        "iterations": int(newer.get("iterations") or 0) + int(older.get("iterations") or 0),
+        "verbs": counts,
+        "files": files[:FILE_KEEP],
+        "open": bool(older.get("open")),
+    }
+
+
 def journal_scan(blob: bytes, thread: str, chunk: int = 0):
-    """(hit, hit_key, prompts, goals, turns, summaries, models, actions), newest line first.
+    """(hit, hit_key, prompts, goals, turns, summaries, models, actions, turn), newest first.
 
     Keys are (-chunk, -line index) — chunks are read backwards from EOF, so both terms
     grow towards the newest line and a plain tuple comparison is a time comparison.
@@ -959,6 +987,12 @@ def journal_scan(blob: bytes, thread: str, chunk: int = 0):
     summaries: list = []
     models: list = []
     actions: list = []
+    # This TURN, bounded by the request that started it. A plan would supply a denominator;
+    # nothing in these stores does, so nothing here counts progress. What a turn can supply
+    # honestly is a boundary and a numerator: how long this work has been going, how many
+    # model iterations it has taken, and what it has done so far. `open` means the walk has
+    # not reached the request yet — the numbers are then lower bounds and are labelled so.
+    turn = {"start_ms": None, "iterations": 0, "verbs": {}, "files": [], "open": True}
     for order, raw in enumerate(reversed(blob.split(b"\n"))):
         want_call = hit is None and b"write_todos" in raw and b'"todos"' in raw
         want_prompt = b'"prompt"' in raw
@@ -974,11 +1008,12 @@ def journal_scan(blob: bytes, thread: str, chunk: int = 0):
         model = MODEL_RE.search(raw)
         if model:
             models.append(((-chunk, -order), model.group(1).decode("utf-8", "replace")))
-        # The second basket (see `_record_actions`): what this record called. Asked for only
-        # until there are enough, and the newest records are read first — so this is a couple
-        # of extra json parses per poll, not a parse of the whole chunk.
+        # The second basket (see `_record_actions`): what this record called. Every call
+        # record also carries `shouldEndTurn` (measured: 536 of 536), so these are records
+        # the turn counter below already parses — tallying them costs no extra json work.
+        # The cap is the tally's, and the pane's 12-row feed is a slice of it.
         want_action = (
-            len(actions) < ACTION_KEEP and b'"toolCalls"' in raw and b'"toolName"' in raw
+            len(actions) < ACTION_SCAN_KEEP and b'"toolCalls"' in raw and b'"toolName"' in raw
         )
         if not (want_call or want_prompt or want_goal or want_turn or want_summary or want_action):
             continue
@@ -995,6 +1030,16 @@ def journal_scan(blob: bytes, thread: str, chunk: int = 0):
             text = _record_prompt(rec)
             if text:
                 prompts.append((key, text))
+                if turn["open"]:
+                    # The request that opened this turn — the journal logs it on its own
+                    # record as the turn starts, which is the one exact boundary the store
+                    # has. Everything newer is this turn's work; everything older is not, and
+                    # closing here is what stops an earlier turn's calls being counted into
+                    # this one's tally.
+                    asked_ms = _iso_ms(rec.get("timestamp"))
+                    if asked_ms:
+                        turn["start_ms"] = asked_ms
+                    turn["open"] = False
         if want_goal:
             goal_text = _record_goal(rec)
             if goal_text:
@@ -1003,13 +1048,29 @@ def journal_scan(blob: bytes, thread: str, chunk: int = 0):
             ended = _record_turn(rec)
             if ended is not None:
                 turns.append((key, ended))
+                if turn["open"]:
+                    # One model iteration, inside this turn. Walking backwards, the last one
+                    # written is the oldest, so the start keeps being overwritten and ends up
+                    # as the first iteration of the turn — and the request that opened it
+                    # moves it back once more when this walk reaches that record.
+                    iteration_ms = _iso_ms(rec.get("timestamp"))
+                    if iteration_ms:
+                        turn["start_ms"] = iteration_ms
+                    turn["iterations"] += 1
         if want_summary:
             said = _record_summary(rec)
             if said:
                 summaries.append((key, said))
         if want_action:
-            actions.extend(_record_actions(rec, key))
-    return hit, hit_key, prompts, goals, turns, summaries, models, actions
+            acts = _record_actions(rec, key)
+            actions.extend(acts)
+            if turn["open"]:
+                for _k, _ts, verb, what in acts:
+                    turn["verbs"][verb] = turn["verbs"].get(verb, 0) + 1
+                    if what and verb in EDIT_VERBS and what not in turn["files"]:
+                        if len(turn["files"]) < FILE_KEEP:
+                            turn["files"].append(what)
+    return hit, hit_key, prompts, goals, turns, summaries, models, actions, turn
 
 
 # In plain words: the transcript behind the pane. It only ever grows, one line per event,
@@ -1029,7 +1090,7 @@ def scan_live_log(chat_dir: str) -> dict:
     path = os.path.join(chat_dir, "log.jsonl")
     thread = os.path.basename(chat_dir.rstrip("/"))
     scan = {"hit": None, "goal": None, "goal_source": None, "now": None,
-            "turn_ended": False, "summary": None, "observed": []}
+            "turn_ended": False, "summary": None, "observed": [], "turn": {}}
     try:
         size = os.path.getsize(path)
         fh = open(path, "rb")
@@ -1043,6 +1104,7 @@ def scan_live_log(chat_dir: str) -> dict:
         summaries: list = []
         models: list = []
         actions: list = []
+        turn = None
         tail, read, pos, chunk = b"", 0, size, 0
         while pos > 0 and read < MAX_SCAN:
             step = min(CHUNK, pos)
@@ -1056,7 +1118,8 @@ def scan_live_log(chat_dir: str) -> dict:
             else:
                 tail = b""
             (found, found_key, found_prompts, found_goals, found_turns, found_said,
-             found_models, found_actions) = journal_scan(b"\n".join(lines), thread, chunk)
+             found_models, found_actions, found_turn) = journal_scan(
+                b"\n".join(lines), thread, chunk)
             if found and hit is None:
                 hit, hit_key, hit_chunk = found, found_key, chunk
             prompts.extend(found_prompts)
@@ -1065,6 +1128,10 @@ def scan_live_log(chat_dir: str) -> dict:
             summaries.extend(found_said)
             models.extend(found_models)
             actions.extend(found_actions)
+            turn = found_turn if turn is None else (
+                _turn_extend(turn, found_turn) if turn.get("open") else turn
+            )
+            turn_found = turn is not None and not turn.get("open")
             if hit is not None:
                 # Stop as soon as a usable goal prompt is in hand; a tail of nothing
                 # but "continue" is worth a few more chunks, not an unbounded scan.
@@ -1073,10 +1140,20 @@ def scan_live_log(chat_dir: str) -> dict:
                     for k, t in prompts
                 ):
                     break
-                if chunk - hit_chunk >= GOAL_CHASE_CHUNKS:
+                # The start of this turn is one more thing worth a bounded look back: while
+                # it is unfound the budget is TURN_CHASE_CHUNKS, and past it the pane prints
+                # minimums instead of reading on. Once found, this is the rule it always was.
+                budget = GOAL_CHASE_CHUNKS if turn_found else TURN_CHASE_CHUNKS
+                if chunk - hit_chunk >= budget:
                     break
             chunk += 1
         scan["hit"] = hit
+        # The turn, with `open` resolved into `truncated`: left standing it means the walk
+        # never reached the request that started this turn, so the numbers the pane prints
+        # are lower bounds ("12+") rather than a measured span.
+        final_turn = dict(turn or {})
+        final_turn["truncated"] = bool(final_turn.pop("open", True))
+        scan["turn"] = final_turn
         # The second basket: the newest calls, newest first, for the pane to draw when the
         # agent has written no list. Capped here rather than left whole, so the state file
         # stays small — a glance needs a handful of rows, not a history.
@@ -1172,8 +1249,10 @@ def read_cli(chat_dir: str) -> dict:
         }
     state["chat_dir"] = chat_dir
     state["model"] = scan.get("model") or None
-    # What the session has actually done — the pane's fallback when there is no list.
+    # What the session has actually done — the pane's fallback when there is no list — and
+    # the turn those calls belong to.
     state["observed"] = scan.get("observed") or []
+    state["turn"] = scan.get("turn") or {}
     state["first_prompt"] = meta.get("firstPrompt")
     # The heading is only ever the agent's own line: `first_prompt` is kept for `status`
     # and `json`, never rendered as a goal (a quote is the phrasing, not the objective).
@@ -3220,8 +3299,10 @@ def _snapshot(args, cwd: str | None = None, instance_pid=None) -> dict:
                 source_updated_ms=st.get("ts"),
                 no_log=bool(st.get("no_log")),
                 todos=st.get("todos") or [],
-                # The pane's fallback when there is no list: what this session has done.
+                # The pane's fallback when there is no list: what this session has done,
+                # and the turn it did it in.
                 observed=st.get("observed") or [],
+                turn=st.get("turn") or {},
                 # Which model this session runs: the estimates are remembered per model,
                 # because a step's span is not comparable across them.
                 model=st.get("model"),
@@ -4385,6 +4466,41 @@ def tools_note(tools: dict, limit: int = 3) -> str:
 # fact, not a plan. So when there is no list, the pane says what the session has actually
 # DONE, newest first, and never dresses it up as a list of steps: no progress bar over it,
 # no estimate, no ticks.
+# In plain words: what a TURN can honestly say, as opposed to what a list would say. A plan
+# supplies a denominator — seven steps — and nothing in these stores has one, so a bar, a
+# percentage or an estimate would be a guess by construction, and this pane does not guess.
+# What the store does have is a boundary and a numerator: the request that opened the turn
+# (the journal logs it on its own record), how long ago that was, how many model iterations
+# have run since, and what they have done. That is status, not progress, and the two are
+# deliberately separate things.
+def turn_note(state: dict, now_ms: int) -> str:
+    """`turn 11m · 9 iterations · 3 files edited · 24 calls`, or "" with no turn to name."""
+    turn = state.get("turn")
+    if not isinstance(turn, dict) or not turn.get("start_ms"):
+        return ""
+    # Past the scan's cap the counts are lower bounds, and a `+` says so rather than leaving
+    # a number that reads as exact.
+    plus = "+" if turn.get("truncated") else ""
+    bits = [f"turn {short_duration(max(0, now_ms - int(turn['start_ms']))) or '0s'}"]
+    iters = int(turn.get("iterations") or 0)
+    if iters:
+        bits.append(f"{iters}{plus} iteration" + ("" if iters == 1 else "s"))
+    files = turn.get("files") or []
+    if files:
+        bits.append(f"{len(files)}{plus} file" + ("" if len(files) == 1 else "s") + " edited")
+    calls = sum(int(n or 0) for n in (turn.get("verbs") or {}).values())
+    if calls:
+        bits.append(f"{calls}{plus} call" + ("" if calls == 1 else "s"))
+    note = " · ".join(bits)
+    # The slot `[STUCK?]` takes when a step's clock has a list to sit on. A turn with no list
+    # has no clock, so a transcript that has gone quiet is what is left to report — and it
+    # says exactly that, because a long command writes no records either.
+    quiet_ms = now_ms - int(state.get("store_mtime_ms") or 0)
+    if not state.get("turn_ended") and quiet_ms >= QUIET_MS:
+        note += "  ·  quiet " + (short_duration(quiet_ms) or "0m")
+    return note
+
+
 def observed_rows(state: dict, limit: int = ACTION_ROWS, now_ms: int | None = None) -> list:
     """`edited fbtodo · 2m ago` — the newest calls, for a session that wrote no list.
 
@@ -4575,9 +4691,13 @@ def _render_plain(
             lines += [c(dim, seg) for seg in _wrap(str(state["first_prompt"]), width, 2)]
         why = no_list_reason(state)
         lines += [c(dim, seg) for seg in _wrap(why, width, 2)]
-        # The second basket, when there is one: what the session has done instead. Absent
-        # from a state with no calls in it, so this snapshot is unchanged there.
-        for seg in observed_rows(state, 2, now_ms):
+        # The turn first — a boundary and a numerator, never a denominator — and the second
+        # basket after it: what the session has done. Both are absent from a state that
+        # carries neither, so this snapshot is unchanged there.
+        turn_line = turn_note(state, now_ms)
+        if turn_line:
+            lines += [c(dim, s) for s in _wrap("  " + turn_line, width, 1)]
+        for seg in observed_rows(state, 1 if turn_line else 2, now_ms):
             lines += [c(dim, s) for s in _wrap("  " + seg, width, 1)]
         lines.append(c(dim, f"  live {time.strftime('%H:%M:%S', time.localtime(now_ms / 1000))}"))
         return "\n".join(lines)
@@ -5153,11 +5273,18 @@ def _render_rich(
         # both say "and here is what it has been doing instead", and the feed says it with
         # less room — which matters, because this branch has no height management of its own.
         note = tools_note(state.get("tool_calls") or {})
-        feed = [_clip_cells(seg, inner - 4) for seg in observed_rows(state, now_ms=now_ms)]
-        feed = feed[: max(0, (height - 9) if height else ACTION_ROWS)]
-        if feed:
-            for seg in feed:
-                rows.append(_frame_row(c(muted, "  " + seg), width, frame))
+        # The turn is the frame the calls sit in, so it is drawn first; both are clipped to a
+        # single row each, which is what keeps this branch's height countable. Nine rows of
+        # chrome and the no-list explanation are already spent above this point.
+        room = max(0, (height - 9) if height else ACTION_ROWS + 1)
+        turn_line = turn_note(state, now_ms)
+        body = [turn_line] if turn_line else []
+        body += observed_rows(state, ACTION_ROWS, now_ms)[: max(0, room - len(body))]
+        if body:
+            for seg in body:
+                rows.append(
+                    _frame_row(c(muted, "  " + _clip_cells(seg, inner - 4)), width, frame)
+                )
         else:
             for seg in _wrap(note, inner, 1) if note else []:
                 rows.append(_frame_row(c(muted, seg), width, frame))
@@ -5988,6 +6115,12 @@ def cmd_status(args) -> int:
             print(f"  goal source       : agent's `Goal:` line")
     if view and view.get("now"):
         print(f"  newer request     : {view.get('now')}  — the list has not caught up")
+    if view:
+        # The turn, for both cases: with a list it says which turn the list belongs to, and
+        # without one it is the only measured thing there is. Same sentence as the pane's.
+        turn_line = turn_note(view, int(time.time() * 1000))
+        if turn_line:
+            print(f"  turn              : {turn_line}")
     if view and view.get("nudge"):
         print(
             f"  pending nudge     : {view.get('nudge')}  — "

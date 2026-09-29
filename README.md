@@ -89,7 +89,7 @@ session that never writes a list has nothing to draw — that is the first thing
 |---|---|
 | nothing at all | you are not in tmux: run `tmux new -s work`, then start the agent inside it |
 | `fbtodo: command not found` | `~/.local/bin` is not on your `PATH` — the one line to add is in [Install, in detail](#is-it-on-your-path) |
-| a pane, but no list | the agent has not written a todo list yet — [ask it for one](#getting-a-list-in-the-first-place); `fbtodo status` says what it sees, and the pane lists the newest calls the session *did* make |
+| a pane, but no list | the agent has not written a todo list yet — [ask it for one](#getting-a-list-in-the-first-place); `fbtodo status` says what it sees, and the pane still shows the turn's clock and the newest calls the session *did* make |
 | the pane is somewhere odd | `fbtodo why` — it names the pane, the anchor and where the placement came from |
 
 </details>
@@ -334,7 +334,7 @@ fbtodo prune           # enforce retention now
 | *(no argument)* | the live pane; also starts the watcher for you |
 | `snap` / `json` | the list as text or JSON — script it, or read it once |
 | `bar` | a `todos 3/5` string for your tmux status line, and `todos -` when there is no list yet (`FBTODO_NO_PANE=1` if you only want this) |
-| `status` | everything the tool thinks: which instance, which watcher, which build, which state file, remembered pace — and, with no list, why there is none and what the session has been doing instead (`last actions`) |
+| `status` | everything the tool thinks: which instance, which watcher, which build, which state file, remembered pace, which turn (`turn`) — and, with no list, why there is none and what the session has been doing instead (`last actions`) |
 | `why` | the first thing to run when a pane is somewhere unexpected |
 | `pin` | force a pane's side or size, per window |
 | `daemon` / `pane-watch` | the two background processes, usually started for you (`-f` keeps one in the foreground) |
@@ -491,6 +491,24 @@ and the words differ by cause:
 | `new session — old list dropped, waiting for a new one` | the session changed, so the previous list was dropped rather than left up as if it were current |
 | `called so far: run_terminal_command 20, skill 3` | a second line, on a session that has been busy: what it *has* been doing instead. A pane that only says "no list yet" is shrugging; this one is diagnosing. Drawn when there are no calls it can name, below |
 | `edited fbtodo  ·  2m ago` (up to three rows) | the newest calls the session actually made, newest first — the file it edited, the command it ran. This is the second source: the transcript records every call whether or not a list was written, so the pane has something factual to draw even when the model never calls `write_todos`. It is a record of work done, never a plan, so it carries no bar, no estimate and no ticks — nothing here is guessed |
+
+**What a list-free session can still be measured by.** A plan supplies a *denominator* — seven
+steps — and nothing in the store has one, so a session that never wrote a list gets no bar, no
+percentage and no estimate from this pane: any of those would be a guess by construction. What
+the store does have is a **boundary**. The journal logs your request on its own record as the
+turn starts, so everything newer than it is *this* turn, and that gives one measured line:
+
+```
+turn 11m · 9 iterations · 2 files edited · 24 calls
+```
+
+The clock starts when your request arrived, the iterations are the model's own reported
+turn-end flags, and the tally is the calls this turn actually made. `fbtodo status` prints the
+same line as `turn`. It is status, not progress, and the two are deliberately different
+things. Two honest edges: if the scan's own cap is reached before it finds your request, the
+counts are lower bounds and say so (`9+ iterations`); and a transcript with no new record for
+three minutes picks up `· quiet 4m` while the turn is still open — a fact about the file, not a
+verdict on the work, because a ten-minute command writes nothing either.
 
 **A list with no numbers in it** is the other half of the same case. A step gets a clock only
 if the watcher saw it unfinished, so a list whose steps were never seen that way — every one

@@ -406,7 +406,7 @@ try:
     goals = os.path.join(TEST_HOME, "goalstore")
     os.makedirs(goals, exist_ok=True)
 
-    def rec(prompt=None, todos=None, filler=None, prose=None, ended=None):
+    def rec(prompt=None, todos=None, filler=None, prose=None, ended=None, calls=None):
         data = {"iteration": 1}
         if prompt is not None:
             data["prompt"] = prompt
@@ -418,6 +418,8 @@ try:
             data["toolCalls"] = [
                 {"toolName": "write_todos", "input": {"todos": todos}}
             ]
+        if calls is not None:
+            data["toolCalls"] = calls
         if filler is not None:
             data["toolResults"] = [filler]
         return {"level": "DEBUG", "timestamp": "2026-09-21T01:00:00.000Z", "data": data}
@@ -454,6 +456,68 @@ try:
     st_g = module.read_cli(goals)
     assert st_g["now"] is None, st_g
     say("a repeated prompt is not reported as drift: ok")
+
+    # ---- THE TURN: a boundary and a numerator, never a denominator. The request is the
+    # boundary (the journal logs it on its own record as the turn starts), so the calls of
+    # the previous turn must not be counted into this one's tally.
+    write_journal(
+        [
+            rec(prompt="first turn",
+                calls=[{"toolName": "str_replace", "input": {"path": "/a/one.md"}}]),
+            rec(calls=[{"toolName": "run_terminal_command", "input": {"command": "ls"}}],
+                ended=True),
+            # the boundary: everything below this row belongs to the next turn
+            rec(prompt="second turn"),
+            rec(calls=[{"toolName": "str_replace", "input": {"path": "/a/two.md"}}],
+                ended=False),
+            rec(calls=[{"toolName": "run_terminal_command", "input": {"command": "make"}}],
+                ended=False),
+        ]
+    )
+    st_t = module.read_cli(goals)
+    turn = st_t["turn"]
+    assert turn["iterations"] == 2, turn
+    assert turn["verbs"] == {"edited": 1, "ran": 1}, turn
+    assert turn["files"] == ["two.md"], turn          # the other turn's file is not in it
+    assert turn["truncated"] is False, turn
+    say("a turn is bounded by the request that opened it, and counts only its own calls: ok")
+
+    # ...and with no request in the store the counts are lower bounds, said out loud
+    write_journal(
+        [rec(calls=[{"toolName": "run_terminal_command", "input": {"command": "ls"}}],
+             ended=False)]
+    )
+    st_t2 = module.read_cli(goals)
+    assert st_t2["turn"]["truncated"] is True, st_t2["turn"]
+    assert st_t2["turn"]["iterations"] == 1, st_t2["turn"]
+    say("a turn whose start was never reached reports minimums, not a number: ok")
+
+    # ---- the words: one line, no percentage, and the two honest suffixes
+    note = module.turn_note(
+        {"turn": {"start_ms": 40_000, "iterations": 1, "verbs": {"ran": 3}, "files": []}},
+        100_000,
+    )
+    assert note == "turn 1m · 1 iteration · 3 calls", note
+    capped = module.turn_note(
+        {"turn": {"start_ms": 40_000, "iterations": 9, "verbs": {}, "files": ["a", "b"],
+                  "truncated": True}},
+        100_000,
+    )
+    assert capped == "turn 1m · 9+ iterations · 2+ files edited", capped
+    quiet = module.turn_note(
+        {"turn": {"start_ms": 40_000, "iterations": 2, "verbs": {}},
+         "store_mtime_ms": 100_000 - 4 * 60_000},
+        100_000,
+    )
+    assert quiet.endswith("quiet 4m"), quiet
+    ended_note = module.turn_note(
+        {"turn": {"start_ms": 40_000, "iterations": 2, "verbs": {}},
+         "store_mtime_ms": 0, "turn_ended": True},
+        100_000,
+    )
+    assert "quiet" not in ended_note, ended_note
+    assert "%" not in quiet and "~" not in quiet, quiet
+    say("the turn note is a sentence, not a percentage: ok")
 
     # ---- the summary the phone message carries under the heading: the agent's own
     # last sentence, which is the only place a "what happened" line can come from

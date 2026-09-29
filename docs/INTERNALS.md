@@ -53,6 +53,7 @@ fields that matter:
 | `model` | the model the session names; the pace is quoted with it |
 | `patch`, `alert` | the two optional footer facts, read from the logs that produce them |
 | `ts`, `source_updated_ms`, `store_mtime_ms`, `probed_ms`, `heartbeat_ms` | the clocks. `ts` is when the drawn `write_todos` record was written (and `source_updated_ms` mirrors it), which is what the pane's `LIST: #7 · 12m ago` and `status`'s `list written` report; `store_mtime_ms` is the transcript's mtime, and `store_mtime_ms - ts` past `LIST_BEHIND_MS` in a session with every step ticked is the `[STALE?]` marker and `status`'s `list behind` |
+| `turn` | `{start_ms, iterations, verbs, files, truncated}` — this turn, bounded by the request that opened it (the journal logs it on its own record). A boundary and a numerator only: nothing in the store is a denominator, so nothing here is progress. `iterations` counts records carrying `shouldEndTurn`; `verbs` is the tally of the calls `observed` is a slice of; `files` is the distinct files edited (empty on the NAS, which records no inputs); `truncated` means the walk never reached the request, so every count is a lower bound and the pane prints `9+` |
 | `status`, `stop_reason` | why the watcher is where it is |
 | `tool_version` | the build that wrote it |
 
