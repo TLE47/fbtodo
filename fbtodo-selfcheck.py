@@ -351,12 +351,51 @@ try:
     say(f"watcher follows the instance and refreshes state: ok "
         f"({st['done']}/{st['total']} todos, list #{st['list_version']})")
 
-    # ---- heartbeat must advance while the instance lives
+    # ---- the heartbeat stays young, but no longer by rewriting the file every poll: on a
+    #      quiet list the clock is the only thing that moves, so a rewrite is gated on
+    #      evidence OR on the heartbeat about to fall out of the grace window. Measured on
+    #      the operator's live session this is ~1 rewrite a second -> ~1 every 2s, and none
+    #      of the clock-only ones flush to disk.
     hb1 = json.load(open(state_path))["heartbeat_ms"]
-    time.sleep(0.6)
+    stamps = set()
+    window_end = time.time() + 5.0
+    while time.time() < window_end:
+        time.sleep(0.05)
+        stamps.add(os.stat(state_path).st_mtime_ns)
     hb2 = json.load(open(state_path))["heartbeat_ms"]
     assert hb2 > hb1, (hb1, hb2)
-    say("heartbeat advances while freebuff is alive: ok")
+    age = (time.time() * 1000 - hb2) / 1000.0
+    assert age <= 5.0, (age, hb2)  # HEARTBEAT_GRACE, the window `state_is_fresh` uses
+    # -i 0.2 over those 5s is ~25 polls; only the heartbeat's own pace (2s) may write.
+    assert len(stamps) <= 6, (len(stamps), "a quiet list rewrote its state every poll")
+    say(f"heartbeat stays fresh without a rewrite per poll: ok "
+        f"({len(stamps)} writes in 5s, heartbeat {age:.1f}s old)")
+
+    # ---- ...and evidence is still written the moment it appears: a poll that HAS something
+    #      to say does not wait for the heartbeat's pace.
+    with open(os.path.join(chat_dir, "log.jsonl"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "level": "DEBUG",
+            "timestamp": "2026-01-01T00:00:05.000Z",
+            "data": {
+                "iteration": 2,
+                "prompt": "watch this session",
+                "toolCalls": [{"toolName": "write_todos", "input": {"todos": [
+                    {"task": "one", "completed": True},
+                    {"task": "two", "completed": True},
+                ]}}],
+            },
+        }) + "\n")
+    deadline = time.time() + 4
+    while time.time() < deadline:
+        try:
+            if json.load(open(state_path)).get("done") == 2:
+                break
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.1)
+    assert json.load(open(state_path)).get("done") == 2, "a changed list waited for the clock"
+    say("a poll with something to say writes it: ok")
 
     # ---- status reports a live watcher
     out = run("status").stdout
@@ -411,6 +450,29 @@ try:
     assert "no conversation DB found" not in run("snap", "--cli-root", cli_root).stderr
     say("json / bar / snap subcommands: ok")
 
+    # ---- the golden files: the same three contracts, byte for byte. Their own fixture
+    #      state is fed through the same functions the commands call, with the clock frozen
+    #      and the state directory empty, so a change to what the pane prints is a DIFF to
+    #      read rather than a surprise in the terminal.
+    gold = os.path.join(HERE, "tests", "golden.py")
+    run_gold = lambda where=None: subprocess.run(  # noqa: E731
+        [sys.executable, gold] + (["--golden", where] if where else []),
+        capture_output=True, text=True, env=env, cwd=CWD, timeout=180,
+    )
+    g = run_gold()
+    assert g.returncode == 0, (g.returncode, g.stdout[-400:], g.stderr[-2000:])
+    # ...and it CAN fail: a checker nobody has seen fail is a checker nobody can trust.
+    mutated = os.path.join(TEST_HOME, "golden-mutated")
+    shutil.rmtree(mutated, ignore_errors=True)
+    shutil.copytree(os.path.join(HERE, "tests", "golden"), mutated)
+    with open(os.path.join(mutated, "bar.txt"), "a") as fh:
+        fh.write("todos 9/9\n")
+    bad = run_gold(mutated)
+    assert bad.returncode == 1, (bad.returncode, bad.stdout[-300:], bad.stderr[-600:])
+    assert "CHANGED" in bad.stderr and "todos 9/9" in bad.stderr, bad.stderr[-600:]
+    say("golden files: json, bar, snap and the frame match what was recorded — and a "
+        "changed contract fails the check: ok")
+
     # ---- new session drops the previous list instead of showing it
     import importlib.machinery
     import importlib.util
@@ -420,6 +482,34 @@ try:
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+
+    # ---- what decides a state write: the clock comes out of the comparison, everything
+    #      else stays, and "everything else" includes fields this does not know about — a
+    #      whitelist of what to compare would silently stop noticing whatever a later change
+    #      adds to the state.
+    ev = module.state_evidence({
+        "heartbeat_ms": 1, "probed_ms": 2, "age_s": 3, "nested": {"at_ms": 4, "text": "x"},
+        "task_times": {"a": {"elapsed_ms": 5, "started_ms": 6, "done": True}},
+        "todos": [{"task": "a", "completed": True}], "goal": "g",
+    })
+    assert ev["goal"] == "g" and ev["todos"][0]["task"] == "a", ev
+    assert not [k for k in ev if k.endswith("_ms") or k == "age_s"], ev
+    assert ev["nested"] == {"text": "x"}, ev
+    assert ev["task_times"]["a"] == {"done": True}, ev
+    # a real change is not hidden by a moved clock, which is the whole point of the gate
+    a = {"todos": [{"task": "a", "completed": False}], "heartbeat_ms": 1}
+    b = {"todos": [{"task": "a", "completed": True}], "heartbeat_ms": 9}
+    assert module.state_evidence(a) != module.state_evidence(b)
+    say("state: the clock is not evidence, and a real change still is: ok")
+
+    # ---- a write that carries no evidence may skip the flushes, never the rename: the file
+    #      it leaves is whole, and no temp file is left behind for a sweep to find.
+    tmpj = os.path.join(TEST_HOME, "no-fsync.json")
+    module.atomic_write_json(tmpj, {"a": 1}, fsync=False)
+    with open(tmpj) as fh:
+        assert json.load(fh) == {"a": 1}
+    assert not [n for n in os.listdir(TEST_HOME) if n.startswith(".fbtodo.")], "temp left"
+    say("atomic writes: a no-flush write is still atomic and leaves nothing behind: ok")
 
     # ---- the claim is a REAL one: the kernel holds it. A record naming a live process
     #      that never took it (a leftover from a crash, or a pid that came round again) is

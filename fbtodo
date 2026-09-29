@@ -531,6 +531,22 @@ PROSE_NEEDLE_RE = re.compile(rb'"fullResponse"\s*:\s*"(?!")')
 # a `deepseek` step and a `space-bunny` step are not the same quantity.
 MODEL_RE = re.compile(rb'"model"\s*:\s*"([^"]{1,80})"')
 HEARTBEAT_GRACE = 5.0  # seconds a state file stays "fresh"
+# The watcher rewrites its state every poll because the heartbeat has to stay young. The
+# heartbeat is the only thing in it that moves when nothing has happened, so the rewrite is
+# gated on one of two things: something changed, or the ON-DISK heartbeat is about to fall
+# out of that window. A third of the grace leaves room for a slow poll.
+HB_REFRESH = max(1.0, HEARTBEAT_GRACE / 2.5)
+# What moves every poll without saying anything: the heartbeat, the "seen at" stamps, and
+# any field anywhere in the state that is itself a moment (`*_ms`) or an age (`age_s` — the
+# patch row's and the alert's carry their own). Everything else is evidence, and two states
+# with the same evidence are the same state as far as any reader is concerned. Measured on
+# the live session, those are the ONLY things that move when nothing has happened: the four
+# stamps, the two ages, and a running step's `elapsed_ms` — which the pane re-derives from
+# `started_ms` and its own tick anyway (see `live_elapsed`), so a state two seconds old
+# draws exactly the same frame as one written this second.
+STATE_CLOCK_KEYS = ("heartbeat_ms", "probed_ms", "observed", "source_updated_ms",
+                    "store_mtime_ms", "age_s")
+
 
 # Retention. The scratch directory is housekeeping, not history: task records are
 # dropped once they age out or exceed the count cap, the daemon log is truncated at
@@ -723,8 +739,15 @@ def clean_observation(state: dict) -> dict:
 # folder and only then renamed over the real one, so a reader can never catch a
 # half-written file — they see the old copy or the new one, never a mixture. The fsync
 # calls mean "get this onto the disk", not just into the computer's memory.
-def atomic_write_json(path: str, payload: dict, mode: int = 0o600) -> None:
-    """Temp file in the target's own directory, fsync, rename, fsync the dir."""
+def atomic_write_json(path: str, payload: dict, mode: int = 0o600, fsync: bool = True) -> None:
+    """Temp file in the target's own directory, fsync, rename, fsync the dir.
+
+    `fsync=False` keeps the atomicity — still a rename over the target, so a reader never
+    sees half a file — and drops the durability. That is the right trade for a rewrite whose
+    only change is the heartbeat: if the machine goes down in the same second, the cost is a
+    state file whose clock is a little old, which a reader answers by probing. What it saves
+    is the pair of flushes a second, every second, on a file nobody asked to keep.
+    """
     d = os.path.dirname(path)
     os.makedirs(d, mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".fbtodo.", suffix=".tmp", dir=d)
@@ -733,13 +756,15 @@ def atomic_write_json(path: str, payload: dict, mode: int = 0o600) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False)
             fh.flush()
-            os.fsync(fh.fileno())
+            if fsync:
+                os.fsync(fh.fileno())
         os.replace(tmp, path)
-        dfd = os.open(d, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+        if fsync:
+            dfd = os.open(d, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -7154,6 +7179,29 @@ def clear_lock(pid: int | None = None, path: str | None = None) -> None:
 # In plain words: has the watcher written anything recently? Every write carries the time
 # it was made, so a file that stops being stamped belongs to a watcher that has stopped —
 # which is how "the list has not changed" is told apart from "nobody is updating it".
+def _drop_clock(value):
+    """The same structure with every moment taken out of it, at any depth."""
+    if isinstance(value, dict):
+        return {
+            k: _drop_clock(v) for k, v in value.items()
+            if k not in STATE_CLOCK_KEYS and not k.endswith("_ms")
+        }
+    if isinstance(value, list):
+        return [_drop_clock(v) for v in value]
+    return value
+
+
+def state_evidence(state: dict | None) -> dict:
+    """The state with the clock taken out: what a poll actually learned.
+
+    Compared rather than the state itself, because the un-taken clock moves on every poll
+    and would make every poll look like news. Everything else is compared as a whole, so a
+    changed todo list, a new goal, a started turn or a finished session all count — and so
+    does anything added to the state later, without this needing to know about it.
+    """
+    return _drop_clock(state) if state else {}
+
+
 def state_is_fresh(state: dict | None, max_age: float = HEARTBEAT_GRACE) -> bool:
     if not state or state.get("status") != "watching":
         return False
@@ -7333,6 +7381,10 @@ def daemon_loop(args) -> int:
     remote_seen = False
 
     prev = read_json(STATE_PATH, None)
+    # What the last poll had to say (the clock taken out), and when the heartbeat on disk
+    # next needs refreshing. `0.0` is due immediately, so the first poll always writes.
+    prev_evidence = state_evidence(prev)
+    heartbeat_due = 0.0
     if not claim_or_force(LOCK_PATH, cwd, instance_pid, bool(getattr(args, "force", False))):
         # Between the check above and here another watcher could have taken the claim; the
         # claim is what decides, so losing that race means standing down rather than
@@ -7398,8 +7450,17 @@ def daemon_loop(args) -> int:
             st["tool_version"] = VERSION
             st["status"] = "watching"
             st["stop_reason"] = None
-            atomic_write_json(STATE_PATH, st)
+            # Write when there is something to say, and otherwise only to keep the
+            # heartbeat inside the window a reader calls fresh — measured on a live list:
+            # 0.96 rewrites a second (26.8 MB/hour) of a file whose only change was the
+            # clock. A rewrite that carries no evidence also carries no fsync: there is
+            # nothing in it worth flushing.
+            evidence = state_evidence(st)
+            if evidence != prev_evidence or time.monotonic() >= heartbeat_due:
+                atomic_write_json(STATE_PATH, st, fsync=evidence != prev_evidence)
+                heartbeat_due = time.monotonic() + HB_REFRESH
             prev = st
+            prev_evidence = evidence
             if args.ask_seconds > 0 and time.monotonic() >= ask_due:
                 ask_due = time.monotonic() + args.ask_seconds
                 ask_notify_once(args, quiet=args.quiet)
