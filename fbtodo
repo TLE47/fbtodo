@@ -425,8 +425,15 @@ HEARTBEAT_GRACE = 5.0  # seconds a state file stays "fresh"
 # dropped once they age out or exceed the count cap, the daemon log is truncated at
 # the cap, and temp files orphaned by a hard kill are swept. Enforced at most once
 # per PRUNE_INTERVAL so the hot path (a status bar polling every second) stays cheap.
-MAX_TASK_RECORDS = 500
-MAX_TASK_AGE_DAYS = 7
+# ...but the ESTIMATES are the one thing here that is supposed to get better with use, and
+# the old 7 days / 500 records could not give them enough to learn from: measured 2026-09-29
+# on this machine, the log held 176 records over 3 days of which only 39 carried a finished
+# span, and its oldest record was 6.68 days old — the prune was cutting the memory off
+# exactly as it matured, leaving the shape memory with one sample and the wording memory
+# with nothing. 60 days / 2000 records is the trade: about a month of real use at 182 bytes
+# a record (≈365 KB, parsed in a few ms on each poll) instead of a week.
+MAX_TASK_RECORDS = 2000
+MAX_TASK_AGE_DAYS = 60
 LOG_CAP_BYTES = 1 << 20
 PRUNE_INTERVAL_S = 3600.0
 TEMP_MAX_AGE_S = 3600.0
@@ -434,7 +441,10 @@ TEMP_MAX_AGE_S = 3600.0
 # map is capped to the most recently seen names, so a long-dead wording cannot drag the
 # pace it is never asked about.
 HISTORY_MAX_AGE_DAYS = MAX_TASK_AGE_DAYS
-HISTORY_MAX_ENTRIES = 200
+# Cap on the WORDING map, which grows without bound (a new label per step, essentially).
+# The shape map, which is what can actually accumulate, is keyed by a space of a few dozen
+# buckets, so this cap never binds it — no bucket is ever evicted for being old.
+HISTORY_MAX_ENTRIES = 400
 SHAPE_MAX = 3            # coarse bin for a step's call mix: 1, 2, or "3+" calls of one verb
 SHAPE_MIN_SAMPLES = 2    # remembered steps a shape needs before it may set anyone's number
 SPREAD_MIN_SAMPLES = 2   # measured steps needed before a spread may be claimed at all
@@ -4117,6 +4127,24 @@ def estimate_for(
     return task_estimate_ms(task, pace_ms, history, shapes, step_shape_bucket(times, task))
 
 
+# In plain words: the ladder the estimate walks, written once so that no caller can drift
+# from it. `None` for the value means "nothing better than the list's pace was available",
+# and the source it returns is what the error report files the result under.
+def pick_estimate(
+    task: str, history: dict | None = None, shapes: dict | None = None, bucket: str = ""
+) -> tuple[int | None, str]:
+    """(value or None, source) — own wording, then shared shape, then the list's pace."""
+    span = hist_med((history or {}).get(str(task)))
+    if span:
+        return min(span, EST_CAP_MS), "own"
+    entry = (shapes or {}).get(bucket) if bucket else None
+    if isinstance(entry, dict) and int(entry.get("n") or 0) >= SHAPE_MIN_SAMPLES:
+        seen = hist_med(entry)
+        if seen:
+            return min(seen, EST_CAP_MS), "shape"
+    return None, "pace"
+
+
 def task_estimate_ms(
     task: str,
     pace_ms: int,
@@ -4136,15 +4164,8 @@ def task_estimate_ms(
     `SHAPE_MIN_SAMPLES` remembering steps of that same shape stand behind it, so one
     coincidence never overrides the list's own pace.
     """
-    span = hist_med((history or {}).get(str(task)))
-    if span:
-        return min(span, EST_CAP_MS)
-    entry = (shapes or {}).get(bucket) if bucket else None
-    if isinstance(entry, dict) and int(entry.get("n") or 0) >= SHAPE_MIN_SAMPLES:
-        seen = hist_med(entry)
-        if seen:
-            return min(seen, EST_CAP_MS)
-    return pace_ms
+    value, _source = pick_estimate(task, history, shapes, bucket)
+    return value if value else pace_ms
 
 
 # In plain words: how far apart the samples behind a number were. Two finished steps of
@@ -4209,6 +4230,58 @@ def entry_spread(entry) -> tuple[int, int] | None:
     except (TypeError, ValueError):
         return None
     return (lo, hi) if lo > 0 and hi > 0 else None
+
+
+# In plain words: did the estimates get better? The task log already holds the pair needed
+# to answer that — what a step was projected to take at the moment it closed, and what it
+# actually took — so the error is computed from the records rather than kept in a tally that
+# could drift away from them. Reported per SOURCE, because that is the only way to see
+# whether the shape memory is earning its place on this machine's real work.
+def estimate_error(
+    tasks: dict,
+    now_ms: int | None = None,
+    model: str | None = None,
+    days: float | None = None,
+) -> dict:
+    """{source: {n, med, mean, worst}} — how far closed steps missed, by where the number came from.
+
+    Factor error (`max(pred/actual, actual/pred)`), so a step that took twice its estimate
+    and one that took half of it count the same. Records written before this build stamped
+    an estimate carry none, so the report fills in as steps close.
+    """
+    now_ms = now_ms or int(time.time() * 1000)
+    cutoff = now_ms - int((days if days is not None else HISTORY_MAX_AGE_DAYS) * 86400 * 1000)
+    factors: dict[str, list[float]] = {}
+    for key, rec in (tasks or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        started, stopped = rec.get("started_ms"), rec.get("done_ms")
+        if not started or not stopped or stopped <= started or stopped < cutoff:
+            continue
+        if model and rec.get("model") and rec.get("model") != model:
+            continue
+        try:
+            pred = int(rec.get("est_ms"))
+        except (TypeError, ValueError):
+            continue
+        if pred <= 0:
+            continue
+        actual = stopped - started
+        factors.setdefault(str(rec.get("est_src") or "pace"), []).append(
+            max(pred / actual, actual / pred)
+        )
+    report = {}
+    for src, fs in factors.items():
+        fs = sorted(fs)
+        mid = len(fs) // 2
+        med = fs[mid] if len(fs) % 2 else (fs[mid - 1] + fs[mid]) / 2
+        report[src] = {
+            "n": len(fs),
+            "med": round(med, 2),
+            "mean": round(sum(fs) / len(fs), 2),
+            "worst": round(max(fs), 1),
+        }
+    return report
 
 
 def estimate_spread_ms(
@@ -4566,12 +4639,6 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
         for gone in [k for k in tasks if k.startswith(prefix) and k not in seen]:
             tasks.pop(gone, None)
 
-    if persist and json.dumps(log, sort_keys=True) != before:
-        try:
-            atomic_write_json(TASKS_PATH, log)
-        except OSError:
-            pass
-        prune_scratch(now_ms=now_ms)  # throttled internally; keeps the record count capped
     # Per-task memory, kept ACROSS sessions: every finished step in the log contributes its
     # measured span under its own text, so a later list projects a step from what it took
     # last time instead of from the average of an unrelated list. Age-gated and capped
@@ -4581,6 +4648,30 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
     # with use: wordings never repeat (172 of 173 seen once) while shapes do, so samples
     # accumulate in a bucket instead of scattering one per step name.
     state["task_shapes"] = shape_history_from_log(tasks, now_ms, state.get("model"))
+    # What the pane is projecting for the step in flight at this moment, stamped onto its
+    # record. The moment that step closes, its estimate and its actual span are a matched
+    # pair, and `estimate_error` reads the pair straight back out of the log — which is the
+    # only way "are these numbers getting better?" can be answered with evidence rather than
+    # with faith. Written before the persist below, so the stamp is what lands on disk.
+    idx = current_index(todos)
+    if idx is not None and not ended:
+        label = str(todos[idx].get("task", ""))
+        rec = tasks.get(task_key(session, label))
+        if isinstance(rec, dict) and rec.get("started_ms"):
+            value, src = pick_estimate(
+                label,
+                state["task_history"],
+                state["task_shapes"],
+                step_shape_bucket(times, label),
+            )
+            rec["est_ms"] = value or step_pace_ms(times, todos, now_ms, state["task_history"])
+            rec["est_src"] = src
+    if persist and json.dumps(log, sort_keys=True) != before:
+        try:
+            atomic_write_json(TASKS_PATH, log)
+        except OSError:
+            pass
+        prune_scratch(now_ms=now_ms)  # throttled internally; keeps the record count capped
     state["task_times"] = times
     return state
 
@@ -6581,6 +6672,22 @@ def cmd_status(args) -> int:
         print(f"  remembered shapes : {len(shapes)} kept — {shown}")
     else:
         print("  remembered shapes : none yet (a shape is learned when a step finishes)")
+    # The one line that answers "is this getting better?" — and the only honest way to
+    # answer it, since the estimate and the outcome are both in the log. Split by source so
+    # a shape that is pulling its weight shows up as a lower median than the list's pace.
+    err = estimate_error(log.get("tasks") or {}, model=model)
+    parts = [
+        f"{src} {err[src]['med']:.2f}x median over {err[src]['n']}"
+        for src in ("own", "shape", "pace")
+        if err.get(src)
+    ]
+    if parts:
+        print(f"  estimate error    : {' · '.join(parts)}  (factor error of closed steps)")
+    else:
+        print(
+            "  estimate error    : — nothing closed yet since estimates were stamped "
+            "(a factor of 1.0x would be exact)"
+        )
     # whose steps those are: the memory is per model, so a number without its model is
     # not auditable — a fast model remembered here must not project a slow one
     if model:

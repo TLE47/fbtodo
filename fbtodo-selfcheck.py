@@ -2175,8 +2175,11 @@ try:
         mod.DEFAULT_PACE_MS, "a session with no past lost its default pace"
     # a stale wording falls out of the memory instead of skewing a pace it is never asked
     # about: a record outside the retention window contributes nothing
+    # expressed against the retention window itself rather than a hardcoded week: the claim
+    # is "a record outside the window contributes nothing", and it has to keep holding
+    # whichever way the window is set (it was 7 days until 2026-09-29)
     day = 86400 * 1000
-    later = t0 + 8 * day
+    later = t0 + int(mod.HISTORY_MAX_AGE_DAYS + 1) * day
     aged = mod.task_history_from_log(
         {
             mod.task_key("S", "ancient"): {"started_ms": t0, "done_ms": t0 + 600_000},
@@ -2271,6 +2274,72 @@ try:
     # the wording still wins when it is known: a step remembered by NAME beats its shape
     assert mod.estimate_for(own, "h-three", 240_000, {"h-three": {"med": 90_000, "n": 1}},
                             shapes) == 90_000
+
+    # ---- the estimate the pane is SHOWING is stamped on the step in flight, so that when
+    #      that step closes its projection and its outcome are a matched pair in the log.
+    #      Stamped from the same ladder the renderers use, and asserted against that same
+    #      call: a stamp that drifts from what the pane showed would measure nothing.
+    E = {"session": "E", "model": "m/e"}
+    # two remembered `edited3+` steps for this model, written into the log the watcher reads,
+    # so the stamp below is taken through the whole live path and not from a local fixture
+    e_log = mod.load_tasklog()
+    for n, span in enumerate((10_000, 30_000)):
+        e_log["tasks"][mod.task_key("SEED", f"seed {n}")] = {
+            "started_ms": t0, "done_ms": t0 + span, "model": "m/e", "shape": {"edited": 4},
+        }
+    mod.atomic_write_json(mod.TASKS_PATH, e_log)
+    e_state = mod.track_tasks(
+        dict(E, todos=[{"task": "e-one", "completed": False}], **hturn({"edited": 5}, t0)),
+        now_ms=t0 + 300_000)
+    e_rec = mod.load_tasklog()["tasks"][mod.task_key("E", "e-one")]
+    e_pace = mod.step_pace_ms(e_state["task_times"], e_state["todos"], t0 + 300_000,
+                              e_state["task_history"])
+    assert e_rec["est_ms"] == mod.estimate_for(
+        e_state["task_times"], "e-one", e_pace, e_state["task_history"],
+        e_state["task_shapes"]) == 20_000, e_rec
+    # ...and the source is named, so the error report knows which rung of the ladder missed:
+    # two remembered `edited3+` steps at 10s and 30s stand behind this one
+    assert e_rec["est_src"] == "shape", e_rec
+    assert mod.pick_estimate("nothing known", {}, {}) == (None, "pace")
+    assert mod.pick_estimate("e-one", {"e-one": {"med": 5_000, "n": 1}}, shapes) == (5_000, "own")
+
+    # ---- did the estimates get better? The pair (projection, outcome) is in the records, so
+    #      the answer is computed from them per source rather than kept in a tally of its own
+    errt = {
+        mod.task_key("E", "over"): {"started_ms": t0, "done_ms": t0 + 100_000,
+                                     "est_ms": 200_000, "est_src": "pace", "model": "m/e"},
+        mod.task_key("E", "under"): {"started_ms": t0, "done_ms": t0 + 200_000,
+                                      "est_ms": 100_000, "est_src": "pace", "model": "m/e"},
+        mod.task_key("E", "exact"): {"started_ms": t0, "done_ms": t0 + 100_000,
+                                      "est_ms": 100_000, "est_src": "own", "model": "m/e"},
+        # a step that closed before this build stamped anything contributes nothing
+        mod.task_key("E", "unstamped"): {"started_ms": t0, "done_ms": t0 + 100_000,
+                                          "model": "m/e"},
+        # ...and neither does another model's work
+        mod.task_key("E", "elsewhere"): {"started_ms": t0, "done_ms": t0 + 100_000,
+                                          "est_ms": 9_000_000, "est_src": "pace", "model": "z"},
+    }
+    err = mod.estimate_error(errt, t0 + 1000, "m/e")
+    # two 2x misses either side of the true value, counted the same, and one exact hit
+    assert err["pace"] == {"n": 2, "med": 2.0, "mean": 2.0, "worst": 2.0}, err
+    assert err["own"] == {"n": 1, "med": 1.0, "mean": 1.0, "worst": 1.0}, err
+    assert "elsewhere" not in str(err) and err.get("z") is None, err
+    assert mod.estimate_error({}, t0) == {}
+    say("estimates: the projection is stamped, and scored when the step closes: ok")
+
+    # ---- and the memory it is scored against now spans a month, not a week: the old cap
+    #      pruned records while they were still the only evidence there was (measured
+    #      2026-09-29: the oldest record in a real log was 6.68 days old, one day from
+    #      being thrown away, and the shape memory held one sample)
+    assert mod.MAX_TASK_AGE_DAYS >= 30, mod.MAX_TASK_AGE_DAYS
+    assert "recent" in mod.task_history_from_log({
+        mod.task_key("R", "recent"): {
+            "started_ms": now_ms - 30 * day, "done_ms": now_ms - 30 * day + 60_000},
+    }, now_ms)
+    assert mod.task_history_from_log({
+        mod.task_key("R", "ancient"): {
+            "started_ms": now_ms - 400 * day, "done_ms": now_ms - 400 * day + 60_000},
+    }, now_ms) == {}
     say("per-task timing: one clock per step, counting up then freezing: ok")
 
     # ---- the CLI process must be identified by argv, not by stray text
@@ -2451,8 +2520,16 @@ try:
             "schema": 1,
             "session": "S",
             "tasks": {
-                "ancient": {"started_ms": now - 30 * day, "done_ms": now - 30 * day},
-                "stale": {"started_ms": now - 8 * day, "done_ms": None},
+                # ages are expressed against the retention window itself, not a hardcoded
+                # week: the rule under test is "outside the window, gone", and it has to
+                # keep holding whichever way the window is set
+                "ancient": {
+                    "started_ms": now - int((mp.MAX_TASK_AGE_DAYS + 30) * day),
+                    "done_ms": now - int((mp.MAX_TASK_AGE_DAYS + 30) * day),
+                },
+                "stale": {
+                    "started_ms": now - int((mp.MAX_TASK_AGE_DAYS + 1) * day), "done_ms": None,
+                },
                 "a": {"started_ms": now - 3000, "done_ms": now - 2000},
                 "b": {"started_ms": now - 2000, "done_ms": None},
                 "c": {"started_ms": now - 1000, "done_ms": None},

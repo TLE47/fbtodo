@@ -645,6 +645,14 @@ Which is where most of the care in this tool has gone.
   plain number is kept (2 m from 2 m *is* 2 m), and `fbtodo status` prints the sample count
   behind every number, so `~2m, 1 sample` and `~2m, 9 samples` are told apart. A piped
   `snap` deliberately keeps the bare `~2m`: that token is a published contract.
+- **Every estimate is scored once the step closes**, and `fbtodo status` shows the running
+  result by source (e.g. `shape 1.8x median over 9 · pace 3.4x median over 31`; the numbers
+  are whatever your own steps did).
+  A factor of 1.0x would be exact; two steps that took twice their estimate and half of it
+  count the same. That line is the only honest answer to "are these numbers getting
+  better?", and it is also what tells you whether the shape memory is pulling its weight on
+  your own work. The memory behind it is kept for 60 days / 2000 records — about a month of
+  real use — because the estimates are the one thing here meant to improve with use.
 - Past twice the estimate a step is marked `[STUCK?]` — a hint, not a verdict.
 - The **list's own age** rides on `LIST:` (`LIST: #7 · 12m ago`), so a list the agent has
   stopped re-writing is visible while a step's clock is still counting. A narrow strip spends
