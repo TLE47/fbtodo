@@ -529,6 +529,87 @@ EX_CODES = {
 }
 
 
+# ------------------------------------------------------------- untrusted text
+# Every string the pane prints that is not the tool's own comes out of a file an agent
+# wrote: a step's name, the `Goal:` line, the last thing the agent said, the command in
+# an action-feed row, the tail of a far-side log. A journal is not hostile input in the
+# usual sense, but a terminal is a PROGRAM, and it obeys what it is fed: H1 measured an
+# OSC 52 sequence in a step's name setting the owner's clipboard, `\x1b[2J` wiping the
+# frame the pane sits under, a CSI move putting the cursor outside the box, and U+202E
+# reversing a row so it reads as something it never said — in the rich pane, in the
+# plain `snap` frame and in `json`, all verbatim (2026-09-29).
+#
+# So the filter lives here, and it is applied twice: where a source's prose enters the
+# state (which is also what `json` and `status` read, so cleaning only at render would
+# leave them exposed) and again as the frame is built, because a state file an older
+# build wrote is still on disk and a cache is not a promise.
+_ESC_SEQ_RE = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"     # OSC … BEL | ST (window title, clipboard)
+    r"|\x1b[P^_X][^\x1b]*(?:\x1b\\)?"         # DCS / PM / APC / SOS … ST
+    r"|\x1b\[[0-?]*[ -/]*[@-~]"               # CSI (cursor moves, erases, SGR)
+    r"|\x1b[@-_]"                             # two-character escape
+)
+_TEXT_DROP_RE = re.compile(
+    "["
+    "\x00-\x08\x0b-\x1f\x7f-\x9f"   # C0 (tab and newline aside), DEL, and all of C1
+    "\u200b-\u200f"                 # zero-width space and joiners, LRM, RLM
+    "\u202a-\u202e\u2066-\u2069"    # bidi embeddings, overrides and isolates
+    "\ufeff"                        # BOM / zero-width no-break space
+    "]"
+)
+# The keys a source contributes as prose, and the row keys inside the two lists.
+TEXT_KEYS = ("goal", "now", "nudge", "summary", "title", "first_prompt", "model",
+             "thread", "session", "patch", "alert", "error", "stop_reason")
+TEXT_LIST_KEYS = ("todos", "observed")
+TEXT_ROW_KEYS = ("task", "verb", "what")
+
+
+def clean_text(value) -> str:
+    """One string, stripped of everything a terminal would ACT on rather than show.
+
+    Escape sequences go whole — an OSC 52 leaves no `52;c;…` behind to read — and then
+    every remaining control, delimiter and bidi/zero-width character. Newlines stay: a
+    step's name may legitimately be three lines, and the row splitter needs them. A CR
+    becomes one, because a CR moves the cursor rather than starting a line.
+    """
+    text = _ESC_SEQ_RE.sub("", str("" if value is None else value))
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return _TEXT_DROP_RE.sub("", text)
+
+
+def clean_observation(state: dict) -> dict:
+    """The prose a source contributes, filtered — see `clean_text`.
+
+    Called where a source's state is assembled and again by `render()`; both, so the
+    state file itself is clean for its other readers and a frame cannot be painted from
+    a state that was written before this filter existed.
+    """
+    if not isinstance(state, dict):
+        return state
+    out = dict(state)
+    for key in TEXT_KEYS:
+        if isinstance(out.get(key), str):
+            out[key] = clean_text(out[key])
+    for key in TEXT_LIST_KEYS:
+        rows = out.get(key)
+        if not isinstance(rows, list):
+            continue
+        fixed = []
+        for row in rows:
+            if isinstance(row, str):
+                fixed.append(clean_text(row))
+            elif isinstance(row, dict):
+                row = dict(row)
+                for field in TEXT_ROW_KEYS:
+                    if isinstance(row.get(field), str):
+                        row[field] = clean_text(row[field])
+                fixed.append(row)
+            else:
+                fixed.append(row)
+        out[key] = fixed
+    return out
+
+
 # --------------------------------------------------------------------- helpers
 # In plain words: save, then swap. The new copy is written to a scratch name in the same
 # folder and only then renamed over the real one, so a reader can never catch a
@@ -1355,7 +1436,7 @@ def read_cli(chat_dir: str) -> dict:
     state["summary"] = scan.get("summary")
     if state.get("ts") is None:
         state["ts"] = meta.get("messagesMtimeMs")
-    return state
+    return clean_observation(state)
 
 
 # ==================================================================== NAS backend
@@ -1648,11 +1729,11 @@ def read_nas(args) -> dict:
     if not host or not root or not project:
         # No built-in target (see NAS_HOST): say which knob is missing rather than letting
         # ssh fail with "could not resolve hostname" three frames down.
-        return {
+        return clean_observation({
             "todos": [], "no_log": True, "title": "", "iteration": None, "ts": None,
             "goal": None, "now": None, "nudge": None, "tool_calls": {},
             "nas": {"dir": None, "error": NAS_UNCONFIGURED},
-        }
+        })
     prev = read_json(os.path.join(SCRATCH, "fbtodo-nas.json"), {}) or {}
     prev_mtime = prev.get("mtime_ms") if prev.get("dir") else None
     marker = getattr(args, "fb_marker", None) or "$HOME/.fb-session"
@@ -1688,7 +1769,7 @@ def read_nas(args) -> dict:
     }
     if not probe.get("dir"):
         nas["error"] = probe.get("error") or "no session on the NAS"
-        return empty
+        return clean_observation(empty)
     state = probe.get("state") or {}
     # The far side skips its parse while the transcript has not moved, so an "unchanged"
     # answer carries no list: serve the one we already extracted, or the pane would blank
@@ -1737,7 +1818,7 @@ def read_nas(args) -> dict:
              "calls": state.get("calls"), "goal": goal, "now": now, "nudge": nudge,
              "tool_calls": tools},
         )
-        return {
+        return clean_observation({
             "todos": todos,
             "ts": ms,
             "calls": state.get("calls"),
@@ -1750,11 +1831,11 @@ def read_nas(args) -> dict:
             "tool_calls": tools,
             "nas": nas,
             "patch": probe.get("patch"), "alert": probe.get("alert"),
-        }
+        })
     # `NONE` means this session has written no list yet. That is not an error and not a
     # zero: the pane says "no write_todos call yet", rather than claiming an empty list.
     empty["thread"] = probe.get("thread")
-    return empty
+    return clean_observation(empty)
 
 
 # ==================================================== the NAS pane watcher
@@ -5901,25 +5982,60 @@ def _theme_stamp() -> tuple:
 _THEME_CACHE: tuple | None = None
 
 
+# A theme value ends up INSIDE an escape sequence, which makes it code the terminal
+# runs: H2 measured `FBTODO_ACCENT='1;36<BEL><ESC>]52;c;…<BEL>'` painting a real escape
+# into the frame, because a value without a `#` is passed through as an SGR list. Two
+# forms are accepted — a raw SGR parameter list and a `#rrggbb` colour — and nothing
+# else, so the value can only ever be parameters.
+THEME_VALUE_RE = re.compile(r"^(?:#[0-9a-fA-F]{6}|\d{1,3}(?:;\d{1,3})*)$")
+# [(source, value)] the last `read_theme()` refused. `status` prints it: a theme that
+# silently does nothing is exactly how a bad value got this far unnoticed.
+THEME_PROBLEMS: list = []
+
+
+def _theme_value(value) -> str | None:
+    """The value when it is a colour or an SGR list, and None when it is neither."""
+    raw = str(value or "").strip()
+    return raw if THEME_VALUE_RE.match(raw) else None
+
+
 def read_theme() -> dict:
-    """The frame's palette, resolved once per env/file state — a pane repaints often."""
-    global _THEME_CACHE
+    """The frame's palette, resolved once per env/file state — a pane repaints often.
+
+    Each value is validated as it is read (`_theme_value`): an unusable one leaves the
+    role at its default rather than at a value that would carry whatever it contained
+    into the frame, and is remembered for `status`.
+    """
+    global _THEME_CACHE, THEME_PROBLEMS
     stamp = _theme_stamp()
     if _THEME_CACHE and _THEME_CACHE[0] == stamp:
+        THEME_PROBLEMS = _THEME_CACHE[2]
         return _THEME_CACHE[1]
     theme = dict(THEME_DEFAULTS)
-    for path in (THEME_FILE_GLOBAL, THEME_FILE_LOCAL):
+    problems: list = []
+    for source, path in (("theme.json", THEME_FILE_GLOBAL),
+                         ("project theme", THEME_FILE_LOCAL)):
         data = read_json(path, None)
         if isinstance(data, dict):
-            theme.update({
-                k: str(v).strip() for k, v in data.items()
-                if k in THEME_KEYS and str(v).strip()
-            })
+            for k, v in data.items():
+                if k not in THEME_KEYS or not str(v).strip():
+                    continue
+                good = _theme_value(v)
+                if good is None:
+                    problems.append((f"{source}: {k}", str(v)[:40]))
+                else:
+                    theme[k] = good
     for key in THEME_KEYS:
         value = (os.environ.get("FBTODO_" + key.upper()) or "").strip()
-        if value:
-            theme[key] = value
-    _THEME_CACHE = (stamp, theme)
+        if not value:
+            continue
+        good = _theme_value(value)
+        if good is None:
+            problems.append((f"FBTODO_{key.upper()}", value[:40]))
+        else:
+            theme[key] = good
+    THEME_PROBLEMS = problems
+    _THEME_CACHE = (stamp, theme, problems)
     return theme
 
 
@@ -6653,6 +6769,10 @@ def render(
     height: int | None = None,
 ) -> str:
     """Pick the framed pane (colour terminal) or the plain machine-readable text."""
+    # The second half of the text filter (see `clean_text`): a state that came off disk —
+    # this process's own cache, or a file an older build wrote — is filtered here, so no
+    # frame can be painted from prose that never went through a source.
+    state = clean_observation(state)
     now_ms = now_ms or int(time.time() * 1000)
     if color and width >= 30:
         return _render_rich(
@@ -7043,6 +7163,7 @@ def cmd_status(args) -> int:
     # session found" was a lie about a box that was running a freebuff at the time.
     live = adopt_version(finish_state(snapshot(args), None)) if args.source == "nas" else None
     view = live or st
+    read_theme()  # the palette resolves its refusals here, so both branches can report them
     if args.json:
         json.dump(
             {
@@ -7051,6 +7172,7 @@ def cmd_status(args) -> int:
                 "watcher_pid": pid,
                 "state_file": STATE_PATH,
                 "state_fresh": state_is_fresh(st),
+                "theme_problems": [list(p) for p in THEME_PROBLEMS],
                 "refit_readiness": refit_readiness(
                     load_tasklog().get("tasks") or {}, model=(st or {}).get("model")
                 ),
@@ -7072,6 +7194,13 @@ def cmd_status(args) -> int:
         )
         print(f"  other instances   : {shown}  — pin one with --instance-of/--watch-pid")
     print(f"  watcher           : {pid or '— not running'}")
+    # A theme value the palette REFUSED (see `read_theme`) is reported here rather than at
+    # render time: the pane falls back to the default and looks right, which is exactly
+    # how a bad value survived unnoticed before.
+    read_theme()
+    if THEME_PROBLEMS:
+        shown = ", ".join(f"{name}={value!r}" for name, value in THEME_PROBLEMS)
+        print(f"  theme values      : {len(THEME_PROBLEMS)} ignored  ({shown})")
     # In plain words: which build of fbtodo is actually running. The version is
     # hand-maintained, so a watcher left over from an earlier copy keeps working while the
     # pane beside it is a different build — the one way this pane has ever misled its

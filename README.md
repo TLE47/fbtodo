@@ -379,6 +379,24 @@ success colour, so a bar and the ticks beside it agree).
 Colours are 24-bit where the terminal takes them and the nearest 256-colour entry where it
 does not; `FBTODO_TRUECOLOR=0|1` forces the choice.
 
+A theme value is a `#rrggbb` colour or a raw SGR parameter list such as `1;36` — the value
+ends up *inside* an escape sequence, so those two forms are the only ones accepted. Anything
+else is ignored, the role keeps whatever the next source down gave it, and `fbtodo status`
+prints what was refused (`theme_problems` in `status --json`). The `#fff` shorthand is not
+one of the two forms; write `#ffffff`.
+
+### What reaches the screen
+
+Everything the pane prints that is not its own — a step's name, the `Goal:` line, `now`, the
+action feed, a command string, the tail of a far-side log — comes out of a file an agent
+wrote, and a terminal *obeys* what it is fed: a clipboard sequence in a step's name sets your
+clipboard, `\x1b[2J` wipes the frame above the pane, and a RIGHT-TO-LEFT OVERRIDE reverses a
+row so it reads as something it never said. One filter (`clean_text`) drops escape sequences
+whole, then every remaining control, delimiter and bidi/zero-width character, and it runs
+twice: where a source's prose enters the state — so the state file, `json` and `status` are
+clean too — and again as the frame is built, so a state file written by an older build cannot
+paint one either. Newlines survive (a three-line step is legitimate); a CR becomes one.
+
 ### Size and placement
 
 ```sh

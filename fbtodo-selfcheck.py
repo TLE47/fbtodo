@@ -2124,15 +2124,155 @@ try:
         assert len(stops) >= 2, repr(bar_row)
         first, last = stops[0], stops[-1]
         assert first[0] > last[0] and last[2] > first[2], (first, last)  # ramps red to blue
-        # a broken theme must not break the pane: a stop that is not a colour falls back to
-        # the default one, and a theme file that is not an object is ignored
+        # a broken theme must not break the pane: a value that is not a colour is IGNORED,
+        # so the stop keeps whatever the earlier source gave it — and the built-in default
+        # is what is left when no source gave it one
         os.environ.pop("FBTODO_GRADIENT_START", None)
         os.environ["FBTODO_GRADIENT_END"] = "mauve"
         assert module._theme_gradient(module.read_theme())[0] == module._hex_rgb("#ff0000")
+        assert module._theme_gradient(module.read_theme())[1] == module._hex_rgb("#0000ff")
+        assert [name for name, _v in module.THEME_PROBLEMS] == ["FBTODO_GRADIENT_END"], \
+            module.THEME_PROBLEMS
+        with open(local_file, "w", encoding="utf-8") as fh:
+            json.dump({"gradient_end": "mauve"}, fh)
+        os.environ.pop("FBTODO_GRADIENT_END", None)
         assert module._theme_gradient(module.read_theme())[1] == module._hex_rgb("#2ea043")
+        assert [name for name, _v in module.THEME_PROBLEMS] == ["project theme: gradient_end"]
+        # ...and a theme file that is not an object is ignored
         with open(local_file, "w", encoding="utf-8") as fh:
             fh.write("[1, 2, 3]")
         assert module.read_theme()["accent"] == "1;33", module.read_theme()
+
+        # ---- an untrusted theme value is a piece of code the terminal runs. H2 measured
+        #      `FBTODO_ACCENT='1;36<BEL><ESC>]52;c;…<BEL>'` painting real escapes into the
+        #      frame, because a value without a `#` is passed through as an SGR list. A
+        #      value is now an SGR parameter list or a `#rrggbb` colour and nothing else,
+        #      and what was thrown away is NAMED in `status`: a theme that silently does
+        #      nothing is how the value got this far.
+        bad_values = {
+            "FBTODO_ACCENT": "1;36\x07\x1b]52;c;aGFjaw==\x07",
+            "FBTODO_MUTED": "not-a-colour",
+            "FBTODO_TRACK": "1;36;2J",
+        }
+        for var, value in bad_values.items():
+            os.environ[var] = value
+        theme = module.read_theme()
+        # the refused env value is thrown away, so `accent` keeps what the theme FILE gave
+        # it and a role nothing else set stays on the built-in colour
+        assert theme["accent"] == "#ff8800", theme["accent"]
+        assert theme["muted"] == module.THEME_DEFAULTS["muted"], theme["muted"]
+        assert theme["track"] == module.THEME_DEFAULTS["track"], theme["track"]
+        reported = " ".join(name for name, _value in module.THEME_PROBLEMS)
+        for var in bad_values:
+            assert var in reported, (var, module.THEME_PROBLEMS)
+        bad_frame = module.render(
+            with_patch, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW,
+        )
+        assert "\x1b]52" not in bad_frame and "\x07" not in bad_frame, repr(bad_frame[:200])
+        # ...and a value that IS one of the two forms still gets through: a filter, not a mute
+        os.environ["FBTODO_ACCENT"] = "1;33"
+        os.environ["FBTODO_MUTED"] = "#89b4fa"
+        os.environ["FBTODO_TRACK"] = "1;90"
+        assert module.read_theme()["accent"] == "1;33"
+        assert module.read_theme()["muted"] == "#89b4fa"
+        assert module.read_theme()["track"] == "1;90"
+        assert not module.THEME_PROBLEMS, module.THEME_PROBLEMS
+        for var in bad_values:
+            os.environ.pop(var, None)
+        env["FBTODO_ACCENT"] = "not-a-colour"
+        status_out = run("status").stdout
+        env.pop("FBTODO_ACCENT", None)
+        assert "theme values" in status_out and "FBTODO_ACCENT" in status_out, status_out[-400:]
+        say("theme: a value that is neither a colour nor an SGR list is ignored, and `status` says so: ok")
+
+        # ---- untrusted journal text (H1): a step's name, the `Goal:` line, `now`, the
+        #      action feed's `what` and a command string all reached the terminal exactly
+        #      as they were written. Measured 2026-09-29: OSC 52 (sets the clipboard),
+        #      OSC 0 (retitles the window), a CSI cursor move, a RIGHT-TO-LEFT OVERRIDE, a
+        #      zero-width space and a raw BEL all printed verbatim — in the rich pane, in
+        #      the plain `snap` frame and in `json`. One filter now runs where a source's
+        #      prose enters state AND where the frame is built, because a state file an
+        #      older build wrote is still on disk.
+        osc52 = "\x1b]52;c;aGFjaw==\x07"
+        osc0 = "\x1b]0;pwnd\x07"
+        csi = "\x1b[9;1H"
+        rlo, zwsp, bom = "\u202e", "\u200b", "\ufeff"
+        dirty_bits = (osc52, osc0, csi, rlo, zwsp, bom)
+        ESC_SEQ = re.compile(r"\x1b(?:\[[0-9;?]*[A-Za-z]|.)")
+        TOOL_SEQ = re.compile(r"^\x1b\[[0-9;?]*[A-Za-z]$")
+
+        def uncleaned(obj):
+            """Every escape, control or bidi character still anywhere in a value."""
+            found = []
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    found += uncleaned(key) + uncleaned(value)
+            elif isinstance(obj, (list, tuple)):
+                for value in obj:
+                    found += uncleaned(value)
+            elif isinstance(obj, str):
+                found += [c for c in obj if c in dirty_bits or (ord(c) < 32 and c != "\n")]
+            return found
+
+        dirty_prose = "Goal: " + rlo + "ship it" + osc52 + "\n\nthe work " + osc0
+        dirty_todos = [
+            {"task": "tick " + osc52 + "one", "completed": True},
+            {"task": "write " + rlo + "left" + zwsp, "completed": False},
+        ]
+        dirty_store = os.path.join(TEST_HOME, "dirtystore")
+        os.makedirs(dirty_store, exist_ok=True)
+        with open(os.path.join(dirty_store, "log.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "level": "DEBUG", "timestamp": "2026-01-01T00:00:00.000Z",
+                "data": {
+                    "iteration": 1,
+                    "prompt": "run " + csi + "the thing",
+                    "fullResponse": dirty_prose,
+                    "toolCalls": [
+                        {"toolName": "write_todos", "input": {"todos": dirty_todos}},
+                        {"toolName": "run_terminal_command",
+                         "input": {"command": "git status " + osc52, "pattern": "a" + bom}},
+                    ],
+                },
+            }) + "\n")
+        # ...the source's own state, before any pane sees it: `json` and `status` print
+        # this file too, so cleaning only at render would leave the other readers exposed
+        ingested = module.read_cli(dirty_store)
+        assert ingested["todos"], ingested
+        assert not uncleaned(ingested), uncleaned(ingested)[:8]
+        assert "ship it" in json.dumps(ingested), "the readable part of the prose was dropped too"
+        say("text: prose, a step's name and a command arrive from the journal stripped: ok")
+
+        # ...and the render-side half, handed a state that never went through a source:
+        # an older build's state file, or a cache, must not be able to paint a frame like
+        # that either
+        dirty_state = dict(
+            with_patch, todos=dirty_todos, done=1, total=2, goal=dirty_prose,
+            now="ran " + osc0 + "ls", list_version=3,
+            observed=[{"verb": "ran " + csi, "what": "git " + osc52 + " status",
+                       "ts_ms": SWEEP_NOW - 60_000}],
+        )
+        for colour in (False, True):
+            framed = module.render(
+                dirty_state, colour, watching=999, width=80, height=20, now_ms=SWEEP_NOW,
+            )
+            for bad in dirty_bits:
+                assert bad not in framed, (colour, repr(bad), framed[:200])
+            # the tool's own escapes are the only ones left: strip them and nothing that a
+            # terminal would ACT on may remain
+            assert not uncleaned(ESC_SEQ.sub("", framed)), (colour, uncleaned(framed)[:8])
+            for seq in ESC_SEQ.findall(framed):
+                assert TOOL_SEQ.match(seq), (colour, repr(seq))
+            assert "ship it" in framed, framed[:400]
+        # the action feed draws only when there is no list: give it one and check the same
+        feed_frame = module.render(
+            dict(dirty_state, todos=[]), True, watching=999, width=80, height=20,
+            now_ms=SWEEP_NOW,
+        )
+        for bad in dirty_bits:
+            assert bad not in feed_frame, (repr(bad), feed_frame[:200])
+        assert not uncleaned(ESC_SEQ.sub("", feed_frame)), uncleaned(feed_frame)[:8]
+        say("text: OSC 52, OSC 0, cursor moves and bidi overrides never reach the terminal: ok")
     finally:
         for key, value in saved_env.items():
             var = "FBTODO_" + key.upper()

@@ -117,6 +117,19 @@ back.
   fact is stated once: the running clock is on the row, not repeated on the status chip;
   `EST REM` is on the bar row, and the `GOAL` row carries only what it alone has (spent and
   total).
+- **Text from a source is filtered, twice.** `clean_text()` strips escape sequences whole
+  (an OSC 52 leaves no `52;c;…` behind to read), then every other C0/C1 control, DEL and
+  bidi/zero-width character, keeping newlines. It is applied where a source's prose enters
+  the state — so the state file, `json` and `status` are clean — and again in `render()`,
+  because a state file an older build wrote is still on disk. H1 measured all of it reaching
+  the terminal verbatim before (OSC 52, OSC 0, CSI moves, U+202E) in the rich pane, in
+  `snap` and in `json`.
+- **A theme value is validated where it is read.** `THEME_VALUE_RE` accepts a `#rrggbb`
+  colour or a raw SGR parameter list and nothing else, because the value is interpolated into
+  an escape sequence. A refused value leaves the role at whatever the next source down gave
+  it, and is named by `status` / `status --json` (`theme_problems`): silently ignoring it is
+  how a bad value survives. `_color_sgr` still understands 3-digit shorthand when called
+  directly; the palette no longer feeds it any.
 - **The plain renderer is the machine-readable path.** `snap`, `json` and `bar` stay
   line-oriented and uncoloured; colour belongs to the framed pane.
 - **Every subprocess has a timeout**, and every network or ssh call is bounded. A pane is
