@@ -980,14 +980,62 @@ try:
         keyed["tasks"][module.task_key("S", name)] = {
             "started_ms": now_ms - span - 60_000, "done_ms": now_ms - 60_000, "model": model,
         }
-    assert module.task_history_from_log(keyed["tasks"], now_ms, fast) == {"Run the tests": 30_000}
-    assert module.task_history_from_log(keyed["tasks"], now_ms, slow) == {"Deploy": 600_000}
+    # an entry is a small record now, not a bare number: the median is still what a caller
+    # reads, and `n` says how many samples stand behind it
+    meds = lambda h: {k: module.hist_med(v) for k, v in h.items()}  # noqa: E731
+    counts = lambda h: {k: v["n"] for k, v in h.items()}  # noqa: E731
+    assert meds(module.task_history_from_log(keyed["tasks"], now_ms, fast)) == {
+        "Run the tests": 30_000}
+    assert meds(module.task_history_from_log(keyed["tasks"], now_ms, slow)) == {
+        "Deploy": 600_000}
+    assert counts(module.task_history_from_log(keyed["tasks"], now_ms, fast)) == {
+        "Run the tests": 1}
     # a model with no history of its own still gets a number, borrowed from any model
-    borrowed = module.task_history_from_log(keyed["tasks"], now_ms, "some/new-model")
+    borrowed = meds(module.task_history_from_log(keyed["tasks"], now_ms, "some/new-model"))
     assert borrowed == {"Run the tests": 30_000, "Deploy": 600_000}, borrowed
     # ...and with no model named at all, nothing is filtered
-    assert module.task_history_from_log(keyed["tasks"], now_ms) == borrowed
+    assert meds(module.task_history_from_log(keyed["tasks"], now_ms)) == borrowed
     say("estimates: a step's remembered span is kept per model, not pooled: ok")
+
+    # ---- the SHAPE memory: the same span, keyed by what a step DID rather than what it
+    #      was called. This is the half that can improve with use, because call mixes
+    #      repeat where 172 of 173 remembered wordings did not.
+    shaped = {"schema": module.TASKLOG_SCHEMA, "session": "S", "tasks": {}}
+    for name, verbs, span in (
+        ("Fix the parser", {"edited": 4, "ran": 1}, 60_000),
+        ("Repair the tokenizer", {"edited": 5, "ran": 1}, 90_000),  # same shape: edited3+ ran1
+        ("Run the tests", {"ran": 1}, 20_000),
+    ):
+        shaped["tasks"][module.task_key("S", name)] = {
+            "started_ms": now_ms - span - 60_000, "done_ms": now_ms - 60_000,
+            "model": fast, "shape": verbs,
+        }
+    sh = module.shape_history_from_log(shaped["tasks"], now_ms, fast)
+    # `edited: 4, ran: 1` and `edited: 5, ran: 1` land in the SAME bucket, which is the
+    # whole point: two differently-worded steps of one kind, pooled into a median of 1m15s
+    assert set(sh) == {"edited3+ ran1", "ran1"}, sh
+    assert sh["edited3+ ran1"] == {"med": 75_000, "n": 2}, sh
+    assert sh["ran1"] == {"med": 20_000, "n": 1}, sh
+    assert module.shape_of({"edited": 9, "ran": 2}) == "edited3+ ran2", module.shape_of(
+        {"edited": 9, "ran": 2})
+    assert module.shape_of({}) == "" and module.shape_of(None) == ""
+    # the multi-word verbs in ACTION_TOOLS keep their first word, not their spaces
+    assert module.shape_of({"searched the web": 1}) == "searched1"
+    # a step whose calls were never recorded gets no bucket rather than an empty one
+    assert module.shape_history_from_log(
+        {module.task_key("S", "nothing"): {"started_ms": 1, "done_ms": 2}}, now_ms) == {}
+    say("estimates: a step's shape pools steps worded differently: ok")
+
+    # ---- the ladder: exact wording first, then the shape, then the list's pace — and a
+    #      shape may only answer once SHAPE_MIN_SAMPLES steps of that shape stand behind it
+    assert module.task_estimate_ms("anything", 600_000, {}, {"edited3+": {"med": 30_000, "n": 2}},
+                                   "edited3+") == 30_000
+    assert module.task_estimate_ms("anything", 600_000, {}, {"edited3+": {"med": 30_000, "n": 1}},
+                                   "edited3+") == 600_000   # one sample: not yet
+    assert module.task_estimate_ms("mine", 600_000, {"mine": {"med": 5_000, "n": 1}},
+                                   {"edited3+": {"med": 30_000, "n": 9}}, "edited3+") == 5_000
+    assert module.task_estimate_ms("anything", 600_000, {}, {}, "") == 600_000
+    say("estimates: the shape only answers behind a same-shaped step: ok")
 
     # ...which the pane's journal reader has to know in the first place: the model comes
     # out of the same backward pass that finds the list, with no json parse per line.
@@ -2085,8 +2133,8 @@ try:
     say("a clock left open on disk by the old rule renders as idle, not working: ok")
     # what a step took is remembered under its own text, ACROSS sessions: a later list
     # projects it from that rather than from the average of an unrelated list
-    assert reopened["task_history"]["a"] == 120_000, reopened["task_history"]
-    assert reopened["task_history"]["b"] == 180_000, reopened["task_history"]
+    assert mod.hist_med(reopened["task_history"]["a"]) == 120_000, reopened["task_history"]
+    assert mod.hist_med(reopened["task_history"]["b"]) == 180_000, reopened["task_history"]
     assert mod.task_estimate_ms("a", 90_000, reopened["task_history"]) == 120_000
     assert mod.task_estimate_ms("never seen", 90_000, reopened["task_history"]) == 90_000
     # with nothing finished in this list the remembered pace stands in for the default
@@ -2106,7 +2154,7 @@ try:
         },
         later,
     )
-    assert "ancient" not in aged and aged.get("fresh") == 1000, aged
+    assert "ancient" not in aged and mod.hist_med(aged.get("fresh")) == 1000, aged
     # ...and the map is capped to the most recently seen names, so the fallback median is
     # not diluted by a long tail of one-off titles
     many = mod.task_history_from_log(
@@ -2129,6 +2177,70 @@ try:
     legacy = mod.track_tasks(dict(S, todos=[{"task": "a", "completed": True}]), now_ms=t0 + 60_000)
     assert legacy["task_times"]["a"]["elapsed_ms"] == 5000, "an upgrade threw the clocks away"
     assert mod.task_key(None, "a") != mod.task_key("S", "a"), "records are not session-scoped"
+
+    # ---- a step's SHAPE: what it DID, taken from the turn's own call tally and shared out
+    #      between the steps of that turn BY ORDER. Step one is credited first, the step in
+    #      flight takes what is left, and a finished step keeps what it earned — so no call
+    #      is counted twice, none is lost, and no timestamp is needed to tell them apart.
+    def hseq(a, b, c):
+        return [
+            {"task": "h-one", "completed": a},
+            {"task": "h-two", "completed": b},
+            {"task": "h-three", "completed": c},
+        ]
+
+    def hturn(verbs, start):
+        return {"turn": {"start_ms": start, "verbs": verbs}}
+
+    H = {"session": "H", "model": "m/h"}
+    k1 = mod.track_tasks(
+        dict(H, todos=hseq(False, False, False), **hturn({"edited": 2}, t0)), now_ms=t0)
+    assert k1["task_times"]["h-one"]["shape"] == {"edited": 2}, k1["task_times"]
+    # the first step is ticked: two edits are ITS shape, and the step now in flight starts
+    # from nothing rather than inheriting them
+    k2 = mod.track_tasks(
+        dict(H, todos=hseq(True, False, False), **hturn({"edited": 2, "ran": 1}, t0)),
+        now_ms=t0 + 10_000)
+    assert k2["task_times"]["h-one"]["shape"] == {"edited": 2}, k2["task_times"]
+    assert k2["task_times"]["h-two"]["shape"] == {"ran": 1}, k2["task_times"]
+    assert mod.shape_of(k2["task_times"]["h-one"]["shape"]) == "edited2"
+    assert mod.shape_of(k2["task_times"]["h-two"]["shape"]) == "ran1"
+    # the finished step's shape is remembered with its span; the one still running has no
+    # span yet, so it contributes nothing to the memory it will later feed
+    mem = mod.shape_history_from_log(mod.load_tasklog()["tasks"], t0 + 10_000, "m/h")
+    assert mem == {"edited2": {"med": 10_000, "n": 1}}, mem
+    # a NEW turn brings its own tally, and the previous turn's steps are not credited
+    # against it — otherwise a call made before the request would be billed to the work
+    # the request started
+    k3 = mod.track_tasks(
+        dict(H, todos=hseq(True, True, False), **hturn({"edited": 1}, t0 + 20_000)),
+        now_ms=t0 + 30_000)
+    assert k3["task_times"]["h-three"]["shape"] == {"edited": 1}, k3["task_times"]
+    assert k3["task_times"]["h-two"]["shape"] == {"ran": 1}, "a finished shape moved"
+    # ...and a turn with no tally at all (a session fbtodo attached to mid-flight) leaves
+    # the step's shape as it stood rather than blanking it: it is the same step, and the
+    # calls it already made were still made
+    k4 = mod.track_tasks(dict(H, todos=hseq(True, True, False)), now_ms=t0 + 31_000)
+    assert k4["task_times"]["h-three"]["shape"] == {"edited": 1}, k4["task_times"]
+    # a step the pane can project from what it is DOING: four edits and nine edits are the
+    # same kind of work (`edited3+`), so two such steps at 10s and 30s set that shape's
+    # number at 20s — where the list's own pace says 4m
+    shapes = mod.shape_history_from_log({
+        mod.task_key("H", "x"): {"started_ms": t0, "done_ms": t0 + 10_000,
+                                 "model": "m/h", "shape": {"edited": 4}},
+        mod.task_key("H", "y"): {"started_ms": t0, "done_ms": t0 + 30_000,
+                                 "model": "m/h", "shape": {"edited": 9}},
+    }, t0 + 60_000, "m/h")
+    assert shapes == {"edited3+": {"med": 20_000, "n": 2}}, shapes
+    own = {"h-three": {"started_ms": t0, "done_ms": None, "shape": {"edited": 9}}}
+    assert mod.estimate_for(own, "h-three", 240_000, {}, shapes) == 20_000
+    # one step of that shape is not evidence yet, and neither is a shape nobody has seen
+    assert mod.estimate_for(own, "h-three", 240_000, {}, {"edited3+": {"med": 5_000, "n": 1}}) \
+        == 240_000
+    assert mod.estimate_for({}, "nothing", 240_000, {}, shapes) == 240_000
+    # the wording still wins when it is known: a step remembered by NAME beats its shape
+    assert mod.estimate_for(own, "h-three", 240_000, {"h-three": {"med": 90_000, "n": 1}},
+                            shapes) == 90_000
     say("per-task timing: one clock per step, counting up then freezing: ok")
 
     # ---- the CLI process must be identified by argv, not by stray text

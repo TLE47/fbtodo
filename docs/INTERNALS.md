@@ -49,8 +49,9 @@ fields that matter:
 | `done`, `total`, `list_id`, `list_version` | progress, and the identity of *this* list |
 | `cleared`, `cleared_turn` | no list is drawn, and which drop caused it. `cleared` is a dropped list: a new session, or a **finished** list the next turn replaced. `cleared_turn` names the second and is what `no_list_reason` prints for it. A drop never touches `list_version` — the number identifies a list, and the new turn's list is what increments it |
 | `turn_ended` | the journal's `shouldEndTurn` — the other half of "finished" |
-| `task_times` | per-step `started_ms` / `done_ms` / `elapsed_ms`, from the tick that saw it |
-| `task_history` | per-step remembered span, model-aware |
+| `task_times` | per-step `started_ms` / `done_ms` / `elapsed_ms` / `shape`, from the tick that saw it. `shape` is the call mix the step has revealed so far, credited from the turn's own tally by order, and only for the step in flight |
+| `task_history` | per-step remembered span, model-aware: `{label: {med, n}}`, where `n` is how many samples the median stands on. A state written by an older build holds a bare int and is read the same way |
+| `task_shapes` | the same memory keyed by what a step *did* (`edited3+ ran2`) rather than what it was called, with the same `{med, n}` entries. This is the half that accumulates: step wordings almost never repeat (172 of 173 remembered labels had been seen once) while call mixes do |
 | `model` | the model the session names; the pace is quoted with it |
 | `patch`, `alert` | the two optional footer facts, read from the logs that produce them |
 | `ts`, `source_updated_ms`, `store_mtime_ms`, `probed_ms`, `heartbeat_ms` | the clocks. `ts` is when the drawn `write_todos` record was written (and `source_updated_ms` mirrors it), which is what the pane's `LIST: #7 · 12m ago` and `status`'s `list written` report; `store_mtime_ms` is the transcript's mtime, and `store_mtime_ms - ts` past `LIST_BEHIND_MS` in a session with every step ticked is the `[STALE?]` marker and `status`'s `list behind` |

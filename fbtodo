@@ -108,7 +108,7 @@ import textwrap
 import time
 import unicodedata
 
-VERSION = "4.20.0"
+VERSION = "4.21.0"
 HOME = os.path.expanduser("~")
 # FBTODO_HOME points state/lock/log elsewhere — used by the self-check so it never
 # touches the real watcher's files.
@@ -435,6 +435,8 @@ TEMP_MAX_AGE_S = 3600.0
 # pace it is never asked about.
 HISTORY_MAX_AGE_DAYS = MAX_TASK_AGE_DAYS
 HISTORY_MAX_ENTRIES = 200
+SHAPE_MAX = 3            # coarse bin for a step's call mix: 1, 2, or "3+" calls of one verb
+SHAPE_MIN_SAMPLES = 2    # remembered steps a shape needs before it may set anyone's number
 
 EX_CODES = {
     "ok": 0,
@@ -3914,7 +3916,58 @@ def task_history_from_log(tasks: dict, now_ms: int | None = None, model: str | N
     model, records carrying that model win, and records from any other model are used only
     if it has none of its own (a model seen for the first time is better served by a rough
     number than by none, and its own records take over as soon as it has them).
+
+    Each entry is `{"med": int, "n": int}` rather than a bare number: the median is still
+    what a caller reads, and `n` is how many samples stand behind it — which is the whole
+    difference between a guess from one run and a settled number. Older state files hold a
+    bare int and read the same way (see `hist_med`).
     """
+    by_task, last_seen = _history_gather(
+        tasks, now_ms, model, lambda rec, label: label
+    )
+    history: dict[str, dict] = {}
+    for label, spans in by_task.items():
+        mid = _median_ms(spans)
+        if mid:
+            history[label] = {"med": mid, "n": len(spans)}
+    if len(history) > HISTORY_MAX_ENTRIES:
+        recent = sorted(history, key=lambda k: last_seen.get(k, 0), reverse=True)
+        history = {k: history[k] for k in recent[:HISTORY_MAX_ENTRIES]}
+    return history
+
+
+# In plain words: the same memory, keyed by what a step DID instead of what it was called.
+# This is the one that can actually get better with use: the wording space grows without
+# bound (172 of 173 labels seen once) while the shape space is small — a handful of verbs
+# binned three ways — so samples accumulate in the same bucket and the number sharpens.
+def shape_history_from_log(
+    tasks: dict, now_ms: int | None = None, model: str | None = None
+) -> dict:
+    """Per-SHAPE remembered span: {`edited3+ ran2`: {med, n}} from the log's finished steps.
+
+    Same retention and model rules as `task_history_from_log` (one gatherer serves both),
+    so a shape learned on a fast model never projects a slow one. A step whose calls were
+    never recorded contributes nothing rather than a bucket of its own.
+    """
+    by_shape, last_seen = _history_gather(
+        tasks, now_ms, model, lambda rec, label: shape_of(rec.get("shape"))
+    )
+    shapes: dict[str, dict] = {}
+    for bucket, spans in by_shape.items():
+        mid = _median_ms(spans)
+        if mid:
+            shapes[bucket] = {"med": mid, "n": len(spans)}
+    if len(shapes) > HISTORY_MAX_ENTRIES:
+        recent = sorted(shapes, key=lambda k: last_seen.get(k, 0), reverse=True)
+        shapes = {k: shapes[k] for k in recent[:HISTORY_MAX_ENTRIES]}
+    return shapes
+
+
+# In plain words: one pass over the task log, read either way — by step wording for the
+# per-step memory, or by call shape for the one that accumulates. One gatherer, so both
+# memories age out, cap and split by model identically.
+def _history_gather(tasks: dict, now_ms: int | None, model: str | None, key_of):
+    """({key: [spans]}, {key: last stamp}) for this model, or for every model if it has none."""
     now_ms = now_ms or int(time.time() * 1000)
     cutoff = now_ms - HISTORY_MAX_AGE_DAYS * 86400 * 1000
     mine: dict[str, list[int]] = {}      # spans this model took
@@ -3924,28 +3977,56 @@ def task_history_from_log(tasks: dict, now_ms: int | None = None, model: str | N
         if not isinstance(rec, dict):
             continue
         label = key.split("\x1f", 1)[1] if "\x1f" in key else key
+        bucket = key_of(rec, label)
+        if not bucket:
+            continue
         started, stopped = rec.get("started_ms"), rec.get("done_ms")
         stamp = stopped or started or 0
         if stamp and stamp < cutoff:
             continue
-        last_seen[label] = max(last_seen.get(label, 0), stamp)
+        last_seen[bucket] = max(last_seen.get(bucket, 0), stamp)
         if not started or not stopped or stopped <= started:
             continue
         span = min(stopped - started, EST_CAP_MS)
-        every.setdefault(label, []).append(span)
+        every.setdefault(bucket, []).append(span)
         if model and rec.get("model") == model:
-            mine.setdefault(label, []).append(span)
+            mine.setdefault(bucket, []).append(span)
     # this model's own spans when it has any, every model's when it has none yet
-    by_task = mine or every
-    history: dict[str, int] = {}
-    for label, spans in by_task.items():
-        mid = _median_ms(spans)
-        if mid:
-            history[label] = mid
-    if len(history) > HISTORY_MAX_ENTRIES:
-        recent = sorted(history, key=lambda k: last_seen.get(k, 0), reverse=True)
-        history = {k: history[k] for k in recent[:HISTORY_MAX_ENTRIES]}
-    return history
+    return (mine or every), last_seen
+
+
+# In plain words: the SHAPE of a step is what it DID — how many edits, how many commands —
+# rather than what it was called. "Fix the parser" and "Repair the tokenizer" are the same
+# kind of work when they make the same calls, and that is the only way this memory can ever
+# accumulate: measured 2026-09-29, 172 of the 173 remembered step WORDINGS had been seen
+# exactly once, so a memory keyed by wording is asked a question it has never heard before
+# almost every time. Calls repeat far more often than sentences do.
+SHAPE_VERB_LIMIT = 8     # verbs kept in one signature: a step doing nine things is "mixed"
+
+
+def shape_of(shape: dict | None) -> str:
+    """A coarse signature of a step's call mix: `edited3+ ran2`.
+
+    Coarse on purpose. Counts are binned to 1, 2 or `3+` so that two runs of the same kind
+    of work land in the SAME bucket — a bucket per exact count would be as sparse as the
+    wording memory it exists to replace.
+    """
+    parts = []
+    for verb, n in sorted((shape or {}).items()):
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            continue
+        if n <= 0:
+            continue
+        # ACTION_TOOLS holds multi-word verbs (`searched the web`); the first word is the verb
+        parts.append(f"{str(verb).split()[0]}{n if n < SHAPE_MAX else str(SHAPE_MAX) + '+'}")
+    return " ".join(parts[:SHAPE_VERB_LIMIT])
+
+
+def step_shape_bucket(times: dict, task) -> str:
+    """The shape the step being worked on has revealed so far, or "" for one that has none."""
+    return shape_of(((times or {}).get(str(task)) or {}).get("shape"))
 
 
 # In plain words: one remembered span, read the same way whether it was stored as a bare
@@ -4010,22 +4091,55 @@ def step_pace_ms(times: dict, todos: list, now_ms: int, history: dict | None = N
     return pace
 
 
-def task_estimate_ms(task: str, pace_ms: int, history: dict | None = None) -> int:
-    """The estimate for one step: what THIS step took before, else the list's pace.
+# In plain words: one step's estimate, in the order the evidence deserves — what this exact
+# step took before, then what steps of the same SHAPE took, then the list's pace.
+def estimate_for(
+    times: dict, task: str, pace_ms: int, history: dict | None = None, shapes: dict | None = None
+) -> int:
+    """One step's projection, from the best evidence available about it."""
+    return task_estimate_ms(task, pace_ms, history, shapes, step_shape_bucket(times, task))
+
+
+def task_estimate_ms(
+    task: str,
+    pace_ms: int,
+    history: dict | None = None,
+    shapes: dict | None = None,
+    bucket: str = "",
+) -> int:
+    """The estimate for one step: what THIS step took before, else its shape's, else the pace.
 
     The task log remembers every finished step by (session, task), so a step that has run
     in an earlier session — a `Run the tests` from a previous turn — is projected from its
     own history rather than from the average of whatever this list happens to contain.
+
+    When the wording has never been seen (the usual case: 172 of 173 remembered labels were
+    one-offs), the step's SHAPE is asked instead. For a step already running that is real
+    evidence — the calls it has made so far — and a shape is only allowed to answer once
+    `SHAPE_MIN_SAMPLES` remembering steps of that same shape stand behind it, so one
+    coincidence never overrides the list's own pace.
     """
     span = hist_med((history or {}).get(str(task)))
-    return min(span, EST_CAP_MS) if span else pace_ms
+    if span:
+        return min(span, EST_CAP_MS)
+    entry = (shapes or {}).get(bucket) if bucket else None
+    if isinstance(entry, dict) and int(entry.get("n") or 0) >= SHAPE_MIN_SAMPLES:
+        seen = hist_med(entry)
+        if seen:
+            return min(seen, EST_CAP_MS)
+    return pace_ms
 
 
 # In plain words: how much is left — each remaining step at its usual duration, less the
 # time the step in progress has already spent. So the number falls as work lands rather
 # than sitting still until the next list.
 def remaining_estimate_ms(
-    times: dict, todos: list, now_ms: int, pace_ms: int, history: dict | None = None
+    times: dict,
+    todos: list,
+    now_ms: int,
+    pace_ms: int,
+    history: dict | None = None,
+    shapes: dict | None = None,
 ) -> int:
     """Projected time still to run, at the pace (and history) learned from finished steps.
 
@@ -4039,7 +4153,7 @@ def remaining_estimate_ms(
     for i, t in enumerate(todos or []):
         if t.get("completed"):
             continue
-        est = task_estimate_ms(t.get("task", ""), pace_ms, history)
+        est = estimate_for(times, t.get("task", ""), pace_ms, history, shapes)
         if i == idx:
             elapsed = live_elapsed(
                 (times or {}).get(str(t.get("task", ""))) or {}, now_ms
@@ -4070,7 +4184,12 @@ def elapsed_total_ms(times: dict, todos: list, now_ms: int) -> int | None:
 
 
 def total_estimate_ms(
-    times: dict, todos: list, now_ms: int, pace_ms: int, history: dict | None = None
+    times: dict,
+    todos: list,
+    now_ms: int,
+    pace_ms: int,
+    history: dict | None = None,
+    shapes: dict | None = None,
 ) -> int | None:
     """The overall time to reach the goal: what the list has spent plus what is left.
 
@@ -4084,7 +4203,7 @@ def total_estimate_ms(
     spent = elapsed_total_ms(times, todos, now_ms)
     if spent is None:
         return None
-    return spent + remaining_estimate_ms(times, todos, now_ms, pace_ms, history)
+    return spent + remaining_estimate_ms(times, todos, now_ms, pace_ms, history, shapes)
 
 
 def run_variance_ms(times: dict, todos: list, now_ms: int, pace_ms: int) -> int | None:
@@ -4265,6 +4384,11 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
     ended = bool(state.get("turn_ended"))
     times: dict[str, dict] = {}
     seen: set[str] = set()
+    prefix = task_key(session, "")
+    # The calls this TURN has made, and which of its steps they belong to (see below).
+    turn = state.get("turn") or {}
+    turn_ms = int(turn.get("start_ms") or 0)
+    turn_verbs = dict(turn.get("verbs") or {})
 
     for i, t in enumerate(todos):
         label = str(t.get("task", ""))
@@ -4279,6 +4403,28 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
         # record written before this field existed picks it up on the next poll.
         if state.get("model"):
             rec["model"] = state["model"]
+        # What this step has DONE, as opposed to what it was called: the calls this turn
+        # has made, less what the steps BEFORE it in the same turn were credited with.
+        # Order decides who did what — no timestamps needed, and no call is counted twice.
+        # Only the step in flight is credited: a waiting step has made no calls, and a
+        # finished one keeps the shape it earned. Nothing is credited once the turn ends,
+        # so the last step's signature is whatever it had when the work stopped.
+        if i == running and not ended and turn_verbs and turn_ms:
+            credited: dict[str, int] = {}
+            for other, other_rec in tasks.items():
+                if other == key or not isinstance(other_rec, dict):
+                    continue
+                if not (other.startswith(prefix) and prefix):
+                    continue
+                if int(other_rec.get("turn_ms") or 0) != turn_ms:
+                    continue
+                for verb, n in (other_rec.get("shape") or {}).items():
+                    credited[verb] = credited.get(verb, 0) + int(n or 0)
+            left = {v: n - credited.get(v, 0) for v, n in turn_verbs.items()}
+            left = {v: n for v, n in left.items() if n > 0}
+            if left:
+                rec["shape"] = left
+            rec["turn_ms"] = turn_ms
         if t.get("completed"):
             if rec.get("started_ms"):
                 rec["done_ms"] = rec.get("done_ms") or now_ms
@@ -4310,6 +4456,9 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
             "elapsed_ms": None
             if not started
             else (rec.get("done_ms") or now_ms) - started,
+            # carried out to the renderers so a running step can be projected from the kind
+            # of work it is visibly doing, without a second pass over the task log
+            "shape": rec.get("shape") or {},
         }
 
     # only this session's tasks, and never on a snapshot that reads as empty: a
@@ -4330,6 +4479,10 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
     # last time instead of from the average of an unrelated list. Age-gated and capped
     # inside, so a stale wording falls out rather than skewing today's projections.
     state["task_history"] = task_history_from_log(tasks, now_ms, state.get("model"))
+    # ...and the same memory keyed by what each step DID. This is the half that can improve
+    # with use: wordings never repeat (172 of 173 seen once) while shapes do, so samples
+    # accumulate in a bucket instead of scattering one per step name.
+    state["task_shapes"] = shape_history_from_log(tasks, now_ms, state.get("model"))
     state["task_times"] = times
     return state
 
@@ -4785,6 +4938,7 @@ def _render_plain(
 
     times = state.get("task_times") or {}
     history = state.get("task_history") or {}
+    shapes = state.get("task_shapes") or {}
     blocks: list[list[str]] = []
     cur_index = current_index(todos)
     pace_ms = step_pace_ms(times, todos, now_ms, history)
@@ -4819,7 +4973,7 @@ def _render_plain(
         # When the token does not fit, it is simply dropped — the duration above, when
         # there is one, has already had its say.
         if not done_flag:
-            token = fmt_estimate(task_estimate_ms(task, pace_ms, history))
+            token = fmt_estimate(estimate_for(times, task, pace_ms, history, shapes))
             token = (" · " + token) if elapsed is None else (" / " + token)
             if len(segs[-1]) + len(token) <= width - 6:
                 segs[-1] += token
@@ -4856,8 +5010,8 @@ def _render_plain(
     # the same liveness rule as the framed pane: a closed clock is a measurement, and a
     # finished turn is idle even if the file still says the clock is counting
     cur_elapsed = live_elapsed(cur_rec or {}, now_ms) if step_is_running(state, cur_rec) else None
-    cur_est_ms = task_estimate_ms(
-        str(current.get("task", "")) if current else "", pace_ms, history
+    cur_est_ms = estimate_for(
+        times, str(current.get("task", "")) if current else "", pace_ms, history, shapes
     )
     if cur_elapsed is not None:
         working = "working " + (short_duration(cur_elapsed, seconds=True) or "0s")
@@ -4883,13 +5037,13 @@ def _render_plain(
     # all-or-nothing rule they had, and the overall time to the goal is appended after them
     # so a narrow strip gains the total rather than losing the remaining count.
     extra = ""
-    rem_ms = remaining_estimate_ms(times, todos, now_ms, pace_ms, history)
+    rem_ms = remaining_estimate_ms(times, todos, now_ms, pace_ms, history, shapes)
     if rem_ms > 0:
         suffix = " | EST REM: " + (short_duration(rem_ms, seconds=True) or "0s")
         suffix += " | ETA " + fmt_eta(rem_ms, now_ms)
         if _cell_width(progress) + _cell_width(extra) + len(suffix) <= width:
             extra += suffix
-    tot_ms = total_estimate_ms(times, todos, now_ms, pace_ms, history)
+    tot_ms = total_estimate_ms(times, todos, now_ms, pace_ms, history, shapes)
     if tot_ms is not None:
         tot_suffix = " | TOT " + (short_duration(tot_ms) or "0s")
         if _cell_width(progress) + _cell_width(extra) + len(tot_suffix) <= width:
@@ -5374,6 +5528,7 @@ def _render_rich(
 
     times = state.get("task_times") or {}
     history = state.get("task_history") or {}
+    shapes = state.get("task_shapes") or {}
     cur_index = current_index(todos)
     # The pace the whole list is projected at, learned from the steps already finished —
     # and from what those steps took in earlier sessions.
@@ -5403,7 +5558,7 @@ def _render_rich(
         )
         # This step's own estimate: its remembered history when there is one, else the
         # pace the list has settled on.
-        est_ms = task_estimate_ms(task, pace_ms, history)
+        est_ms = estimate_for(times, task, pace_ms, history, shapes)
         est = fmt_estimate(est_ms)
         budget = max(0, inner - indent - 8)
         if done_flag:
@@ -5508,7 +5663,7 @@ def _render_rich(
     # the pace is the first field to go there, and it went).
     pace_field = f"{fmt_estimate(pace_ms)} · {model}" if model and pace_ms else ""
 
-    rem_ms = remaining_estimate_ms(times, todos, now_ms, pace_ms, history)
+    rem_ms = remaining_estimate_ms(times, todos, now_ms, pace_ms, history, shapes)
     # Vertical room for a row of its own is decided above, where the step rows were fitted.
     spent_ms = elapsed_total_ms(times, todos, now_ms)
     tot_ms = (
@@ -5567,8 +5722,8 @@ def _render_rich(
     # carried rides in the parentheses, and the LIVE clock stays rightmost.
     # Uppercase, like the title chip: the pane's chrome is one voice, so a badge never
     # mixes `FREEBUFF TODOS` with `All done` in the same frame.
-    cur_est_ms = task_estimate_ms(
-        current.get("task", "") if current else "", pace_ms, history
+    cur_est_ms = estimate_for(
+        times, current.get("task", "") if current else "", pace_ms, history, shapes
     )
     over_ms = (cur_elapsed - cur_est_ms) if cur_elapsed is not None else 0
     if cur_elapsed is not None:
@@ -6279,21 +6434,42 @@ def cmd_status(args) -> int:
     # step ~5m?" without reading the JSON by hand.
     model = (view or {}).get("model") or None
     history = task_history_from_log(log.get("tasks") or {}, model=model)
+    shapes = shape_history_from_log(log.get("tasks") or {}, model=model)
     todos = (view or {}).get("todos") or []
     times = (view or {}).get("task_times") or {}
     pace = step_pace_ms(times, todos, int(time.time() * 1000), history)
     origin = f"{len(history)} remembered step(s)" if history else "no remembered steps yet"
     print(f"  remembered pace   : {short_duration(pace, seconds=True)}  ({origin})")
+    # The memory that can improve with use: keyed by what a step DID rather than what it was
+    # called, so its samples accumulate where the wording memory has almost none. Printed
+    # with its own sample counts, because "is this getting better?" should be answerable
+    # from the terminal and not from faith.
+    if shapes:
+        top = sorted(shapes.items(), key=lambda kv: -int(kv[1].get("n") or 0))[:3]
+        shown = ", ".join(
+            f"{bucket} {fmt_estimate(entry.get('med') or 0)} (n={entry.get('n')})"
+            for bucket, entry in top
+        )
+        print(f"  remembered shapes : {len(shapes)} kept — {shown}")
+    else:
+        print("  remembered shapes : none yet (a shape is learned when a step finishes)")
     # whose steps those are: the memory is per model, so a number without its model is
     # not auditable — a fast model remembered here must not project a slow one
     if model:
         print(f"  remembered from   : {model}")
     for t in [t for t in todos if not t.get("completed")][:5]:
         task = str(t.get("task", ""))
-        source = "own history" if hist_med(history.get(task)) else "list pace"
+        bucket = step_shape_bucket(times, task)
+        entry = shapes.get(bucket) if bucket else None
+        if hist_med(history.get(task)):
+            source = "own history"
+        elif isinstance(entry, dict) and int(entry.get("n") or 0) >= SHAPE_MIN_SAMPLES:
+            source = f"shape {bucket} (n={entry.get('n')})"
+        else:
+            source = "list pace"
         print(
             f"  estimate          : {_clip(task, 44)}  "
-            f"{fmt_estimate(task_estimate_ms(task, pace, history))}  ({source})"
+            f"{fmt_estimate(estimate_for(times, task, pace, history, shapes))}  ({source})"
         )
     print(f"  scratch           : {scratch_size()} bytes in {SCRATCH}")
     return 0
