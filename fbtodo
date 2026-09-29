@@ -5275,9 +5275,15 @@ def _render_rich(
         """The status strip: the state on a badge, then the fields ` │ ` apart."""
         body = chip(f" {text} ")
         fields = [pace_field] if (keep_pace and pace_field) else []
-        if keep_list and listed:
+        if listed:
             # the age is what a narrow strip spends after the pace, and it goes whole
-            fields.append(listed_age if keep_age else listed)
+            if keep_list:
+                fields.append(listed_age if keep_age else listed)
+        elif keep_age and age_text:
+            # No LIST field exists to carry the age — a one-shot probe has no list NUMBER to
+            # show (measured on this machine: a bare `json` reports `list #0`) — so the age
+            # stays where it used to live rather than going missing.
+            body += c(muted, age_text)
         return body + "".join(
             c(st["faint"], " │ ") + c(muted, field) for field in fields + [live_field]
         )
