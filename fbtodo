@@ -97,6 +97,13 @@ import argparse
 import calendar
 import glob
 import hashlib
+
+try:
+    # POSIX only, and the watcher's claim is a real one because of it: see `write_lock`.
+    import fcntl
+except ImportError:  # pragma: no cover - no flock, so a claim is the record alone
+    fcntl = None
+
 import re
 import shlex
 import shutil as _shutil
@@ -379,6 +386,13 @@ print(json.dumps({"todos": (last.get("input") or last.get("args") or {}).get("to
                   "nudge": nudge, "tools": tools}))
 '''
 FB_PROC = "bin/freebuff"
+FB_NAME = "freebuff"
+# Where a Linux machine keeps every process's working directory. macOS has no /proc, so
+# cwd discovery asks this first on both and falls back to one batched lsof (see `cwds_for`).
+PROC_ROOT = "/proc"
+# The `freebuff` a bare command name means: one PATH lookup for the process, not one per
+# candidate per poll. A list, not a scalar, so a caller (and the self-check) can refill it.
+_FREEBUFF_WHICH: list = []
 CHUNK = 1 << 20
 MAX_SCAN = 64 << 20
 # A list is only half the story: the prompt it was written for is what makes it
@@ -660,11 +674,32 @@ def pid_alive(pid) -> bool:
         return True
 
 
-def cwds_for(pids: list[int]) -> dict[int, str]:
-    """pid -> cwd for many pids in ONE lsof call.
+def proc_cwds(pids: list[int]) -> dict[int, str]:
+    """pid -> cwd from /proc, for the pids that answer there ({} when there is no /proc).
 
-    Per-pid lsof calls dominated the poll (and a transient failure silently
-    dropped a candidate); the comma-separated `-p` form returns them all.
+    Linux keeps the working directory of every process as a symlink, so this is a readlink
+    and no subprocess at all — the cheapest question in the poll on the platform most
+    likely to be running a watcher under load. A pid owned by another user answers with
+    EACCES and is simply left out for lsof to try (which will also fail, quietly).
+    """
+    if not os.path.isdir(PROC_ROOT):
+        return {}
+    found: dict[int, str] = {}
+    for pid in pids:
+        try:
+            found[pid] = os.readlink(os.path.join(PROC_ROOT, str(pid), "cwd"))
+        except OSError:
+            continue
+    return found
+
+
+def lsof_cwds(pids: list[int]) -> dict[int, str]:
+    """pid -> cwd for many pids in ONE lsof call — the macOS fallback.
+
+    Per-pid lsof calls dominated the poll (and a transient failure silently dropped a
+    candidate); the comma-separated `-p` form returns them all. A machine with no lsof on
+    it is not an error here: `except Exception` covers a missing binary, and the caller
+    keeps whatever `/proc` could answer.
     """
     if not pids:
         return {}
@@ -685,6 +720,25 @@ def cwds_for(pids: list[int]) -> dict[int, str]:
         elif line.startswith("n") and current is not None:
             cwds[current] = line[1:]
             current = None
+    return cwds
+
+
+def cwds_for(pids: list[int]) -> dict[int, str]:
+    """pid -> cwd, by /proc where there is one and one batched lsof for the rest.
+
+    Both, rather than either: on Linux `/proc/<pid>/cwd` answers without a subprocess, so
+    it is asked first and lsof only covers what it could not answer (another user's
+    process, a pid that went away) — and on a machine with no lsof at all, a normal Linux
+    server, the watcher can still follow its own session instead of giving up on a missing
+    binary.
+    """
+    want = [int(p) for p in pids]
+    if not want:
+        return {}
+    cwds = proc_cwds(want)
+    missing = [p for p in want if p not in cwds]
+    if missing:
+        cwds.update(lsof_cwds(missing))
     return cwds
 
 
@@ -731,17 +785,43 @@ def ages_for(pids: list[int]) -> dict[int, int]:
     return ages
 
 
+def installed_freebuff() -> str | None:
+    """The executable a bare `freebuff` would run, or None when PATH has none."""
+    if not _FREEBUFF_WHICH:
+        found = _shutil.which(FB_NAME)
+        _FREEBUFF_WHICH.append(os.path.realpath(found) if found else None)
+    return _FREEBUFF_WHICH[0]
+
+
 def is_freebuff_cmd(cmd: str) -> bool:
     """True only for the CLI itself.
 
     Deliberately not a substring test on the whole command line: any process whose
-    *arguments* mention `bin/freebuff` (a python -c probe, a grep, a test) would
-    match, and the pane would then follow the wrong pid. The token must be an
-    absolute path ending in `bin/freebuff`.
+    *arguments* mention the path (a python -c probe, a grep, a test) would match, and the
+    pane would then follow the wrong pid. A TOKEN has to be the CLI, in one of the shapes a
+    launcher actually produces:
+
+      * argv[0] is a bare `freebuff` — how a PATH lookup is spelled in argv, which the
+        original rule (an absolute path) could not see at all. Accepted only when such a
+        program exists, never because the word appears;
+      * a path-like token ending in `bin/freebuff` — the original rule, still a subset of
+        this one, plus `./bin/freebuff` and `~/bin/freebuff`;
+      * a path-like token that mentions `freebuff` and RESOLVES to `.../bin/freebuff`, so a
+        symlinked or relocated install is still the CLI (an absolute path only, and only
+        where the name gives a reason to resolve it).
     """
-    return any(
-        tok.startswith("/") and tok.endswith("bin/freebuff") for tok in cmd.split()
-    )
+    toks = cmd.split()
+    if toks and toks[0] == FB_NAME:
+        return bool(installed_freebuff())
+    for tok in toks:
+        if not tok.startswith(("~", "/", ".")) or FB_NAME not in tok:
+            continue  # `grep freebuff`, `python3 -c '…bin/freebuff…'`, any other argument
+        if tok.endswith(FB_PROC):
+            return True
+        real = os.path.realpath(tok)
+        if real.endswith(FB_PROC) or os.path.basename(real) == FB_NAME:
+            return True
+    return False
 
 
 def freebuff_pids() -> list[int]:
@@ -2561,10 +2641,10 @@ def ensure_pane_keeper(args, quiet: bool = True) -> int | None:
         + (f"{rec.get('pid')} for {rec.get('tmux')}" if rec.get("pid") else "none")
         + ")"
     )
-    pid = rec.get("pid")
-    if pid and pid_alive(pid) and rec.get("version") == VERSION and rec.get("tmux") == target:
+    pid = lock_holder(PANE_KEEPER_PATH)
+    if pid and rec.get("version") == VERSION and rec.get("tmux") == target:
         return int(pid)
-    if pid and pid_alive(pid):
+    if pid:
         # An older build, or a keeper for another server: it cannot serve this one, and
         # leaving it in place would block the keeper that can (measured in the self-check:
         # a keeper watching a since-killed private server kept every pane it was asked to
@@ -2595,9 +2675,9 @@ def ensure_pane_keeper(args, quiet: bool = True) -> int | None:
         log.close()
     for _ in range(40):
         time.sleep(0.05)
-        rec = read_json(PANE_KEEPER_PATH, {}) or {}
-        if rec.get("pid") and pid_alive(rec.get("pid")):
-            return int(rec["pid"])
+        pid = lock_holder(PANE_KEEPER_PATH)
+        if pid:
+            return int(pid)
     pane_log(f"keeper {child.pid} never claimed the lock (every {args.pane_seconds:.0f}s)")
     if not quiet:
         print("fbtodo: the pane keeper did not start; see " + PANE_LOG_PATH, file=sys.stderr)
@@ -2614,22 +2694,17 @@ def cmd_pane_watch(args) -> int:
     last freebuff does — so it never outlives what it is for.
     """
     target = tmux_identity()
-    rec = read_json(PANE_KEEPER_PATH, {}) or {}
-    running = rec.get("pid") if pid_alive(rec.get("pid")) else None
+    running = lock_holder(PANE_KEEPER_PATH)
+    rec = (read_json(PANE_KEEPER_PATH, {}) or {}) if running else {}
     if running and rec.get("version") == VERSION and rec.get("tmux") == target and not args.force:
         if not args.quiet:
             print(f"pane keeper already running (pid {running})", file=sys.stderr)
         return 0
-    atomic_write_json(
-        PANE_KEEPER_PATH,
-        {
-            "pid": os.getpid(),
-            "cwd": os.getcwd(),
-            "tmux": target,
-            "started_ms": int(time.time() * 1000),
-            "version": VERSION,
-        },
-    )
+    if not write_lock(os.getcwd(), None, path=PANE_KEEPER_PATH, extra={"tmux": target}):
+        if not args.quiet:
+            print("pane keeper already running (another process holds the lock)",
+                  file=sys.stderr)
+        return 0
     pane_log(f"keeper started (pid {os.getpid()}, tmux {target}, every {args.pane_seconds:.0f}s)")
 
     stop_reason, code = "stopped", 0
@@ -2943,11 +3018,10 @@ def live_watcher_pid(path: str) -> int | None:
     added. That is how a pre-fix NAS watcher stayed "live" forever, and how an upgrade
     could leave the pane rendering yesterday's shape.
     """
-    rec = read_json(path, {}) or {}
-    pid = rec.get("pid")
-    if not (pid and pid_alive(pid)):
+    pid = lock_holder(path)  # the claim, not the number: a leftover record is not a watcher
+    if not pid:
         return None
-    if rec.get("version") != VERSION:
+    if (read_json(path, {}) or {}).get("version") != VERSION:
         try:
             os.kill(int(pid), signal.SIGTERM)
         except OSError:
@@ -2956,10 +3030,7 @@ def live_watcher_pid(path: str) -> int | None:
             if not pid_alive(int(pid)):
                 break
             time.sleep(0.05)
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        clear_lock(path=path)  # free once it is gone; refused while it still holds it
         return None
     return int(pid)
 
@@ -3105,7 +3176,12 @@ def nas_watch_loop(args) -> int:
             if not args.quiet:
                 print(f"fbtodo nas watcher already running (pid {nas_pane_daemon_pid()})", file=sys.stderr)
             return 0
-        write_lock(os.path.realpath(os.getcwd()), None, path=NAS_LOCK_PATH)
+        if not claim_or_force(NAS_LOCK_PATH, os.path.realpath(os.getcwd()), None,
+                              bool(getattr(args, "force", False))):
+            if not args.quiet:
+                print(f"fbtodo nas watcher already running (pid {nas_pane_daemon_pid() or '—'})",
+                      file=sys.stderr)
+            return 0
 
     stop_reason, code = "stopped", 0
     owned: list[str] = []
@@ -6807,45 +6883,176 @@ def bar_text(state: dict) -> str:
     if not todos:
         return "todos -"
     done = sum(1 for t in todos if t.get("completed"))
-    return f"todos {done}/{len(todos)}"
+    return f"todos {done}/{len(todos)}"# ======================================================================== lock
+# In plain words: a claim is a file HOLDING A LOCK THE OPERATING SYSTEM OWNS. The number
+# is written inside the file for a person reading the scratch dir, but the exclusion comes
+# from the kernel, because a number is not evidence: a pid can come round again, and a
+# process that answers `kill -0` may never have been the watcher at all — which is how a
+# record left behind by a crash could hold the next watcher off, and how a pid reused by
+# something else could make a dead watcher look alive. The kernel drops the lock when the
+# process that took it ends, however it ends, so nothing has to be cleaned up to be
+# correct: a claim that cannot be taken is live, and one that can be taken is not.
+_LOCK_FDS: dict[str, int] = {}
 
 
-# ======================================================================== lock
+def lock_open(path: str) -> int:
+    """A 0600 fd for the claim file, created if it is not there yet."""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    return fd
+
+
+def lock_take(fd: int) -> bool:
+    """True when this fd now holds the exclusive claim. Never blocks."""
+    if fcntl is None:  # pragma: no cover - a platform without flock keeps the old guard
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def lock_ours(path: str) -> bool:
+    """Is `path` still the SAME claim this process took — not a file that replaced it?"""
+    fd = _LOCK_FDS.get(path)
+    if fd is None:
+        return False
+    try:
+        return os.fstat(fd).st_ino == os.stat(path).st_ino
+    except OSError:
+        return False
+
+
+def lock_holder(path: str) -> int | None:
+    """The pid holding the claim on `path`, or None when nobody does.
+
+    `flock` cannot say WHO holds a lock, so this asks the one question that does have an
+    answer: can the claim be taken? If it can, nobody holds it — and the record sitting
+    there is a leftover, so it is removed instead of believed (a reader that believed it
+    would report a watcher that is not running). If it cannot, the pid inside the record
+    is the holder's: it was written by whoever took the claim, and the claim is still held.
+    """
+    fd = lock_open(path)
+    try:
+        if lock_take(fd):
+            if fcntl is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                os.unlink(path)  # free, so the record is a leftover
+            except OSError:
+                pass
+            return None
+        rec = read_json(path, {}) or {}
+        pid = rec.get("pid")
+        # 0 means "held, and the record says nothing": the caller refuses to start rather
+        # than run a second watcher over one scratch dir, but has no number to print.
+        return int(pid) if pid else 0
+    finally:
+        os.close(fd)
+
+
 def daemon_pid() -> int | None:
-    rec = read_json(LOCK_PATH, {}) or {}
-    pid = rec.get("pid")
-    if pid and pid_alive(pid):
-        return int(pid)
-    return None
+    return lock_holder(LOCK_PATH)
 
 
-# In plain words: a note left on disk saying "a watcher is running, and its number is
-# this". The number is the point: a note whose owner is no longer alive is how a leftover
-# from a crash or an upgrade gets noticed and replaced, instead of blocking the fresh one.
-def write_lock(cwd: str, instance_pid, path: str | None = None) -> None:
-    # `path` exists for the NAS pane watcher, whose claim on the scratch dir is a second
-    # lock file: two daemons, two responsibilities (one follows a local instance, the
-    # other watches the NAS for a session starting), and they must not block each other.
-    # `version` lets a reader tell a live watcher from one left behind by an upgrade.
-    atomic_write_json(
-        path or LOCK_PATH,
-        {
-            "pid": os.getpid(),
-            "instance_pid": instance_pid,
-            "cwd": cwd,
-            "started_ms": int(time.time() * 1000),
-            "version": VERSION,
-        },
-    )
+def write_lock(cwd: str, instance_pid, path: str | None = None,
+               extra: dict | None = None) -> bool:
+    """Claim `path` for this process, and write the record a reader sees.
+
+    `path` exists for the NAS watcher and the pane keeper, whose claims on the scratch dir
+    are their own files: three roles, three claims, and they must not block each other.
+    `version` lets a reader tell a live watcher from one left behind by an upgrade.
+
+    False when someone else holds it — the caller must stop rather than run a second
+    watcher over one scratch dir. The record is written THROUGH the locked fd and never by
+    rename: replacing the file would leave the new copy unlocked and the claim lost.
+    """
+    target = path or LOCK_PATH
+    fd = _LOCK_FDS.get(target)
+    if fd is None:
+        fd = lock_open(target)
+        if not lock_take(fd):
+            os.close(fd)
+            return False
+    record = {
+        "pid": os.getpid(),
+        "instance_pid": instance_pid,
+        "cwd": cwd,
+        "started_ms": int(time.time() * 1000),
+        "version": VERSION,
+    }
+    record.update(extra or {})
+    payload = json.dumps(record, ensure_ascii=False).encode("utf-8") + b"\n"
+    try:
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, payload)
+        os.fsync(fd)
+    except OSError:
+        pass
+    _LOCK_FDS[target] = fd  # held until this process ends; the kernel frees it then
+    return True
+
+
+def claim_or_force(path: str, cwd: str, instance_pid=None, force: bool = False,
+                   extra: dict | None = None) -> bool:
+    """Claim `path` — and with `--force`, stop whoever holds it first.
+
+    `--force` cannot mean "run a second watcher anyway": two processes writing one state
+    file is the interference this claim exists to prevent. It means "the one that is
+    running is in the way", so it is asked to stop (SIGTERM, then a bounded wait for the
+    kernel to drop its lock) and the claim is taken once it is free.
+    """
+    if write_lock(cwd, instance_pid, path=path, extra=extra):
+        return True
+    if not force:
+        return False
+    pid = lock_holder(path)
+    if pid:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(40):
+            if not pid_alive(int(pid)):
+                break
+            time.sleep(0.05)
+    return write_lock(cwd, instance_pid, path=path, extra=extra)
 
 
 def clear_lock(pid: int | None = None, path: str | None = None) -> None:
+    """Give up the claim and remove the record — never stealing one that is live.
+
+    Unlinking a file another process holds the claim on does NOT lift that claim: the
+    holder keeps its inode, and a third process could then create a fresh file and claim
+    that, so two watchers would own one scratch dir. So a claim is only removed when it is
+    OURS to remove: held by this process, or free (a leftover).
+    """
     target = path or LOCK_PATH
-    rec = read_json(target, {}) or {}
-    if pid is not None and rec.get("pid") not in (None, pid):
-        return  # someone else owns it now
+    fd = _LOCK_FDS.pop(target, None)
+    if fd is None:
+        if pid is not None:
+            rec = read_json(target, {}) or {}
+            if rec.get("pid") not in (None, pid):
+                return  # someone else owns it now
+        lock_holder(target)  # removes the record itself when the claim is free
+        return
     try:
         os.unlink(target)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
     except OSError:
         pass
 
@@ -7022,8 +7229,6 @@ def daemon_loop(args) -> int:
         if not args.quiet:
             print(f"watcher already running (pid {daemon_pid()})", file=sys.stderr)
         return 0
-    if os.path.exists(LOCK_PATH) and not daemon_pid():
-        clear_lock()  # stale lock from a crashed watcher
 
     cwd, instance_pid = resolve_instance(args)
     remote = args.source == "nas"
@@ -7034,7 +7239,13 @@ def daemon_loop(args) -> int:
     remote_seen = False
 
     prev = read_json(STATE_PATH, None)
-    write_lock(cwd, instance_pid)
+    if not claim_or_force(LOCK_PATH, cwd, instance_pid, bool(getattr(args, "force", False))):
+        # Between the check above and here another watcher could have taken the claim; the
+        # claim is what decides, so losing that race means standing down rather than
+        # writing a second watcher's state over the same files.
+        if not args.quiet:
+            print(f"watcher already running (pid {daemon_pid() or '—'})", file=sys.stderr)
+        return 0
     # The ask watch's own clock: one scan of the panes every `--ask-seconds`, whatever the
     # render interval is, because a question can arrive between two of them.
     ask_due = 0.0
@@ -7066,10 +7277,11 @@ def daemon_loop(args) -> int:
                 stop_reason = "instance-exited"
                 stop_code = 0
                 break
-            if not os.path.exists(LOCK_PATH):
-                # the lock is this watcher's claim on the state directory; if it
-                # is gone (removed, or the directory itself), the watcher is no
-                # longer wanted — stop instead of re-creating the directory.
+            if not lock_ours(LOCK_PATH):
+                # the claim is this watcher's hold on the state directory; if it is gone
+                # (removed, or the directory itself), or if the file is no longer the one
+                # this process locked (something replaced it), the watcher is no longer
+                # the owner — stop instead of re-creating the directory.
                 stop_reason = "lock-removed"
                 stop_code = 0
                 break

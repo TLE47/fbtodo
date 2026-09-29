@@ -134,7 +134,20 @@ back.
   line-oriented and uncoloured; colour belongs to the framed pane.
 - **Every subprocess has a timeout**, and every network or ssh call is bounded. A pane is
   useless if a poll can outlive its interval.
-- **A lock is validated, not trusted** — pid, build and (for the keeper) tmux server.
+- **A claim is held by the KERNEL, and the number inside it is for humans.** `write_lock`
+  takes an `flock` on the file and writes the record through that same fd (a rename would
+  leave the new copy unlocked and the claim lost); `lock_holder` decides who is live by
+  trying to take it, because a pid can be reused and a leftover record can name a process
+  that is alive and never was a watcher; `clear_lock` refuses to unlink a claim it does not
+  hold (unlinking does not lift the holder's lock, and a third process would then claim a
+  fresh file of the same name — two watchers, one scratch dir). The build is still checked,
+  and a version-stale holder is stopped and replaced rather than adopted.
+- **Discovery asks `/proc` first, then one batched `lsof`** — `/proc/<pid>/cwd` is a readlink
+  with no subprocess (Linux), and a machine with no `lsof` at all can still follow its own
+  session. A process is the CLI when a TOKEN is one: `argv[0]` a bare `freebuff` that PATH
+  resolves, a path-like token ending in `bin/freebuff` (the original rule, still a subset),
+  or a path-like token that mentions `freebuff` and resolves to one. A `grep` or a `python3
+  -c` whose argument names the path is not the CLI, however it is worded.
 - **Nothing grows without a cap.** Retention is enforced about hourly as well as on demand.
   Task records are the one thing kept deliberately long — 2000 records / 60 days, roughly
   365 KB — because the estimate memory is the only part of the tool that is supposed to get

@@ -421,6 +421,104 @@ try:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
+    # ---- the claim is a REAL one: the kernel holds it. A record naming a live process
+    #      that never took it (a leftover from a crash, or a pid that came round again) is
+    #      not a watcher, and a bystander cannot give away a live watcher's claim by
+    #      unlinking its file — the holder keeps its inode while a third process could
+    #      claim a fresh file of the same name, which is two watchers on one scratch dir.
+    victim_lk = spawn_quiet("sleep", "600")
+    holder = subprocess.Popen(
+        [sys.executable, FB, "daemon", "--foreground", "--quiet",
+         "--instance-pid", str(victim_lk.pid), "--cwd", CWD, "-i", "0.2"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True, env=env, cwd=CWD,
+    )
+    deadline = time.time() + 10
+    while time.time() < deadline and not os.path.exists(lock_path):
+        time.sleep(0.1)
+    assert module.lock_holder(lock_path) == holder.pid, (module.lock_holder(lock_path),
+                                                         holder.pid)
+    # ...with the path spelled out everywhere: this process's own LOCK_PATH is the REAL
+    # scratch dir (only the child daemon gets FBTODO_HOME), and a claim taken there would
+    # be a claim over the operator's live watcher
+    assert module.write_lock(CWD, victim_lk.pid, path=lock_path) is False, \
+        "a second claim was taken over a live one"
+    assert not module.clear_lock(path=lock_path), "a bystander removed a live watcher's claim"
+    assert os.path.exists(lock_path), "a bystander removed the lock file"
+    assert module.lock_holder(lock_path) == holder.pid, module.lock_holder(lock_path)
+    # SIGKILL is what a crash looks like: no chance to tidy up, so the RECORD survives the
+    # watcher while the CLAIM does not — the kernel drops it with the process. The leftover
+    # is removed by whoever asks next, which is the other half of `lock_holder`.
+    kill_tree(holder)
+    kill_tree(victim_lk)
+    deadline = time.time() + 10
+    while time.time() < deadline and module.lock_holder(lock_path):
+        time.sleep(0.1)
+    assert module.lock_holder(lock_path) is None, "a killed watcher's claim survived it"
+    assert not os.path.exists(lock_path), "the leftover record was not cleaned up"
+    say("locks: the claim is the kernel's, and only its holder can give it up: ok")
+
+    # ---- a record naming a LIVE process is not a watcher. The pid resolves (it is ours),
+    #      and a pid-alive check would believe it; the claim decides, so the leftover is
+    #      cleaned up and a fresh watcher is free to start over it.
+    module.atomic_write_json(lock_path, {"pid": os.getpid(), "cwd": CWD, "started_ms": 0,
+                                         "instance_pid": None, "version": module.VERSION})
+    assert module.lock_holder(lock_path) is None, "a leftover record was read as a running watcher"
+    assert not os.path.exists(lock_path), "the leftover record was left behind"
+    assert module.live_watcher_pid(lock_path) is None
+    say("locks: a leftover record whose pid is alive is not a watcher, and is cleaned up: ok")
+
+    # ---- discovery, including the platform this machine is not: /proc answers first where
+    #      it exists, lsof covers the rest, and the machine's own answer still works
+    victim_cwd = os.path.join(TEST_HOME, "victimcwd")
+    os.makedirs(victim_cwd, exist_ok=True)
+    proc_fixture = os.path.join(TEST_HOME, "proc")
+    os.makedirs(os.path.join(proc_fixture, "4242"), exist_ok=True)
+    os.symlink(victim_cwd, os.path.join(proc_fixture, "4242", "cwd"))
+    saved_proc = module.PROC_ROOT
+    module.PROC_ROOT = proc_fixture
+    try:
+        assert module.cwds_for([4242]) == {4242: victim_cwd}, module.cwds_for([4242])
+        assert module.pid_cwd(4242) == victim_cwd
+        # a pid /proc cannot answer for is left to the fallback, not guessed at
+        assert module.cwds_for([4242, 999_999]).get(4242) == victim_cwd
+    finally:
+        module.PROC_ROOT = saved_proc
+    me = os.path.realpath(module.pid_cwd(os.getpid()) or "")
+    assert me == os.path.realpath(os.getcwd()), (me, os.getcwd())
+    say("discovery: /proc answers first, and the real root still resolves this process: ok")
+
+    # ...and the shapes argv can take. A bare `freebuff` is how a PATH lookup is spelled in
+    # argv — invisible to the old absolute-path rule — and a token that RESOLVES to a
+    # `bin/freebuff` is the same CLI installed elsewhere. A probe whose ARGUMENT happens to
+    # name the path is not the CLI, however it is worded.
+    launcher = os.path.join(TEST_HOME, "freebuff-relocated")
+    target = os.path.join(TEST_HOME, "bin", "freebuff")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    open(target, "w").close()
+    os.symlink(target, launcher)
+    saved_which = list(module._FREEBUFF_WHICH)
+    module._FREEBUFF_WHICH[:] = ["/somewhere/else/bin/freebuff"]  # a PATH answer exists
+    try:
+        assert module.is_freebuff_cmd("/opt/homebrew/bin/freebuff")
+        assert module.is_freebuff_cmd("./bin/freebuff")
+        assert module.is_freebuff_cmd("~/bin/freebuff")
+        assert module.is_freebuff_cmd("freebuff")
+        assert module.is_freebuff_cmd(launcher + " --cli")
+        # the OLD rule is a subset of this one: everything it matched, this matches
+        for old in ("/x/bin/freebuff", "/opt/a/b/bin/freebuff --flag"):
+            assert module.is_freebuff_cmd(old), old
+        # ...and none of these is the CLI
+        for other in ("grep bin/freebuff", "python3 -c print('/x/bin/freebuff')",
+                      "/usr/bin/grep freebuff", "sleep 600", "node /apps/freebuff-ui"):
+            assert not module.is_freebuff_cmd(other), other
+    finally:
+        module._FREEBUFF_WHICH[:] = saved_which
+    module._FREEBUFF_WHICH[:] = [None]  # ...with nothing on PATH a bare name is not the CLI
+    assert not module.is_freebuff_cmd("freebuff"), "a bare name matched with no freebuff"
+    module._FREEBUFF_WHICH[:] = saved_which
+    say("discovery: a launcher's argv is matched by shape, and a probe that names it is not: ok")
+
     old = module.finish_state(
         {"session": "S1", "todos": [{"task": "a", "completed": True}]}, None
     )
