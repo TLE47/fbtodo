@@ -119,6 +119,7 @@ import tempfile
 import textwrap
 import time
 import unicodedata
+import zlib
 
 VERSION = "4.29.0"
 HOME = os.path.expanduser("~")
@@ -1353,8 +1354,11 @@ def _turn_extend(newer: dict, older: dict) -> dict:
 def journal_scan(blob: bytes, thread: str, chunk: int = 0):
     """(hit, hit_key, prompts, goals, turns, summaries, models, actions, turn), newest first.
 
-    Keys are (-chunk, -line index) — chunks are read backwards from EOF, so both terms
-    grow towards the newest line and a plain tuple comparison is a time comparison.
+    Keys are (chunk, -line index) — chunks are numbered from the start of the file and read
+    backwards from its end, so both terms grow towards the newest line and a plain tuple
+    comparison is a time comparison. Numbering them from the start (rather than by counting
+    back from an end that moves with every append) is what lets a walk keep the chunks it
+    has parsed — see `scan_live_log`.
     Cheap by construction: the substring test runs on every line, but json parses only
     the rare line mentioning write_todos with a payload, or carrying a prompt.
     """
@@ -1386,7 +1390,7 @@ def journal_scan(blob: bytes, thread: str, chunk: int = 0):
         # none of the above, so the early `continue` below would otherwise skip it.
         model = MODEL_RE.search(raw)
         if model:
-            models.append(((-chunk, -order), model.group(1).decode("utf-8", "replace")))
+            models.append(((chunk, -order), model.group(1).decode("utf-8", "replace")))
         # The second basket (see `_record_actions`): what this record called. Every call
         # record also carries `shouldEndTurn` (measured: 536 of 536), so these are records
         # the turn counter below already parses — tallying them costs no extra json work.
@@ -1400,7 +1404,7 @@ def journal_scan(blob: bytes, thread: str, chunk: int = 0):
             rec = json.loads(raw.decode("utf-8", "replace"))
         except Exception:
             continue
-        key = (-chunk, -order)
+        key = (chunk, -order)
         if want_call:
             found = _record_todos(rec, thread)
             if found:
@@ -1464,8 +1468,19 @@ def journal_scan(blob: bytes, thread: str, chunk: int = 0):
 # to the one before. The key is the whole of what the answer depends on, so a rewritten or
 # rotated log is a MISS rather than a stale answer; the value is a copy on the way out,
 # because the caller decorates what it gets back.
+#
+# A journal that GREW is the third case, and the one a working session produces poll after
+# poll: the same file with a few more lines on the end. The chunks of an append-only file
+# never change once they are full, so each is remembered against the bytes it was (checked,
+# not trusted), and a walk that reaches back into them re-parses only the chunk at the end
+# that moved. Remembering them by absolute index from the START of the file — rather than by
+# counting back from its end, which shifts with every append — is what lets them survive the
+# next line, and why the walk's window no longer decides its price.
 _SCAN_CACHE: dict = {}
 _SCAN_HITS = [0]
+_SCAN_PARSED = [0]  # bytes handed to journal_scan: the walk's price, read by the self-check
+_SCAN_REUSED = [0]  # chunks answered from that memory rather than parsed a second time
+CACHED_CHUNKS = 48  # per journal: deeper than any chase, bounded for a long-lived watcher
 
 
 def scan_live_log(chat_dir: str) -> dict:
@@ -1486,15 +1501,23 @@ def scan_live_log(chat_dir: str) -> dict:
         st = os.stat(path)
         key = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
         cached = _SCAN_CACHE.get(path)
-        if cached is not None and cached[0] == key:
+        if cached is not None and cached["key"] == key:
             _SCAN_HITS[0] += 1
-            return copy.deepcopy(cached[1])
+            return copy.deepcopy(cached["scan"])
         size = st.st_size
         fh = open(path, "rb")
     except OSError:
         return scan
+    # What the cursor remembered, and only when it applies: the same file (same device and
+    # inode) holding the same session, and LONGER than the walk that remembered it. A
+    # rewrite or a rotation is a different file's worth of chunks, and a shorter one is not
+    # a prefix of what was read.
+    chunks: dict = {}
+    if (cached is not None and cached["id"] == (st.st_dev, st.st_ino)
+            and cached["thread"] == thread and 0 < cached["size"] < size):
+        chunks = cached["chunks"]
     try:
-        hit = hit_key = hit_chunk = None
+        hit = hit_key = hit_step = None
         prompts: list = []
         goals: list = []
         turns: list = []
@@ -1502,23 +1525,44 @@ def scan_live_log(chat_dir: str) -> dict:
         models: list = []
         actions: list = []
         turn = None
-        tail, read, pos, chunk = b"", 0, size, 0
-        while pos > 0 and read < MAX_SCAN:
-            step = min(CHUNK, pos)
-            pos -= step
-            fh.seek(pos)
-            blob = fh.read(step) + tail
-            read += step
-            lines = blob.split(b"\n")
-            if pos > 0:
-                tail, lines = lines[0], lines[1:]
+        tail = b""
+        covered = 0
+        step_no = 0
+        for chunk in range((size - 1) // CHUNK, -1, -1):
+            start = chunk * CHUNK
+            step = min(CHUNK, size - start)
+            covered += step
+            if covered > MAX_SCAN:
+                break
+            fh.seek(start)
+            raw = fh.read(step)
+            crc = zlib.crc32(raw)
+            remembered = chunks.get(chunk)
+            if remembered is not None and remembered[0] == thread and remembered[1] == crc:
+                _SCAN_REUSED[0] += 1
+                (found, found_key, found_prompts, found_goals, found_turns, found_said,
+                 found_models, found_actions, found_turn) = remembered[2]
+                leading = remembered[3]
             else:
-                tail = b""
-            (found, found_key, found_prompts, found_goals, found_turns, found_said,
-             found_models, found_actions, found_turn) = journal_scan(
-                b"\n".join(lines), thread, chunk)
+                lines = (raw + tail).split(b"\n")
+                if start > 0:
+                    leading, lines = lines[0], lines[1:]
+                else:
+                    leading = b""
+                _SCAN_PARSED[0] += step
+                result = journal_scan(b"\n".join(lines), thread, chunk)
+                (found, found_key, found_prompts, found_goals, found_turns, found_said,
+                 found_models, found_actions, found_turn) = result
+                # Only a FULL chunk is remembered, and only when it holds a newline of its
+                # own: an append cannot reach a full chunk's bytes, and the partial line at
+                # its start (the tail end of a line that began in the chunk below it) is the
+                # bytes before that first newline — final, and the same value the next walk
+                # computes when it reaches this chunk from the other side.
+                if step == CHUNK and b"\n" in raw:
+                    chunks[chunk] = (thread, crc, result, leading)
+            tail = leading
             if found and hit is None:
-                hit, hit_key, hit_chunk = found, found_key, chunk
+                hit, hit_key, hit_step = found, found_key, step_no
             prompts.extend(found_prompts)
             goals.extend(found_goals)
             turns.extend(found_turns)
@@ -1541,9 +1585,9 @@ def scan_live_log(chat_dir: str) -> dict:
                 # it is unfound the budget is TURN_CHASE_CHUNKS, and past it the pane prints
                 # minimums instead of reading on. Once found, this is the rule it always was.
                 budget = GOAL_CHASE_CHUNKS if turn_found else TURN_CHASE_CHUNKS
-                if chunk - hit_chunk >= budget:
+                if step_no - hit_step >= budget:
                     break
-            chunk += 1
+            step_no += 1
         scan["hit"] = hit
         # The turn, with `open` resolved into `truncated`: left standing it means the walk
         # never reached the request that started this turn, so the numbers the pane prints
@@ -1628,7 +1672,11 @@ def scan_live_log(chat_dir: str) -> dict:
         )
         if len(_SCAN_CACHE) > 8:  # a long-lived watcher that keeps switching sessions
             _SCAN_CACHE.clear()
-        _SCAN_CACHE[path] = (key, scan)
+        if len(chunks) > CACHED_CHUNKS:  # hygiene: the walk reaches the newest ones first
+            for stale in sorted(chunks)[: len(chunks) - CACHED_CHUNKS]:
+                chunks.pop(stale, None)
+        _SCAN_CACHE[path] = {"key": key, "id": (st.st_dev, st.st_ino), "size": size,
+                             "thread": thread, "chunks": chunks, "scan": scan}
         return scan
     finally:
         fh.close()
