@@ -3016,6 +3016,25 @@ try:
         assert out.startswith("\x1b[H\x1b[2J"), (len(shaped), repr(out[:24]))
     say("the pane repaints only the rows that moved, and writes nothing when none did: ok")
 
+    # ---- the frame has a floor: below 30 columns there is no room for a box, its rules and a
+    #      step, so the plain strip is drawn even on a colour terminal — the same rule that
+    #      decides `snap`'s output, in one place. What must NOT happen is a box drawn into a
+    #      strip it does not fit, which is what the width check above would catch only after
+    #      the fact.
+    for narrow_w in (12, 20, 29):
+        strip = module.render(
+            rich_state, True, width=narrow_w, now_ms=SWEEP_NOW,
+            theme=module.THEME_DEFAULTS, truecolor=True,
+        )
+        assert "╭" not in strip and "│" not in strip, (narrow_w, strip[:120])
+        assert all(module._cell_width(line) <= narrow_w for line in strip.splitlines()), narrow_w
+    boxed = module.render(
+        rich_state, True, width=30, now_ms=SWEEP_NOW,
+        theme=module.THEME_DEFAULTS, truecolor=True,
+    )
+    assert STRIP(boxed).splitlines()[0].startswith("╭"), boxed[:80]
+    say("the frame has a floor of 30 columns; below it the strip is plain: ok")
+
     # ---- the framed top border: the right slot names the watcher, or — with no watcher
     #      serving the pane — the session it is showing, and it never breaks the frame
     def top_of(state_dict, width, watching=None):

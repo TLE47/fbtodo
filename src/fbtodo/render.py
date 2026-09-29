@@ -191,6 +191,18 @@ def no_times_note(state: dict) -> str:
 # In plain words: the renderer a script gets — plain text, one line per thing, no frame and
 # no colour unless asked for. It is deliberately the boring one: other programs read it, so it
 # stays stable while the framed pane is free to be pretty.
+def _clamp_widths(lines: list, width: int) -> list:
+    """Cut every row to the width the frame was asked for, styled or not.
+
+    Each row above has its own budget, and that budget is the frame's real clipping. This is the
+    guarantee BEHIND them: a row that slipped past its own budget — a very narrow pane, a prefix
+    that is wider than the strip, an emoji counted as one cell somewhere — would wrap in the
+    terminal and take the frame's shape with it, which is what a pane that has gone wrong looks
+    like. Rows already inside the width come back untouched, so a recorded frame does not move.
+    """
+    return [line if _cell_width(line) <= width else _clip_cells(line, width) for line in lines]
+
+
 def _clamp_rows(rows: list, height: int | None, head: int, tail: int) -> list:
     """A frame cut to `height` rows, keeping `head` at the top and `tail` at the end.
 
@@ -282,12 +294,12 @@ def _render_plain(
     if goal_lines > 0:
         if not goal and state.get("todos"):
             # Said, not silently replaced by a quote of the request: the heading is the
-            # agent's to write, and a missing one is a rule that was skipped. Wrapped like
-            # the heading itself — it is 24 columns, so on a 22-column pane a raw append
-            # ran past the edge (caught by the width sweep, on a list with no heading).
+            # agent's to write, and a missing one is a rule that was skipped. Wrapped like the
+            # heading itself, at the width it was given: a floor here (16 columns, once) drew
+            # rows wider than a 12-column pane, which is the frame wrapping as it is printed.
             segs = textwrap.wrap(
                 "— none stated",
-                width=max(16, width),
+                width=max(1, width),
                 initial_indent="big goal · ",
                 subsequent_indent="           ",
                 max_lines=goal_lines,
@@ -299,7 +311,7 @@ def _render_plain(
             # here: subtracting the label as well wrapped headings 11 columns early.
             segs = textwrap.wrap(
                 goal,
-                width=max(16, width),
+                width=max(1, width),
                 initial_indent="big goal · ",
                 subsequent_indent="           ",
                 max_lines=goal_lines,
@@ -310,7 +322,7 @@ def _render_plain(
         if now_txt:
             segs = textwrap.wrap(
                 now_txt,
-                width=max(16, width),
+                width=max(1, width),
                 initial_indent="now · ",
                 subsequent_indent="      ",
                 max_lines=2,
@@ -432,7 +444,7 @@ def _render_plain(
     done = sum(1 for t in todos if t.get("completed"))
     # the bar shares its line with "  [" + "]" + " n/m done"; size it to fit
     label = f"{done}/{total} done" if width >= 40 else f"{done}/{total}"
-    bar_w = max(6, min(20, width - (len(label) + 6)))
+    bar_w = max(1, min(20, width - (len(label) + 6)))
     filled = int(bar_w * done / total) if total else 0
     bar = c(green, "#" * filled) + c(dim, "-" * (bar_w - filled))
     meta = []
@@ -1495,13 +1507,15 @@ def render(
     state = clean_observation(state)
     now_ms = now_ms or int(time.time() * 1000)
     if color and width >= 30:
-        return _render_rich(
+        frame = _render_rich(
             state, color, watching, width, now_ms, idle_s, stale_after_s, goal_lines, height,
             theme=theme, truecolor=truecolor,
         )
-    return _render_plain(
-        state, color, watching, width, now_ms, idle_s, stale_after_s, goal_lines, height,
-    )
+    else:
+        frame = _render_plain(
+            state, color, watching, width, now_ms, idle_s, stale_after_s, goal_lines, height,
+        )
+    return "\n".join(_clamp_widths(frame.split("\n"), width))
 
 
 def width_of_default() -> int:
