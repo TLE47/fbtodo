@@ -635,8 +635,16 @@ Which is where most of the care in this tool has gone.
   repaints far more often (default every `--tick` 5 s, 1 s while a step is counting) so the
   seconds move even when nothing else does.
 - **Estimates** ride the same row as the duration: `~1m` for a pending step, `4m10s / ~3m`
-  for the active one. They come from this project's own history of completed steps
-  (`~/.freebuff/fbtodo-tasks.json`), with the list's own pace as the fallback.
+  for the active one. The number walks a ladder of evidence: what that exact step took
+  before, then what steps that *made the same calls* took (`edited3+ ran2` — four edits and
+  nine edits are the same kind of work), then the list's own pace. All of it lives in
+  `~/.freebuff/fbtodo-tasks.json`.
+- **When the evidence disagrees, you get a range.** Three finished steps of 10 s, 2 m and
+  20 m do not entitle the pane to say `~2m` and stop there, so it says `~2m (10s–20m)`
+  instead — on the step rows, on `EST REM`, and in `fbtodo status`. Below a 3× spread the
+  plain number is kept (2 m from 2 m *is* 2 m), and `fbtodo status` prints the sample count
+  behind every number, so `~2m, 1 sample` and `~2m, 9 samples` are told apart. A piped
+  `snap` deliberately keeps the bare `~2m`: that token is a published contract.
 - Past twice the estimate a step is marked `[STUCK?]` — a hint, not a verdict.
 - The **list's own age** rides on `LIST:` (`LIST: #7 · 12m ago`), so a list the agent has
   stopped re-writing is visible while a step's clock is still counting. A narrow strip spends
@@ -656,8 +664,10 @@ Which is where most of the care in this tool has gone.
   tidying up, or it may have decided the rest of the work needed no list at all. A list with
   steps *left* on it is never flagged, because a long step is not a stale list — its own clock,
   and `[STUCK?]` past twice its estimate, are the record there.
-- The bar carries `EST REM` and an `ETA`, and `fbtodo status` shows the remembered pace and
-  where each step's number came from.
+- The bar carries `EST REM` and an `ETA`. Where a row has room for only one of them, the
+  spread takes the place of the ETA — it says something the bare number cannot, while the
+  ETA is that same number told as a clock. `fbtodo status` shows the remembered pace, its
+  spread, and where each step's number came from.
 
 ### The goal heading
 

@@ -437,6 +437,8 @@ HISTORY_MAX_AGE_DAYS = MAX_TASK_AGE_DAYS
 HISTORY_MAX_ENTRIES = 200
 SHAPE_MAX = 3            # coarse bin for a step's call mix: 1, 2, or "3+" calls of one verb
 SHAPE_MIN_SAMPLES = 2    # remembered steps a shape needs before it may set anyone's number
+SPREAD_MIN_SAMPLES = 2   # measured steps needed before a spread may be claimed at all
+SPREAD_MIN_RATIO = 3.0   # hi/lo at which one number stops being the honest form
 
 EX_CODES = {
     "ok": 0,
@@ -3927,9 +3929,9 @@ def task_history_from_log(tasks: dict, now_ms: int | None = None, model: str | N
     )
     history: dict[str, dict] = {}
     for label, spans in by_task.items():
-        mid = _median_ms(spans)
-        if mid:
-            history[label] = {"med": mid, "n": len(spans)}
+        entry = _hist_entry(spans)
+        if entry:
+            history[label] = entry
     if len(history) > HISTORY_MAX_ENTRIES:
         recent = sorted(history, key=lambda k: last_seen.get(k, 0), reverse=True)
         history = {k: history[k] for k in recent[:HISTORY_MAX_ENTRIES]}
@@ -3954,13 +3956,28 @@ def shape_history_from_log(
     )
     shapes: dict[str, dict] = {}
     for bucket, spans in by_shape.items():
-        mid = _median_ms(spans)
-        if mid:
-            shapes[bucket] = {"med": mid, "n": len(spans)}
+        entry = _hist_entry(spans)
+        if entry:
+            shapes[bucket] = entry
     if len(shapes) > HISTORY_MAX_ENTRIES:
         recent = sorted(shapes, key=lambda k: last_seen.get(k, 0), reverse=True)
         shapes = {k: shapes[k] for k in recent[:HISTORY_MAX_ENTRIES]}
     return shapes
+
+
+# In plain words: one remembered number together with the evidence behind it — how many
+# samples, and how far apart they were. A number without its `n` cannot be told from a
+# guess, and one without its spread cannot be told from a promise.
+def _hist_entry(spans: list[int]) -> dict | None:
+    """One history entry: the median, its sample count, and its quartiles when there are two."""
+    mid = _median_ms(spans)
+    if not mid:
+        return None
+    entry: dict = {"med": mid, "n": len(spans)}
+    spread = _spread_ms(spans)
+    if spread:
+        entry["lo"], entry["hi"] = spread
+    return entry
 
 
 # In plain words: one pass over the task log, read either way — by step wording for the
@@ -4128,6 +4145,87 @@ def task_estimate_ms(
         if seen:
             return min(seen, EST_CAP_MS)
     return pace_ms
+
+
+# In plain words: how far apart the samples behind a number were. Two finished steps of
+# 10 seconds and 10 minutes is not a pace of five minutes with a bit of noise on it — it is
+# a list where the next step is genuinely unknowable to within a factor of 60, and saying
+# `~5m` alone would be claiming a precision nobody has.
+def _spread_ms(spans: list[int]) -> tuple[int, int] | None:
+    """(low, high) of the samples behind a number — quartiles, or None with too few."""
+    vals = sorted(s for s in (spans or []) if s and s > 0)
+    if len(vals) < SPREAD_MIN_SAMPLES:
+        return None
+    mid = len(vals) // 2
+    low = _median_ms(vals[:mid]) or vals[0]
+    high = _median_ms(vals[mid + (len(vals) % 2):]) or vals[-1]
+    return low, high
+
+
+def fmt_range(lo: int, hi: int) -> str:
+    """`1m–8m` — the low and high of the samples behind an estimate."""
+    return f"{short_duration(lo) or '0s'}–{short_duration(hi) or '0s'}"
+
+
+def is_wide(lo: int, hi: int) -> bool:
+    """Is one number the wrong shape for this spread? 3x or more, measured either side."""
+    return bool(lo and hi and hi >= lo * SPREAD_MIN_RATIO)
+
+
+def fmt_estimate_spread(point: int, spread: tuple[int, int] | None) -> str:
+    """`~3m`, or `~3m (1m–8m)` when the samples behind the 3m disagree by 3x or more.
+
+    The point estimate is never thrown away — it is what the eye wants — and the range is
+    only added where the spread is genuinely wide, so an ordinary list keeps reading `~3m`.
+    """
+    token = fmt_estimate(point)
+    if not spread:
+        return token
+    lo, hi = spread
+    return f"{token} ({fmt_range(lo, hi)})" if is_wide(lo, hi) else token
+
+
+# In plain words: the spread behind the pace — this list's own finished steps when there are
+# two or more, else the remembered ones. Also the honest bound on `EST REM`, which is a sum
+# of projections: if a step is 10s-or-20m, so is the total.
+def pace_spread_ms(
+    times: dict, todos: list, now_ms: int, history: dict | None = None
+) -> tuple[int, int] | None:
+    """The spread the pace rides on, from the same samples that set it."""
+    mine = step_spans_ms(times, todos, now_ms)
+    if len(mine) >= SPREAD_MIN_SAMPLES:
+        return _spread_ms(mine)
+    remembered = [m for m in (hist_med(v) for v in (history or {}).values()) if m]
+    return _spread_ms(remembered)
+
+
+def entry_spread(entry) -> tuple[int, int] | None:
+    """The `lo`/`hi` inside a history entry, when both are there."""
+    if not isinstance(entry, dict):
+        return None
+    lo, hi = entry.get("lo"), entry.get("hi")
+    try:
+        lo, hi = int(lo), int(hi)
+    except (TypeError, ValueError):
+        return None
+    return (lo, hi) if lo > 0 and hi > 0 else None
+
+
+def estimate_spread_ms(
+    times: dict,
+    task: str,
+    history: dict | None = None,
+    shapes: dict | None = None,
+    bucket: str = "",
+) -> tuple[int, int] | None:
+    """The spread belonging to whichever source supplied this step's number."""
+    entry = (history or {}).get(str(task))
+    if hist_med(entry):
+        return entry_spread(entry)
+    shape_entry = (shapes or {}).get(bucket) if bucket else None
+    if isinstance(shape_entry, dict) and int(shape_entry.get("n") or 0) >= SHAPE_MIN_SAMPLES:
+        return entry_spread(shape_entry)
+    return None
 
 
 # In plain words: how much is left — each remaining step at its usual duration, less the
@@ -4973,10 +5071,18 @@ def _render_plain(
         # When the token does not fit, it is simply dropped — the duration above, when
         # there is one, has already had its say.
         if not done_flag:
-            token = fmt_estimate(estimate_for(times, task, pace_ms, history, shapes))
-            token = (" · " + token) if elapsed is None else (" / " + token)
-            if len(segs[-1]) + len(token) <= width - 6:
-                segs[-1] += token
+            est_ms = estimate_for(times, task, pace_ms, history, shapes)
+            spread = estimate_spread_ms(
+                times, task, history, shapes, step_shape_bucket(times, task)
+            ) or pace_spread_ms(times, todos, now_ms, history)
+            # The range is offered FIRST and the plain number second: a row with room says
+            # `~2m (10s–20m)`, and a row without it keeps the `~2m` it would have had, so a
+            # narrow pane never trades its estimate away for detail it cannot show.
+            for cand in (fmt_estimate_spread(est_ms, spread), fmt_estimate(est_ms)):
+                token = (" · " + cand) if elapsed is None else (" / " + cand)
+                if len(segs[-1]) + len(token) <= width - 6:
+                    segs[-1] += token
+                    break
         block = []
         for j, seg in enumerate(segs):
             if j == 0:
@@ -5557,7 +5663,10 @@ def _render_rich(
             if elapsed is not None else ""
         )
         # This step's own estimate: its remembered history when there is one, else the
-        # pace the list has settled on.
+        # pace the list has settled on. The PLAIN path keeps the bare `~3m` on purpose: a
+        # piped `snap` is a published, script-parsed contract, and a range would change the
+        # shape of a token those scripts already match. The framed pane and `fbtodo status`
+        # are where the spread is shown (see `fmt_estimate_spread`).
         est_ms = estimate_for(times, task, pace_ms, history, shapes)
         est = fmt_estimate(est_ms)
         budget = max(0, inner - indent - 8)
@@ -5682,12 +5791,25 @@ def _render_rich(
     cands: list[str] = []
     if rem_ms > 0:
         rem_txt = short_duration(rem_ms, seconds=True) or "0s"
+        rem_spread = pace_spread_ms(times, todos, now_ms, history)
+        # The remaining time is a sum of projections, so it inherits the spread of the
+        # steps it sums: `EST REM: 12m (2m–1h)` says what `EST REM: 12m` alone cannot.
+        # Widest first — the whole range with the clock and the pace, then the same range
+        # on its own, and only then the bare number.
+        ranged = (
+            [f" | EST REM: {rem_txt} ({fmt_range(*rem_spread)})"]
+            if rem_spread and is_wide(*rem_spread) else []
+        )
         cands += [
+            (ranged[0] + f" | ETA {fmt_eta(rem_ms, now_ms)}{pace_suffix}") if ranged else None,
+            (ranged[0] + pace_suffix) if ranged else None,
+            ranged[0] if ranged else None,
             f" | EST REM: {rem_txt} | ETA {fmt_eta(rem_ms, now_ms)}{pace_suffix}",
             f" | EST REM: {rem_txt}{pace_suffix}",
             f" | EST REM: {rem_txt} | ETA {fmt_eta(rem_ms, now_ms)}",
             f" | EST REM: {rem_txt}",
         ]
+        cands = [c for c in cands if c]
     if pace_suffix:
         cands.append(pace_suffix)
     for cand in cands:
@@ -6437,8 +6559,14 @@ def cmd_status(args) -> int:
     shapes = shape_history_from_log(log.get("tasks") or {}, model=model)
     todos = (view or {}).get("todos") or []
     times = (view or {}).get("task_times") or {}
-    pace = step_pace_ms(times, todos, int(time.time() * 1000), history)
+    now_est = int(time.time() * 1000)
+    pace = step_pace_ms(times, todos, now_est, history)
+    pace_spread = pace_spread_ms(times, todos, now_est, history)
     origin = f"{len(history)} remembered step(s)" if history else "no remembered steps yet"
+    # The spread is printed with the pace it belongs to: `2m` from 10s and 20m of finished
+    # steps is a different claim from `2m` from 2m and 2m, and only the spread says which.
+    if pace_spread and is_wide(*pace_spread):
+        origin += f", spread {fmt_range(*pace_spread)}"
     print(f"  remembered pace   : {short_duration(pace, seconds=True)}  ({origin})")
     # The memory that can improve with use: keyed by what a step DID rather than what it was
     # called, so its samples accumulate where the wording memory has almost none. Printed
@@ -6460,16 +6588,19 @@ def cmd_status(args) -> int:
     for t in [t for t in todos if not t.get("completed")][:5]:
         task = str(t.get("task", ""))
         bucket = step_shape_bucket(times, task)
-        entry = shapes.get(bucket) if bucket else None
-        if hist_med(history.get(task)):
-            source = "own history"
+        own, entry = history.get(task), (shapes.get(bucket) if bucket else None)
+        samples = len(step_spans_ms(times, todos, now_est))
+        if hist_med(own):
+            source = f"own history, {own.get('n')} sample(s)"
         elif isinstance(entry, dict) and int(entry.get("n") or 0) >= SHAPE_MIN_SAMPLES:
-            source = f"shape {bucket} (n={entry.get('n')})"
+            source = f"shape {bucket}, {entry.get('n')} sample(s)"
         else:
-            source = "list pace"
+            source = f"list pace, {samples} sample(s)" if samples else "list pace"
+        spread = estimate_spread_ms(times, task, history, shapes, bucket) or pace_spread
         print(
             f"  estimate          : {_clip(task, 44)}  "
-            f"{fmt_estimate(estimate_for(times, task, pace, history, shapes))}  ({source})"
+            f"{fmt_estimate_spread(estimate_for(times, task, pace, history, shapes), spread)}"
+            f"  ({source})"
         )
     print(f"  scratch           : {scratch_size()} bytes in {SCRATCH}")
     return 0

@@ -1014,7 +1014,10 @@ try:
     # `edited: 4, ran: 1` and `edited: 5, ran: 1` land in the SAME bucket, which is the
     # whole point: two differently-worded steps of one kind, pooled into a median of 1m15s
     assert set(sh) == {"edited3+ ran1", "ran1"}, sh
-    assert sh["edited3+ ran1"] == {"med": 75_000, "n": 2}, sh
+    # the entry carries the evidence with the number: how many samples, and how far apart
+    # they were — one sample has no spread and so has no `lo`/`hi` at all
+    assert sh["edited3+ ran1"] == {
+        "med": 75_000, "n": 2, "lo": 60_000, "hi": 90_000}, sh
     assert sh["ran1"] == {"med": 20_000, "n": 1}, sh
     assert module.shape_of({"edited": 9, "ran": 2}) == "edited3+ ran2", module.shape_of(
         {"edited": 9, "ran": 2})
@@ -1666,7 +1669,34 @@ try:
     pending_est = next(line for line in est_lines if "○" in line)
     assert pending_est.rstrip().endswith("~2m │"), pending_est
     est_bar = next(line for line in est_lines if "PROGRESS" in line)
-    assert "EST REM: 3m30s" in est_bar and " | ETA " in est_bar, est_bar
+    # The finished steps are 1m, 2m and 3m, so the spread behind the pace is 1m–3m — 3x, and
+    # therefore wide enough to be said out loud. Where the row has room for only one of
+    # them the RANGE takes it and the ETA does not: the range says something the bare number
+    # cannot, while the ETA is that same number told as a clock. The plain path (checked
+    # below) keeps the bare token, because scripts parse it.
+    assert "EST REM: 3m30s (1m–3m)" in est_bar, est_bar
+    assert " | ETA " not in est_bar, est_bar
+    # ...and a list whose finished steps AGREE shows no range at all: 2m from 2m is a real
+    # 2m, so the eye keeps the plain number and the ETA keeps its place on the row
+    even_times = {
+        "step a": {"started_ms": 0, "done_ms": 120_000, "elapsed_ms": 120_000},
+        "step b": {"started_ms": 0, "done_ms": 120_000, "elapsed_ms": 120_000},
+    }
+    even_todos = [
+        {"task": "step a", "completed": True},
+        {"task": "step b", "completed": True},
+        {"task": "step c", "completed": False},
+    ]
+    assert module.pace_spread_ms(even_times, even_todos, SWEEP_NOW) == (120_000, 120_000)
+    assert not module.is_wide(120_000, 120_000), "2m from 2m must not be called wide"
+    assert module.fmt_estimate_spread(120_000, (120_000, 120_000)) == "~2m"
+    even_bar = next(
+        line for line in ansi.sub("", module.render(
+            dict(est_state, task_times=even_times, todos=even_todos, done=2, total=3),
+            True, watching=999, width=80, height=20, now_ms=SWEEP_NOW,
+        )).splitlines() if "PROGRESS" in line
+    )
+    assert "~2m (" not in even_bar and " | ETA " in even_bar, even_bar
     # ---- the overall time to the goal: 30s already spent plus the 3m30s still to run.
     #      The active step is the only one with a real start (0 means "never seen
     #      running"), so 30s is what the list can be said to have spent.
@@ -2231,7 +2261,7 @@ try:
         mod.task_key("H", "y"): {"started_ms": t0, "done_ms": t0 + 30_000,
                                  "model": "m/h", "shape": {"edited": 9}},
     }, t0 + 60_000, "m/h")
-    assert shapes == {"edited3+": {"med": 20_000, "n": 2}}, shapes
+    assert shapes == {"edited3+": {"med": 20_000, "n": 2, "lo": 10_000, "hi": 30_000}}, shapes
     own = {"h-three": {"started_ms": t0, "done_ms": None, "shape": {"edited": 9}}}
     assert mod.estimate_for(own, "h-three", 240_000, {}, shapes) == 20_000
     # one step of that shape is not evidence yet, and neither is a shape nobody has seen
