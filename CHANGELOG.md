@@ -27,11 +27,27 @@ Entries start at the newest release; each one is a contract change, not a diff.
   changes for anyone who runs, links or copies it: the launcher is the same path, takes
   the same arguments, and a copy of the package without it still runs
   (`python3 src/fbtodo/__init__.py …`).
+- The one file is now **ten modules** — `base` (paths, settings, generic tools), `locks`,
+  `alerts`, `scan` (the CLI journal), `desktop`, `nas`, `tasks` (the log, the clocks and the
+  estimates), `sources`, `panes`, `render` — with `__init__.py` left as the front door (the
+  commands and the daemon). Each module star-imports the layers under it and lists what it
+  holds in `__all__`, so the package is still one namespace: `fbtodo.<name>` and every patched
+  global in the self-check answer exactly as before.
 
 ### Added
 - `tests/golden.py` plus recorded `json` / `bar` / `snap` / frame output: the display
   contract, checked against fixtures with a frozen clock, and the checker itself checked by
   the suite pointing it at a mutated copy.
+- The self-check reads the package statically and fails when a module loads a name that nothing
+  under `fbtodo/` provides — a forgotten layer, caught before the line that needs it runs.
+
+### Fixed
+- The phone's summary line had its markdown left in (`**Goal:**`, backticks, emphasis): two
+  helpers were both called `_plain` and the renderer's ANSI-stripper, defined later in the file,
+  won every call. The prose one is `prose_text` now.
+- `read_theme` filled `THEME_PROBLEMS` by rebinding the list, so a reader in another module (it
+  is `status` that prints it) saw "no problems" for a theme whose values had just been refused.
+  The list is filled in place.
 
 ## 4.29.0
 

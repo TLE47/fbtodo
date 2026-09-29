@@ -18,20 +18,46 @@ fbtodo                 the launcher: `src/` on the import path beside its own re
                        then `main()`. This is the path everything names — a PATH
                        symlink, the pane command lines, the keeper, the daemon's own
                        foreground re-exec
-src/fbtodo/            the program, one module per concern; today `__init__.py` is all
-                       of it, and the split moves it out a slice (and a commit) at a time
+src/fbtodo/            the program, a layer per module (below)
 fbtodo-selfcheck.py    the suite: it imports the package (`load_fbtodo`) rather than
                        loading a file by path, so its patch sites patch module globals
                        the same way they always did
 notify/                the watches, each invoked as a subprocess
 ```
 
-`self_argv()` is how the program re-invokes itself — the panes, the pane keeper, the NAS
-watcher, and the daemon re-execing itself in the foreground: `sys.executable` plus the
-**launcher**, never `__file__`, because a package's `__init__.py` run as a script is not
-the package (every module loaded twice, no relative import resolvable). A copy that
-carries the package without the launcher falls back to the file, and the `__main__` guard
-at the top of `__init__.py` re-enters as the package, so that path still works.
+The program is one package in ten modules, and it is **one namespace** still: each module
+lists what it holds in `__all__` and `__init__.py` imports it back with `from .base import *`,
+so `fbtodo.<anything>` reaches the same name it always did, and the self-check's patched knobs
+keep working. The layers only ever import downwards:
+
+```
+base.py      the floor: the state directory and its migration, every path, the settings read
+             at import, the exit codes, and the generic tools (atomic writes, the process
+             table, the clocks, ANSI/cell-width/wrapping)
+locks.py     the claim files: who is watching, held by the kernel rather than by a pid
+alerts.py    the two rows no store holds: the last patch outcome, the last phone alert
+scan.py      the CLI journal: its record parsers, the chunk memory, `read_cli`
+desktop.py   the desktop app's SQLite conversation
+nas.py       the remote host: one ssh per poll, carrying the extractor that runs there
+tasks.py     the task log (event stream + folded memo), the clocks, the estimates, the pruning
+sources.py   the `Source` protocol and the loop that asks the three readers in order
+panes.py     tmux: the pane, its layout and pins, the keeper, and the watcher loops
+render.py    one state -> lines: the plain renderer, the framed pane, the theme
+__init__.py  the front door: the commands, the daemon, and the import of every layer above
+```
+
+A module's own imports are the promise it keeps: `from .scan import *` at the top of
+`nas.py` is why its liveness probe can read a journal timestamp. The self-check reads the
+package statically and fails if any module loads a name nothing under `fbtodo/` provides —
+which is what a forgotten layer looks like before the line that needs it ever runs.
+
+`self_argv(here="")` is how the program re-invokes itself — the panes, the pane keeper, the
+NAS watcher, and the daemon re-execing itself in the foreground: `sys.executable` plus the
+**launcher**, never the asking file's own path, because a package's `__init__.py` run as a
+script is not the package (every module loaded twice, no relative import resolvable). It
+takes the asking file so the answer does not depend on which module holds the function; a copy
+that carries the package without the launcher falls back to `__init__.py` beside the asker, and
+the `__main__` guard at the top of `__init__.py` re-enters as the package, so that path works.
 
 ## The state directory
 
