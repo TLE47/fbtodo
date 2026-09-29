@@ -108,7 +108,7 @@ import textwrap
 import time
 import unicodedata
 
-VERSION = "4.21.0"
+VERSION = "4.22.0"
 HOME = os.path.expanduser("~")
 # FBTODO_HOME points state/lock/log elsewhere — used by the self-check so it never
 # touches the real watcher's files.
