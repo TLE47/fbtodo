@@ -10,6 +10,8 @@ The suite drives real tmux servers it starts itself and takes ~90-160 s. It clea
 up only that one directory — created by this script, verified by path — never a
 parent.
 """
+import ast
+import builtins
 import importlib
 import json
 import os
@@ -786,6 +788,82 @@ try:
     assert not module.is_freebuff_cmd("freebuff"), "a bare name matched with no freebuff"
     module._FREEBUFF_WHICH[:] = saved_which
     say("discovery: a launcher's argv is matched by shape, and a probe that names it is not: ok")
+
+    # ---- the package is several modules now, and `import *` is what keeps it one namespace. A
+    #      module that reads a global nothing under `fbtodo/` provides would only fail when that
+    #      line runs — for a leaf helper, days later, in the pane. So read the package statically:
+    #      every name a module's functions read must come from that module, from a module it
+    #      star-imports (transitively), or from the builtins. This is what a dropped import or a
+    #      module that forgot a layer looks like before anything runs it.
+    pkg_dir = os.path.dirname(os.path.abspath(module.__file__))
+    trees = {}
+    for _name in sorted(os.listdir(pkg_dir)):
+        if _name.endswith(".py"):
+            with open(os.path.join(pkg_dir, _name), encoding="utf-8") as _fh:
+                trees[_name[:-3]] = ast.parse(_fh.read())
+
+    def _star_deps(mod_name) -> list:
+        return [n.module.split(".")[-1] for n in trees[mod_name].body
+                if isinstance(n, ast.ImportFrom) and n.module
+                and any(a.name == "*" for a in n.names)]
+
+    def _names(mod_name) -> set:
+        """The module-level names one file binds itself."""
+        names = set()
+        for node in trees[mod_name].body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = getattr(node, "targets", None) or [node.target]
+                names |= {x.id for t in targets for x in ast.walk(t) if isinstance(x, ast.Name)}
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                names |= {(a.asname or a.name.split(".")[0]) for a in node.names if a.name != "*"}
+        return names
+
+    def _exports(mod_name, seen=frozenset()) -> set:
+        """What `from .mod import *` hands out: its `__all__`, or its names and its layers'."""
+        if mod_name in seen or mod_name not in trees:
+            return set()
+        for node in trees[mod_name].body:
+            if isinstance(node, ast.Assign) and any(
+                    getattr(t, "id", "") == "__all__" for t in node.targets):
+                return set(ast.literal_eval(node.value))
+        names = _names(mod_name)
+        for dep in _star_deps(mod_name):
+            names |= _exports(dep, seen | {mod_name})
+        return names
+
+    def _available(mod_name, seen=frozenset()) -> set:
+        """Everything one module's own code may read: its names, plus its star-imports'."""
+        if mod_name in seen or mod_name not in trees:
+            return set()
+        names = _names(mod_name)
+        for dep in _star_deps(mod_name):
+            names |= _exports(dep, seen | {mod_name})
+        return names
+
+    for _mod, _tree in trees.items():
+        bound = set(_available(_mod))
+        for _node in ast.walk(_tree):
+            if isinstance(_node, ast.Name) and isinstance(_node.ctx, ast.Store):
+                bound.add(_node.id)  # a local counts as bound, wherever it is bound
+            elif isinstance(_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                bound.add(_node.name)
+            if isinstance(_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                args = [*_node.args.args, *_node.args.kwonlyargs,
+                        *getattr(_node.args, "posonlyargs", [])]
+                bound |= {a.arg for a in args}
+            elif isinstance(_node, ast.ExceptHandler) and _node.name:
+                bound.add(_node.name)
+            elif isinstance(_node, (ast.Import, ast.ImportFrom)):
+                bound |= {(a.asname or a.name.split(".")[0]) for a in _node.names if a.name != "*"}
+        unread = sorted(
+            {n.id for n in ast.walk(_tree)
+             if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)} - bound
+            - set(dir(builtins)) - {"__file__", "__name__", "__doc__", "__package__"},
+        )
+        assert not unread, f"{_mod}.py reads names nothing provides: {unread}"
+    say("the package: every module's globals are provided for by its own layers: ok")
 
     # ---- how the program names itself back to itself. Every pane, the keeper and the daemon
     #      are re-invocations, so this must name something that RUNS. That is the launcher
