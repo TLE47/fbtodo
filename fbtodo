@@ -134,7 +134,8 @@ STATE_DIR = os.path.join(
 # What the move carries. Listed as names rather than taken from the paths below, because the
 # root has to be chosen before those are built.
 LEGACY_NAMES = (
-    "fbtodo-state.json", "fbtodo-tasks.json", "fbtodo-daemon.pid", "fbtodo-daemon.log",
+    "fbtodo-state.json", "fbtodo-tasks.json", "fbtodo-tasks.jsonl",
+    "fbtodo-daemon.pid", "fbtodo-daemon.log",
     "fbtodo-nas-pane.pid", "fbtodo-nas-pane.json", "fbtodo-nas-pane.log",
     "fbtodo-pane-keeper.pid", "fbtodo-pane.log", "fbtodo-pins.json", "fbtodo-last.json",
     "fbtodo-nas.json",
@@ -219,7 +220,22 @@ def _state_root():
 
 SCRATCH, STATE_NOTE = _state_root()
 STATE_PATH = os.path.join(SCRATCH, "fbtodo-state.json")
+# The task log is two files. The stream is the evidence store — one JSON object per line,
+# appended to and never edited — and the document beside it is a memo of the fold, carrying
+# the byte offset it was folded to. Anything that can be derived from the stream is derived
+# again rather than trusted.
 TASKS_PATH = os.path.join(SCRATCH, "fbtodo-tasks.json")
+
+
+def events_path(path: str = "") -> str:
+    """The stream that belongs to a task-log view — `fbtodo-tasks.json` -> `.jsonl`.
+
+    Derived from the view's name rather than held as a second constant, so a caller that
+    points the view somewhere else (the self-check's unit blocks, a restore from a backup)
+    gets its own stream by construction and cannot fold one log's events into another's
+    records.
+    """
+    return (path or TASKS_PATH) + "l"
 LOCK_PATH = os.path.join(SCRATCH, "fbtodo-daemon.pid")
 LOG_PATH = os.path.join(SCRATCH, "fbtodo-daemon.log")
 # The NAS pane watcher: its own lock, log and state, because it is a different question
@@ -3796,6 +3812,14 @@ def prune_scratch(
             report["records_removed"] += 1
     report["records_kept"] = len(tasks)
     log["pruned_ms"] = now_ms
+    # ...and the stream the view came from: this is the one moment the events about records
+    # that are gone can be dropped, and it is why the stream cannot grow without bound
+    # behind the caps above. Compaction carries the cursor with it, so the memo written
+    # below is the fold of what is left rather than of everything ever appended.
+    try:
+        compact_task_events(log)
+    except OSError:
+        pass
     try:
         atomic_write_json(TASKS_PATH, log)
     except OSError:
@@ -5120,6 +5144,155 @@ def task_key(session, task: str) -> str:
     return f"{session or ''}\x1f{task}"
 
 
+# In plain words: a record changes once in a while, and the log has thousands of them. An
+# observation used to rewrite every record to change one; now it appends a line, and the
+# JSON the readers use is a memo of those lines with the offset it was folded to. The
+# events are absolute (last write wins per key), so folding them again is harmless — which
+# is what makes the window between the append and the rewrite cost a re-read, not a step.
+def _task_event(row: dict) -> bytes:
+    """One event, one line — the stream's only writer."""
+    return (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _events_size() -> int:
+    try:
+        return os.path.getsize(events_path())
+    except OSError:
+        return 0
+
+
+def _stamp_events_cursor(log: dict) -> None:
+    """Record how much of the stream this memo has folded.
+
+    Sound because the append that just happened was this process's own and was the last
+    thing written: the file's size now is the end of what the memo holds.
+    """
+    try:
+        st = os.stat(events_path())
+    except OSError:
+        return
+    log["events"] = {"dev": st.st_dev, "ino": st.st_ino, "off": st.st_size}
+
+
+def append_task_events(rows: list) -> int:
+    """Append events to the stream, one JSON object per line; the new size back.
+
+    One `O_APPEND` write per call, so a reader that saw the bytes before this call still
+    sees them after it, and a crash in the middle of a line leaves a prefix rather than a
+    file with a hole in it.
+    """
+    if not rows:
+        return _events_size()
+    blob = b"".join(_task_event(r) for r in rows)
+    try:
+        fd = os.open(events_path(), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    except OSError:
+        return 0
+    try:
+        view = memoryview(blob)
+        while view:
+            wrote = os.write(fd, view)
+            if wrote <= 0:
+                break
+            view = view[wrote:]
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+    return _events_size()
+
+
+def fold_task_events(view: dict) -> dict:
+    """Bring a memo of the task log up to date with the stream.
+
+    A record is set by `k` and removed by `drop`, so the fold is last-write-wins per key
+    and running it twice says the same thing as running it once. Starting from the
+    offset the memo carries and starting from the beginning therefore agree, which is what
+    makes the window between an append and the rewrite harmless: the next reader folds the
+    events the memo missed. A torn last line (a crash mid-append) is left for the rest of
+    itself to arrive rather than guessed at.
+    """
+    stream = events_path()
+    try:
+        st = os.stat(stream)
+    except OSError:
+        return view
+    cur = view.get("events") if isinstance(view.get("events"), dict) else {}
+    start = 0
+    if (cur.get("dev") == st.st_dev and cur.get("ino") == st.st_ino
+            and 0 <= int(cur.get("off") or 0) <= st.st_size):
+        start = int(cur["off"])
+    try:
+        with open(stream, "rb") as fh:
+            fh.seek(start)
+            blob = fh.read()
+    except OSError:
+        return view
+    cut = blob.rfind(b"\n")
+    if cut < 0:
+        return view
+    tasks = view.setdefault("tasks", {})
+    for line in blob[: cut + 1].splitlines():
+        try:
+            row = json.loads(line.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if "k" in row and isinstance(row.get("r"), dict):
+            tasks[row["k"]] = row["r"]
+        elif isinstance(row.get("drop"), list):
+            for key in row["drop"]:
+                tasks.pop(key, None)
+        if "session" in row:
+            view["session"] = row["session"]
+        if "pruned_ms" in row:
+            view["pruned_ms"] = row["pruned_ms"]
+        if row.get("v"):
+            view["schema"] = max(int(view.get("schema") or 0), int(row["v"]))
+    view["events"] = {"dev": st.st_dev, "ino": st.st_ino, "off": start + cut + 1}
+    return view
+
+
+def compact_task_events(log: dict) -> int:
+    """Rewrite the stream as one event per record the log still holds.
+
+    A stream appended to for a month is mostly events about records the prune has since
+    dropped: this is the fold point, run by the prune and only by it. Written to a temp
+    name and renamed, because a reader mid-fold must see the old stream or the new one.
+    """
+    rows = [{"v": TASKLOG_SCHEMA, "session": log.get("session")}]
+    for key, rec in (log.get("tasks") or {}).items():
+        rows.append({"v": TASKLOG_SCHEMA, "k": key, "r": rec})
+    if log.get("pruned_ms"):
+        rows.append({"v": TASKLOG_SCHEMA, "pruned_ms": log["pruned_ms"]})
+    blob = b"".join(_task_event(r) for r in rows)
+    stream = events_path()
+    d = os.path.dirname(stream)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".fbtodo.", suffix=".tmp", dir=d)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(blob)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, stream)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    st = os.stat(stream)
+    log["events"] = {"dev": st.st_dev, "ino": st.st_ino, "off": len(blob)}
+    return len(blob)
+
+
 def load_tasklog() -> dict:
     log = read_json(TASKS_PATH, None)
     if not isinstance(log, dict) or "tasks" not in log:
@@ -5131,7 +5304,7 @@ def load_tasklog() -> dict:
         session = log.get("session")
         log["tasks"] = {task_key(session, k): v for k, v in log["tasks"].items()}
         log["schema"] = TASKLOG_SCHEMA
-    return log
+    return fold_task_events(log)
 
 
 def current_index(todos: list) -> int | None:
@@ -5244,11 +5417,17 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
     """
     now_ms = now_ms or int(time.time() * 1000)
     log = load_tasklog()
-    before = json.dumps(log, sort_keys=True)
     session = state.get("session")
+    prior_session = log.get("session")
     log["session"] = session
     tasks = log.setdefault("tasks", {})
     todos = state.get("todos") or []
+    # What this poll may touch, as text, before anything is mutated: the records of the
+    # steps on this list. The write below then appends the events that differ instead of
+    # rewriting the records that do not, which is most of them — the log is a history and a
+    # list is a handful of steps.
+    touched = [task_key(session, str(t.get("task", ""))) for t in todos]
+    before_recs = {key: json.dumps(tasks.get(key), sort_keys=True) for key in touched}
     running = current_index(todos)
     # The agent's own answer to "is anything being worked on right now", from the
     # journal's end-of-turn record. Everything below hangs off it: a turn that has ended
@@ -5351,15 +5530,17 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
     # more than the current list and "is this getting better?" was unanswerable live. What is
     # still dropped is a record that never finished (no `done_ms`): its `started_ms` would
     # keep a clock running for a step that is no longer on any list.
+    dropped: list = []
     if seen:
         prefix = task_key(session, "")
-        for gone in [
+        dropped = [
             k
             for k, rec in tasks.items()
             if k.startswith(prefix)
             and k not in seen
             and not (isinstance(rec, dict) and rec.get("done_ms"))
-        ]:
+        ]
+        for gone in dropped:
             tasks.pop(gone, None)
 
     # Per-task memory, kept ACROSS sessions: every finished step in the log contributes its
@@ -5422,12 +5603,29 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
                 fc["pace"] = pace
                 fc["pick"] = src
                 rec["fc"] = fc
-    if persist and json.dumps(log, sort_keys=True) != before:
-        try:
-            atomic_write_json(TASKS_PATH, log)
-        except OSError:
-            pass
-        prune_scratch(now_ms=now_ms)  # throttled internally; keeps the record count capped
+    if persist:
+        rows = []
+        if log.get("session") != prior_session:
+            rows.append({"v": TASKLOG_SCHEMA, "session": log.get("session")})
+        for key in touched:
+            if json.dumps(tasks.get(key), sort_keys=True) != before_recs.get(key):
+                rows.append({"v": TASKLOG_SCHEMA, "k": key, "r": tasks.get(key)})
+        if dropped:
+            rows.append({"v": TASKLOG_SCHEMA, "drop": sorted(dropped)})
+        if rows:
+            try:
+                append_task_events(rows)
+            except OSError:
+                pass
+            # The memo carries the offset it was folded to. Stamped after the append and
+            # never before it: an event that landed without a memo is folded again next
+            # time, which costs a read, where the other order would lose the record.
+            _stamp_events_cursor(log)
+            try:
+                atomic_write_json(TASKS_PATH, log)
+            except OSError:
+                pass
+            prune_scratch(now_ms=now_ms)  # throttled internally; keeps the record count capped
     state["task_times"] = times
     return state
 
