@@ -1079,6 +1079,24 @@ try:
     assert st_s["summary"] == "Confirmed — the pipe was never the problem.", st_s
     say("summary: the first usable line of the agent's answer, markdown out: ok")
 
+    # Markdown is stripped as well, because the phone shows this line bare: leaving the
+    # emphasis markers in would make the message read as punctuation. It went missing for a
+    # while unnoticed — the module had two helpers called `_plain`, the later one (ANSI off a
+    # coloured line, for the renderer) shadowed the prose one, and this line was the only
+    # caller of the older of the two.
+    write_journal(
+        [
+            rec(
+                prompt="a markdown answer",
+                todos=[{"task": "t", "completed": True}],
+                prose="**Goal:** x\n\n`fbtodo bar` shows *the box* now.\n",
+            )
+        ]
+    )
+    st_s = module.read_cli(goals)
+    assert st_s["summary"] == "fbtodo bar shows the box now.", st_s
+    say("summary: the phone's line has the markdown taken out: ok")
+
     write_journal(
         [rec(prompt="quiet turn", todos=[{"task": "t", "completed": True}], prose="")]
     )
