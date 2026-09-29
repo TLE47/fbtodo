@@ -49,10 +49,10 @@ fields that matter:
 | `done`, `total`, `list_id`, `list_version` | progress, and the identity of *this* list |
 | `cleared`, `cleared_turn` | no list is drawn, and which drop caused it. `cleared` is a dropped list: a new session, or a **finished** list the next turn replaced. `cleared_turn` names the second and is what `no_list_reason` prints for it. A drop never touches `list_version` — the number identifies a list, and the new turn's list is what increments it |
 | `turn_ended` | the journal's `shouldEndTurn` — the other half of "finished" |
-| `task_times` | per-step `started_ms` / `done_ms` / `elapsed_ms` / `shape`, from the tick that saw it. `shape` is the call mix the step has revealed so far, credited from the turn's own tally by order, and only for the step in flight |
-| `est_ms` / `est_src` (in the task log) | the estimate the pane was showing for the step in flight, and which rung of the ladder produced it (`own` / `shape` / `pace`), stamped on every poll while it runs. When the step closes, the pair (projection, outcome) is what `fbtodo status` scores as `estimate error`, per source — so "is this getting better?" is answered from records rather than from a tally that could drift |
-| `task_history` | per-step remembered span, model-aware: `{label: {med, n}}`, where `n` is how many samples the median stands on. A state written by an older build holds a bare int and is read the same way |
-| `task_shapes` | the same memory keyed by what a step *did* (`edited3+ ran2`) rather than what it was called, with the same `{med, n}` entries. This is the half that accumulates: step wordings almost never repeat (172 of 173 remembered labels had been seen once) while call mixes do |
+| `task_times` | per-step `started_ms` / `done_ms` / `elapsed_ms` / `shape`, from the tick that saw it. `shape` is the call tally the step has revealed so far, credited from the turn's own tally by order, and only for the step in flight |
+| `est_ms` / `est_src` (in the task log) | the estimate the pane was showing for the step in flight, and which rung of the ladder produced it (`shape` / `pace`), stamped on every poll while it runs. When the step closes, the pair (projection, outcome) is what `fbtodo status` scores as `estimate error`, per source — so "is this getting better?" is answered from records rather than from a tally that could drift |
+| `task_history` | per-step remembered span, model-aware: `{label: {med, n}}`, where `n` is how many samples the median stands on. A state written by an older build holds a bare int and is read the same way. It no longer prices a step directly — the `own wording` rung was retired 2026-09-29 after firing 0 times in 170 replayed steps — it is read only as the remembered pace the bound leans on |
+| `task_shapes` | the memory that actually prices a running step, keyed by its **size** — the calls it has made, log-binned (`calls0` … `calls4`: 1, 2-3, 4-7, 8-15, 16-31 calls) — with `{med, n}` entries. Measured 2026-09-29 over 258 replayed steps, the count carries more of a step's duration than the verb mix did (leave-one-session-out R² 0.645 against 0.390); a step that has made no calls yet has no size and falls to the pace |
 | `model` | the model the session names; the pace is quoted with it |
 | `patch`, `alert` | the two optional footer facts, read from the logs that produce them |
 | `ts`, `source_updated_ms`, `store_mtime_ms`, `probed_ms`, `heartbeat_ms` | the clocks. `ts` is when the drawn `write_todos` record was written (and `source_updated_ms` mirrors it), which is what the pane's `LIST: #7 · 12m ago` and `status`'s `list written` report; `store_mtime_ms` is the transcript's mtime, and `store_mtime_ms - ts` past `LIST_BEHIND_MS` in a session with every step ticked is the `[STALE?]` marker and `status`'s `list behind` |
@@ -112,8 +112,10 @@ back.
   365 KB — because the estimate memory is the only part of the tool that is supposed to get
   better with use, and a 7-day window was pruning records while they were still the only
   evidence there was (measured 2026-09-29: the oldest record in a real log was 6.68 days
-  old). The wording map is capped by recency; the shape map is keyed by a space of a few
-  dozen buckets, so that cap never evicts a bucket.
+  old). The wording map is capped by recency; the size map is keyed by log2 call-count
+  buckets — seven distinct keys over the same 170 steps that needed 68 verb-mix keys — so
+  that cap never evicts a bucket. A span under 10 s (`MIN_LABEL_MS`) is shown but never
+  remembered: it is a list flip, not work.
 - **The tests drive private tmux servers** (`FBTODO_TMUX`) and a throwaway `FBTODO_HOME`,
   and mute the notifiers, because some phases start a *real* watcher.
 

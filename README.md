@@ -635,10 +635,12 @@ Which is where most of the care in this tool has gone.
   repaints far more often (default every `--tick` 5 s, 1 s while a step is counting) so the
   seconds move even when nothing else does.
 - **Estimates** ride the same row as the duration: `~1m` for a pending step, `4m10s / ~3m`
-  for the active one. The number walks a ladder of evidence: what that exact step took
-  before, then what steps that *made the same calls* took (`edited3+ ran2` — four edits and
-  nine edits are the same kind of work), then the list's own pace. All of it lives in
-  `~/.freebuff/fbtodo-tasks.json`.
+  for the active one. The number walks a ladder of evidence: what steps of the same **size**
+  took — the calls a step has made so far, log-binned (`calls2` is 4-7 calls) — then the
+  list's own pace. All of it lives in `~/.freebuff/fbtodo-tasks.json`.
+- **A step under 10 s is a list flip, not work.** It is shown on its row, but it sets no pace
+  and enters no memory: measured 2026-09-29, a 2 s flip had once projected a whole list at
+  `~2s` while the next step took 1m53s.
 - **When the evidence disagrees, you get a range.** Three finished steps of 10 s, 2 m and
   20 m do not entitle the pane to say `~2m` and stop there, so it says `~2m (10s–20m)`
   instead — on the step rows, on `EST REM`, and in `fbtodo status`. Below a 3× spread the
@@ -650,7 +652,7 @@ Which is where most of the care in this tool has gone.
   are whatever your own steps did).
   A factor of 1.0x would be exact; two steps that took twice their estimate and half of it
   count the same. That line is the only honest answer to "are these numbers getting
-  better?", and it is also what tells you whether the shape memory is pulling its weight on
+  better?", and it is also what tells you whether the size memory is pulling its weight on
   your own work. The memory behind it is kept for 60 days / 2000 records — about a month of
   real use — because the estimates are the one thing here meant to improve with use.
 - Past twice the estimate a step is marked `[STUCK?]` — a hint, not a verdict.
@@ -715,7 +717,7 @@ asked when a session **dies** rather than ending — a different question from "
 ### Retention
 
 Nothing grows without a cap. About hourly, and on demand with `fbtodo prune`, fbtodo enforces
-retention on its own records: **500 task records**, **7 days**, and **1 MiB** of daemon log.
+retention on its own records: **2000 task records**, **60 days**, and **1 MiB** of daemon log.
 Override with `--max-records`, `--max-age-days`, `--log-cap-kb`.
 
 ---

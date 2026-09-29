@@ -961,11 +961,12 @@ try:
             env=dict(env, FBTODO_HOME=status_home), timeout=30,
         ).stdout
     )
-    # the remembered spans are 3m and 5m, so the pace is their median, 4m; `Run the tests`
-    # projects from its own history while the reworded `Deploy the app` falls to the pace
+    # the remembered spans are 3m and 5m, so the pace is their median, 4m — and since the
+    # `own wording` rung was retired (it fired 0 times in 170 replayed steps), BOTH steps
+    # ride that pace rather than one of them finding its own name in the log
     assert "remembered pace   : 4m00s" in hist_out, hist_out
     assert "2 remembered step(s)" in hist_out, hist_out
-    assert "Run the tests" in hist_out and "~3m" in hist_out and "own history" in hist_out, hist_out
+    assert "Run the tests" in hist_out and "~4m" in hist_out and "list pace" in hist_out, hist_out
     assert "Deploy the app" in hist_out and "list pace" in hist_out, hist_out
     say("status: the remembered pace and each step's estimate are shown: ok")
 
@@ -997,48 +998,51 @@ try:
     assert meds(module.task_history_from_log(keyed["tasks"], now_ms)) == borrowed
     say("estimates: a step's remembered span is kept per model, not pooled: ok")
 
-    # ---- the SHAPE memory: the same span, keyed by what a step DID rather than what it
-    #      was called. This is the half that can improve with use, because call mixes
-    #      repeat where 172 of 173 remembered wordings did not.
+    # ---- the SIZE memory: the same span, keyed by how big a step was rather than what it
+    #      was called. Measured 2026-09-29 over 258 replayed steps, the call COUNT carries
+    #      more of a step's duration than the verb mix did (out-of-sample R^2 0.645 vs
+    #      0.390), so the signature is the log2-binned count.
     shaped = {"schema": module.TASKLOG_SCHEMA, "session": "S", "tasks": {}}
     for name, verbs, span in (
-        ("Fix the parser", {"edited": 4, "ran": 1}, 60_000),
-        ("Repair the tokenizer", {"edited": 5, "ran": 1}, 90_000),  # same shape: edited3+ ran1
-        ("Run the tests", {"ran": 1}, 20_000),
+        ("Fix the parser", {"edited": 4, "ran": 1}, 60_000),      # 5 calls -> calls2
+        ("Repair the tokenizer", {"edited": 5, "ran": 1}, 90_000),  # 6 calls -> calls2
+        ("Run the tests", {"ran": 1}, 20_000),                    # 1 call  -> calls0
     ):
         shaped["tasks"][module.task_key("S", name)] = {
             "started_ms": now_ms - span - 60_000, "done_ms": now_ms - 60_000,
             "model": fast, "shape": verbs,
         }
     sh = module.shape_history_from_log(shaped["tasks"], now_ms, fast)
-    # `edited: 4, ran: 1` and `edited: 5, ran: 1` land in the SAME bucket, which is the
-    # whole point: two differently-worded steps of one kind, pooled into a median of 1m15s
-    assert set(sh) == {"edited3+ ran1", "ran1"}, sh
+    # 5 and 6 calls land in the SAME bucket, which is the whole point: two differently-worded
+    # steps of one size, pooled into a median of 1m15s
+    assert set(sh) == {"calls2", "calls0"}, sh
     # the entry carries the evidence with the number: how many samples, and how far apart
     # they were — one sample has no spread and so has no `lo`/`hi` at all
-    assert sh["edited3+ ran1"] == {
+    assert sh["calls2"] == {
         "med": 75_000, "n": 2, "lo": 60_000, "hi": 90_000}, sh
-    assert sh["ran1"] == {"med": 20_000, "n": 1}, sh
-    assert module.shape_of({"edited": 9, "ran": 2}) == "edited3+ ran2", module.shape_of(
+    assert sh["calls0"] == {"med": 20_000, "n": 1}, sh
+    # the signature is the total call count, binned by powers of two: 1, 2-3, 4-7, 8-15
+    assert module.shape_of({"edited": 9, "ran": 2}) == "calls3", module.shape_of(
         {"edited": 9, "ran": 2})
+    assert module.shape_of({"edited": 1}) == "calls0" and module.shape_of({"edited": 3}) == "calls1"
+    assert module.shape_of({"edited": 4}) == "calls2" and module.shape_of({"edited": 9}) == "calls3"
     assert module.shape_of({}) == "" and module.shape_of(None) == ""
-    # the multi-word verbs in ACTION_TOOLS keep their first word, not their spaces
-    assert module.shape_of({"searched the web": 1}) == "searched1"
+    assert module.shape_of({"searched the web": 1}) == "calls0"
     # a step whose calls were never recorded gets no bucket rather than an empty one
     assert module.shape_history_from_log(
         {module.task_key("S", "nothing"): {"started_ms": 1, "done_ms": 2}}, now_ms) == {}
-    say("estimates: a step's shape pools steps worded differently: ok")
+    say("estimates: a step's size pools steps worded differently: ok")
 
-    # ---- the ladder: exact wording first, then the shape, then the list's pace — and a
-    #      shape may only answer once SHAPE_MIN_SAMPLES steps of that shape stand behind it
-    assert module.task_estimate_ms("anything", 600_000, {}, {"edited3+": {"med": 30_000, "n": 2}},
-                                   "edited3+") == 30_000
-    assert module.task_estimate_ms("anything", 600_000, {}, {"edited3+": {"med": 30_000, "n": 1}},
-                                   "edited3+") == 600_000   # one sample: not yet
-    assert module.task_estimate_ms("mine", 600_000, {"mine": {"med": 5_000, "n": 1}},
-                                   {"edited3+": {"med": 30_000, "n": 9}}, "edited3+") == 5_000
-    assert module.task_estimate_ms("anything", 600_000, {}, {}, "") == 600_000
-    say("estimates: the shape only answers behind a same-shaped step: ok")
+    # ---- the ladder: the size memory, then the list's pace — and a size may only answer
+    #      once SHAPE_MIN_SAMPLES steps of that size stand behind it. The `own wording` rung
+    #      is gone: it fired 0 times in 170 replayed steps.
+    assert module.task_estimate_ms("anything", 600_000, {"calls2": {"med": 30_000, "n": 2}},
+                                   "calls2") == 30_000
+    assert module.task_estimate_ms("anything", 600_000, {"calls2": {"med": 30_000, "n": 1}},
+                                   "calls2") == 600_000   # one sample: not yet
+    assert module.task_estimate_ms("anything", 600_000, {}, "calls2") == 600_000
+    assert module.task_estimate_ms("anything", 600_000, {}, "") == 600_000
+    say("estimates: the size only answers behind a same-sized step: ok")
 
     # ...which the pane's journal reader has to know in the first place: the model comes
     # out of the same backward pass that finds the list, with no json parse per line.
@@ -1756,27 +1760,26 @@ try:
         True, watching=999, width=46, height=9, now_ms=SWEEP_NOW,
     ))
     assert "6 earlier steps completed (+4m00s)" in var_frame, var_frame
-    # a step remembered from an earlier session is projected from its OWN history, not
-    # from this list's pace: `five` is remembered at 5m where the pace says 2m
+    # a remembered NAME no longer prices a step by itself: the `own wording` rung was retired
+    # (it fired 0 times in 170 replayed steps), so `five` is remembered at 5m and still reads
+    # the list's pace, 2m — which is all the ladder can honestly say about a waiting row
     hist_state = dict(est_state, task_history={"five": 300_000})
     hist_wide = ansi.sub("", module.render(
         hist_state, True, watching=999, width=80, height=20, now_ms=SWEEP_NOW,
     ))
     hist_row = next(line for line in hist_wide.splitlines() if "○" in line)
-    assert hist_row.rstrip().endswith("~5m │"), hist_row
+    assert hist_row.rstrip().endswith("~2m │"), hist_row
     hist_bar = next(line for line in hist_wide.splitlines() if "PROGRESS" in line)
-    assert "EST REM: 6m30s" in hist_bar, hist_bar  # 1m30s left of `four` + 5m for `five`
+    assert "EST REM: 3m30s" in hist_bar, hist_bar
 
     # ---- the bound on a YOUNG list's pace, and the measurement behind it. A median of one
     #      or two finished steps is not a distribution, and that is exactly where the
-    #      estimates went badly wrong: replayed over every finished span in this machine's
-    #      task log (2026-09-29, 17 predictions), one 2s step projected a whole list at
-    #      `~2s` while the next step took 1m53s — 45.7x out — and a `~18m` pace came from a
-    #      single fast step, 22.9x out. Bounding the early pace to within 4x of the
-    #      remembered one took the worst miss 45.7x -> 18.0x and the p90 22.9x -> 15.8x,
-    #      for 2.52x -> 2.74x on the median. Blending instead of bounding was tried and is
-    #      WORSE (median 3.1x), so the list's own pace is never replaced by the memory —
-    #      only held near it, and only while it has fewer than three finished steps.
+    #      estimates went badly wrong: replayed over the 258 steps recovered from this
+    #      machine's CLI journals (2026-09-29), a 2s flip could project a whole list at
+    #      `~2s` while the next step took 1m53s — 45.7x out. Two fixes came out of that
+    #      replay: a sub-10s span is not evidence at all (MIN_LABEL_MS), and a young list's
+    #      pace is held within 4x of the remembered one rather than replaced by it.
+    #      Blending instead of bounding was tried and is WORSE (median 3.1x).
     def pace_of(spans, remembered):
         return module.step_pace_ms(
             {f"s{n}": {"started_ms": 0, "done_ms": span, "elapsed_ms": span}
@@ -1784,11 +1787,18 @@ try:
             [{"task": f"s{n}", "completed": True} for n in range(len(spans))],
             SWEEP_NOW, remembered,
         )
-    assert pace_of([2_000], {"t": 50_000}) == 12_500, "a 2s single sample must not pace the list"
+    # the floor first: a sub-10s span is a list flip and is not a sample at all (see
+    # MIN_LABEL_MS), so it cannot pace the list however few real samples there are
+    assert pace_of([2_000], {"t": 50_000}) == 50_000, "a 2s flip is not a pace"
+    assert pace_of([2_000, 4_000], {"t": 50_000}) == 50_000, "nor are two of them"
+    assert pace_of([2_000, 20_000], {"t": 50_000}) == 20_000, "the real sample stands alone"
+    # and then the bound: one or two REAL samples are not a distribution, so a young list's
+    # pace is held within 4x of the remembered one
+    assert pace_of([12_000], {"t": 50_000}) == 12_500, "a 12s single sample is held near 50s"
     assert pace_of([600_000], {"t": 50_000}) == 200_000, "nor must one 10m sample"
-    assert pace_of([2_000, 4_000], {"t": 50_000}) == 12_500, "two samples are still not enough"
-    assert pace_of([2_000, 4_000, 9_000], {"t": 50_000}) == 4_000, "three: the list's own median"
-    assert pace_of([2_000], {}) == 2_000, "nothing remembered: nothing to bound against"
+    assert pace_of([12_000, 14_000], {"t": 50_000}) == 13_000, "two samples: still bounded"
+    assert pace_of([12_000, 14_000, 19_000], {"t": 50_000}) == 14_000, "three: the list's own median"
+    assert pace_of([12_000], {}) == 12_000, "nothing remembered: nothing to bound against"
     # an older task log stored a bare number here; a small record must read the same way
     assert module.hist_med(50_000) == 50_000 and module.hist_med({"med": 50_000}) == 50_000
     assert module.hist_med(None) is None and module.hist_med({"n": 2}) is None
@@ -2161,12 +2171,13 @@ try:
     )
     assert "IDLE" in stale_framed, stale_framed
     say("a clock left open on disk by the old rule renders as idle, not working: ok")
-    # what a step took is remembered under its own text, ACROSS sessions: a later list
-    # projects it from that rather than from the average of an unrelated list
+    # what a step took is remembered ACROSS sessions; since the `own wording` rung was
+    # retired the map feeds the PACE rather than pricing a step directly, so a remembered
+    # name no longer changes its own step's number
     assert mod.hist_med(reopened["task_history"]["a"]) == 120_000, reopened["task_history"]
     assert mod.hist_med(reopened["task_history"]["b"]) == 180_000, reopened["task_history"]
-    assert mod.task_estimate_ms("a", 90_000, reopened["task_history"]) == 120_000
-    assert mod.task_estimate_ms("never seen", 90_000, reopened["task_history"]) == 90_000
+    assert mod.task_estimate_ms("a", 90_000) == 90_000
+    assert mod.task_estimate_ms("never seen", 90_000) == 90_000
     # with nothing finished in this list the remembered pace stands in for the default
     assert mod.step_pace_ms(
         {}, [{"task": "z", "completed": False}], t0, reopened["task_history"]
@@ -2183,17 +2194,17 @@ try:
     aged = mod.task_history_from_log(
         {
             mod.task_key("S", "ancient"): {"started_ms": t0, "done_ms": t0 + 600_000},
-            mod.task_key("S", "fresh"): {"started_ms": later - 1000, "done_ms": later},
+            mod.task_key("S", "fresh"): {"started_ms": later - 60_000, "done_ms": later},
         },
         later,
     )
-    assert "ancient" not in aged and mod.hist_med(aged.get("fresh")) == 1000, aged
+    assert "ancient" not in aged and mod.hist_med(aged.get("fresh")) == 60_000, aged
     # ...and the map is capped to the most recently seen names, so the fallback median is
     # not diluted by a long tail of one-off titles
     many = mod.task_history_from_log(
         {
             mod.task_key("S", f"step {n}"): {
-                "started_ms": later - 1000, "done_ms": later - 1000 + (n + 1),
+                "started_ms": later - mod.MIN_LABEL_MS - n, "done_ms": later,
             }
             for n in range(mod.HISTORY_MAX_ENTRIES + 5)
         },
@@ -2236,12 +2247,12 @@ try:
         now_ms=t0 + 10_000)
     assert k2["task_times"]["h-one"]["shape"] == {"edited": 2}, k2["task_times"]
     assert k2["task_times"]["h-two"]["shape"] == {"ran": 1}, k2["task_times"]
-    assert mod.shape_of(k2["task_times"]["h-one"]["shape"]) == "edited2"
-    assert mod.shape_of(k2["task_times"]["h-two"]["shape"]) == "ran1"
-    # the finished step's shape is remembered with its span; the one still running has no
+    assert mod.shape_of(k2["task_times"]["h-one"]["shape"]) == "calls1"
+    assert mod.shape_of(k2["task_times"]["h-two"]["shape"]) == "calls0"
+    # the finished step's size is remembered with its span; the one still running has no
     # span yet, so it contributes nothing to the memory it will later feed
     mem = mod.shape_history_from_log(mod.load_tasklog()["tasks"], t0 + 10_000, "m/h")
-    assert mem == {"edited2": {"med": 10_000, "n": 1}}, mem
+    assert mem == {"calls1": {"med": 10_000, "n": 1}}, mem
     # a NEW turn brings its own tally, and the previous turn's steps are not credited
     # against it — otherwise a call made before the request would be billed to the work
     # the request started
@@ -2255,32 +2266,29 @@ try:
     # calls it already made were still made
     k4 = mod.track_tasks(dict(H, todos=hseq(True, True, False)), now_ms=t0 + 31_000)
     assert k4["task_times"]["h-three"]["shape"] == {"edited": 1}, k4["task_times"]
-    # a step the pane can project from what it is DOING: four edits and nine edits are the
-    # same kind of work (`edited3+`), so two such steps at 10s and 30s set that shape's
-    # number at 20s — where the list's own pace says 4m
+    # a step the pane can project from what it is DOING: four and five calls are the same
+    # SIZE (`calls2`), so two such steps at 10s and 30s set that size's number at 20s —
+    # where the list's own pace says 4m
     shapes = mod.shape_history_from_log({
         mod.task_key("H", "x"): {"started_ms": t0, "done_ms": t0 + 10_000,
                                  "model": "m/h", "shape": {"edited": 4}},
         mod.task_key("H", "y"): {"started_ms": t0, "done_ms": t0 + 30_000,
-                                 "model": "m/h", "shape": {"edited": 9}},
+                                 "model": "m/h", "shape": {"edited": 5}},
     }, t0 + 60_000, "m/h")
-    assert shapes == {"edited3+": {"med": 20_000, "n": 2, "lo": 10_000, "hi": 30_000}}, shapes
-    own = {"h-three": {"started_ms": t0, "done_ms": None, "shape": {"edited": 9}}}
-    assert mod.estimate_for(own, "h-three", 240_000, {}, shapes) == 20_000
-    # one step of that shape is not evidence yet, and neither is a shape nobody has seen
-    assert mod.estimate_for(own, "h-three", 240_000, {}, {"edited3+": {"med": 5_000, "n": 1}}) \
+    assert shapes == {"calls2": {"med": 20_000, "n": 2, "lo": 10_000, "hi": 30_000}}, shapes
+    own = {"h-three": {"started_ms": t0, "done_ms": None, "shape": {"edited": 4}}}
+    assert mod.estimate_for(own, "h-three", 240_000, shapes) == 20_000
+    # one step of that size is not evidence yet, and neither is a size nobody has seen
+    assert mod.estimate_for(own, "h-three", 240_000, {"calls2": {"med": 5_000, "n": 1}}) \
         == 240_000
-    assert mod.estimate_for({}, "nothing", 240_000, {}, shapes) == 240_000
-    # the wording still wins when it is known: a step remembered by NAME beats its shape
-    assert mod.estimate_for(own, "h-three", 240_000, {"h-three": {"med": 90_000, "n": 1}},
-                            shapes) == 90_000
+    assert mod.estimate_for({}, "nothing", 240_000, shapes) == 240_000
 
     # ---- the estimate the pane is SHOWING is stamped on the step in flight, so that when
     #      that step closes its projection and its outcome are a matched pair in the log.
     #      Stamped from the same ladder the renderers use, and asserted against that same
     #      call: a stamp that drifts from what the pane showed would measure nothing.
     E = {"session": "E", "model": "m/e"}
-    # two remembered `edited3+` steps for this model, written into the log the watcher reads,
+    # two remembered `calls2` steps for this model, written into the log the watcher reads,
     # so the stamp below is taken through the whole live path and not from a local fixture
     e_log = mod.load_tasklog()
     for n, span in enumerate((10_000, 30_000)):
@@ -2295,13 +2303,15 @@ try:
     e_pace = mod.step_pace_ms(e_state["task_times"], e_state["todos"], t0 + 300_000,
                               e_state["task_history"])
     assert e_rec["est_ms"] == mod.estimate_for(
-        e_state["task_times"], "e-one", e_pace, e_state["task_history"],
+        e_state["task_times"], "e-one", e_pace,
         e_state["task_shapes"]) == 20_000, e_rec
     # ...and the source is named, so the error report knows which rung of the ladder missed:
-    # two remembered `edited3+` steps at 10s and 30s stand behind this one
+    # two remembered `calls2` steps at 10s and 30s stand behind this one
     assert e_rec["est_src"] == "shape", e_rec
-    assert mod.pick_estimate("nothing known", {}, {}) == (None, "pace")
-    assert mod.pick_estimate("e-one", {"e-one": {"med": 5_000, "n": 1}}, shapes) == (5_000, "own")
+    assert mod.pick_estimate({}, "") == (None, "pace")
+    assert mod.pick_estimate(shapes, "calls2") == (20_000, "shape")
+    # the retired `own` rung is never a source any more: only size and pace remain
+    assert mod.pick_estimate(shapes, "calls9") == (None, "pace")
 
     # ---- did the estimates get better? The pair (projection, outcome) is in the records, so
     #      the answer is computed from them per source rather than kept in a tally of its own
@@ -2311,7 +2321,7 @@ try:
         mod.task_key("E", "under"): {"started_ms": t0, "done_ms": t0 + 200_000,
                                       "est_ms": 100_000, "est_src": "pace", "model": "m/e"},
         mod.task_key("E", "exact"): {"started_ms": t0, "done_ms": t0 + 100_000,
-                                      "est_ms": 100_000, "est_src": "own", "model": "m/e"},
+                                      "est_ms": 100_000, "est_src": "shape", "model": "m/e"},
         # a step that closed before this build stamped anything contributes nothing
         mod.task_key("E", "unstamped"): {"started_ms": t0, "done_ms": t0 + 100_000,
                                           "model": "m/e"},
@@ -2322,7 +2332,7 @@ try:
     err = mod.estimate_error(errt, t0 + 1000, "m/e")
     # two 2x misses either side of the true value, counted the same, and one exact hit
     assert err["pace"] == {"n": 2, "med": 2.0, "mean": 2.0, "worst": 2.0}, err
-    assert err["own"] == {"n": 1, "med": 1.0, "mean": 1.0, "worst": 1.0}, err
+    assert err["shape"] == {"n": 1, "med": 1.0, "mean": 1.0, "worst": 1.0}, err
     assert "elsewhere" not in str(err) and err.get("z") is None, err
     assert mod.estimate_error({}, t0) == {}
     say("estimates: the projection is stamped, and scored when the step closes: ok")
