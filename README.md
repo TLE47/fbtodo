@@ -1,6 +1,6 @@
 # fbtodo
 
-**Watch your coding agent work — its checklist, live, in a pane under the session.**
+**Watch your coding agent work — its checklist, live, in a pane beside it.**
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org)
 [![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#start-here)
@@ -26,9 +26,22 @@
 
 [fbtodo](.) mirrors the todo list a [Freebuff](https://freebuff.com) session is working
 through — the very list the agent keeps for itself — and draws it in a small framed pane
-**directly underneath the session that owns it**, refreshing while the agent works. It
+**next to the session that owns it**: below it by default, beside it with one flag, or
+wherever you move it to. It
 times each step from the moment the step actually starts, estimates what is left, and can
 ring your phone when a session finishes, stalls, stops on a question, or loses its pane.
+
+There is no single side for it. Below and beside are the two fbtodo opens itself; the rest of
+the terminal is yours to arrange, and a layout you chose is left alone:
+
+```
+┌──────────┐┌──────────┐   ┌──────────────────┐   ┌────┬─────┐
+│  agent   ││  FBTODO  │   │      agent       │   │todo│ any │
+│          ││   4/7    │   ├──────────────────┤   │    │ way │
+│          ││          │   │      FBTODO      │   │    │ you │
+└──────────┘└──────────┘   └──────────────────┘   └────┴─────┘
+   beside the session          below it             your own layout
+```
 
 Quick links: [Start here](#start-here) · [What is tmux?](#what-is-tmux) · [What it does](#what-it-does) ·
 [Commands](#everyday-commands) · [Settings](#settings) · [FAQ](#faq) ·
@@ -58,7 +71,7 @@ Then, in tmux, start your agent the way you always do:
 ```sh
 tmux new -s work      # 1. a tmux session
 freebuff              # 2. your agent, in it
-#                      3. a FBTODO pane opens underneath, on its own
+#                      3. a FBTODO pane opens next to it, on its own
 ```
 
 That is the whole setup. No config file, no hook, nothing to add to a prompt: fbtodo reads
@@ -82,7 +95,8 @@ already on macOS and most Linux) and **tmux**, and something to watch.
 tmux is a *terminal multiplexer*: it keeps terminal sessions alive when a window closes, and
 it lets one window hold several **panes** — rectangles you split, each running its own
 program. That is the only reason fbtodo wants it: the list is drawn in a small pane
-**underneath the pane your agent runs in**, which is where a glance looks for it.
+**next to the pane your agent runs in** — below it by default, beside it with one flag — which
+is where a glance looks for it.
 
 | Keys | What it does |
 |---|---|
@@ -93,8 +107,8 @@ program. That is the only reason fbtodo wants it: the list is drawn in a small p
 | `Ctrl-b d` | detach — everything keeps running · `tmux a -t work` comes back |
 
 A pane is a rectangle inside a **window**, and a window lives in a **session**. fbtodo cares
-about that hierarchy for one reason: "underneath the session" has to mean underneath the
-actual pane, not merely somewhere in the same window.
+about that hierarchy for one reason: "next to the session" has to mean next to the actual
+pane, not merely somewhere in the same window.
 
 **Do you have to use it?** Only for the pane. `fbtodo snap`, `json` and `bar` are plain
 commands that work anywhere, and a status line is a perfectly good tmux-free setup — see
@@ -334,6 +348,10 @@ Without a pin, the pane is **remembered, not argued with**: the keeper records t
 drag it to and opens the next one that way. `FBTODO_SPLIT` (`v` = below, `h` = beside) and
 `FBTODO_PANE_SIZE` (default `12`) set the fallback.
 
+**Anywhere else in the terminal** is yours: those two are the sides fbtodo opens itself, and
+any other layout you arrange — a strip along the top, a column of your own in its own window —
+is treated as a decision, not as a pane that has drifted.
+
 ### Turn parts off
 
 ```sh
@@ -443,8 +461,9 @@ remembered for this project.
 
 ### Where the pane goes
 
-The rule is: **a list pane opens under the pane its session is drawn in.** That is where a
-glance looks for it. Two consequences, both learned the hard way:
+The rule is: **a list pane opens next to the pane its session is drawn in** — below it by
+default, beside it with `FBTODO_SPLIT=h` or `fbtodo pin --side h`. That is where a glance
+looks for it. Two consequences, both learned the hard way:
 
 - The pane is split off the *pane* running the session, never off its *window*: given a
   window, tmux uses that window's **active** pane, which is not necessarily the one running
@@ -454,8 +473,13 @@ glance looks for it. Two consequences, both learned the hard way:
   and a step that is counting is not restarted.
 
 A pane in **another window** than its session is left alone on purpose: that is an
-arrangement the operator made. So is a pane wider than the session's (a full-width strip
-under two panes).
+arrangement the operator made. So is a pane wider than the session's — a full-width strip
+across the window is accepted wherever it sits, top or bottom.
+
+That leniency is the escape hatch for the rest of the terminal: a strip along the top, a
+column of your own in another window, a pane you moved somewhere deliberate. fbtodo opens
+the two sides it knows itself (below and beside) and treats anything else it cannot read as a
+mistake as a decision — it is your terminal, and the pane goes where you put it.
 
 ### What the pane draws
 
