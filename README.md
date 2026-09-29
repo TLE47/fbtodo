@@ -500,9 +500,9 @@ ever seen running`) instead of looking like a stopped clock.
 
 **A list that stops being re-written** is the third way a pane can look stuck while the agent
 is working — and the reason it is worth understanding is that nothing is wrong with fbtodo. The
-list carries its own age: `fbtodo status` always reports it (`list written : 12m ago`), and the
-pane's strip shows it in the parentheses after the state (`ALL DONE (2h ago)`) whenever nothing
-is counting. When that number grows, the progress on screen is no longer the agent's progress:
+list carries its own age, on the pane (`LIST: #7 · 12m ago`) and in `fbtodo status`
+(`list written : 12m ago`). When that number grows, the progress on screen is no longer the
+agent's progress:
 `write_todos` is the only record fbtodo ever sees, so a session that stops publishing leaves its
 last list up, with its last percentages, and nothing can tell that a step has moved on. Two
 things do still move, and both are worth reading: the step that is nominally running keeps its
@@ -611,6 +611,16 @@ Which is where most of the care in this tool has gone.
   for the active one. They come from this project's own history of completed steps
   (`~/.freebuff/fbtodo-tasks.json`), with the list's own pace as the fallback.
 - Past twice the estimate a step is marked `[STUCK?]` — a hint, not a verdict.
+- The **list's own age** rides on `LIST:` (`LIST: #7 · 12m ago`), so a list the agent has
+  stopped re-writing is visible while a step's clock is still counting. A narrow strip spends
+  the model's pace first, then that age, and only then the whole `LIST:` field.
+- When the list is **finished but the session is not** — every step ticked, and the session
+  has gone on writing for ten minutes past it — the age gains `[STALE?]`, and `fbtodo status`
+  says `list behind : yes`. That is the one case fbtodo can actually prove, and it is stated
+  as a question because it is still a guess: the agent may be tidying up, or it may have
+decided the rest of the work needed no list at all. A list with steps *left* on it is never
+  flagged, because a long step is not a stale list — its own clock, and `[STUCK?]` past twice
+  its estimate, are the record there.
 - The bar carries `EST REM` and an `ETA`, and `fbtodo status` shows the remembered pace and
   where each step's number came from.
 
@@ -697,7 +707,7 @@ store · `75` the watcher failed to start.
 | Pane gone after a while | `--stale-after` (default: 60 min of store silence). `0` = never. |
 | Pane not where you want it | `fbtodo why` — read the `source` on the line, it is usually the answer. Then `fbtodo pin`. |
 | Pane killed mid-session | It comes back within ~3 s. If it does not, the pane watch is what tells you. |
-| List shows old progress | Check the list's own age: `list written` in `fbtodo status` (the pane shows it too, in the strip's parentheses, whenever nothing is counting). If it is growing, the agent has stopped calling `write_todos` — count them in the journal, and [ask for the rewrite](#getting-a-list-in-the-first-place). A `goal`/`now` pair that disagree is the pane saying the same thing about a *request* that is waiting. |
+| List shows old progress | Check the list's own age: `LIST: #7 · 12m ago` in the strip, or `list written` in `fbtodo status`. `[STALE?]` beside that age (and `list behind : yes` in `status`) means the list is finished and the session has worked on — the agent owes a new list. If it is growing, the agent has stopped calling `write_todos` — count them in the journal, and [ask for the rewrite](#getting-a-list-in-the-first-place). A `goal`/`now` pair that disagree is the pane saying the same thing about a *request* that is waiting. |
 | A step with no duration | The watcher never saw it running. A step's clock starts at the tick, not at the list's mtime. |
 | Different code running | The pane and the watcher hold what they started with: `fbtodo stop`, then re-open the pane. |
 

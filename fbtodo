@@ -3658,6 +3658,7 @@ def short_duration(ms, seconds: bool = False) -> str:
 DEFAULT_PACE_MS = 120_000       # nothing finished yet: fall back to a couple of minutes
 STUCK_FACTOR = 2.0              # running time / pace at which a step reads as stuck
 EST_CAP_MS = 6 * 3_600_000      # clamp one span, so a runaway clock cannot skew the ETA
+LIST_BEHIND_MS = 10 * 60_000   # a FINISHED list this far behind a still-writing session
 MIN_TASK_TEXT = 18              # columns a tagged row keeps for the task text itself
 
 
@@ -4241,6 +4242,27 @@ def no_list_reason(state: dict) -> str:
     if state.get("cleared"):
         return "new session — old list dropped, waiting for a new one"
     return "no write_todos call yet in this session"
+
+
+# In plain words: "is the list behind the work?" — usually this cannot be answered, and it is
+# worth being precise about why. A step takes as long as it takes and the list is not supposed
+# to change while one runs, so the transcript moving on is NORMAL, not evidence. What is
+# evidence is a list with nothing left on it — every step ticked — inside a session that is
+# still writing: then the agent is doing work the list does not describe at all. Only that case
+# is flagged. The ones that cannot be proved are left to the step's own clock (`[STUCK?]`, past
+# twice its estimate) and to `now`/`NUDGE` when a request is waiting on the list.
+def list_behind(state: dict, now_ms: int) -> bool:
+    """A finished list, in a session that has kept writing past it."""
+    todos = state.get("todos") or []
+    written = int(state.get("ts") or state.get("source_updated_ms") or 0)
+    moved = int(state.get("store_mtime_ms") or 0)
+    if not todos or written <= 0 or moved <= 0:
+        return False
+    if any(not t.get("completed") for t in todos):
+        return False          # work left on the list: the step's own clock is the record
+    if state.get("turn_ended"):
+        return False          # waiting for you, not working past it
+    return moved - written >= LIST_BEHIND_MS
 
 
 # In plain words: a pane with no list should not just shrug at you. This lists the tools the
@@ -5223,13 +5245,27 @@ def _render_rich(
     # The age belongs to a state that is waiting: beside a running step its own counter
     # is the honest number, and the two would read as a contradiction ("Working 42s
     # (2m ago)").
-    updated = int(state.get("source_updated_ms") or 0)
-    age_text = ""
-    if cur_elapsed is None and updated and now_ms - updated >= 60_000:
-        age_text = f"({short_duration(now_ms - updated) or '0m'} ago)"
+    # The list's OWN age, carried by the LIST field rather than by the chip: `LIST: #3 ·
+    # 12m ago`. On the chip it had to be hidden whenever a step was running — `Working 42s
+    # (2m ago)` read as the STATE's age, and the two looked like a contradiction — and that
+    # hid it on exactly the panes that need it, because a list an agent has stopped
+    # re-writing looks current for as long as a clock is on it. On the LIST field there is
+    # nothing to misread, so it is drawn whatever the state is doing. The minute's gate
+    # stays: below it the number would jitter on every repaint and say nothing new.
+    updated = int(state.get("source_updated_ms") or state.get("ts") or 0)
+    age_text = (
+        f"{short_duration(now_ms - updated) or '0m'} ago"
+        if (updated and now_ms - updated >= 60_000)
+        else ""
+    )
     clock = time.strftime("%H:%M:%S", time.localtime(now_ms / 1000))
     live_field = "LIVE: " + clock
-    listed = [f"LIST: #{state['list_version']}"] if state.get("list_version") else []
+    listed = f"LIST: #{state['list_version']}" if state.get("list_version") else ""
+    listed_age = f"{listed} · {age_text}" if (listed and age_text) else listed
+    if listed_age and list_behind(state, now_ms):
+        # A finished list in a session that has written well past it: the one case worth a
+        # verdict, and a question mark because it is still a guess (see `list_behind`).
+        listed_age += " [STALE?]"
 
     # An over-budget step keeps the same chip shape but turns it red, so the overrun reads
     # at a glance without adding a word to the strip.
@@ -5238,20 +5274,22 @@ def _render_rich(
     def strip(text: str, keep_list: bool, keep_age: bool, keep_pace: bool = True) -> str:
         """The status strip: the state on a badge, then the fields ` │ ` apart."""
         body = chip(f" {text} ")
-        if keep_age and age_text:
-            body += c(muted, age_text)
         fields = [pace_field] if (keep_pace and pace_field) else []
-        fields += ([f"LIST: #{state['list_version']}"] if (keep_list and listed) else [])
+        if keep_list and listed:
+            # the age is what a narrow strip spends after the pace, and it goes whole
+            fields.append(listed_age if keep_age else listed)
         return body + "".join(
             c(st["faint"], " │ ") + c(muted, field) for field in fields + [live_field]
         )
 
-    # On a strip too narrow for all of it the AGE goes first (it is only a hint that
-    # nothing has moved), then the model's pace, then LIST: — the state chip and the live
-    # clock are what the row is for. The tiers are (keep_list, keep_age, keep_pace), and
-    # the age is what a 66-column strip spends first: without the pace the row is the one
-    # it always was, and with a model named the pace is worth more than an idle counter.
-    for tier in ((word, True, True, True), (word, True, False, True),
+    # On a strip too narrow for all of it the model's PACE goes first, then the list's own
+    # age, then LIST: itself — the state chip and the live clock are what the row is for.
+    # The tiers are (keep_list, keep_age, keep_pace). The pace is spent before the age
+    # because the two are not the same kind of fact: `~2m · model` is a nicety, while the
+    # age is the only thing on the row that says the list has fallen behind the work — and
+    # spending the age first, which is what this order used to do, hid it on exactly the
+    # panes with a step running in them.
+    for tier in ((word, True, True, True), (word, True, True, False),
                  (word, True, False, False), (short, False, False, False)):
         status = strip(*tier)
         if _cell_width(status) <= inner:
@@ -5770,6 +5808,14 @@ def cmd_status(args) -> int:
             "  list written      : "
             + (fmt_age(view.get("source_updated_ms") or view.get("ts")) or "?")
         )
+        if list_behind(view, int(time.time() * 1000)):
+            moved = int(view.get("store_mtime_ms") or 0) - int(
+                view.get("ts") or view.get("source_updated_ms") or 0
+            )
+            print(
+                "  list behind       : yes  — every step is ticked, and no newer"
+                f" `write_todos` in {short_duration(moved) or '10m'}"
+            )
     if view and (view.get("goal") or view.get("todos")):
         goal = str(view.get("goal") or "")
         if not goal:

@@ -1043,6 +1043,16 @@ try:
         wide_state, False, width=80, now_ms=2000
     ), "footer clock does not move — a still pane would look frozen"
 
+    # The same pair with a clock only 42 s old: an ordinary running step, which is the case
+    # the list's age has to survive.
+    SHORT_CLOCKS = dict(
+        clocks,
+        **{
+            "Add a liveness tick so the pane repaints on a clock": {
+                "started_ms": SWEEP_NOW - 42_000, "done_ms": None, "elapsed_ms": 42_000,
+            }
+        },
+    )
     # the colour pane is framed and high-density: boxes line up, the active step is
     # the only loud one, and every visible row still fits the pane it was drawn in
     rich_state = dict(wide_state, task_times=clocks)
@@ -1284,38 +1294,49 @@ try:
     assert "🎯" not in bare and "none stated" not in bare, bare
     # one state word, with the age in the parentheses the idle counter used to spend —
     # and the three states a list can be in, at the width the real pane gets
-    def footer_of(state_dict):
+    def footer_of(state_dict, width=66):
         frame = ansi.sub("", module.render(
-            state_dict, True, watching=999, width=66, height=20, now_ms=SWEEP_NOW,
+            state_dict, True, watching=999, width=width, height=20, now_ms=SWEEP_NOW,
         ))
         return next(line for line in frame.splitlines() if "LIVE:" in line), frame
 
-    # the strip is a badge and then fields: the state chip carries one space of padding,
-    # the age follows it directly, and the separators are ` │ `
+    # The strip is a badge and then fields, ` │ ` apart. The LIST's OWN AGE rides on the
+    # LIST field (`LIST: #3 · 2m ago`) rather than after the chip, where `Working 42s
+    # (2m ago)` read as the STATE's age and had to be hidden whenever a step was running —
+    # which hid it on exactly the panes that need it. On the LIST field it cannot be
+    # misread, so it is drawn whatever the state is doing; the pace is what a narrow strip
+    # spends first.
     idle_row, _ = footer_of(
         dict(rich_state, task_times={}, source_updated_ms=SWEEP_NOW - 143_000)
     )
-    # With a model named, the strip carries that model's pace and the idle age is what
-    # gives way — the age is only a hint that nothing moved, the pace is what the work
-    # costs. The same state with no model keeps the row it always had.
-    assert " IDLE  │ ~2m · space-bunny-a… │ LIST: #3 │ LIVE: " in idle_row, repr(idle_row)
+    assert " IDLE  │ LIST: #3 · 2m ago │ LIVE: " in idle_row, repr(idle_row)
     no_model_row, _ = footer_of(
         dict(rich_state, model=None, task_times={}, source_updated_ms=SWEEP_NOW - 143_000)
     )
-    assert " IDLE (2m ago) │ LIST: #3 │ LIVE: " in no_model_row, repr(no_model_row)
+    assert " IDLE  │ LIST: #3 · 2m ago │ LIVE: " in no_model_row, repr(no_model_row)
     assert "space-bunny" not in no_model_row, repr(no_model_row)
-    # a longer model name is clipped, never wrapped: the row is one line by contract
+    # A row with room for all four fields carries the pace as well, and a longer model name
+    # is clipped, never wrapped: the row is one line by contract.
     long_row, _ = footer_of(
         dict(rich_state, model="some-provider/space-bunny-alpha-preview",
-             task_times={}, source_updated_ms=SWEEP_NOW - 143_000)
+             task_times={}, source_updated_ms=SWEEP_NOW - 143_000),
+        width=70,
     )
-    assert "space-bunny-a…" in long_row and "preview" not in long_row, repr(long_row)
+    assert " ~2m · space-bunny-a… │ LIST: #3 · 2m ago │ LIVE: " in long_row, repr(long_row)
+    assert "preview" not in long_row, repr(long_row)
     # ...and the model is named on the TOP BORDER too, where there is room for it at any
     # width the strip cannot hold: the pane that quotes a pace says whose pace it is.
     _, bordered = footer_of(dict(rich_state, model="stealth/space-bunny-alpha"))
     assert "watcher: pid 999 · space-bunny-a…" in bordered.splitlines()[0], bordered
-    run_row, _ = footer_of(rich_state)
-    # no age while a step is running, so the chip's own padding sits before the separator.
+    # A step that is RUNNING does not hide the list's age: that is the case this row exists
+    # for, because a list an agent has stopped re-writing looked current for exactly as long
+    # as a clock was on it.
+    tick_row, _ = footer_of(dict(rich_state, source_updated_ms=SWEEP_NOW - 143_000,
+                                 task_times=SHORT_CLOCKS))
+    assert " WORKING 42s  │ LIST: #3 · 2m ago │ LIVE: " in tick_row, repr(tick_row)
+    # The longest chip a step can wear does spend the age, because the row still has to fit:
+    # `59m59s (+58m29s)` is 23 columns, and the age is what goes rather than the list itself.
+    run_row, _ = footer_of(dict(rich_state, source_updated_ms=SWEEP_NOW - 143_000))
     # The step has long outrun the pace its list taught (the one finished step took 90s),
     # so the running clock names the overrun inline, and the chip is flagged red.
     assert " WORKING 59m59s (+58m29s)  │ LIST: #3 │ LIVE: " in run_row, repr(run_row)
@@ -1332,11 +1353,40 @@ try:
     assert spin_now != spin_next, (spin_now, spin_next)  # the spinner moves on the tick
     ended_row, ended = footer_of(dict(
         rich_state, done=2, total=2, list_version=9, source_updated_ms=SWEEP_NOW - 143_000,
+        store_mtime_ms=SWEEP_NOW - 143_000,
         todos=[dict(t, completed=True) for t in rich_state["todos"]],
     ))
-    assert " ALL DONE  │ ~30m · space-bunny-a… │ LIST: #9 │ LIVE: " in ended_row, repr(ended_row)
+    # `ALL DONE` is a wider chip than `IDLE`, and the age is held: at 66 columns the pace
+    # is what gives way here, which the long_model row above pins at a width that holds it.
+    assert " ALL DONE  │ LIST: #9 · 2m ago │ LIVE: " in ended_row, repr(ended_row)
     # one state, not two: the chip says it once, and never sighs both "done" and "idle"
     assert ended.count("ALL DONE") == 1 and "IDLE" not in ended, ended
+    # A finished list inside a session that has written well past it: the ONE staleness
+    # fbtodo can actually prove, and even that is a question mark — the agent may simply be
+    # tidying up. The marker rides with the age, so a narrow strip spends them together.
+    finished = [dict(t, completed=True) for t in rich_state["todos"]]
+    stale_row, _ = footer_of(dict(
+        rich_state, done=2, total=2, list_version=9, todos=finished,
+        ts=SWEEP_NOW - 900_000, source_updated_ms=SWEEP_NOW - 900_000,
+        store_mtime_ms=SWEEP_NOW - 60_000,
+    ))
+    assert " ALL DONE  │ LIST: #9 · 15m ago [STALE?] │ LIVE: " in stale_row, repr(stale_row)
+    # ...waiting for you is not "behind": the turn ended, so nothing is being worked on past
+    # the list, and that case belongs to the bell and the stall watch.
+    waiting_row, _ = footer_of(dict(
+        rich_state, done=2, total=2, list_version=9, todos=finished, turn_ended=True,
+        ts=SWEEP_NOW - 900_000, source_updated_ms=SWEEP_NOW - 900_000,
+        store_mtime_ms=SWEEP_NOW - 60_000,
+    ))
+    assert "[STALE?]" not in waiting_row, repr(waiting_row)
+    # ...nor is a list with a step still to do, however long the session has written: a step
+    # takes as long as it takes, and its own clock (with `[STUCK?]` past twice its estimate)
+    # is the record there. This is the boundary the marker exists on the right side of.
+    busy_row, _ = footer_of(dict(
+        rich_state, ts=SWEEP_NOW - 900_000, source_updated_ms=SWEEP_NOW - 900_000,
+        store_mtime_ms=SWEEP_NOW - 60_000,
+    ))
+    assert "[STALE?]" not in busy_row, repr(busy_row)
     # the chrome is one voice: the state chip and the title are both uppercase
     assert " FREEBUFF TODOS " in ended and " All done" not in ended, ended
     # an elided window must word its marker from the steps it stands for: a finished list
