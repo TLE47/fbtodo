@@ -140,15 +140,19 @@ LEGACY_NAMES = (
 )
 
 
-def _legacy_claim_live() -> bool:
-    """Is a live process still writing the legacy directory?
+# The records that say "a process is using this directory": the watcher's and the keeper's.
+# Both are checked, because moving the keeper's claim out from under a keeper leaves it
+# writing a record at a path nothing reads, and a second keeper would then start.
+LEGACY_CLAIMS = ("fbtodo-daemon.pid", "fbtodo-pane-keeper.pid")
 
-    Two gates, both of which err towards "yes": the record at the legacy lock must not be
-    flocked, and its pid must not be alive. The second one matters because a watcher from
-    before there was a claim left a record nobody holds, and the pid is then the only thing
-    that says it is still there.
+
+def _claim_live(record: str) -> bool:
+    """Is the process at `record` still there? Two gates, both of which err towards yes.
+
+    The record must not be flocked, and its pid must not be alive. The second one matters
+    because a process from before there was a claim left a record nobody holds, and the pid
+    is then the only thing that says it is still running.
     """
-    record = os.path.join(LEGACY_SCRATCH, "fbtodo-daemon.pid")
     try:
         with open(record, "r", encoding="utf-8") as fh:
             pid = int((json.load(fh) or {}).get("pid") or 0)
@@ -173,6 +177,13 @@ def _legacy_claim_live() -> bool:
     except OSError:
         return False
     return False
+
+
+def _legacy_claim_live() -> bool:
+    """Is any of the legacy locks held, or its record's pid alive?"""
+    return any(
+        _claim_live(os.path.join(LEGACY_SCRATCH, name)) for name in LEGACY_CLAIMS
+    )
 
 
 def _state_root():
@@ -7507,8 +7518,8 @@ def cmd_doctor(args) -> int:
         checks.append(("ok", "state", f"{SCRATCH} (moved from {LEGACY_SCRATCH})"))
     elif STATE_NOTE == "live":
         checks.append(("warn", "state",
-                       f"still {SCRATCH} — a live watcher owns it; "
-                       f"`fbtodo stop` there finishes the move to {STATE_DIR}"))
+                       f"still {SCRATCH} — a live watcher or keeper owns it; "
+                       f"stop both and the next run moves it to {STATE_DIR}"))
     elif STATE_NOTE == "failed":
         checks.append(("warn", "state", f"still {SCRATCH} — could not move to {STATE_DIR}"))
     holder = lock_holder(LOCK_PATH)
@@ -7937,7 +7948,7 @@ def cmd_status(args) -> int:
         print(f"  state             : {SCRATCH} (moved from {LEGACY_SCRATCH})")
     elif STATE_NOTE in ("live", "failed"):
         print(f"  state             : {SCRATCH} — "
-              + ("a watcher there still holds it; restart it to finish the move to "
+              + ("a watcher or the keeper still holds it; stop them to finish the move to "
                  f"{STATE_DIR}" if STATE_NOTE == "live" else f"could not move to {STATE_DIR}"))
     return 0
 

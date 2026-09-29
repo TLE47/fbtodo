@@ -603,7 +603,18 @@ try:
     assert not os.path.exists(
         os.path.join(c_home, ".local", "state", "fbtodo", "fbtodo-state.json")
     ), "copied out from under a live watcher"
-    say("state root: a live watcher keeps the old root, and the move waits for it: ok")
+    # ...and the keeper counts too: moving ITS claim would leave the running keeper writing a
+    # record nothing reads, and a second keeper would start on top of it.
+    d_home = os.path.join(root, "d")
+    checks = state_checks(
+        d_home,
+        {"fbtodo-state.json": '{"todos": []}',
+         "fbtodo-pane-keeper.pid": json.dumps({"pid": os.getpid(), "tmux": "default"})},
+    )
+    assert checks["scratch"]["detail"] == os.path.join(d_home, ".freebuff"), checks["scratch"]
+    assert checks["state"]["level"] == "warn", checks
+    assert os.path.exists(os.path.join(d_home, ".freebuff", "fbtodo-pane-keeper.pid")), "moved anyway"
+    say("state root: a live watcher or keeper keeps the old root, and the move waits: ok")
 
     old = module.finish_state(
         {"session": "S1", "todos": [{"task": "a", "completed": True}]}, None
