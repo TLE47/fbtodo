@@ -111,7 +111,7 @@ import textwrap
 import time
 import unicodedata
 
-VERSION = "4.26.0"
+VERSION = "4.27.0"
 HOME = os.path.expanduser("~")
 # FBTODO_HOME points state/lock/log elsewhere — used by the self-check so it never
 # touches the real watcher's files.
@@ -470,7 +470,22 @@ MIN_LABEL_MS = max(0, int(LABEL_FLOOR_S * 1000))
 # 74% of steps" - was a harness bug: it ordered each session's steps by span instead of by
 # time, so the "pace so far" it compared against was the session's smallest steps. So keep the
 # blend as a tail-smoother, not as a median win, and let the `forecast error` scoreboard settle
-# it on real traffic. Tunable with `--blend-weight W` / `FBTODO_BLEND_WEIGHT`.
+# it on real traffic.
+# Refit 2026-09-29 on the same 161 spans, paired and bootstrapped over sessions (every step
+# decides here, because the blend changes nearly every number):
+#
+#     w=0 (pace alone)  even     — beats this one on 50% of steps, 51% of resamples
+#     w=0.25            53%      80% of resamples — not significant, and worse on the mean/worst
+#     w=0.75            44%       6% of resamples — worse
+#     w=1.0             42%       2% of resamples — the only comparison that RESOLVES
+#
+# So the one thing the data settles is that handing the number to the label model outright
+# (1.0) is worse, in 98% of resamples: the pace has to stay in the blend. Everything between
+# 0 and 0.75 is a plateau — 0.25 leans slightly better on the typical step, 0.5 on the mean and
+# the worst case, and neither lean is separable from noise. The midpoint stands for that
+# reason: it sits inside the flat top of the surface, and picking a different point on the
+# curve would be picking the one this particular sample happened to favour.
+# Tunable with `--blend-weight W` / `FBTODO_BLEND_WEIGHT`.
 BLEND_WEIGHT = min(1.0, max(0.0, float(os.environ.get("FBTODO_BLEND_WEIGHT") or 0.5)))
 # The forecast ledger is only a forecast if it was written before the step had run. A watcher
 # that starts (or restarts) with a step already in flight sees it running for the first time
@@ -478,6 +493,15 @@ BLEND_WEIGHT = min(1.0, max(0.0, float(os.environ.get("FBTODO_BLEND_WEIGHT") or 
 # vector is still recorded — the record is the record — but flagged, and `forecast_error`
 # leaves flagged rows out of the scoreboard. One poll of grace, generously.
 LEDGER_FRESH_MS = 5000
+# What it would take to re-choose the two estimate constants from the LOG instead of from a
+# replay of the journals, so `fbtodo status` can say how far off that is. Both numbers come
+# from the 2026-09-29 refit (the table is in the `step_pace_ms` docstring): a median needs
+# about this many closed steps before one step stops being the whole distribution, and the
+# clip needs about this many steps on which it actually MOVED the number — it is consulted
+# only on the first few steps of a list, and on most of those it changes nothing, which is
+# why the second count and not the first is the one that decides.
+REFIT_MIN_SCORED = 30
+REFIT_MIN_DECIDED = 78
 
 EX_CODES = {
     "ok": 0,
@@ -3824,6 +3848,30 @@ def _shrink(pair: tuple, width: int) -> list:
     return [(label, _clip(" · ".join(bits), room), sev)]
 
 
+def refit_row(state: dict, width: int | None = None) -> list:
+    """The refit progress as one row of [(label, text, severity)] — or nothing at all.
+
+    Nothing until the log carries `REFIT_MIN_SCORED` closed steps: below that a "progress"
+    row would be counting towards a number nobody can read yet, and every row of chrome is a
+    step the list loses. Once it shows, it counts the steps the young-list clip actually
+    DECIDED — the only ones that can judge the clip, since on most steps the two configs write
+    the same number — against what the 2026-09-29 refit says it takes (see `REFIT_MIN_DECIDED`).
+    `ok` throughout: this is the pane's quiet chrome, and the words say whether it is ready.
+    """
+    rr = state.get("refit") or {}
+    scored = int(rr.get("scored") or 0)
+    if scored < REFIT_MIN_SCORED:
+        return []
+    decided = int(rr.get("decided") or 0)
+    if decided >= REFIT_MIN_DECIDED:
+        text = f"ready · {decided} decided over {scored} scored — the clip can be judged"
+    else:
+        pct = int(round(100.0 * decided / REFIT_MIN_DECIDED))
+        text = f"{decided}/{REFIT_MIN_DECIDED} decided · {scored} scored ({pct}% to judging the clip)"
+    room = None if width is None else max(8, width - _cell_width("  REFIT  "))
+    return [("REFIT", text if room is None else _clip(text, room), "ok")]
+
+
 def patch_row(state: dict, width: int | None = None) -> list:
     """The two facts as ONE row of [(label, text, severity)], laddered to `width`.
 
@@ -4219,23 +4267,40 @@ def step_pace_ms(times: dict, todos: list, now_ms: int, history: dict | None = N
     every step in the log has taken before — and only a session with no past at all falls
     back to the default that keeps the numbers in the order of minutes.
 
-    BOUNDED while the list is still young, and that bound was measured, not guessed
-    (2026-09-29, replayed over every finished span in this machine's task log, 17
-    predictions): a median of ONE OR TWO finished steps is not a distribution, and it is
-    where the estimates go badly wrong — one 2s step projected the whole list at `~2s`
-    while the next step took 1m53s (45x out), and a `~18m` pace came from a single fast
-    step (22x out). Blending the pace toward history instead was tried and REJECTED: it
-    made the typical case worse (median error 2.5x -> 3.1x), because a list is
-    homogeneous within itself and the log's other sessions are not. Bounding costs a
-    little in the typical case and buys the tail:
+    BOUNDED while the list is still young, and that bound was measured, not guessed: a median
+    of ONE OR TWO finished steps is not a distribution, and it is where the estimates go
+    badly wrong — one 2s step projected the whole list at `~2s` while the next step took
+    1m53s (45x out), and a `~18m` pace came from a single fast step (22x out). Blending the
+    pace toward history instead was tried and REJECTED: it made the typical case worse,
+    because a list is homogeneous within itself and the log's other sessions are not.
 
-        strategy            median err   mean err   p90     worst
-        list median (was)      2.52x      8.26x   22.9x    45.7x
-        bounded at 4x          2.74x      5.18x   15.8x    18.0x
+    So the list's own pace still wins whenever it has `PACE_BOUND_SAMPLES` or more finished
+    steps behind it; below that it is clipped to within `PACE_BOUND_FACTOR` of what this
+    model's steps are remembered to cost, and never replaced by it.
 
-    So the list's own pace still wins whenever it has `PACE_BOUND_SAMPLES` or more
-    finished steps behind it; below that it is clipped to within `PACE_BOUND_FACTOR` of
-    what this model's steps are remembered to cost, and never replaced by it.
+    REFIT 2026-09-29 over the 161 real spans recovered from the CLI journals, leave-one-
+    session-out, through this function. It replaces a 17-prediction table whose harness walked
+    each session's steps by SPAN instead of by time, which is what made the bound look better
+    than it is; the honest numbers are:
+
+        config                     median    mean     p90     worst
+        no bound at all             2.18x    3.80x   7.56x    33.9x
+        4x, while n < 3 (ships)     2.18x    3.70x   7.56x    29.9x
+        2x, while n < 3             2.41x    3.66x   7.46x    29.9x
+        8x, while n < 3             2.18x    3.80x   7.56x    33.9x
+
+    The median does not move at ANY factor — a tighter bound is worse on it (2.41x at 2x) and no
+    bound at all is worse only in the tail. That much of the original reasoning survives. What
+    does not is how much the bound is buying: it is consulted on FOUR steps of the whole replay
+    (every other step has the same number either way), and on those four the no-bound reading
+    wins three — the bound turns one 45x miss into an 18x one and makes three 1.2-2.8x steps
+    about a tenth of a factor worse. So it trades one large save for three small losses: better
+    on the mean and the worst case, worse on a bare step count, identical on the median and p90,
+    and a bootstrap over sessions cannot separate the two readings (73% of resamples, on four
+    steps). Four steps do not settle that, so the bound stays as a JUDGMENT CALL rather than a
+    finding — and neither constant is worth refitting again until there are several hundred
+    spans, because at 161 a median difference under about 0.15x is noise and screening a grid
+    for something smaller is how noise gets shipped as a result.
     """
     spans = step_spans_ms(times, todos, now_ms)
     pace = _median_ms(spans)
@@ -4454,6 +4519,81 @@ def forecast_error(
     if late:
         report["late"] = {"n": late, "med": 0.0, "mean": 0.0, "worst": 0.0}
     return report
+
+
+def refit_readiness(
+    tasks: dict,
+    now_ms: int | None = None,
+    model: str | None = None,
+    days: float | None = None,
+) -> dict:
+    """{scored, eligible, decided, spans_needed} — how close the log is to refitting itself.
+
+    The score lines say what the rungs are doing; this says whether there is enough of it to
+    re-choose the constants, and it is computed from the log alone, no replay needed:
+
+    * `scored` — closed steps carrying a forecast: the sample a median would stand on. One
+      step is not a distribution, so this is compared against `REFIT_MIN_SCORED`.
+    * `eligible` — steps that started while their own LIST (the `lv` stamped on the record,
+      or the session on older records) had fewer than `PACE_BOUND_SAMPLES` FINISHED steps,
+      which is the only time the clip is consulted.
+    * `decided` — steps where it actually MOVED the number. The pace stored in the step's own
+      vector is the clipped one, and the median of its list's earlier finished spans — read
+      from the log, the same way `step_spans_ms` reads it, floor and cap included — is what
+      it would have used WITHOUT the clip. When those two differ, the clip decided this step.
+      Measured over the 161-span replay, 157 spans were identical either way, so this count
+      is the one that governs how long it takes to judge the clip at all.
+
+    `spans_needed` extrapolates the observed decide rate to `REFIT_MIN_DECIDED`, and is None
+    while fewer than five steps have been decided: a rate built on one or two is not a rate.
+    """
+    now_ms = now_ms or int(time.time() * 1000)
+    cutoff = now_ms - int((days if days is not None else HISTORY_MAX_AGE_DAYS) * 86400 * 1000)
+    rows: list[tuple[str, int, int, dict]] = []
+    for key, rec in (tasks or {}).items():
+        if not isinstance(rec, dict) or not isinstance(rec.get("fc"), dict):
+            continue
+        started, stopped = rec.get("started_ms"), rec.get("done_ms")
+        if not started or not stopped or stopped <= started or started < cutoff:
+            continue
+        if model and (rec.get("model") or "") != model:
+            continue
+        # The LIST it was in when it was last seen, falling back to the session for records
+        # written before `lv` existed — a coarser grouping, and the only one available then.
+        group = f"{str(key).partition(chr(31))[0]}\x1f{rec.get('lv')}"
+        rows.append((group, started, stopped - started, rec["fc"]))
+    rows.sort(key=lambda r: r[1])
+    by_list: dict[str, list[tuple[int, int]]] = {}
+    scored = eligible = decided = 0
+    for group, started, span, fc in rows:
+        prior = [
+            sp
+            for st, sp in by_list.get(group, [])
+            if st < started and sp >= MIN_LABEL_MS
+        ]
+        by_list.setdefault(group, []).append((started, span))
+        if span < MIN_LABEL_MS:
+            continue
+        scored += 1
+        unclipped = _median_ms([min(sp, EST_CAP_MS) for sp in prior])
+        if unclipped is None or len(prior) >= PACE_BOUND_SAMPLES:
+            continue
+        eligible += 1
+        try:
+            clipped = int(fc.get("pace") or 0)
+        except (TypeError, ValueError):
+            continue
+        if clipped and abs(clipped - unclipped) > 500:
+            decided += 1
+    rate = (decided / scored) if scored else 0.0
+    return {
+        "scored": scored,
+        "eligible": eligible,
+        "decided": decided,
+        "spans_needed": (
+            int(REFIT_MIN_DECIDED / rate) if decided >= 5 and rate > 0 else None
+        ),
+    }
 
 
 def estimate_error(
@@ -4791,6 +4931,12 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
         # record written before this field existed picks it up on the next poll.
         if state.get("model"):
             rec["model"] = state["model"]
+        # Which LIST this step was last seen in. The pace a step was given came from the
+        # steps finished before it IN ITS OWN LIST, so that is what the clip's own readiness
+        # count has to group by — a session can hold many lists, and grouping by session
+        # would count steps from earlier turns as if this step had inherited their pace.
+        if state.get("list_version") is not None:
+            rec["lv"] = state["list_version"]
         # What this step has DONE, as opposed to what it was called: the calls this turn
         # has made, less what the steps BEFORE it in the same turn were credited with.
         # Order decides who did what — no timestamps needed, and no call is counted twice.
@@ -4849,11 +4995,26 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
             "shape": rec.get("shape") or {},
         }
 
-    # only this session's tasks, and never on a snapshot that reads as empty: a
-    # momentary no-list poll means "nothing to look at", not "those tasks are gone"
+    # Only this session's tasks, and never on a snapshot that reads as empty: a momentary
+    # no-list poll means "nothing to look at", not "those tasks are gone".
+    # FINISHED records are then deliberately spared. A record with a span is evidence — it is
+    # what `estimate_error` and `forecast_error` score, and what the pace, size and call
+    # memories learn from — and this session's key is (session, label), so a step that was
+    # reworded becomes another sample rather than a duplicate. Dropping them made the two
+    # score lines self-erasing: measured 2026-09-29, a rewritten list deleted the very step
+    # whose forecast was the only scored row in the log, so `fbtodo status` could never show
+    # more than the current list and "is this getting better?" was unanswerable live. What is
+    # still dropped is a record that never finished (no `done_ms`): its `started_ms` would
+    # keep a clock running for a step that is no longer on any list.
     if seen:
         prefix = task_key(session, "")
-        for gone in [k for k in tasks if k.startswith(prefix) and k not in seen]:
+        for gone in [
+            k
+            for k, rec in tasks.items()
+            if k.startswith(prefix)
+            and k not in seen
+            and not (isinstance(rec, dict) and rec.get("done_ms"))
+        ]:
             tasks.pop(gone, None)
 
     # Per-task memory, kept ACROSS sessions: every finished step in the log contributes its
@@ -4869,6 +5030,9 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
     # calls a step of its KIND makes, and the seconds each of those calls costs (see
     # call_memory_from_log). This is what prices a pending row, blended with the pace.
     state["task_calls"] = call_memory_from_log(tasks, now_ms, state.get("model"))
+    # ...and how close the log is to being able to re-choose these constants, so the pane's
+    # REFIT row and `fbtodo status` report the same count from the same function.
+    state["refit"] = refit_readiness(tasks, now_ms, state.get("model"))
     # What the pane is projecting for the step in flight at this moment, stamped onto its
     # record. The moment that step closes, its estimate and its actual span are a matched
     # pair, and `estimate_error` reads the pair straight back out of the log — which is the
@@ -5512,6 +5676,11 @@ def _render_plain(
     row = patch_row(state, width)
     if row:
         footer.append("  " + patch_row_text(row))
+    # ...and the refit progress, when the log has enough closed steps for it to mean anything.
+    # The plain path is the machine-readable one, so this is the same text the pane draws.
+    refit = refit_row(state, width)
+    if refit:
+        footer.append("  " + patch_row_text(refit))
     if idle_s and idle_s >= 60:
         txt = f"  idle {short_duration(idle_s * 1000)}"
         if stale_after_s:
@@ -5859,6 +6028,7 @@ def _render_rich(
     # was last told something. They cost rows of the fixed height, which the budgets below
     # are told about through `patch_rows`.
     patch_row_here = patch_row(state, inner)
+    refit_row_here = refit_row(state, inner)
 
     def patch_row_styled(pairs: list) -> str:
         """A row as drawn: labels in the frame's grey, values in their own severity."""
@@ -5932,7 +6102,8 @@ def _render_rich(
         # the no-times note borrows one more when it is there, so the frame still fits the
         # pane rather than pushing its top border off the screen on every repaint.
         head = head[: max(1, min(
-            len(head), height - 7 - (1 if patch_row_here else 0) - (1 if no_times else 0)
+            len(head), height - 7 - (1 if patch_row_here else 0)
+            - (1 if refit_row_here else 0) - (1 if no_times else 0)
         ))]
 
     # In plain words: the same situations the plain renderer names, plus the one line the
@@ -5951,8 +6122,10 @@ def _render_rich(
         note = tools_note(state.get("tool_calls") or {})
         # The turn is the frame the calls sit in, so it is drawn first; both are clipped to a
         # single row each, which is what keeps this branch's height countable. Nine rows of
-        # chrome and the no-list explanation are already spent above this point.
-        room = max(0, (height - 9) if height else ACTION_ROWS + 1)
+        # chrome and the no-list explanation are already spent above this point — plus the
+        # refit row when it has something to say, which is charged here too.
+        room = max(0, (height - 9 - (1 if refit_row_here else 0)) if height
+                   else ACTION_ROWS + 1)
         turn_line = turn_note(state, now_ms)
         body = [turn_line] if turn_line else []
         body += observed_rows(state, ACTION_ROWS, now_ms)[: max(0, room - len(body))]
@@ -5968,6 +6141,8 @@ def _render_rich(
             # A frame with no list at all is exactly the NAS pane waiting for `fb` — when
             # "did the hook's patch step come out clean?" is the question being asked.
             rows.append(_frame_row(patch_row_styled(patch_row_here), width, frame))
+        if refit_row_here:
+            rows.append(_frame_row(patch_row_styled(refit_row_here), width, frame))
         rows.append(_bottom_row(width, frame))
         return "\n".join(rows)
 
@@ -6070,6 +6245,7 @@ def _render_rich(
 
     avail = None if not height else max(
         1, height - len(head) - 6 - (1 if patch_row_here else 0)
+        - (1 if refit_row_here else 0)
     )
     anchor = _window_anchor(cur_index, len(blocks))
     start, end = _fit_blocks(blocks, avail, anchor)
@@ -6297,6 +6473,8 @@ def _render_rich(
         rows.append(_frame_row(c(muted, no_times), width, frame))
     if patch_row_here:
         rows.append(_frame_row(patch_row_styled(patch_row_here), width, frame))
+    if refit_row_here:
+        rows.append(_frame_row(patch_row_styled(refit_row_here), width, frame))
     rows.append(_frame_row(status, width, frame))
     rows.append(_bottom_row(width, frame))
     return "\n".join(rows)
@@ -6712,6 +6890,9 @@ def cmd_status(args) -> int:
                 "watcher_pid": pid,
                 "state_file": STATE_PATH,
                 "state_fresh": state_is_fresh(st),
+                "refit_readiness": refit_readiness(
+                    load_tasklog().get("tasks") or {}, model=(st or {}).get("model")
+                ),
                 "state": st,
             },
             sys.stdout,
@@ -6978,6 +7159,33 @@ def cmd_status(args) -> int:
         print(f"  forecast error    : — {skipped} step(s) stamped late, not scored")
     else:
         print("  forecast error    : — no step has started since the ledger was added")
+    # ...and whether there is yet enough of that to re-choose the constants from the log
+    # rather than from a replay of the journals. Both counts are what the constants' own
+    # comments say they need; the second is the one that governs the pace bound, because the
+    # clip is consulted on the first few steps of every list and changes nothing on most.
+    rr = refit_readiness(log.get("tasks") or {}, model=model)
+    if not rr["scored"]:
+        print("  refit readiness   : — no closed step carries a forecast yet")
+    else:
+        short = max(0, REFIT_MIN_SCORED - rr["scored"])
+        head = f"{rr['scored']} closed step(s) scored"
+        if short:
+            head += f", {short} short of the {REFIT_MIN_SCORED} a median needs"
+        else:
+            head += f" — a median can be read from these ({REFIT_MIN_SCORED}+)"
+        print(f"  refit readiness   : {head}")
+        detail = (f"the bound was consulted on {rr['eligible']} of them and moved the number "
+                  f"on {rr['decided']}")
+        if rr["spans_needed"]:
+            print(f"                      {detail}; judging the clip needs ~"
+                  f"{REFIT_MIN_DECIDED} decided, which at this rate is ~{rr['spans_needed']} "
+                  f"spans")
+        elif rr["decided"]:
+            print(f"                      {detail}; too few to say how many spans judging the "
+                  f"clip would take")
+        else:
+            print(f"                      {detail} — the clip has not changed a single number "
+                  f"here yet")
     # whose steps those are: the memory is per model, so a number without its model is
     # not auditable — a fast model remembered here must not project a slow one
     if model:
@@ -7091,6 +7299,10 @@ def ledger_rows(
             note = ver
         elif stamp_in < 0:
             note = f"{ver} · stamped {short_duration(-stamp_in, seconds=True)} before this run"
+        elif stamp_in < 1000:
+            # the normal case: the poll that started the clock wrote the vector on the same
+            # pass, and `short_duration(0)` is an empty string — which read as "stamped  in"
+            note = f"{ver} · stamped on the first poll"
         else:
             note = f"{ver} · stamped {short_duration(stamp_in, seconds=True)} in"
         rows.append({

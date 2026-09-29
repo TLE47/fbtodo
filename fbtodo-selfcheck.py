@@ -2158,6 +2158,25 @@ try:
     # re-opening a finished step restarts its clock
     reopened = mod.track_tasks(dict(S, todos=seq(True, True, False)), now_ms=t0 + 700_000)
     assert reopened["task_times"]["c"]["started_ms"] == t0 + 700_000, reopened["task_times"]
+    # ---- but a record that FINISHED is evidence, and evidence is not dropped because the list
+    # moved on. Measured live 2026-09-29: a rewritten list deleted the one step whose forecast
+    # was the only scored row in the log, so `estimate error` and `forecast error` could never
+    # show more than the current list. A record with no `done_ms` still goes: its `started_ms`
+    # would keep a clock running for a step that is on no list any more.
+    keep = mod.load_tasklog()
+    keep["tasks"][mod.task_key("KEEP", "gone but finished")] = {
+        "started_ms": t0, "done_ms": t0 + 60_000, "model": "m/e",
+        "fc": {"at": t0, "v": "0", "pace": 60_000}}
+    keep["tasks"][mod.task_key("KEEP", "gone and unfinished")] = {
+        "started_ms": t0, "model": "m/e"}
+    mod.atomic_write_json(mod.TASKS_PATH, keep)
+    mod.track_tasks(
+        {"session": "KEEP", "todos": [{"task": "now", "completed": False}]},
+        now_ms=t0 + 120_000)
+    left = mod.load_tasklog()["tasks"]
+    assert mod.task_key("KEEP", "gone but finished") in left, "a measured span was thrown away"
+    assert "fc" in left[mod.task_key("KEEP", "gone but finished")], "its forecast went with it"
+    assert mod.task_key("KEEP", "gone and unfinished") not in left, "a stale clock survived"
     # ---- a turn that ENDS with a step still current must stop counting. Reported 2026-09-25:
     # a finished list sat at 9/10 with the last step unticked, the turn ended, and the pane
     # kept saying WORKING with a number that grew past the estimate — because the clock was
@@ -2449,12 +2468,97 @@ try:
     text = mod.fmt_ledger(pre, t0 + 1000, None, 0)
     assert "stamped 1m00s before this run" in text, text
     assert "pace 1m40s ×1.40" in text, text
+    # ...while the ordinary case — the poll that started the clock wrote the vector on the
+    # same pass — reads as prose rather than as an empty duration ("stamped  in")
+    same = mod.ledger_rows({mod.task_key("E", "same"): {
+        "started_ms": t0, "model": "m/e",
+        "fc": {"at": t0, "v": "9.9.9", "pace": 100_000, "pick": "pace"}}},
+        t0 + 1000, None, "m/e")
+    assert same[0]["stamp_in_ms"] == 0, same[0]
+    assert "stamped on the first poll" in mod.fmt_ledger(same, t0 + 1000, None, 0)
     # the report counts what it set aside, and the tail names the way to widen it
     text = mod.fmt_ledger(lr, t0 + 1000, None, 2)
     assert "1 stamped late (not scored)" in text, text
     assert "1 more (--limit 0 for all" in text, text
     assert "no step carries a forecast yet" in mod.fmt_ledger([], t0, None, 20)
     say("estimates: `fbtodo ledger` prints the vector beside the outcome: ok")
+
+    # ---- and how far the log is from re-choosing its own constants: the clip is consulted
+    #      only on a young list, and moves the number only sometimes, so the count that
+    #      governs it is the second one. Measured over the 161-span replay, 157 of those spans
+    #      wrote the same number either way.
+    rc = {
+        mod.task_key("R", "first"): {
+            "started_ms": t0, "done_ms": t0 + 60_000, "model": "m/e",
+            "fc": {"at": t0, "pace": 60_000}},                     # no prior: not consulted
+        mod.task_key("R", "clipped"): {
+            "started_ms": t0 + 60_000, "done_ms": t0 + 120_000, "model": "m/e",
+            "fc": {"at": t0 + 60_000, "pace": 240_000}},           # 1 prior at 60s: MOVED
+        mod.task_key("R", "same"): {
+            "started_ms": t0 + 120_000, "done_ms": t0 + 180_000, "model": "m/e",
+            "fc": {"at": t0 + 120_000, "pace": 60_000}},           # 2 priors at 60s: unchanged
+        mod.task_key("R", "old enough"): {
+            "started_ms": t0 + 180_000, "done_ms": t0 + 240_000, "model": "m/e",
+            "fc": {"at": t0 + 180_000, "pace": 60_000}},           # 3 priors: not consulted
+        mod.task_key("R", "flip"): {
+            "started_ms": t0 + 240_000, "done_ms": t0 + 242_000, "model": "m/e",
+            "fc": {"at": t0 + 240_000, "pace": 60_000}},           # under the floor
+    }
+    rr = mod.refit_readiness(rc, t0 + 300_000, "m/e")
+    assert rr["scored"] == 4, rr
+    assert rr["eligible"] == 2, rr
+    assert rr["decided"] == 1, rr
+    assert rr["spans_needed"] is None, "a rate from one decided step is not a rate"
+    # ...and once there are enough decided steps, the extrapolation is just the rate. Six
+    # lists of two, each with its second step clipped, plus one step nothing was decided about.
+    many = {}
+    for n in range(6):
+        s0 = t0 + n * 200_000
+        many[mod.task_key("S2", f"l{n}a")] = {
+            "started_ms": s0, "done_ms": s0 + 60_000, "model": "m/e", "lv": n,
+            "fc": {"at": s0, "pace": 60_000}}
+        many[mod.task_key("S2", f"l{n}b")] = {
+            "started_ms": s0 + 60_000, "done_ms": s0 + 120_000, "model": "m/e", "lv": n,
+            "fc": {"at": s0 + 60_000, "pace": 240_000}}
+    many[mod.task_key("S2", "tail")] = {
+        "started_ms": t0 + 1_400_000, "done_ms": t0 + 1_460_000, "model": "m/e", "lv": 99,
+        "fc": {"at": t0 + 1_400_000, "pace": 60_000}}
+    rr2 = mod.refit_readiness(many, t0 + 2_000_000, "m/e")
+    assert rr2["scored"] == 13 and rr2["decided"] == 6 and rr2["eligible"] == 6, rr2
+    assert rr2["spans_needed"] == int(mod.REFIT_MIN_DECIDED / (6 / 13)), rr2
+    assert mod.refit_readiness({}, t0) == {
+        "scored": 0, "eligible": 0, "decided": 0, "spans_needed": None}
+    # ...and the pane says it too, on the same terms as PATCH and ALERT: only when the state
+    # carries the fact, so an older state (or a fixture) draws exactly as it always did, and
+    # only once a median could be read — below that the row would count towards a number
+    # nobody can use yet, and every row of chrome is a step the list loses.
+    assert mod.refit_row({}) == [] and mod.refit_row({"todos": []}) == []
+    assert mod.refit_row({"refit": {"scored": 29, "decided": 9}}) == [], "shows too early"
+    row = mod.refit_row({"refit": {"scored": 31, "decided": 12}})
+    assert row and row[0][0] == "REFIT" and "12/78" in row[0][1], row
+    ready = mod.refit_row({"refit": {"scored": 214, "decided": mod.REFIT_MIN_DECIDED}})
+    assert ready and "ready" in ready[0][1], ready
+    narrow = mod.refit_row({"refit": {"scored": 31, "decided": 12}}, 40)
+    assert mod._cell_width("  " + mod.patch_row_text(narrow)) <= 40, narrow
+    # ...and its row is charged to the height budget, so a pane never loses its bottom border
+    pane = {
+        "todos": [{"task": f"s{i}", "completed": i < 3} for i in range(12)],
+        "done": 3, "total": 12, "list_version": 1, "model": "m/e",
+        "task_times": {f"s{i}": {"started_ms": t0 - 600_000, "done_ms": t0 - 300_000}
+                       for i in range(3)},
+        "patch": {"outcome": "ok", "version": "9.9.9", "at_ms": t0, "severity": "ok"},
+    }
+    for h in (10, 12, 14):
+        bare = ansi.sub("", mod.render(dict(pane), False, width=100, height=h, now_ms=t0))
+        drawn = ansi.sub(
+            "",
+            mod.render(dict(pane, refit={"scored": 31, "decided": 12}),
+                       False, width=100, height=h, now_ms=t0),
+        )
+        assert len(drawn.split("\n")) <= h, (h, len(drawn.split("\n")))
+        assert any("REFIT" in ln for ln in drawn.split("\n")), h
+        assert "REFIT" not in bare, "a state without the fact grew a row"
+    say("estimates: the log says how far it is from refitting the rate constants: ok")
 
     # ---- and the memory it is scored against now spans a month, not a week: the old cap
     #      pruned records while they were still the only evidence there was (measured

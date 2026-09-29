@@ -335,7 +335,7 @@ fbtodo prune           # enforce retention now
 | *(no argument)* | the live pane; also starts the watcher for you |
 | `snap` / `json` | the list as text or JSON — script it, or read it once |
 | `bar` | a `todos 3/5` string for your tmux status line, and `todos -` when there is no list yet (`FBTODO_NO_PANE=1` if you only want this) |
-| `status` | everything the tool thinks: which instance, which watcher, which build, which state file, remembered pace, which turn (`turn`) — and, with no list, why there is none and what the session has been doing instead (`last actions`) |
+| `status` | everything the tool thinks: which instance, which watcher, which build, which state file, remembered pace, which turn (`turn`), how far the evidence is from re-choosing the estimates' own constants (`refit readiness`) — and, with no list, why there is none and what the session has been doing instead (`last actions`) |
 | `ledger` | the rows behind the scoreboard: every step's forecast vector, what each rung predicted, the span it was scored against and each rung's miss — or why a row could not be scored. `--days N`, `--limit N`, `--model M`, `--json` |
 | `why` | the first thing to run when a pane is somewhere unexpected |
 | `pin` | force a pane's side or size, per window |
@@ -622,9 +622,20 @@ A frame with a status strip, in a themeable palette.
 - **`PATCH` / `ALERT` row** — when there is something to say: the last outcome of an optional
   CLI-patch step, and the last thing the phone was told. Both are read from a log the
   producing step already writes, so neither costs a probe of its own.
+- **`REFIT` row** — and only once the log has 30 closed steps behind it, because before that
+  a progress bar toward a number nobody can read is just a row the list loses:
+
+  ```
+  REFIT  12/78 decided · 31 scored (15% to judging the clip)
+  REFIT  ready · 78 decided over 214 scored — the clip can be judged
+  ```
+
+  It counts the steps the young-list **pace bound actually moved** rather than all of them,
+  since on most steps the bounded and unbounded paces are the same number — so the left number
+  is the one that governs, and `fbtodo status` prints the same count in words.
 
 The **plain** renderer is deliberately untouched — it is the machine-readable path, and the
-`PATCH`/`ALERT` row appears there too, but only when the state carries it.
+`PATCH`/`ALERT` rows appear there too, but only when the state carries them.
 
 ### Clocks, estimates, ETA
 
@@ -672,11 +683,19 @@ Which is where most of the care in this tool has gone.
   A step the watcher only picked up mid-flight (a restart) is flagged and left out of the
   score rather than counted as a forecast it never was, and `status` says how many were set
   aside. The memory behind it is kept for 60 days / 2000 records — about a month of
-  real use — because the estimates are the one thing here meant to improve with use.
+  real use — because the estimates are the one thing here meant to improve with use. A step
+  that has finished is kept even after the agent rewrites its list: a measured span *is* the
+  evidence both score lines are computed from, and dropping it left the live scores looking
+  at nothing but the list on screen.
 - **`fbtodo ledger` is those rows themselves**: one per step, newest first, with what each
   rung predicted, the span it was scored against and each rung's miss — and the honest note
   when a row could not be scored (still running, too short to be evidence, or stamped after
   the step had already started). `status` gives the average; `ledger` gives the argument.
+- **`status` also says when the numbers could be re-chosen**, as `refit readiness`: how many
+  closed steps carry a forecast (a median wants ~30 before one step stops being the whole
+  distribution), and how often the young-list bound actually *changed* a number — the bound is
+  consulted on the first steps of a list and moves nothing on most of them, so that second
+  count is the one that governs it, and the line extrapolates the spans it would take.
 - Past twice the estimate a step is marked `[STUCK?]` — a hint, not a verdict.
 - The **list's own age** rides on `LIST:` (`LIST: #7 · 12m ago`), so a list the agent has
   stopped re-writing is visible while a step's clock is still counting. A narrow strip spends
