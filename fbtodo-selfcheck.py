@@ -995,6 +995,15 @@ try:
         json.loads(run("json").stdout),
         model="some-provider/space-bunny-alpha-preview",
         task_history={},        # no remembered pace: the default keeps `~2m` in the strip
+        # `now`, `nudge` and the patch/alert pair ride along in the live `json`, and each one
+        # can add a ROW to the frame. Measured 2026-09-29: a request arriving mid-run put a
+        # `NOW` row in, took the 12-line frame to 13 and failed the height assertion below —
+        # with nothing wrong with the renderer. The shape still comes from the live `json`;
+        # the height budget is tested on a head with no live text in it.
+        now=None,
+        nudge=None,
+        patch=None,
+        alert=None,
     )
     steps = [
         {"task": "Diagnose the frozen-looking pane and prove it is alive", "completed": True},
