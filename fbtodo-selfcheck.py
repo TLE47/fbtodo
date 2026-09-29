@@ -854,6 +854,34 @@ try:
     assert os.path.exists(os.path.join(d_home, ".freebuff", "fbtodo-pane-keeper.pid")), "moved anyway"
     say("state root: a live watcher or keeper keeps the old root, and the move waits: ok")
 
+    # ---- the source seam: three readers of three machines' transcripts, one protocol, and
+    #      a dispatch that is a loop. What matters is not that the loop exists but that the
+    #      contract holds for every source — a name, the backend it reports, its own answer
+    #      for "there is nothing here" — and that `-s` picks the sources it documents.
+    class _Ask:
+        def __init__(self, mode: str):
+            self.source = mode
+
+    def asked(mode: str) -> list:
+        return [src.name for src in module.sources_for(_Ask(mode))]
+
+    assert sorted(module.SOURCES) == ["cli", "desktop", "nas"], sorted(module.SOURCES)
+    for name, cls in (("cli", "CliSource"), ("desktop", "DesktopSource"),
+                      ("nas", "NasSource")):
+        src = module.SOURCES[name]
+        assert isinstance(src, getattr(module, cls)), (name, type(src))
+        assert (src.name, src.backend) == (name, name), (src.name, src.backend)
+        for method in ("find", "describe", "miss"):
+            assert getattr(type(src), method) is not getattr(module.Source, method), (name, method)
+        assert src.miss().get("error"), (name, src.miss())
+    assert asked("auto") == ["cli", "desktop"], asked("auto")
+    assert asked("cli") == ["cli"] and asked("desktop") == ["desktop"] and asked("nas") == ["nas"]
+    # `-s cli` asks ONE source: with no journal in this directory the answer is an error,
+    # not the desktop store — which is what the whole seam has to keep true
+    assert module.SOURCES["cli"].miss()["error"] == "no CLI chat for this directory"
+    assert module.SOURCES["desktop"].miss()["error"] == "no conversation DB found"
+    say("sources: one protocol, three readers, and the order `-s` asks them in: ok")
+
     old = module.finish_state(
         {"session": "S1", "todos": [{"task": "a", "completed": True}]}, None
     )
