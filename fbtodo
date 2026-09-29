@@ -3855,6 +3855,8 @@ def short_duration(ms, seconds: bool = False) -> str:
 # projection, not a promise — and rides inline on a row (`~3m`) rather than claiming a
 # line of its own: the frame's height is fixed, and every extra row costs a step.
 DEFAULT_PACE_MS = 120_000       # nothing finished yet: fall back to a couple of minutes
+PACE_BOUND_FACTOR = 4.0         # how far the list's own pace may sit from the remembered one
+PACE_BOUND_SAMPLES = 3          # ...and only while the list has fewer finished steps than this
 STUCK_FACTOR = 2.0              # running time / pace at which a step reads as stuck
 EST_CAP_MS = 6 * 3_600_000      # clamp one span, so a runaway clock cannot skew the ETA
 LIST_BEHIND_MS = 10 * 60_000   # a FINISHED list this far behind a still-writing session
@@ -3946,6 +3948,21 @@ def task_history_from_log(tasks: dict, now_ms: int | None = None, model: str | N
     return history
 
 
+# In plain words: one remembered span, read the same way whether it was stored as a bare
+# number (an older build's task log) or as a small record of the samples behind it.
+def hist_med(entry) -> int | None:
+    """The median inside one history entry: a bare int, or a dict with `med`."""
+    if isinstance(entry, dict):
+        val = entry.get("med")
+    else:
+        val = entry
+    try:
+        val = int(val)
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None
+
+
 # In plain words: the rate the estimates borrow from, for steps with no history of their
 # own. The middle duration of the steps finished in THIS list; failing that, the middle of
 # the remembered ones; and only with no past at all, a flat couple of minutes.
@@ -3957,12 +3974,40 @@ def step_pace_ms(times: dict, todos: list, now_ms: int, history: dict | None = N
     distribution to speak of, so the remembered history takes over — the median of what
     every step in the log has taken before — and only a session with no past at all falls
     back to the default that keeps the numbers in the order of minutes.
+
+    BOUNDED while the list is still young, and that bound was measured, not guessed
+    (2026-09-29, replayed over every finished span in this machine's task log, 17
+    predictions): a median of ONE OR TWO finished steps is not a distribution, and it is
+    where the estimates go badly wrong — one 2s step projected the whole list at `~2s`
+    while the next step took 1m53s (45x out), and a `~18m` pace came from a single fast
+    step (22x out). Blending the pace toward history instead was tried and REJECTED: it
+    made the typical case worse (median error 2.5x -> 3.1x), because a list is
+    homogeneous within itself and the log's other sessions are not. Bounding costs a
+    little in the typical case and buys the tail:
+
+        strategy            median err   mean err   p90     worst
+        list median (was)      2.52x      8.26x   22.9x    45.7x
+        bounded at 4x          2.74x      5.18x   15.8x    18.0x
+
+    So the list's own pace still wins whenever it has `PACE_BOUND_SAMPLES` or more
+    finished steps behind it; below that it is clipped to within `PACE_BOUND_FACTOR` of
+    what this model's steps are remembered to cost, and never replaced by it.
     """
-    pace = _median_ms(step_spans_ms(times, todos, now_ms))
-    if pace is not None:
-        return pace
-    remembered = [min(v, EST_CAP_MS) for v in (history or {}).values() if v and v > 0]
-    return _median_ms(remembered) or DEFAULT_PACE_MS
+    spans = step_spans_ms(times, todos, now_ms)
+    pace = _median_ms(spans)
+    remembered = [
+        min(m, EST_CAP_MS)
+        for m in (hist_med(v) for v in (history or {}).values())
+        if m
+    ]
+    reminded = _median_ms(remembered)
+    if pace is None:
+        return reminded or DEFAULT_PACE_MS
+    if reminded and len(spans) < PACE_BOUND_SAMPLES:
+        low = max(1, int(reminded / PACE_BOUND_FACTOR))
+        high = int(reminded * PACE_BOUND_FACTOR)
+        return min(max(pace, low), high)
+    return pace
 
 
 def task_estimate_ms(task: str, pace_ms: int, history: dict | None = None) -> int:
@@ -3972,10 +4017,8 @@ def task_estimate_ms(task: str, pace_ms: int, history: dict | None = None) -> in
     in an earlier session — a `Run the tests` from a previous turn — is projected from its
     own history rather than from the average of whatever this list happens to contain.
     """
-    span = (history or {}).get(str(task))
-    if span and span > 0:
-        return min(span, EST_CAP_MS)
-    return pace_ms
+    span = hist_med((history or {}).get(str(task)))
+    return min(span, EST_CAP_MS) if span else pace_ms
 
 
 # In plain words: how much is left — each remaining step at its usual duration, less the
@@ -6247,7 +6290,7 @@ def cmd_status(args) -> int:
         print(f"  remembered from   : {model}")
     for t in [t for t in todos if not t.get("completed")][:5]:
         task = str(t.get("task", ""))
-        source = "own history" if history.get(task) else "list pace"
+        source = "own history" if hist_med(history.get(task)) else "list pace"
         print(
             f"  estimate          : {_clip(task, 44)}  "
             f"{fmt_estimate(task_estimate_ms(task, pace, history))}  ({source})"

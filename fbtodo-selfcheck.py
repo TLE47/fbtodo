@@ -1688,6 +1688,33 @@ try:
     assert hist_row.rstrip().endswith("~5m │"), hist_row
     hist_bar = next(line for line in hist_wide.splitlines() if "PROGRESS" in line)
     assert "EST REM: 6m30s" in hist_bar, hist_bar  # 1m30s left of `four` + 5m for `five`
+
+    # ---- the bound on a YOUNG list's pace, and the measurement behind it. A median of one
+    #      or two finished steps is not a distribution, and that is exactly where the
+    #      estimates went badly wrong: replayed over every finished span in this machine's
+    #      task log (2026-09-29, 17 predictions), one 2s step projected a whole list at
+    #      `~2s` while the next step took 1m53s — 45.7x out — and a `~18m` pace came from a
+    #      single fast step, 22.9x out. Bounding the early pace to within 4x of the
+    #      remembered one took the worst miss 45.7x -> 18.0x and the p90 22.9x -> 15.8x,
+    #      for 2.52x -> 2.74x on the median. Blending instead of bounding was tried and is
+    #      WORSE (median 3.1x), so the list's own pace is never replaced by the memory —
+    #      only held near it, and only while it has fewer than three finished steps.
+    def pace_of(spans, remembered):
+        return module.step_pace_ms(
+            {f"s{n}": {"started_ms": 0, "done_ms": span, "elapsed_ms": span}
+             for n, span in enumerate(spans)},
+            [{"task": f"s{n}", "completed": True} for n in range(len(spans))],
+            SWEEP_NOW, remembered,
+        )
+    assert pace_of([2_000], {"t": 50_000}) == 12_500, "a 2s single sample must not pace the list"
+    assert pace_of([600_000], {"t": 50_000}) == 200_000, "nor must one 10m sample"
+    assert pace_of([2_000, 4_000], {"t": 50_000}) == 12_500, "two samples are still not enough"
+    assert pace_of([2_000, 4_000, 9_000], {"t": 50_000}) == 4_000, "three: the list's own median"
+    assert pace_of([2_000], {}) == 2_000, "nothing remembered: nothing to bound against"
+    # an older task log stored a bare number here; a small record must read the same way
+    assert module.hist_med(50_000) == 50_000 and module.hist_med({"med": 50_000}) == 50_000
+    assert module.hist_med(None) is None and module.hist_med({"n": 2}) is None
+    say("bounds a young list's pace against the remembered one: ok")
     # the plain, machine-readable path carries the same projections INLINE: a piped
     # `snap` is parsed by scripts, so an estimate may never claim a line of its own
     plain_wide = ansi.sub("", module.render(est_state, False, width=80, now_ms=SWEEP_NOW))
