@@ -866,6 +866,8 @@ def _render_rich(
     stale_after_s: float,
     goal_lines: int,
     height: int | None,
+    theme: dict | None = None,
+    truecolor: bool | None = None,
 ) -> str:
     """The framed, high-density pane shown on a colour terminal.
 
@@ -878,8 +880,8 @@ def _render_rich(
     # for is a role from `_styles`. `warn` is a step past its estimate, a nudge or a patch
     # that did not come out clean; `red` is a failure or an overrun.
     yellow, red = "33", "31"
-    theme = read_theme()
-    truecolor = _supports_truecolor()
+    theme = read_theme() if theme is None else theme
+    truecolor = _supports_truecolor() if truecolor is None else truecolor
     # Every colour decision lives in `_styles`; this function only asks for roles, so the
     # drawing below reads the same whatever the palette resolves to.
     st = _styles(theme, truecolor)
@@ -1452,8 +1454,17 @@ def render(
     stale_after_s: float = 0.0,
     goal_lines: int = 3,
     height: int | None = None,
+    theme: dict | None = None,
+    truecolor: bool | None = None,
 ) -> str:
-    """Pick the framed pane (colour terminal) or the plain machine-readable text."""
+    """Pick the framed pane (colour terminal) or the plain machine-readable text.
+
+    `theme` and `truecolor` are the palette and the colour depth. Left out, they are resolved
+    here from the environment and the theme files, which is how every command calls this; passed
+    in, the frame is a function of the arguments alone — the same state and clock give the same
+    bytes, whatever the terminal says. That is what makes a recorded frame a contract and lets
+    the pane diff one paint against the last (see `pane_repaint`).
+    """
     # The second half of the text filter (see `clean_text`): a state that came off disk —
     # this process's own cache, or a file an older build wrote — is filtered here, so no
     # frame can be painted from prose that never went through a source.
@@ -1462,6 +1473,7 @@ def render(
     if color and width >= 30:
         return _render_rich(
             state, color, watching, width, now_ms, idle_s, stale_after_s, goal_lines, height,
+            theme=theme, truecolor=truecolor,
         )
     return _render_plain(
         state, color, watching, width, now_ms, idle_s, stale_after_s, goal_lines, height,

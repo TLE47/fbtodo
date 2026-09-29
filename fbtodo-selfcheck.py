@@ -2914,6 +2914,44 @@ try:
         set_knob(module, "_THEME_CACHE", None)
     say("the frame palette resolves from the env and the theme files: ok")
 
+    # ---- with the palette AND the colour depth handed to it, `render` is a function of its
+    #      arguments: same state, same clock, same bytes, whatever the environment or the theme
+    #      files say. That is what a recorded frame is a contract on (tests/golden) and what a
+    #      repaint can be diffed against — a frame that quietly reads the environment behind the
+    #      palette it was given can be neither.
+    def frozen_frame(depth=True, theme=None, width=68, height=18):
+        return module.render(
+            rich_state, True, watching=999, width=width, height=height, now_ms=SWEEP_NOW,
+            theme=dict(theme if theme is not None else module.THEME_DEFAULTS),
+            truecolor=depth,
+        )
+
+    frozen = frozen_frame()
+    assert frozen == frozen_frame(), "two frames of one state differ"
+    probe = {var: os.environ.get(var)
+             for var in ("FBTODO_ACCENT", "FBTODO_GRADIENT_END", "FBTODO_TRUECOLOR",
+                         "COLORTERM", "TERM")}
+    try:
+        os.environ["FBTODO_ACCENT"] = "#ff0000"
+        os.environ["FBTODO_GRADIENT_END"] = "#00ff00"
+        os.environ["FBTODO_TRUECOLOR"] = "0"
+        os.environ["COLORTERM"] = "truecolor"
+        assert frozen_frame() == frozen, "the frame read the environment behind the palette"
+    finally:
+        for var, value in probe.items():
+            if value is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = value
+    # ...and only the INK follows the depth: an 8-colour terminal gets different escapes, not a
+    # different layout — same geometry, same words, or the two panes would disagree about what
+    # is on the list
+    shallow = frozen_frame(depth=False)
+    assert shallow != frozen, "the colour depth made no difference at all"
+    sgr = lambda s: re.sub(r"\x1b\[[0-9;]*m", "", s)  # noqa: E731
+    assert sgr(shallow) == sgr(frozen), "the layout moved with the colour depth"
+    say("render: handed a palette and a depth, the frame is a function of its arguments: ok")
+
     # ---- the framed top border: the right slot names the watcher, or — with no watcher
     #      serving the pane — the session it is showing, and it never breaks the frame
     def top_of(state_dict, width, watching=None):
