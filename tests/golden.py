@@ -56,6 +56,10 @@ def frozen_env(home: str) -> dict:
         FBTODO_TRUECOLOR="1",
         LANG="en_US.UTF-8",
         LC_ALL="en_US.UTF-8",
+        # The pane ticks a wall clock and `time.localtime` answers in the RECORDER's zone: without
+        # this, a frame recorded in PDT and checked on a UTC runner differs by seven hours in its
+        # footer row — a check that only passes on one machine, which is no check at all.
+        TZ="UTC",
         # No patch row and no alert line: their ages would be relative to the frozen clock
         # anyway, but a real log on the recording machine must never leak into a golden.
         FBTODO_PATCH_LOG=missing,
@@ -75,13 +79,30 @@ def load_module():
     return importlib.import_module("fbtodo")
 
 
-def products(module, home: str, golden: str = GOLDEN) -> dict:
-    """The contract texts, from the fixture state, exactly as the commands build them."""
-    with open(os.path.join(golden, "state.json")) as fh:
+# The pane's own shapes, each from its own fixture: a list mid-flight (the one above), a
+# FINISHED one (every step ticked, so the run that gets elided is the earlier, completed work
+# and the window anchors at its end), one LONGER than the pane (the window, its markers and the
+# counts), and the same long list in a NARROW pane. These are the shapes a change to the layout
+# breaks first, and a frame is the only place the break shows.
+FRAMES = (
+    ("done", "done.json", WIDTH, HEIGHT),
+    ("long", "long.json", WIDTH, HEIGHT),
+    ("narrow", "long.json", 34, 10),
+)
+
+
+def state_of(module, golden: str, fixture: str) -> dict:
+    """One fixture file, as the commands build the state they render."""
+    with open(os.path.join(golden, fixture)) as fh:
         raw = json.load(fh)
     state = module.adopt_version(module.finish_state(dict(raw), None))
-    state = module.track_tasks(state, now_ms=NOW_MS, persist=False)
-    return {
+    return module.track_tasks(state, now_ms=NOW_MS, persist=False)
+
+
+def products(module, home: str, golden: str = GOLDEN) -> dict:
+    """The contract texts, from each fixture state, exactly as the commands build them."""
+    state = state_of(module, golden, "state.json")
+    made = {
         # `cmd_json` writes the state itself, with these two flags.
         "json.txt": json.dumps(state, ensure_ascii=False) + "\n",
         # `cmd_bar`.
@@ -91,6 +112,12 @@ def products(module, home: str, golden: str = GOLDEN) -> dict:
         # The pane's rich frame at a fixed size and 24-bit ink: the display contract.
         "frame.txt": module.render(state, True, width=WIDTH, height=HEIGHT, now_ms=NOW_MS) + "\n",
     }
+    for name, fixture, width, height in FRAMES:
+        other = state_of(module, golden, fixture)
+        made[f"{name}.frame.txt"] = module.render(
+            other, True, width=width, height=height, now_ms=NOW_MS,
+        ) + "\n"
+    return made
 
 
 def check(module, home: str, write: bool, golden: str = GOLDEN) -> int:
