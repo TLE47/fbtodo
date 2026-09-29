@@ -1,0 +1,55 @@
+name: ci
+
+# Both suites, on both platforms the pane claims to support, on the oldest Python it
+# promises (3.9) and the newest. The suites are the contract: `fbtodo-selfcheck.py` drives
+# private tmux servers and a throwaway FBTODO_HOME, and `notify/test-freebuff-notify.sh`
+# drives the bells with stubbed senders, so nothing here touches a real session or phone.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  suites:
+    name: ${{ matrix.os }} · py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.x"]
+    env:
+      # The pane is drawn for a UTF-8 256-colour terminal; without this a runner's locale
+      # is C and the frame's glyph checks would report a locale they do not have.
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      TERM: xterm-256color
+      FBTODO_NO_AUTOSTART: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: install tmux and lsof (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux lsof
+
+      - name: install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: command -v tmux >/dev/null || brew install tmux
+
+      - name: what the runner has
+        run: |
+          python3 -V
+          tmux -V || true
+          python3 fbtodo doctor || true
+
+      - name: self-check
+        run: python3 fbtodo-selfcheck.py
+
+      - name: notify suite
+        run: bash notify/test-freebuff-notify.sh
