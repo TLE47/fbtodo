@@ -327,6 +327,37 @@ def pane_log(line: str) -> None:
     append_log(PANE_LOG_PATH, line)
 
 
+def pane_repaint(previous: list | None, frame: list, rows: int) -> str:
+    """The bytes that turn the last painted frame into this one, row by row.
+
+    A pane repaints on a tick even when nothing moved — its clock does — and clearing the screen
+    and writing the whole frame every time is a flash on every tick, in a pane that sits there
+    all day at 1Hz. So the repaint is a diff: each row that changed is addressed and rewritten in
+    place (`\\x1b[<row>;1H`, then erase the line, then the row), and an unchanged frame writes
+    NOTHING at all — no cursor move, no erase, not one byte.
+
+    A frame whose SHAPE changed is painted whole instead: the row count moves on a resize and on
+    the first paint, and rewriting rows one by one would leave the rows that are no longer spoken
+    for on the screen. `rows` is the pane's height: a frame that does not fill the pane keeps a
+    trailing newline, because a newline after a full one scrolls the top border — and the title
+    with it — off the screen. For the same reason the cursor is left on the row BELOW the frame
+    (the whole-frame paint gets there with its newline, a diff with one cursor move), which is
+    where the pane prints the line it says on the way out.
+    """
+    if previous is None or len(previous) != len(frame):
+        tail = "" if len(frame) >= rows else "\n"
+        return "\x1b[H\x1b[2J" + "\n".join(frame) + tail
+    out = "".join(
+        f"\x1b[{at};1H\x1b[2K{line}"
+        for at, (old, line) in enumerate(zip(previous, frame), start=1) if old != line
+    )
+    if not out:
+        return ""
+    if len(frame) < rows:
+        out += f"\x1b[{len(frame) + 1};1H"
+    return out
+
+
 def pane_rows() -> list[dict]:
     """Every pane, with what deciding about it needs: its id, its window, its shell."""
     fmt = "#{pane_id}\t#{window_id}\t#{pane_pid}\t#{pane_start_command}"
@@ -1431,8 +1462,8 @@ __all__ = [
     "tmux_run", "tmux_split_target", "SSH_SESSION_CMDS", "SSH_NON_SESSION_FLAGS",
     "NAS_CLOCK_SKEW_MS", "is_ssh_cmd", "nas_host_tokens", "ssh_session_candidates",
     "pick_ssh_pane", "nas_ssh_pane", "nas_pane_ids", "nas_place_panes", "nas_pane_open",
-    "nas_pane_command", "nas_pane_kill", "PANE_INSTANCE_RE", "PANE_WATCH_RE", "pane_off",
-    "append_log", "pane_log", "pane_rows", "local_pane_ids", "freebuff_pane_id",
+    "nas_pane_command", "nas_pane_kill", "PANE_INSTANCE_RE", "PANE_WATCH_RE",    "pane_off", "append_log", "pane_log", "pane_repaint", "pane_rows", "local_pane_ids",
+    "freebuff_pane_id",
     "session_windows", "instances_with_pane", "pane_rects", "placed_beside",
     "place_pane_beside", "load_pins", "window_key", "pin_for_window", "load_last", "save_last",
     "pin_value", "pane_layout", "source_note", "_SETTLED", "_LAST_SEEN", "resize_pane_to",

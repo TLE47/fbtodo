@@ -1237,6 +1237,7 @@ def cmd_pane(args) -> int:
     saw_instance = False
     last_sig = None
     last_draw = 0.0
+    last_frame = None
     tick = max(1.0, args.tick)
     stale_after_s = max(0.0, args.stale_after) * 60.0
     last_act = None
@@ -1260,11 +1261,17 @@ def cmd_pane(args) -> int:
         signal.signal(sig, restore)
 
     def draw(text: str) -> None:
-        # The frame is built to fill the pane exactly; a trailing newline on a full
-        # frame scrolls the top border off the screen on every single repaint.
+        # Row by row against the last paint (see `pane_repaint`): the clock moves every tick and
+        # only its own row changes, so a full clear-and-paint would flash the whole pane to move
+        # one line — and would write kilobytes a second to move it.
+        nonlocal last_frame
+        frame = text.splitlines()
         rows = _shutil.get_terminal_size(fallback=(80, 24)).lines
-        tail = "" if len(text.splitlines()) >= rows else "\n"
-        sys.stdout.write("\x1b[H\x1b[2J" + text + tail)
+        out = pane_repaint(last_frame, frame, rows)
+        last_frame = frame
+        if not out:
+            return
+        sys.stdout.write(out)
         sys.stdout.flush()
 
     try:
