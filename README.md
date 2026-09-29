@@ -1,10 +1,12 @@
-# fbtodo — watch a coding agent's todo list, live, in a tmux pane
+# fbtodo
 
-`fbtodo` renders the todo list a [Freebuff](https://freebuff.com) session is working
-through — the `write_todos` calls the agent makes — as a small framed pane that sits
-**underneath the session it belongs to**, refreshing as the agent works. It also times each
-step, estimates what is left, and can push to your phone when a session finishes, stalls,
-asks you a question, or loses its pane.
+**Watch your coding agent work — its checklist, live, in a pane under the session.**
+
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org)
+[![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#requirements)
+[![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#requirements)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Tests: self-check](https://img.shields.io/badge/tests-self--check%20%2B%20notify%20suite-blueviolet)](#development)
 
 ```
 ┌ FBTODO ────────────────────────────── 4/7 ─·····──┐
@@ -22,63 +24,115 @@ asks you a question, or loses its pane.
 └───────────────────────────────────────────────────┘
 ```
 
-Everything is one Python file with no third-party dependencies. Three stores, four
-watches, a pane, and a lot of care about what "the clock" means.
+[fbtodo](.) mirrors the todo list a [Freebuff](https://freebuff.com) session is working
+through — the very list the agent keeps for itself — and draws it in a small framed pane
+**directly underneath the session that owns it**, refreshing while the agent works. It
+times each step from the moment the step actually starts, estimates what is left, and can
+ring your phone when a session finishes, stalls, stops on a question, or loses its pane.
+
+Quick links: [What it does](#what-it-does) · [Install](#install-60-seconds) ·
+[Commands](#everyday-commands) · [Settings](#settings) · [FAQ](#faq) ·
+[Ideas & roadmap](#ideas--roadmap)
 
 ---
 
-## Contents
+## What it does
 
-- [Install](#install)
-- [Quick start](#quick-start)
-- [How it works](#how-it-works)
-  - [The three stores](#the-three-stores)
-  - [Which store gets read](#which-store-gets-read)
-  - [The watcher](#the-watcher)
-  - [The pane, and where it goes](#the-pane-and-where-it-goes)
-  - [Pins, remembered layout, and `why`](#pins-remembered-layout-and-why)
-  - [What the pane draws](#what-the-pane-draws)
-  - [Clocks, estimates, ETA](#clocks-estimates-eta)
-  - [The goal heading](#the-goal-heading)
-  - [Ending a turn: the bell](#ending-a-turn-the-bell)
-  - [The four watches](#the-four-watches)
-  - [The remote (`nas`) source](#the-remote-nas-source)
-  - [Retention](#retention)
-- [Configuration](#configuration)
-- [Exit codes](#exit-codes)
-- [Notification kit](#notification-kit)
-- [Development](#development)
-- [Internals](docs/INTERNALS.md) — the state file, the remote probe protocol, the notifier contracts
-- [Troubleshooting](#troubleshooting)
-- [Limits](#limits)
+If you have ever watched an agent chew through a long task, you know the feeling: the
+terminal scrolls, you have no idea whether it is two minutes or twenty from done, and you
+refresh the window just to feel something. The agent *does* keep a plan — it writes a todo
+list and ticks items off — but that list lives in a transcript file, not on your screen.
+
+fbtodo puts that list where you are already looking.
+
+| You want to know | fbtodo shows |
+|---|---|
+| What is it doing right now? | the list, with `✓` done, `▸` running, `·` still to come |
+| How long has this step taken? | a clock per step, right-aligned so the numbers line up |
+| How much is left? | `EST REM` and an `ETA`, learned from this project's own history |
+| Is it stuck? | `[STUCK?]` once a step runs past twice its estimate |
+| Is it finished, or just thinking? | the bell rings only when the list is done **and** the turn has ended |
+| Is it waiting on me? | an `ask` watch that pushes the question to your phone |
+
+Everything is **one self-contained Python file** with no third-party dependencies — three
+stores, four watches, a pane, and a lot of care about what "the clock" means.
 
 ---
 
-## Install
+## Install (60 seconds)
 
-The whole tool is two files (`fbtodo` and `fbtodo-selfcheck.py`) plus an optional
-notification kit in `notify/`.
+### Requirements
+
+- **Python 3.9+** — already on macOS and most Linux boxes; no `pip install` of anything.
+- **tmux** — only for the pane itself. `snap`, `json` and `bar` work fine without it.
+- **macOS or Linux**, and Freebuff running somewhere to watch.
 
 ```sh
-git clone https://github.com/<you>/fbtodo ~/Projects/fbtodo
-ln -s ~/Projects/fbtodo/fbtodo ~/.local/bin/fbtodo     # or anywhere on $PATH
+# tmux, if you do not have it yet
+brew install tmux            # macOS
+sudo apt install tmux        # Debian / Ubuntu
+```
+
+### Install it
+
+```sh
+git clone https://github.com/TLE47/fbtodo ~/Projects/fbtodo
+mkdir -p ~/.local/bin
+ln -s ~/Projects/fbtodo/fbtodo ~/.local/bin/fbtodo
 chmod +x ~/Projects/fbtodo/fbtodo
 ```
 
-Requirements:
+Make sure `~/.local/bin` is on your `PATH` (add
+`export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` or `~/.bashrc` if it is not), then:
 
-- **Python 3.9+** (no packages — standard library only).
-- **tmux** for the pane itself. `snap`, `json` and `bar` work without it.
-- **Linux or macOS**, and a Freebuff CLI session to watch.
+```sh
+fbtodo -V          # prints the version — you are installed
+fbtodo snap        # one plain-text snapshot of the list (works with no tmux)
+```
 
-For the notification kit, see [notify/README.md](notify/README.md).
+### Use it
+
+The intended setup is *be in tmux*: the pane keeper opens a todo pane by itself for any
+local session that is in tmux and does not have one yet.
+
+```sh
+tmux new -s work           # 1. start a tmux session
+freebuff                   # 2. run your agent in it
+#                           3. a FBTODO pane appears underneath, on its own
+```
+
+If you would rather place it yourself, split the pane and bind it to *that* shell:
+
+```
+Ctrl-b "                   # split the current pane downwards
+fbtodo --instance-of $$    # the list for the agent running in this pane
+```
+
+`--instance-of` is how a wrapper — or you — attaches a pane to a specific session rather
+than to whatever is newest in the directory.
+
+<details>
+<summary><b>New to tmux? The four keys you need</b></summary>
+
+| Keys | What it does |
+|---|---|
+| `tmux new -s work` | start a named session |
+| `Ctrl-b "` | split the current pane, top and bottom |
+| `Ctrl-b %` | split the current pane, side by side |
+| `Ctrl-b` then arrow | move between panes |
+| `Ctrl-b d` | detach (everything keeps running) · `tmux a -t work` re-attaches |
+
+A pane is a rectangle inside a window; a window holds the panes; a session holds the
+windows. fbtodo cares about that hierarchy because "underneath the session" has to mean
+underneath the actual pane, not merely somewhere in the same window.
+</details>
 
 ---
 
-## Quick start
+## Everyday commands
 
 ```sh
-fbtodo                 # the live pane (default); starts the watcher, exits with the session
+fbtodo                 # the live pane (default) — starts the watcher, exits with the session
 fbtodo snap            # one snapshot, plain text
 fbtodo json            # one snapshot, clean JSON
 fbtodo bar             # "todos 3/5" — for a tmux status bar
@@ -89,157 +143,181 @@ fbtodo stop            # stop the watcher
 fbtodo prune           # enforce retention now
 ```
 
-Run `fbtodo -h` for the full flag list and the same prose you are reading here, or
-`fbtodo -V` for the version.
+| Command | What it is for |
+|---|---|
+| *(no argument)* | the live pane; also starts the watcher for you |
+| `snap` / `json` | the list as text or JSON — script it, or read it once |
+| `bar` | a `todos 3/5` string for your tmux status line (`FBTODO_NO_PANE=1` if you only want this) |
+| `status` | everything the tool thinks: which instance, which watcher, which state file, remembered pace |
+| `why` | the first thing to run when a pane is somewhere unexpected |
+| `pin` | force a pane's side or size, per window |
+| `daemon` / `pane-watch` | the two background processes, usually started for you (`-f` keeps one in the foreground) |
+| `stop` / `prune` | stop the watcher · enforce retention now |
 
-The normal way to use it is to **put it next to the session**:
+`fbtodo -h` prints the full flag list, `fbtodo -V` the version.
+Useful flags: `-s auto|cli|nas|desktop` (which store), `-i` (poll interval), `--tick`
+(how often the clock repaints), `--stale-after MIN`, `--goal-lines N`, `--once`.
+
+---
+
+## Make it yours
+
+### Theme it
+
+The palette is data, not code — layout never names a colour. Drop a
+`~/.config/fbtodo/theme.json` (or a `./.fbtodo-theme.json` for one project), or set the
+variables directly:
 
 ```sh
-tmux new-session -s work
-# … run the agent in this pane …
-# Ctrl-b "  → split below → run:  fbtodo --instance-of <the shell's pid>
+export FBTODO_ACCENT="#89b4fa"        # the title badge
+export FBTODO_GRADIENT_START="#89b4fa"  # progress bar, left
+export FBTODO_GRADIENT_END="#a6e3a1"    # progress bar, right
+export FBTODO_FAINT="#6c7086"         # the frame's own ink
+export FBTODO_MUTED="#9399b2"         # step durations, labels, the status strip
+export FBTODO_TRACK="#313244"         # the progress bar's empty cells
 ```
 
-Inside tmux, `fbtodo` with no arguments does exactly that. The pane keeper (below) will
-also open one for you for any local session that is in tmux and has no list, so the
-minimal setup is "be in tmux".
+Colours are 24-bit where the terminal takes them and the nearest 256-colour entry where it
+does not; `FBTODO_TRUECOLOR=0|1` forces the choice.
+
+### Size and placement
+
+```sh
+fbtodo pin --size 9                 # this window, both roles
+fbtodo pin --role nas --size 7      # this window, the remote pane only
+fbtodo pin --side h --size 30       # beside the session, 30 columns wide
+fbtodo pin --list                   # what is set, and where each half came from
+fbtodo pin --clear                  # drop it
+```
+
+Without a pin, the pane is **remembered, not argued with**: the keeper records the size you
+drag it to and opens the next one that way. `FBTODO_SPLIT` (`v` = below, `h` = beside) and
+`FBTODO_PANE_SIZE` (default `12`) set the fallback.
+
+### Turn parts off
+
+```sh
+export FBTODO_NO_PANE=1        # no panes at all (keep `fbtodo bar` in your status line)
+export FBTODO_GOAL_LINES=0     # hide the goal heading
+```
+
+---
+
+## Alerts on your phone
+
+`notify/` holds the little programs that make the alerts real — five watches, a `bell.sh`
+for the local chime, and a `phone.sh` that sends to **iMessage and/or
+[ntfy](https://ntfy.sh)**. They are optional: fbtodo runs fine without them and skips any
+that are missing.
+
+| Watch | Question it answers |
+|---|---|
+| finish | the list is complete **and** the turn ended — ring, and push to the phone |
+| ask | the agent is stopped on a question, waiting on you |
+| stall | the agent stopped without ending its turn and work remains |
+| pane | a session has no todo pane the keeper failed to put back |
+| drop | the session died rather than ending |
+
+Install by copying the directory into place and letting `phone.sh --init` generate the
+config:
+
+```sh
+mkdir -p ~/.config/freebuff-notify
+cp -R notify/* ~/.config/freebuff-notify/
+~/.config/freebuff-notify/phone.sh --init     # writes phone.conf (chmod 600) for you
+```
+
+See [notify/README.md](notify/README.md) for the transports, the topics and the tests.
 
 ---
 
 ## How it works
 
-### The three stores
+Enough to be useful, without the tour of every corner. The genuinely deep detail — the
+state-file contract, the remote probe wire format, the notifier contracts and the pane
+lifecycle — is in **[docs/INTERNALS.md](docs/INTERNALS.md)**.
+
+### Where the list comes from: three stores
 
 A coding agent's todo list is not a side channel — it is written to whatever transcript
-store the client keeps. Freebuff has three, and picking the wrong one is the usual reason
-a pane looks broken:
+store the client keeps. Freebuff has three, and picking the wrong one is the usual reason a
+pane looks broken:
 
 | Source | Store | Granularity |
 |---|---|---|
 | **cli** (`freebuff` in a terminal) | `~/.config/manicode/projects/<project>/chats/<ISO>/log.jsonl` | **live — mid-turn** |
-| **desktop** (the app) | `~/.config/freebuff-desktop/projects/<slug>/desktop-v2.db` (SQLite) | per turn, and only while the app runs |
-| **nas** (a session on another host, reached over ssh) | `<root>/<project>/chats/<ISO>/chat-messages.json` | per completed turn |
+| **desktop** (the app) | `~/.config/freebuff-desktop/projects/<slug>/desktop-v2.db` (SQLite) | per turn, while the app runs |
+| **nas** (a session on another host, over ssh) | `<root>/<project>/chats/<ISO>/chat-messages.json` | per completed turn |
 
-The CLI journal is the good one, because it is append-only and written *during* the turn:
-each record is a JSON line, and a `write_todos` call appears in it the moment the agent
-makes it. `fbtodo` tails that file, keeps every `write_todos` it has seen, and renders the
-newest one. A new list **replaces** the previous one wholesale — state is never merged —
-and when the session changes, the old list is dropped immediately instead of lingering.
+The CLI journal is the good one: append-only, written *during* the turn. Each record is a
+JSON line, and a `write_todos` call lands in it the moment the agent makes it. fbtodo tails
+that file, keeps every `write_todos` it has seen, and renders the newest. A new list
+**replaces** the old one wholesale — state is never merged — and when the session changes,
+the old list is dropped immediately instead of lingering.
 
-The Desktop store is read per *turn* from its SQLite database, so it is a photograph, not a
-live view; it is what makes an app-only workflow work at all.
+`--source auto` (the default) prefers a live CLI chat for the current directory. An explicit
+`-s cli|nas|desktop` is never answered from cached watcher state unless that state describes
+the same backend — a status bar asking for the remote list used to print the local one,
+which read as "the remote host has one too".
 
-### Which store gets read
+The instance to follow is found in this order:
 
-`--source auto` (the default) prefers a live CLI chat for the current directory. An
-explicit `-s cli|nas|desktop` is never answered from the cached watcher state unless that
-state describes the same backend — a status bar asking for the remote list used to print
-the local one, which read as "the remote host has one too".
-
-The instance to follow is found like this:
-
-1. `--instance-of PID` — the freebuff process launched by that shell (how a wrapper binds a
-   pane to *its* session rather than to whatever is newest in the directory).
+1. `--instance-of PID` — the agent process launched by that shell.
 2. `--watch-pid PID` — take this pid as the instance, outright.
-3. Otherwise the freebuff processes are enumerated (`ps`), a cwd match on the current
-   directory is preferred, and the **youngest** wins. A directory can host several
-   sessions, and "the one started here" is what a human means.
+3. Otherwise the agent processes are enumerated (`ps`), a cwd match on the current directory
+   is preferred, and the **youngest** wins. A directory can host several sessions, and "the
+   one started here" is what a human means.
 
-### The watcher
+### The two background processes
 
 A pane cannot watch itself, so the work is split:
 
 - **`fbtodo daemon`** follows one running instance: while it lives, the todo state is
   refreshed into `~/.freebuff/fbtodo-state.json`; when the process exits the daemon shuts
-  itself down and removes its lock (`fbtodo-daemon.pid`). It is started for you by anything
-  that needs it; `-f` keeps it in the foreground.
+  itself down and removes its lock (`fbtodo-daemon.pid`). Anything that needs it starts it
+  for you; `-f` keeps it in the foreground.
 - **`fbtodo pane-watch`** is the pane keeper: one process per tmux *server*, 3 s cadence. It
   opens a pane for every local session that is in tmux and has none, and exits when the last
   one goes. It has its own lock and log, because being kept out by the watcher's lock *was*
   the bug (a `-s nas` daemon holding `fbtodo-daemon.pid` left a killed local pane unopened).
 
-`fbtodo status` reports both, plus the state file, the scratch footprint, and the pace it
-has remembered for this project.
+`fbtodo status` reports both, plus the state file, the scratch footprint, and the pace it has
+remembered for this project.
 
-### The pane, and where it goes
+### Where the pane goes
 
 The rule is: **a list pane opens under the pane its session is drawn in.** That is where a
 glance looks for it. Two consequences, both learned the hard way:
 
 - The pane is split off the *pane* running the session, never off its *window*: given a
   window, tmux uses that window's **active** pane, which is not necessarily the one running
-  the agent. One remote ssh pane sharing a window with a session pane was enough to land a
-  fresh pane in the wrong column.
-- Every keeper pass re-derives the geometry (`tmux list-panes -a`) and `move-pane`s a
-  drifted pane back — *in place*, so the pane keeps its process, its scrollback and its step
-  clocks, and a step that is counting is not restarted.
+  the agent.
+- Every keeper pass re-derives the geometry (`tmux list-panes -a`) and `move-pane`s a drifted
+  pane back — *in place*, so the pane keeps its process, its scrollback and its step clocks,
+  and a step that is counting is not restarted.
 
-A pane that is in **another window** than its session is left alone on purpose: that is an
-arrangement the operator made. So is a pane that is wider than the session's (a full-width
-strip under two panes).
-
-For a remote session the anchor is the ssh the session runs in, found by matching the ssh
-login on the far host — see [the remote source](#the-remote-nas-source).
-
-Two knobs set the default geometry, used when there is no pin and nothing remembered:
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `FBTODO_SPLIT` | `v` | split direction: `v` opens the list **below**, `h` beside |
-| `FBTODO_PANE_SIZE` | `12` | lines (or columns) for a fresh pane |
-
-### Pins, remembered layout, and `why`
-
-Where a pane goes can be overruled **per window, per role**:
-
-```sh
-fbtodo pin --size 9                    # this window, both roles
-fbtodo pin --role nas --size 7         # this window, the remote pane only
-fbtodo pin --side h --size 30          # beside, 30 wide
-fbtodo pin --list                      # what is set, and where each half came from
-fbtodo pin --clear                     # drop it
-```
-
-A pin is keyed `<session>:<index>` (e.g. `main:2`) — the window you would *type*, not the
-`@71` id that a tmux restart takes with it — and stored in `~/.freebuff/fbtodo-pins.json`.
-A role is `local` (the pane beside a local session) or `nas` (the pane beside an ssh). One
-window can hold both, so one `{side, size}` cannot answer for both: a `local`/`nas` half
-outranks the window's shared half.
-
-A pane that has no pin is **remembered, not argued with**: the keeper records what it sees
-in `~/.freebuff/fbtodo-last.json`, and the next pane is opened at that size. Two deliberate
-limits — the remembered size is applied *once* (a standing instruction would make
-hand-resizing impossible) and it is only written after the same numbers have been seen
-twice, so a drag through intermediate sizes is not recorded as a choice.
-
-`fbtodo why` is the first thing to run when a pane is somewhere unexpected. It names the
-side and size in force **with the source that supplied each** (`pin (main:1 nas)`,
-`remembered`, `FBTODO_SPLIT/FBTODO_PANE_SIZE`, `default`), the pane it is placed against and
-what that anchor is, the geometry now, and whether it is actually placed. `--json` carries
-the same records plus the pins file, the remembered layout and the two knobs.
+A pane in **another window** than its session is left alone on purpose: that is an
+arrangement the operator made. So is a pane wider than the session's (a full-width strip
+under two panes). For a remote session the anchor is the ssh the session runs in.
 
 ### What the pane draws
 
-The colour pane is a frame with a status strip, and its palette is themeable. Layout never
-names a colour: the styles are resolved into roles (`accent`, `faint`, `muted`, `track`,
-gradient ends) and the drawing code asks for a role, so a theme is a data change.
+A frame with a status strip, in a themeable palette.
 
-- **Title** — `FBTODO` on an accent badge, drawn in reverse video so no background selector
-  is needed, with the `done/total` count on the right.
-- **Progress bar** — a gradient of `█` over a visible `░` track, with an eighth block for
-  the one cell at the boundary. Drawn in 24-bit colour where the terminal takes it and in
-  the nearest 256-colour entry where it does not, always as a **glyph in a foreground
-  colour** rather than a filled background cell.
-- **Steps** — `✓` done, `▸` running, `·` pending. A step's duration is right-aligned against
-  the frame's right wall, so the numbers form a column.
+- **Title** — `FBTODO` on an accent badge, in reverse video (so no background selector is
+  needed), with the `done/total` count on the right.
+- **Progress bar** — a gradient of `█` over a visible `░` track, with an eighth block for the
+  one cell at the boundary.
+- **Steps** — `✓` done, `▸` running, `·` pending; durations right-aligned against the frame's
+  right wall so the numbers form a column.
 - **Status strip** — badges the live state (`working 9m38s`, `waiting`, `done`) and spins
   while a step runs.
 - **`PATCH` / `ALERT` row** — when there is something to say: the last outcome of an optional
-  CLI-patch step and the last thing the phone was told. Both are read from a log the
-  producing step already writes, so neither costs a probe. Neither present renders as before.
+  CLI-patch step, and the last thing the phone was told. Both are read from a log the
+  producing step already writes, so neither costs a probe of its own.
 
-Everything about the **plain** renderer is deliberately untouched — it is the machine-readable
-path (`snap`, `json`, `bar`).
+The **plain** renderer is deliberately untouched — it is the machine-readable path, and the
+`PATCH`/`ALERT` row appears there too, but only when the state carries it.
 
 ### Clocks, estimates, ETA
 
@@ -252,8 +330,8 @@ Which is where most of the care in this tool has gone.
   the remote source, one ssh each); the *clock* repaints far more often (default every
   `--tick` 5 s, 1 s while a step is counting) so the seconds move even when nothing else does.
 - **Estimates** ride the same row as the duration: `~1m` for a pending step, `4m10s / ~3m`
-  for the active one. They come from this project's own history of completed steps (kept in
-  `~/.freebuff/fbtodo-tasks.json`), with the list's own pace as the fallback.
+  for the active one. They come from this project's own history of completed steps
+  (`~/.freebuff/fbtodo-tasks.json`), with the list's own pace as the fallback.
 - Past twice the estimate a step is marked `[STUCK?]` — a hint, not a verdict.
 - The bar carries `EST REM` and an `ETA`, and `fbtodo status` shows the remembered pace and
   where each step's number came from.
@@ -268,57 +346,42 @@ renderer) rather than repeating the request back at you.
 When a newer request has arrived since the list was written, a `now` line says so — a list
 can sit unchanged for hours while the session works on. A request that is a continuation
 ("continue", "keep going") is shown as a **nudge** instead: the one thing the operator is
-waiting to see is whether the agent rewrote its list.
-
-`--goal-lines N` (default 3, 1 in a narrow strip) sets how many lines the heading may take;
-`0` hides it.
+waiting to see is whether the agent rewrote its list. `--goal-lines N` (default 3, 1 in a
+narrow strip) sets how many lines the heading may take; `0` hides it.
 
 ### Ending a turn: the bell
 
 The journal records whether a turn **ended** (`shouldEndTurn`). A finished list is therefore
 two facts, not one: every step ticked *and* the turn over. Only then does something ring.
 The point is to distinguish "the agent is done" from "the agent is thinking", which a
-`done/total` count alone cannot.
+`done/total` count alone cannot. The remote build writes no `shouldEndTurn`, so a remote list
+can never claim its turn ended; the bell is a local-session feature.
 
-The remote build writes no `shouldEndTurn`, so a remote list can never claim its turn ended;
-the bell is a local-session feature.
+### The watches
 
-### The four watches
-
-Each of these is an **optional** script in `~/.config/freebuff-notify/`. `fbtodo` only times
-them and reads nothing back — the notifier owns the decision *and* the "already pushed"
-record, so nothing has to be kept in sync and a machine without the directory simply never
-asks. Each is skipped when its script is missing.
-
-| Watch | Script | Question it answers |
-|---|---|---|
-| finish | `todo-bell.py` | the list is complete and the turn ended — ring, and push to the phone |
-| ask | `ask-bell.py` | the agent is **stopped on a question** and waiting on you |
-| stall | `pause-bell.py` | the agent stopped *without* ending its turn and the list still has work (local only) |
-| pane | `pane-bell.py` | a session has no todo pane the keeper failed to put back, or there is no keeper at all |
-
-A fifth, `drop-bell.py`, is asked when a session **dies** rather than ending — the marker's
-pid is gone while the marker is still there, which is a different question from "did it
-finish".
+Each is an **optional** script in `~/.config/freebuff-notify/`. fbtodo only times them and
+reads nothing back — the notifier owns the decision *and* the "already pushed" record, so
+nothing has to be kept in sync and a machine without the directory simply never asks.
 
 The pane watch exists because every other failure here is quiet by construction: the keeper
-has no stderr anybody reads, and its log records a pane that came **back**, never one that
-did not. Ask it directly with
+has no stderr anybody reads, and its log records a pane that came **back**, never one that did
+not. Ask it directly with
 `pane-bell.py --print --keeper ~/.freebuff/fbtodo-pane-keeper.pid`.
 
 Cadences: `--notify-seconds` (15 s), `--ask-seconds` (3 s), `--pause-seconds` (30 s),
-`--pane-bell-seconds` (60 s). `0` switches any of them off.
+`--pane-bell-seconds` (60 s). `0` switches any of them off. A fifth script, `drop-bell.py`, is
+asked when a session **dies** rather than ending — a different question from "did it finish".
 
-### The remote (`nas`) source
+### Watching a session on another machine (`-s nas`)
 
-`-s nas` reads a session that is running on another host — typically a container on a NAS,
-reached over ssh — and follows **that host's** process rather than a local pid, so the pane
-lives exactly as long as the remote session does.
+`-s nas` reads a session running on another host — typically a container on a NAS, reached
+over ssh — and follows **that host's** process rather than a local pid, so the pane lives
+exactly as long as the remote session does.
 
-There is no built-in target. Set:
+There is no built-in target:
 
 ```sh
-export FBTODO_NAS=user@host                              # or --nas-host
+export FBTODO_NAS=user@host                               # or --nas-host
 export FBTODO_NAS_ROOT=/srv/app/state/manicode/projects   # or --nas-root
 export FBTODO_NAS_PROJECT=myproject                       # or --nas-project
 ```
@@ -337,25 +400,23 @@ Reading it is **one ssh round trip per poll**, and the probe is careful about co
 - The parse itself runs **on the remote host** (`python3` must be there): the conversation
   store is a few megabytes, and pulling it across per poll would be absurd.
 
-Two things are worth knowing about the remote build:
-
-- Its journal does **not** record tool inputs, so the only place a todo list exists over
-  there is the per-turn conversation store. That is why the remote source is turn-granular.
-- The remote build's patch/alert log paths have no default; set `FBTODO_NAS_PATCH_LOG` and
-  `FBTODO_NAS_ALERT_LOG` if you want that row.
+The remote build's journal does **not** record tool inputs, so the only place a todo list
+exists over there is the per-turn conversation store — which is why the remote source is
+turn-granular. Its patch/alert log paths have no default either; set `FBTODO_NAS_PATCH_LOG`
+and `FBTODO_NAS_ALERT_LOG` if you want that row.
 
 **The marker.** If you wrap your remote login in a shell function, have it write a marker to
-`$HOME/.fb-session` on the remote host:
+`$HOME/.fb-session` on the remote host — one line, three fields:
 
 ```
 <pid> <started> <dir>
 ```
 
-…one line, three fields: the pid of the session, when it started, and the directory it
-started in. `fbtodo` reads it as `1` (that session is live), `0` (the marker is stale) or
-`-` (no marker — the hook is not installed, and the process probe is used instead). The
-directory also names the project whose store gets read, which matters because the wrapper
-runs from all over the host. `--fb-marker PATH` points at a different path.
+…the pid of the session, when it started, and the directory it started in. fbtodo reads it as
+`1` (that session is live), `0` (the marker is stale) or `-` (no marker — the hook is not
+installed, and the process probe is used instead). The directory also names the project whose
+store gets read, which matters because the wrapper runs from all over the host.
+`--fb-marker PATH` points at a different path.
 
 A minimal wrapper, on the remote host's shell:
 
@@ -369,15 +430,18 @@ remote() {
 
 ### Retention
 
-Nothing grows without a cap. About hourly, and on demand with `fbtodo prune`, `fbtodo`
-enforces retention on its own records: **500 task records**, **7 days**, and **1 MiB** of
-daemon log. Override with `--max-records`, `--max-age-days`, `--log-cap-kb`.
+Nothing grows without a cap. About hourly, and on demand with `fbtodo prune`, fbtodo enforces
+retention on its own records: **500 task records**, **7 days**, and **1 MiB** of daemon log.
+Override with `--max-records`, `--max-age-days`, `--log-cap-kb`.
 
 ---
 
-## Configuration
+## Settings
 
 Precedence is the usual one: a command-line flag, then the environment, then a file.
+
+<details>
+<summary><b>Every environment variable</b></summary>
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -398,54 +462,13 @@ Precedence is the usual one: a command-line flag, then the environment, then a f
 | `FBTODO_TRUECOLOR` | auto | force 24-bit colour on or off |
 | `FBTODO_TMUX` | `tmux` | the tmux binary/args to drive (a test knob) |
 
+</details>
+
 Theming is a file, not a flag: `~/.config/fbtodo/theme.json`, overridden by
 `./.fbtodo-theme.json` in the working directory, overridden by the environment above.
 
 Exit codes: `0` ok · `2` usage (including polling without a TTY) · `66` no instance or no
 store · `75` the watcher failed to start.
-
----
-
-## Notification kit
-
-`notify/` holds the little programs that make the phone alerts real: the five watches, a
-`bell.sh` for the local chime, a `phone.sh` that sends to iMessage and/or [ntfy](https://ntfy.sh),
-and their test suite. They are **optional** — `fbtodo` runs fine without them, and skips any
-that are missing. See [notify/README.md](notify/README.md).
-
----
-
-## Development
-
-The self-check drives the real thing: it runs against a throwaway `FBTODO_HOME`, spawns fake
-instances (plain `sleep` processes) whose death must stop the watcher, and starts private
-tmux servers so it never touches yours.
-
-```sh
-python3 fbtodo-selfcheck.py              # all of it, ~90-160 s
-python3 fbtodo-selfcheck.py --list       # the phases, with line numbers and check counts
-python3 fbtodo-selfcheck.py --only nas-live
-python3 fbtodo-selfcheck.py --only 1 --only "nas pane"
-FBTODO_SELFCHECK_TIME=1 python3 fbtodo-selfcheck.py   # per-check cost
-bash notify/test-freebuff-notify.sh      # the notification kit's own suite
-```
-
-`--only` re-runs the file with the phases you did not name cut out (`pass`, line numbers
-preserved), keeping the cheap body every phase depends on — fixture setup, the unit checks.
-That is the way to run one phase in ~20 s instead of the whole thing.
-
-[`docs/INTERNALS.md`](docs/INTERNALS.md) has the state-file contract, the wire format of the
-remote probe, the notifier contracts and the pane lifecycle.
-
-Two habits the suite encodes, because both have bitten:
-
-- **Mute the notifiers.** Some phases start a *real* watcher, and a real watcher reading a
-  fixture's dead-looking session pushes "freebuff dropped" to your phone.
-- **Private tmux servers.** Every tmux call names a socket (`FBTODO_TMUX`), so a test can
-  never move a pane in the server you are sitting in.
-
-After changing the code you also have to restart anything already running: the pane and the
-watcher hold the old code until they exit.
 
 ---
 
@@ -465,12 +488,70 @@ watcher hold the old code until they exit.
 
 ---
 
+## FAQ
+
+**Do I need Freebuff?**
+Yes, today — it reads Freebuff's transcript stores. The same idea generalises to any agent
+that publishes a checklist, which is what [the roadmap](#ideas--roadmap) is for.
+
+**Do I need tmux?**
+Only for the pane. `fbtodo snap`, `json` and `bar` are plain programs that work anywhere —
+`bar` in a status line is a nice tmux-free setup.
+
+**Does this send my code or my data anywhere?**
+No. It reads local transcript files. The only outbound traffic is the notification kit, and
+only if you install it.
+
+**Will it slow the agent down?**
+No — it reads files that are being written anyway. The remote source is the one place where
+cost is real, and it is deliberately one multiplexed ssh round trip per poll.
+
+**Why does the pane show nothing?**
+The agent has not written a todo list yet, or the pane is bound to the wrong session. Run
+`fbtodo status`, then `fbtodo why`.
+
+**Can I use it for several sessions at once?**
+Yes — one pane per session, each bound to its own. The keeper manages them all.
+
+**Does it work on Windows?**
+Not today; tmux is the missing piece. WSL works if you install it there.
+
+**What if I just want a number in my status bar?**
+`fbtodo bar` prints `todos 3/5`. Set `FBTODO_NO_PANE=1` so nothing else opens.
+
+---
+
+## Ideas & roadmap
+
+Not built yet — this is the list of things that would make fbtodo appeal to a lot more
+people, roughly in the order I would build them. Ideas, arguments and pull requests are all
+welcome; each item below is scoped so one person could land it.
+
+| Idea | Why it would matter |
+|---|---|
+| **`brew install fbtodo` + `uvx fbtodo` + a one-line installer** | Removing "clone and symlink" is the single biggest adoption lever. |
+| **`fbtodo board` — all live sessions in one pane** | People run two or three agents at once. One pane showing every session, its list and its clock beats switching windows. |
+| **`fbtodo serve` — a read-only web mirror** | Watch from your phone or another machine, no ssh. Pairs with the notify kit you already have. |
+| **Theme presets and `fbtodo theme`** (`catppuccin`, `gruvbox`, `nord`, `dracula`, `--preview`) | Theming is already data — shipping a gallery makes the pane look good in seconds. |
+| **More transports: Slack, Discord, Telegram, Pushover, native macOS notifications** | iMessage + ntfy covers two platforms; a room of teammates is one webhook away. |
+| **`fbtodo stats` — history and retro** | Per-project step times, slowest step types, a "where did the session actually spend its time" summary. This is the feature that makes people keep it installed. |
+| **Generic sources: a JSON file, an MCP tool, another agent's todo format** | Drops the Freebuff requirement and makes the tool useful to everyone. |
+| **zellij (and other multiplexers), plus a no-multiplexer fallback** | Same pane, more terminals — and somewhere to land for people who do not want tmux. |
+| **Step-change hooks (`--on-step`, `--on-complete`)** | Lets people wire in their own scripts instead of asking for a transport. |
+| **Accessibility modes: ASCII-only, no-emoji, high contrast** | `[x]`/`[>]`/`[ ]` and a plain palette are easy wins for terminals and screen readers. |
+
+Good first issues, if you want something small: a `--no-emoji` renderer, a `zellij` probe
+next to the tmux one, a new theme file, or one more transport in the notify kit (each has
+tests to copy). The self-check below is the contract — a change is done when it still passes.
+
+---
+
 ## Limits
 
 - **The CLI journal is the only live source.** The Desktop store is per turn; the remote
   store is per turn and needs a parse on the far host.
-- **A turn is the unit of "ended".** A long turn with a finished list rings nothing until
-  the turn actually closes.
+- **A turn is the unit of "ended".** A long turn with a finished list rings nothing until the
+  turn actually closes.
 - **The pane needs tmux.** There is no terminal-UI fallback; `snap`/`json`/`bar` are the
   non-tmux interface.
 - **The notification kit is macOS-leaning.** The chime uses macOS system sounds and the
@@ -478,6 +559,37 @@ watcher hold the old code until they exit.
 - **Not included:** the shell wrapper that opens the pane on launch, the remote launch hook,
   and the CLI-patch step whose log the `PATCH` row reads. Each is glue around this tool —
   their contracts are documented above, so you can write your own or ignore them.
+
+---
+
+## Development
+
+The self-check drives the real thing: it runs against a throwaway `FBTODO_HOME`, spawns fake
+instances (plain `sleep` processes) whose death must stop the watcher, and starts private tmux
+servers so it never touches yours.
+
+```sh
+python3 fbtodo-selfcheck.py              # all of it, ~90-160 s
+python3 fbtodo-selfcheck.py --list       # the phases, with line numbers and check counts
+python3 fbtodo-selfcheck.py --only nas-live
+python3 fbtodo-selfcheck.py --only 1 --only "nas pane"
+FBTODO_SELFCHECK_TIME=1 python3 fbtodo-selfcheck.py   # per-check cost
+bash notify/test-freebuff-notify.sh      # the notification kit's own suite
+```
+
+`--only` re-runs the file with the phases you did not name cut out (`pass`, line numbers
+preserved), keeping the cheap body every phase depends on — fixture setup, the unit checks.
+That is the way to run one phase in ~20 s instead of the whole thing.
+
+Two habits the suite encodes, because both have bitten:
+
+- **Mute the notifiers.** Some phases start a *real* watcher, and a real watcher reading a
+  fixture's dead-looking session pushes "freebuff dropped" to your phone.
+- **Private tmux servers.** Every tmux call names a socket (`FBTODO_TMUX`), so a test can
+  never move a pane in the server you are sitting in.
+
+After changing the code you also have to restart anything already running: the pane and the
+watcher hold the old code until they exit.
 
 ## License
 
