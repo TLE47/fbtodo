@@ -970,6 +970,50 @@ try:
     assert "Deploy the app" in hist_out and "list pace" in hist_out, hist_out
     say("status: the remembered pace and each step's estimate are shown: ok")
 
+    # ---- the size memory is reported for what the LADDER can read of it, not for what is
+    #      kept: a bucket under `SHAPE_MIN_BUCKET` is never looked up, so showing it beside the
+    #      readable ones would read as evidence that is in use. Its own FBTODO_HOME.
+    sizes_home = os.path.join(TEST_HOME, "sizes-home")
+    os.makedirs(sizes_home, mode=0o700, exist_ok=True)
+    module.atomic_write_json(
+        os.path.join(sizes_home, "fbtodo-tasks.json"),
+        {
+            "schema": module.TASKLOG_SCHEMA, "session": "S",
+            "tasks": {
+                # one `calls2` size (4-7 calls), which the rung may never read...
+                module.task_key("S", "small a"): {
+                    "started_ms": now_ms - 300_000, "done_ms": now_ms - 60_000,
+                    "shape": {"edited": 4},
+                },
+                # ...and two `calls4` ones (16-31), both 4m, which it may
+                module.task_key("S", "big a"): {
+                    "started_ms": now_ms - 300_000, "done_ms": now_ms - 60_000,
+                    "shape": {"edited": 16},
+                },
+                module.task_key("S", "big b"): {
+                    "started_ms": now_ms - 300_000, "done_ms": now_ms - 60_000,
+                    "shape": {"edited": 17},
+                },
+            },
+        },
+    )
+    module.atomic_write_json(
+        os.path.join(sizes_home, "fbtodo-state.json"),
+        {"backend": "cli", "session": "S", "tool_version": module.VERSION,
+         "heartbeat_ms": now_ms, "list_version": 1,
+         "todos": [{"task": "Run the tests", "completed": False}]},
+    )
+    sizes_out = STRIP(
+        subprocess.run(
+            [sys.executable, FB, "status"], capture_output=True, text=True, cwd=CWD,
+            env=dict(env, FBTODO_HOME=sizes_home), timeout=30,
+        ).stdout
+    )
+    assert "remembered sizes  : 2 kept — calls4 ~4m (n=2)" in sizes_out, sizes_out
+    assert "1 not read yet (1 under the calls4 floor)" in sizes_out, sizes_out
+    assert "calls2" not in sizes_out.split("remembered sizes")[1].split("\n")[0], sizes_out
+    say("status: a size the rung may not read is counted, not shown as evidence: ok")
+
     # ---- the memory is PER MODEL. Measured 2026-09-26: the same step on
     #      `deepseek/deepseek-v4-flash` and on `stealth/space-bunny-alpha` differed by more
     #      than the whole estimate, so a remembered span from one must not project the
@@ -1036,13 +1080,38 @@ try:
     # ---- the ladder: the size memory, then the list's pace — and a size may only answer
     #      once SHAPE_MIN_SAMPLES steps of that size stand behind it. The `own wording` rung
     #      is gone: it fired 0 times in 170 replayed steps.
-    assert module.task_estimate_ms("anything", 600_000, {"calls2": {"med": 30_000, "n": 2}},
-                                   "calls2") == 30_000
-    assert module.task_estimate_ms("anything", 600_000, {"calls2": {"med": 30_000, "n": 1}},
-                                   "calls2") == 600_000   # one sample: not yet
-    assert module.task_estimate_ms("anything", 600_000, {}, "calls2") == 600_000
+    assert module.task_estimate_ms("anything", 600_000, {"calls4": {"med": 30_000, "n": 2}},
+                                   "calls4") == 30_000
+    assert module.task_estimate_ms("anything", 600_000, {"calls4": {"med": 30_000, "n": 1}},
+                                   "calls4") == 600_000   # one sample: not yet
+    assert module.task_estimate_ms("anything", 600_000, {}, "calls4") == 600_000
     assert module.task_estimate_ms("anything", 600_000, {}, "") == 600_000
-    say("estimates: the size only answers behind a same-sized step: ok")
+    # ---- ...and a RUNNING step below the floor is not sized at all, however many samples that
+    #      bucket holds: a partial tally names a smaller step than the one it is going to be, so
+    #      the memory for `calls3` describes the steps that STOPPED at 8-15 calls (see the
+    #      constant). This is the whole reason the ladder reads through `sized_entry`.
+    assert module.SHAPE_MIN_BUCKET == 4
+    assert module.sized_entry({"calls3": {"med": 30_000, "n": 9}}, "calls3") is None
+    assert module.sized_entry({"calls4": {"med": 30_000, "n": 2}}, "calls4") == {
+        "med": 30_000, "n": 2}
+    assert module.sized_entry({"calls8": {"med": 30_000, "n": 9}}, "calls8") == {
+        "med": 30_000, "n": 9}
+    assert module.sized_entry({"calls4": {"med": 30_000, "n": 1}}, "calls4") is None
+    assert module.sized_entry(None, "calls4") is None and module.sized_entry({}, "") is None
+    # a bucket name that is not one of ours is no size either, rather than a crash
+    for junk in ("calls", "callsX", "edited4", "calls-1", "calls02"):
+        assert module.sized_entry({"calls4": {"med": 30_000, "n": 2}}, junk) is None, junk
+    assert module.task_estimate_ms("anything", 600_000, {"calls3": {"med": 30_000, "n": 9}},
+                                   "calls3") == 600_000
+    assert module.task_estimate_ms("anything", 600_000, {"calls3": {"med": 30_000, "n": 9}},
+                                   "calls4") == 600_000   # a size nobody has seen yet
+    # the memory still RECORDS every bucket: the floor is on the lookup, not on what is kept,
+    # so the evidence for moving the floor stays in the log
+    assert module.shape_history_from_log({
+        module.task_key("S", "small"): {"started_ms": 1, "done_ms": 20_001,
+                                         "model": "m", "shape": {"edited": 2}},
+    }, 60_000, "m") == {"calls1": {"med": 20_000, "n": 1}}
+    say("estimates: the size answers only for a step big enough, and only behind one: ok")
 
     # ---- a WAITING step has made no calls, so it has no size — but it does have its
     #      wording, and its kind of work is a real predictor. Measured 2026-09-29 over the
@@ -1062,8 +1131,13 @@ try:
     assert module.pick_estimate("Run the tests", {}, "", 480_000, cm) == (240_000, "blend")
     # a size that IS known still wins: the blend is for rows with no calls yet
     assert module.pick_estimate(
-        "Run the tests", {"calls2": {"med": 90_000, "n": 2}}, "calls2", 480_000, cm
+        "Run the tests", {"calls4": {"med": 90_000, "n": 2}}, "calls4", 480_000, cm
     ) == (90_000, "shape")
+    # ...but a bucket below the floor hands the number to the blend even when it is full of
+    # samples: the floor outranks the memory, not the other way round
+    assert module.pick_estimate(
+        "Run the tests", {"calls2": {"med": 90_000, "n": 9}}, "calls2", 480_000, cm
+    ) == (240_000, "blend")
     # no call memory (a fresh log): nothing to blend, and the pace stands alone
     assert module.pick_estimate("Run the tests", {}, "", 480_000, {}) == (None, "pace")
     assert module.task_estimate_ms("Run the tests", 480_000, {}, "", {}) == 480_000
@@ -2325,38 +2399,43 @@ try:
     # calls it already made were still made
     k4 = mod.track_tasks(dict(H, todos=hseq(True, True, False)), now_ms=t0 + 31_000)
     assert k4["task_times"]["h-three"]["shape"] == {"edited": 1}, k4["task_times"]
-    # a step the pane can project from what it is DOING: four and five calls are the same
-    # SIZE (`calls2`), so two such steps at 10s and 30s set that size's number at 20s —
+    # a step the pane can project from what it is DOING: sixteen and seventeen calls are the
+    # same SIZE (`calls4`), so two such steps at 10s and 30s set that size's number at 20s —
     # where the list's own pace says 4m
     shapes = mod.shape_history_from_log({
         mod.task_key("H", "x"): {"started_ms": t0, "done_ms": t0 + 10_000,
-                                 "model": "m/h", "shape": {"edited": 4}},
+                                 "model": "m/h", "shape": {"edited": 16}},
         mod.task_key("H", "y"): {"started_ms": t0, "done_ms": t0 + 30_000,
-                                 "model": "m/h", "shape": {"edited": 5}},
+                                 "model": "m/h", "shape": {"edited": 17}},
     }, t0 + 60_000, "m/h")
-    assert shapes == {"calls2": {"med": 20_000, "n": 2, "lo": 10_000, "hi": 30_000}}, shapes
-    own = {"h-three": {"started_ms": t0, "done_ms": None, "shape": {"edited": 4}}}
+    assert shapes == {"calls4": {"med": 20_000, "n": 2, "lo": 10_000, "hi": 30_000}}, shapes
+    own = {"h-three": {"started_ms": t0, "done_ms": None, "shape": {"edited": 16}}}
     assert mod.estimate_for(own, "h-three", 240_000, shapes) == 20_000
     # one step of that size is not evidence yet, and neither is a size nobody has seen
-    assert mod.estimate_for(own, "h-three", 240_000, {"calls2": {"med": 5_000, "n": 1}}) \
+    assert mod.estimate_for(own, "h-three", 240_000, {"calls4": {"med": 5_000, "n": 1}}) \
         == 240_000
     assert mod.estimate_for({}, "nothing", 240_000, shapes) == 240_000
+    # ...and the same step while it is still small is priced at the pace, not at the memory
+    # of the steps that stopped that small
+    young = {"h-three": {"started_ms": t0, "done_ms": None, "shape": {"edited": 4}}}
+    assert mod.estimate_for(young, "h-three", 240_000,
+                            {"calls2": {"med": 20_000, "n": 2}}) == 240_000
 
     # ---- the estimate the pane is SHOWING is stamped on the step in flight, so that when
     #      that step closes its projection and its outcome are a matched pair in the log.
     #      Stamped from the same ladder the renderers use, and asserted against that same
     #      call: a stamp that drifts from what the pane showed would measure nothing.
     E = {"session": "E", "model": "m/e"}
-    # two remembered `calls2` steps for this model, written into the log the watcher reads,
+    # two remembered `calls4` steps for this model, written into the log the watcher reads,
     # so the stamp below is taken through the whole live path and not from a local fixture
     e_log = mod.load_tasklog()
     for n, span in enumerate((10_000, 30_000)):
         e_log["tasks"][mod.task_key("SEED", f"seed {n}")] = {
-            "started_ms": t0, "done_ms": t0 + span, "model": "m/e", "shape": {"edited": 4},
+            "started_ms": t0, "done_ms": t0 + span, "model": "m/e", "shape": {"edited": 16},
         }
     mod.atomic_write_json(mod.TASKS_PATH, e_log)
     e_state = mod.track_tasks(
-        dict(E, todos=[{"task": "e-one", "completed": False}], **hturn({"edited": 5}, t0)),
+        dict(E, todos=[{"task": "e-one", "completed": False}], **hturn({"edited": 17}, t0)),
         now_ms=t0 + 300_000)
     e_rec = mod.load_tasklog()["tasks"][mod.task_key("E", "e-one")]
     e_pace = mod.step_pace_ms(e_state["task_times"], e_state["todos"], t0 + 300_000,
@@ -2365,13 +2444,13 @@ try:
         e_state["task_times"], "e-one", e_pace,
         e_state["task_shapes"]) == 20_000, e_rec
     # ...and the source is named, so the error report knows which rung of the ladder missed:
-    # two remembered `calls2` steps at 10s and 30s stand behind this one
+    # two remembered `calls4` steps at 10s and 30s stand behind this one
     assert e_rec["est_src"] == "shape", e_rec
     # ...and the first-poll ledger rode along on the same record, with the rungs it saw then
     assert isinstance(e_rec.get("fc"), dict), e_rec
     assert e_rec["fc"].get("pace") and e_rec["fc"].get("v") == mod.VERSION, e_rec["fc"]
     assert mod.pick_estimate("anything", {}, "") == (None, "pace")
-    assert mod.pick_estimate("e-one", shapes, "calls2") == (20_000, "shape")
+    assert mod.pick_estimate("e-one", shapes, "calls4") == (20_000, "shape")
     # the retired `own` rung is never a source any more: only size, blend and pace remain
     assert mod.pick_estimate("e-one", shapes, "calls9") == (None, "pace")
 

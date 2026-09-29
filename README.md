@@ -651,7 +651,13 @@ Which is where most of the care in this tool has gone.
   for the active one. The number walks a ladder of evidence: what steps of the same **size**
   took — the calls a step has made so far, log-binned (`calls2` is 4-7 calls) — else what
   steps of the same **kind** took, read from the wording (a `run`-ish step's usual number of
-  calls times what a call costs), blended half-and-half with the list's own pace. That blend
+  calls times what a call costs), blended half-and-half with the list's own pace. The size
+  rung only speaks once the step has made **16 calls** (`calls4`): the memory is built from
+  finished steps' *full* tallies and read with a *running* one, so a smaller running tally
+  names the steps that stopped that small — at the first call the rung was off by a median
+  14× and lost to the pace on 83% of steps. Past 16 calls it is off by a median 2.0× against
+  the pace's 2.5× and wins on 79% of the steps it fires on, so a step still under the floor is
+  priced by the blend or the pace instead. That blend
   is a tail-smoother rather than a clear win — measured on your own replay it is a coin flip
   on the typical step and only plainly better on the worst ones — so `FBTODO_BLEND_WEIGHT`
   turns it down if you would rather have the pace alone. All of it

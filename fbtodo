@@ -449,6 +449,21 @@ HISTORY_MAX_AGE_DAYS = MAX_TASK_AGE_DAYS
 # buckets, so this cap never binds it — no bucket is ever evicted for being old.
 HISTORY_MAX_ENTRIES = 400
 SHAPE_MIN_SAMPLES = 2    # remembered steps a size needs before it may set anyone's number
+# The size memory is keyed by FINISHED steps' full tallies but looked up with a RUNNING step's
+# partial one, and a partial tally is a smaller step: at its first call a step sits a median of
+# 3 buckets below the one it will end in, and it reaches its final bucket only 71% of the way
+# through its own clock (measured 2026-09-30 over the 171 ticked steps whose journals record a
+# per-call trail). So the lookup is not asking "how long does a step this small take" — it is
+# asking "how long did the steps that stopped this small take", which is a different and much
+# smaller population. Asked at the first call the rung misses by a median 14.1x and beats the
+# list's pace on 17% of steps; at 25% of the clock, 3.3x and 42%; only past half the clock does
+# it draw level. A floor at `calls4` (16 calls so far) is where the question starts to have an
+# answer: the number it sets is then a median 1.96x / 3.38x mean off against the pace's 2.45x /
+# 4.39x, beating that same pace on 79% of the steps it fires on, and it scores better in 100%
+# of session bootstraps (2000 resamples over 14 sessions) where every floor below it loses
+# outright (2, 4) or merely ties (8, 12). Below the floor the rung stands aside and the blend or
+# the pace answers — the pace is the floor of the ladder, so standing aside costs nothing.
+SHAPE_MIN_BUCKET = 4     # `calls4` = 16 calls: the youngest tally a running step may be sized at
 SPREAD_MIN_SAMPLES = 2   # measured steps needed before a spread may be claimed at all
 SPREAD_MIN_RATIO = 3.0   # hi/lo at which one number stops being the honest form
 # A span shorter than this is a list flip, not work: the agent ticked a step and the next
@@ -4132,6 +4147,32 @@ def step_shape_bucket(times: dict, task) -> str:
     return shape_of(((times or {}).get(str(task)) or {}).get("shape"))
 
 
+def bucket_ordinal(bucket: str) -> int | None:
+    """The log2 call bucket's ordinal (`calls4` = 16-31 calls -> 4), or None if not a bucket."""
+    name = str(bucket or "")
+    if not name.startswith("calls"):
+        return None
+    try:
+        return int(name[len("calls"):])
+    except ValueError:
+        return None
+
+
+def sized_entry(shapes: dict | None, bucket: str) -> dict | None:
+    """The size memory's entry for `bucket`, or None while that step is too young to have one.
+
+    The one place the sample gate and the `SHAPE_MIN_BUCKET` floor are applied, so no caller
+    can look a size up on its own terms and drift from the ladder `pick_estimate` walks.
+    """
+    ordinal = bucket_ordinal(bucket)
+    if ordinal is None or ordinal < SHAPE_MIN_BUCKET:
+        return None
+    entry = (shapes or {}).get(str(bucket))
+    if isinstance(entry, dict) and int(entry.get("n") or 0) >= SHAPE_MIN_SAMPLES:
+        return entry
+    return None
+
+
 # In plain words: what a WAITING step is probably going to be. It has made no calls, so it
 # has no size and the size memory cannot price it — but it does have its wording. Measured
 # 2026-09-29 over the 170 ticked steps recovered from the CLI journals, a keyword class of
@@ -4340,6 +4381,10 @@ def pick_estimate(
 ) -> tuple[int | None, str]:
     """(value or None, source) — the size memory, then the label blend, then the pace.
 
+    The size rung answers only for a step that has shown `SHAPE_MIN_BUCKET` worth of size, so
+    `bucket` being non-empty is not enough to fire it; below that floor the blend or the pace
+    carries the number (see the constant for why the floor exists at all).
+
     There is deliberately no `own wording` rung any more. It was the first rung for a long
     time and, measured 2026-09-29, it never once fired: replayed over the 258 steps recovered
     from the CLI journals, 0 of 170 ticked steps met their own wording in another session
@@ -4349,8 +4394,8 @@ def pick_estimate(
     What replaced it is the other direction: not "has this step run before", but "what kind
     of step is this" — which is the only question a row that has not STARTED can answer.
     """
-    entry = (shapes or {}).get(bucket) if bucket else None
-    if isinstance(entry, dict) and int(entry.get("n") or 0) >= SHAPE_MIN_SAMPLES:
+    entry = sized_entry(shapes, bucket)
+    if entry:
         seen = hist_med(entry)
         if seen:
             return min(seen, EST_CAP_MS), "shape"
@@ -4373,7 +4418,9 @@ def task_estimate_ms(
     `shape_of`) — so a step already running, whose calls are being counted as it works, is
     projected from steps of the same size rather than from the average of whatever this list
     happens to contain. A size is only allowed to answer once `SHAPE_MIN_SAMPLES` remembered
-    steps of that size stand behind it, so one coincidence never overrides the list's pace.
+    steps of that size stand behind it, so one coincidence never overrides the list's pace —
+    and only once the step's own tally has passed `SHAPE_MIN_BUCKET`, because until then its
+    bucket names a smaller step than the one it is going to be (see the constant).
 
     A waiting row has no calls yet and so no size: it is priced at the pace. That is the
     honest limit of this memory, and the reason `EST REM` — mostly waiting rows — moves
@@ -4652,9 +4699,9 @@ def estimate_spread_ms(
     bucket: str = "",
 ) -> tuple[int, int] | None:
     """The spread belonging to whichever source supplied this step's number."""
-    shape_entry = (shapes or {}).get(bucket) if bucket else None
-    if isinstance(shape_entry, dict) and int(shape_entry.get("n") or 0) >= SHAPE_MIN_SAMPLES:
-        return entry_spread(shape_entry)
+    entry = sized_entry(shapes, bucket)
+    if entry:
+        return entry_spread(entry)
     return None
 
 
@@ -5066,8 +5113,8 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
                 late = now_ms - int(rec.get("started_ms") or now_ms)
                 if late > LEDGER_FRESH_MS:
                     fc["late"] = late  # seen first at this many ms in — not a forecast
-                entry = state["task_shapes"].get(bucket) if bucket else None
-                if isinstance(entry, dict) and int(entry.get("n") or 0) >= SHAPE_MIN_SAMPLES:
+                entry = sized_entry(state["task_shapes"], bucket)
+                if entry:
                     seen = hist_med(entry)
                     if seen:
                         fc["shape"] = seen
@@ -7102,12 +7149,29 @@ def cmd_status(args) -> int:
     # with its own sample counts, because "is this getting better?" should be answerable
     # from the terminal and not from faith.
     if shapes:
-        top = sorted(shapes.items(), key=lambda kv: -int(kv[1].get("n") or 0))[:3]
+        # What the rung can actually READ first: a bucket the ladder would never look up is
+        # not evidence that the memory is pulling its weight, so the held-back ones are
+        # counted beside it rather than shown as if they were in use.
+        readable = {b: e for b, e in shapes.items() if sized_entry(shapes, b)}
+        young = [b for b in shapes if (bucket_ordinal(b) or 0) < SHAPE_MIN_BUCKET]
+        thin = [b for b in shapes if b not in young and sized_entry(shapes, b) is None]
+        held = ""
+        if young or thin:
+            why = []
+            if young:
+                why.append(f"{len(young)} under the calls{SHAPE_MIN_BUCKET} floor")
+            if thin:
+                why.append(f"{len(thin)} short of {SHAPE_MIN_SAMPLES} sample(s)")
+            held = f" · {len(young) + len(thin)} not read yet ({', '.join(why)})"
+        top = sorted(readable.items(), key=lambda kv: -int(kv[1].get("n") or 0))[:3]
         shown = ", ".join(
             f"{bucket} {fmt_estimate(entry.get('med') or 0)} (n={entry.get('n')})"
             for bucket, entry in top
         )
-        print(f"  remembered sizes  : {len(shapes)} kept — {shown}")
+        if top:
+            print(f"  remembered sizes  : {len(shapes)} kept — {shown}{held}")
+        else:
+            print(f"  remembered sizes  : {len(shapes)} kept, none the rung may read yet{held}")
     else:
         print("  remembered sizes  : none yet (a size is learned when a step finishes)")
     # What a WAITING step is priced from: its wording's kind, the calls that kind usually
@@ -7193,10 +7257,10 @@ def cmd_status(args) -> int:
     for t in [t for t in todos if not t.get("completed")][:5]:
         task = str(t.get("task", ""))
         bucket = step_shape_bucket(times, task)
-        entry = shapes.get(bucket) if bucket else None
+        entry = sized_entry(shapes, bucket)
         samples = len(step_spans_ms(times, todos, now_est))
         blended = pending_blend_ms(task, pace, calls_mem)
-        if isinstance(entry, dict) and int(entry.get("n") or 0) >= SHAPE_MIN_SAMPLES:
+        if entry:
             source = f"size {bucket}, {entry.get('n')} sample(s)"
         elif blended:
             source = f"label blend, {label_class(task)}"
