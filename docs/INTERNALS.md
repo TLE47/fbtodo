@@ -3,12 +3,35 @@
 Reference notes for working on `fbtodo` itself. Read [the README](../README.md) first — this
 is the layer underneath it.
 
+- [Layout](#layout)
 - [Files under `FBTODO_HOME`](#files-under-fbtodo_home)
 - [The state file](#the-state-file)
 - [The sources](#the-sources)
 - [Notifier contracts](#notifier-contracts)
 - [The pane lifecycle](#the-pane-lifecycle)
 - [Conventions worth keeping](#conventions-worth-keeping)
+
+## Layout
+
+```
+fbtodo                 the launcher: `src/` on the import path beside its own realpath,
+                       then `main()`. This is the path everything names — a PATH
+                       symlink, the pane command lines, the keeper, the daemon's own
+                       foreground re-exec
+src/fbtodo/            the program, one module per concern; today `__init__.py` is all
+                       of it, and the split moves it out a slice (and a commit) at a time
+fbtodo-selfcheck.py    the suite: it imports the package (`load_fbtodo`) rather than
+                       loading a file by path, so its patch sites patch module globals
+                       the same way they always did
+notify/                the watches, each invoked as a subprocess
+```
+
+`self_argv()` is how the program re-invokes itself — the panes, the pane keeper, the NAS
+watcher, and the daemon re-execing itself in the foreground: `sys.executable` plus the
+**launcher**, never `__file__`, because a package's `__init__.py` run as a script is not
+the package (every module loaded twice, no relative import resolvable). A copy that
+carries the package without the launcher falls back to the file, and the `__main__` guard
+at the top of `__init__.py` re-enters as the package, so that path still works.
 
 ## The state directory
 

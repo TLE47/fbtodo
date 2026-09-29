@@ -22,6 +22,12 @@ Entries start at the newest release; each one is a contract change, not a diff.
 - Scan keys are `(chunk, -line index)` with chunks numbered from the **start** of the journal
   (`journal_scan`), because an append moves every boundary counted back from the end.
 
+### Moved
+- The program is a package (`src/fbtodo/`) behind a thin launcher (`fbtodo`). Nothing
+  changes for anyone who runs, links or copies it: the launcher is the same path, takes
+  the same arguments, and a copy of the package without it still runs
+  (`python3 src/fbtodo/__init__.py …`).
+
 ### Added
 - `tests/golden.py` plus recorded `json` / `bar` / `snap` / frame output: the display
   contract, checked against fixtures with a frozen clock, and the checker itself checked by
