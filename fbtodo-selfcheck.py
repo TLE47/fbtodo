@@ -2576,6 +2576,26 @@ try:
         assert "called so far" not in frame7b, frame7b
         say("nas: a session with no list is told which tools it has called: ok")
 
+        # The SECOND basket: with no list, the pane names what the session has actually
+        # DONE. The feed REPLACES the tool counts rather than joining them — both answer
+        # "and what has it been doing instead?", and rows are the answer that fits.
+        st8 = dict(st7, tool_calls={"run_terminal_command": 2, "skill": 1}, observed=[
+            {"verb": "edited", "what": "fbtodo", "ts_ms": SWEEP_NOW - 120_000},
+            {"verb": "ran", "what": "python3 fbtodo-selfcheck.py", "ts_ms": SWEEP_NOW - 60_000},
+        ])
+        feed = ansi.sub("", module.render(
+            st8, True, watching=999, width=68, height=14, now_ms=SWEEP_NOW))
+        assert "edited fbtodo  ·  2m ago" in feed, feed
+        assert "ran python3 fbtodo-selfcheck.py  ·  1m ago" in feed, feed
+        assert "called so far" not in feed, feed
+        # ...and a state carrying no calls keeps the line it had: the feed is an addition,
+        # never a blank where the old answer used to be.
+        nofeed = ansi.sub("", module.render(
+            dict(st7, tool_calls={"run_terminal_command": 2}), True,
+            watching=999, width=68, height=12, now_ms=SWEEP_NOW))
+        assert "called so far: run_terminal_command 2" in nofeed, nofeed
+        say("nas: with no list the pane names what the session has done: ok")
+
 
 
         # the same marker with a dead pid: a stale marker must not pin a phantom session,

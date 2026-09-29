@@ -737,6 +737,72 @@ def _record_todos(rec: dict, thread: str):
     return None
 
 
+# The second basket, for the model that never calls `write_todos`: what the session has
+# actually DONE. Only calls that change or investigate something are named — `read_files`
+# is left out on purpose, because reading is not progress and a reading session is exactly
+# the one whose pane would fill with noise. The verb is the pane's word for the tool, so
+# the feed reads as English rather than as a tool catalogue.
+ACTION_TOOLS = {
+    "str_replace": "edited",
+    "write_file": "wrote",
+    "apply_patch": "patched",
+    "run_terminal_command": "ran",
+    "code_search": "searched",
+    "web_search": "searched the web",
+    "read_url": "read",
+    "skill": "loaded skill",
+    "render_ui": "rendered a card",
+    "ask_user": "asked you",
+}
+ACTION_KEEP = 12  # the newest calls carried in the state; the pane draws the first few
+ACTION_ROWS = 3   # rows the framed pane gives the feed
+
+
+def _action_what(name: str, inp) -> str:
+    """The most useful few words about one call: the file, the command, the query.
+
+    One line, never a tree: a row in the pane is a glance, so the file's own name is what
+    is wanted and the directories that lead to it are not.
+    """
+    if not isinstance(inp, dict):
+        return ""
+    paths = inp.get("paths")
+    if isinstance(paths, list) and paths:
+        return os.path.basename(str(paths[0]))
+    for key in ("path", "file_path", "filePath", "target"):
+        if isinstance(inp.get(key), str) and inp[key]:
+            return os.path.basename(inp[key])
+    if name == "run_terminal_command" and isinstance(inp.get("command"), str):
+        return " ".join(inp["command"].split())[:80]
+    for key in ("pattern", "query", "url", "name", "prompt", "text"):
+        if isinstance(inp.get(key), str) and inp[key]:
+            return " ".join(inp[key].split())[:60]
+    return ""
+
+
+def _record_actions(rec: dict, key) -> list:
+    """(key, ts_ms, verb, what) for the calls in this record worth naming, newest first.
+
+    The transcript records every call the session made, whether or not it wrote a list, and
+    a call that happened is a fact where a guessed plan could only ever be a guess. That is
+    the point of this second source: the pane stops depending on one tool being used.
+    """
+    ts = _iso_ms(rec.get("timestamp"))
+    out = []
+    for call in (rec.get("data") or {}).get("toolCalls") or []:
+        if not isinstance(call, dict):
+            continue
+        name = call.get("toolName")
+        verb = ACTION_TOOLS.get(name)
+        if not verb:
+            continue
+        inp = call.get("input") or call.get("args") or {}
+        out.append((key, ts, verb, _action_what(name, inp)))
+    # Reversed: one record can hold several calls, written in the order they were made, and
+    # the newest of them is the last.
+    return list(reversed(out))
+
+
 def _record_goal(rec: dict):
     """The agent's own one-line objective, if this record states one.
 
@@ -878,7 +944,7 @@ def _newest(entries):
 # only the few that might are decoded as data. That is the difference between a pane you
 # can leave open all day and one that heats the laptop.
 def journal_scan(blob: bytes, thread: str, chunk: int = 0):
-    """(hit, hit_key, prompts, goals, turns, summaries) for one chunk, newest line first.
+    """(hit, hit_key, prompts, goals, turns, summaries, models, actions), newest line first.
 
     Keys are (-chunk, -line index) — chunks are read backwards from EOF, so both terms
     grow towards the newest line and a plain tuple comparison is a time comparison.
@@ -892,6 +958,7 @@ def journal_scan(blob: bytes, thread: str, chunk: int = 0):
     turns: list = []
     summaries: list = []
     models: list = []
+    actions: list = []
     for order, raw in enumerate(reversed(blob.split(b"\n"))):
         want_call = hit is None and b"write_todos" in raw and b'"todos"' in raw
         want_prompt = b'"prompt"' in raw
@@ -907,7 +974,13 @@ def journal_scan(blob: bytes, thread: str, chunk: int = 0):
         model = MODEL_RE.search(raw)
         if model:
             models.append(((-chunk, -order), model.group(1).decode("utf-8", "replace")))
-        if not (want_call or want_prompt or want_goal or want_turn or want_summary):
+        # The second basket (see `_record_actions`): what this record called. Asked for only
+        # until there are enough, and the newest records are read first — so this is a couple
+        # of extra json parses per poll, not a parse of the whole chunk.
+        want_action = (
+            len(actions) < ACTION_KEEP and b'"toolCalls"' in raw and b'"toolName"' in raw
+        )
+        if not (want_call or want_prompt or want_goal or want_turn or want_summary or want_action):
             continue
         try:
             rec = json.loads(raw.decode("utf-8", "replace"))
@@ -934,7 +1007,9 @@ def journal_scan(blob: bytes, thread: str, chunk: int = 0):
             said = _record_summary(rec)
             if said:
                 summaries.append((key, said))
-    return hit, hit_key, prompts, goals, turns, summaries, models
+        if want_action:
+            actions.extend(_record_actions(rec, key))
+    return hit, hit_key, prompts, goals, turns, summaries, models, actions
 
 
 # In plain words: the transcript behind the pane. It only ever grows, one line per event,
@@ -954,7 +1029,7 @@ def scan_live_log(chat_dir: str) -> dict:
     path = os.path.join(chat_dir, "log.jsonl")
     thread = os.path.basename(chat_dir.rstrip("/"))
     scan = {"hit": None, "goal": None, "goal_source": None, "now": None,
-            "turn_ended": False, "summary": None}
+            "turn_ended": False, "summary": None, "observed": []}
     try:
         size = os.path.getsize(path)
         fh = open(path, "rb")
@@ -967,6 +1042,7 @@ def scan_live_log(chat_dir: str) -> dict:
         turns: list = []
         summaries: list = []
         models: list = []
+        actions: list = []
         tail, read, pos, chunk = b"", 0, size, 0
         while pos > 0 and read < MAX_SCAN:
             step = min(CHUNK, pos)
@@ -980,7 +1056,7 @@ def scan_live_log(chat_dir: str) -> dict:
             else:
                 tail = b""
             (found, found_key, found_prompts, found_goals, found_turns, found_said,
-             found_models) = journal_scan(b"\n".join(lines), thread, chunk)
+             found_models, found_actions) = journal_scan(b"\n".join(lines), thread, chunk)
             if found and hit is None:
                 hit, hit_key, hit_chunk = found, found_key, chunk
             prompts.extend(found_prompts)
@@ -988,6 +1064,7 @@ def scan_live_log(chat_dir: str) -> dict:
             turns.extend(found_turns)
             summaries.extend(found_said)
             models.extend(found_models)
+            actions.extend(found_actions)
             if hit is not None:
                 # Stop as soon as a usable goal prompt is in hand; a tail of nothing
                 # but "continue" is worth a few more chunks, not an unbounded scan.
@@ -1000,6 +1077,13 @@ def scan_live_log(chat_dir: str) -> dict:
                     break
             chunk += 1
         scan["hit"] = hit
+        # The second basket: the newest calls, newest first, for the pane to draw when the
+        # agent has written no list. Capped here rather than left whole, so the state file
+        # stays small — a glance needs a handful of rows, not a history.
+        scan["observed"] = [
+            {"verb": verb, "what": what, "ts_ms": ts}
+            for _key, ts, verb, what in actions[:ACTION_KEEP]
+        ]
         # The newest model this session named. Scanned from the same backward pass, and
         # kept even when the list itself is old: it is what the ESTIMATES are about, and
         # an estimate borrowed from another model's pace is a number with no referent.
@@ -1088,6 +1172,8 @@ def read_cli(chat_dir: str) -> dict:
         }
     state["chat_dir"] = chat_dir
     state["model"] = scan.get("model") or None
+    # What the session has actually done — the pane's fallback when there is no list.
+    state["observed"] = scan.get("observed") or []
     state["first_prompt"] = meta.get("firstPrompt")
     # The heading is only ever the agent's own line: `first_prompt` is kept for `status`
     # and `json`, never rendered as a goal (a quote is the phrasing, not the objective).
@@ -3134,6 +3220,8 @@ def _snapshot(args, cwd: str | None = None, instance_pid=None) -> dict:
                 source_updated_ms=st.get("ts"),
                 no_log=bool(st.get("no_log")),
                 todos=st.get("todos") or [],
+                # The pane's fallback when there is no list: what this session has done.
+                observed=st.get("observed") or [],
                 # Which model this session runs: the estimates are remembered per model,
                 # because a step's span is not comparable across them.
                 model=st.get("model"),
@@ -4092,12 +4180,19 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
     return state
 
 
-def fmt_age(ms) -> str:
+def fmt_age(ms, now_ms: int | None = None) -> str:
     """How long ago the list was last written — '4m ago', so a still pane reads
-    as 'nothing has changed', not 'this is hung'."""
+    as 'nothing has changed', not 'this is hung'.
+
+    `now_ms` is the renderer's own clock when there is one. The pane derives every other
+    number from it, and a fixture's `now` is a constant rather than the wall clock, so
+    reading `time.time()` here would make the one age in the frame disagree with all the
+    others.
+    """
     if not ms:
         return "?"
-    delta = max(0.0, time.time() - ms / 1000.0)
+    now = (now_ms / 1000.0) if now_ms else time.time()
+    delta = max(0.0, now - ms / 1000.0)
     if delta < 60:
         return f"{int(delta)}s ago"
     if delta < 3600:
@@ -4283,6 +4378,35 @@ def tools_note(tools: dict, limit: int = 3) -> str:
     return f"called so far: {head}" + (f" +{more} more" if more > 0 else "")
 
 
+# In plain words: the second basket. `write_todos` is the only place in the transcript that
+# holds a PLAN (measured: no other tool, and no other field, carries one), so a model that
+# skips the call leaves this pane with nothing to draw. What the transcript does hold is
+# every call the session did make — the file it edited, the command it ran — and that is a
+# fact, not a plan. So when there is no list, the pane says what the session has actually
+# DONE, newest first, and never dresses it up as a list of steps: no progress bar over it,
+# no estimate, no ticks.
+def observed_rows(state: dict, limit: int = ACTION_ROWS, now_ms: int | None = None) -> list:
+    """`edited fbtodo · 2m ago` — the newest calls, for a session that wrote no list.
+
+    Empty for a state with no calls recorded in it (a fixture, a brand-new session, or a
+    build that did not carry them), so the renderers that draw this feed fall back to the
+    line they drew before rather than drawing nothing.
+    """
+    acts = state.get("observed")
+    if not isinstance(acts, list):
+        return []
+    out = []
+    for act in acts[:limit]:
+        if not isinstance(act, dict):
+            continue
+        what = " ".join(str(act.get("what") or "").split())
+        verb = " ".join(str(act.get("verb") or "did").split()) or "did"
+        line = f"{verb} {what}".strip()
+        age = fmt_age(act.get("ts_ms"), now_ms)
+        out.append(f"{line}  ·  {age}" if age != "?" else line)
+    return out
+
+
 # In plain words: every duration in the pane is measured by watching, never read from the
 # agent. A step gets a clock only if fbtodo saw it unfinished at least once. So a list that
 # turns up already finished — or one fbtodo attached to after the work had started — has no
@@ -4451,6 +4575,10 @@ def _render_plain(
             lines += [c(dim, seg) for seg in _wrap(str(state["first_prompt"]), width, 2)]
         why = no_list_reason(state)
         lines += [c(dim, seg) for seg in _wrap(why, width, 2)]
+        # The second basket, when there is one: what the session has done instead. Absent
+        # from a state with no calls in it, so this snapshot is unchanged there.
+        for seg in observed_rows(state, 2, now_ms):
+            lines += [c(dim, s) for s in _wrap("  " + seg, width, 1)]
         lines.append(c(dim, f"  live {time.strftime('%H:%M:%S', time.localtime(now_ms / 1000))}"))
         return "\n".join(lines)
     # No note here, deliberately: a plain snapshot is parsed by scripts, and the suite
@@ -5021,9 +5149,18 @@ def _render_rich(
         why = no_list_reason(state)
         for seg in _wrap(why, inner, 0):
             rows.append(_frame_row(c(muted, seg), width, frame))
+        # The second basket first, then the tool counts only when there is no feed to show:
+        # both say "and here is what it has been doing instead", and the feed says it with
+        # less room — which matters, because this branch has no height management of its own.
         note = tools_note(state.get("tool_calls") or {})
-        for seg in _wrap(note, inner, 1) if note else []:
-            rows.append(_frame_row(c(muted, seg), width, frame))
+        feed = [_clip_cells(seg, inner - 4) for seg in observed_rows(state, now_ms=now_ms)]
+        feed = feed[: max(0, (height - 9) if height else ACTION_ROWS)]
+        if feed:
+            for seg in feed:
+                rows.append(_frame_row(c(muted, "  " + seg), width, frame))
+        else:
+            for seg in _wrap(note, inner, 1) if note else []:
+                rows.append(_frame_row(c(muted, seg), width, frame))
         if patch_row_here:
             # A frame with no list at all is exactly the NAS pane waiting for `fb` — when
             # "did the hook's patch step come out clean?" is the question being asked.
@@ -5812,6 +5949,12 @@ def cmd_status(args) -> int:
         # than as "the agent has not written one yet" — which is the whole question this
         # answers. Same sentence as the pane, from the same function.
         print(f"  todos             : — none yet  ({no_list_reason(view)})")
+        # The second basket, in the same words the pane uses: what the session has DONE
+        # instead of writing a list. Absent when the state carries no calls, so a fixture
+        # or a brand-new session prints exactly as it did before this line existed.
+        feed = observed_rows(view, 4)
+        for i, seg in enumerate(feed):
+            print(f"  {'last actions      ' if not i else '                   '}: {seg}")
     if view and view.get("todos"):
         counts = f"{view.get('done', 0)}/{view.get('total', len(view['todos']))} done"
         if view.get("list_version"):
