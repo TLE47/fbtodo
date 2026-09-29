@@ -16,7 +16,10 @@
                         the source that supplied them, the pane it sits beside
                         (--window TARGET, --json)
     fbtodo status       instance, watcher, state-file and scratch footprint
-    fbtodo prune        enforce retention now (defaults: 500 records / 7 days /
+    fbtodo ledger       every step's forecast vector beside the outcome it was scored
+                        against — the rows behind the scoreboard
+                        (--days N, --limit N, --model M, --json)
+    fbtodo prune        enforce retention now (defaults: 2000 records / 60 days /
                         1 MiB log); runs by itself about hourly either way
 
 The watcher (`daemon`) follows one running Freebuff process: while it lives, the
@@ -108,7 +111,7 @@ import textwrap
 import time
 import unicodedata
 
-VERSION = "4.24.0"
+VERSION = "4.26.0"
 HOME = os.path.expanduser("~")
 # FBTODO_HOME points state/lock/log elsewhere — used by the self-check so it never
 # touches the real watcher's files.
@@ -453,8 +456,28 @@ SPREAD_MIN_RATIO = 3.0   # hi/lo at which one number stops being the honest form
 # steps recovered from the CLI journals, 9 of 170 ticked spans were under 10s and they
 # poisoned every score they touched (a 2s step projected a whole list at `~2s`, a 45x miss).
 # Such a span is still SHOWN — it is what happened — but it is not evidence: it sets no pace
-# and moves no memory.
-MIN_LABEL_MS = 10_000
+# and moves no memory. Tunable per machine with `--label-floor SEC` / `FBTODO_LABEL_FLOOR`;
+# 0 keeps every span, which is what the earlier builds did.
+LABEL_FLOOR_S = float(os.environ.get("FBTODO_LABEL_FLOOR") or 10.0)
+MIN_LABEL_MS = max(0, int(LABEL_FLOOR_S * 1000))
+# How much of a WAITING step's number comes from its wording rather than the list's pace, in
+# log space: 0 is the pace alone, 1 is the wording alone, 0.5 is the default.
+# Be honest about what 0.5 buys, because it is less than it first looked. Measured 2026-09-29
+# by leave-one-session-out replay of the 160 real spans, scoring the shipped `pending_blend_ms`
+# against the same step's pace: it is a COIN FLIP on the typical step (better on 77 of 160,
+# worse on 83, median ratio 1.01x) and a real gain only in the tail (mean 3.31x against 3.75x,
+# worst 14.9x against 33.9x). An earlier reading of this - "beats the pace on every column,
+# 74% of steps" - was a harness bug: it ordered each session's steps by span instead of by
+# time, so the "pace so far" it compared against was the session's smallest steps. So keep the
+# blend as a tail-smoother, not as a median win, and let the `forecast error` scoreboard settle
+# it on real traffic. Tunable with `--blend-weight W` / `FBTODO_BLEND_WEIGHT`.
+BLEND_WEIGHT = min(1.0, max(0.0, float(os.environ.get("FBTODO_BLEND_WEIGHT") or 0.5)))
+# The forecast ledger is only a forecast if it was written before the step had run. A watcher
+# that starts (or restarts) with a step already in flight sees it running for the first time
+# minutes in, so its vector would carry the answer's clock, not a prediction of it. Such a
+# vector is still recorded — the record is the record — but flagged, and `forecast_error`
+# leaves flagged rows out of the scoreboard. One poll of grace, generously.
+LEDGER_FRESH_MS = 5000
 
 EX_CODES = {
     "ok": 0,
@@ -4143,14 +4166,20 @@ def call_memory_from_log(tasks: dict, now_ms: int | None = None, model: str | No
     }
 
 
-def pending_blend_ms(task: str, pace_ms: int, calls_mem: dict | None) -> int | None:
+def pending_blend_ms(
+    task: str, pace_ms: int, calls_mem: dict | None, weight: float | None = None
+) -> int | None:
     """A waiting step's projection: label-class calls x seconds-per-call, blended with the pace.
 
-    50/50 in log space, which is the geometric mean — and the weight was measured, not
-    chosen (see `call_memory_from_log`). None when there is nothing to blend with, and then
-    the pace stands alone exactly as it did before.
+    Blended in log space, `w` on the label model and `1 - w` on the pace (0.5 by default,
+    which is the geometric mean). `w` was not fitted — it is the midpoint, and the honest
+    reading of the replay is that the blend smooths the tail rather than beating the pace on
+    the typical step (see BLEND_WEIGHT for the numbers). None when there is nothing to blend
+    with, and then the pace stands alone exactly as it did before, so a fresh log cannot
+    regress.
     """
-    if not calls_mem or not pace_ms:
+    w = BLEND_WEIGHT if weight is None else weight
+    if not calls_mem or not pace_ms or w <= 0:
         return None
     calls = (calls_mem.get("classes") or {}).get(label_class(task)) or calls_mem.get("calls")
     rate = calls_mem.get("rate_ms")
@@ -4159,7 +4188,8 @@ def pending_blend_ms(task: str, pace_ms: int, calls_mem: dict | None) -> int | N
     predicted = int(calls) * int(rate)
     if predicted <= 0:
         return None
-    return min(int((predicted * pace_ms) ** 0.5), EST_CAP_MS)
+    blended = (predicted ** w) * (pace_ms ** (1.0 - w))
+    return min(int(blended), EST_CAP_MS)
 
 
 # In plain words: one remembered span, read the same way whether it was stored as a bare
@@ -4357,6 +4387,75 @@ def entry_spread(entry) -> tuple[int, int] | None:
 # actually took — so the error is computed from the records rather than kept in a tally that
 # could drift away from them. Reported per SOURCE, because that is the only way to see
 # whether the shape memory is earning its place on this machine's real work.
+def forecast_error(
+    tasks: dict,
+    now_ms: int | None = None,
+    model: str | None = None,
+    days: float | None = None,
+) -> dict:
+    """{rung: {n, med, mean, worst}} — each rung scored on its FIRST-poll forecast.
+
+    Rungs whose one vector was stamped too late to be a forecast (see `LEDGER_FRESH_MS`) are
+    left out of every rung and counted under `late`, so a watcher restart mid-step cannot
+    quietly improve the numbers it appears in.
+
+    The honest scoreboard, and the reason the ledger exists. `estimate_error` scores the
+    estimate the pane was showing when a step CLOSED, which for the size rung is a key built
+    from calls the step had already made — so it is partly scored with the answer in hand and
+    can flatter a rung that recognises rather than predicts. This scores the vector written
+    on the first poll that saw the step running (see the `fc` stamp in `track_tasks`), when
+    nothing about the step's size was known, and scores every rung on every step — which is
+    what makes the numbers comparable to each other rather than to their own sample.
+    """
+    now_ms = now_ms or int(time.time() * 1000)
+    cutoff = now_ms - int((days if days is not None else HISTORY_MAX_AGE_DAYS) * 86400 * 1000)
+    out: dict[str, list[float]] = {}
+    late = 0
+    for key, rec in (tasks or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        started, stopped = rec.get("started_ms"), rec.get("done_ms")
+        if not started or not stopped or stopped <= started or stopped < cutoff:
+            continue
+        if model and rec.get("model") and rec.get("model") != model:
+            continue
+        actual = stopped - started
+        if actual < MIN_LABEL_MS:
+            continue
+        fc = rec.get("fc") or {}
+        if not fc:
+            continue
+        # A vector whose own stamp says the step was already running when the watcher first
+        # saw it (a restart mid-step) is not a forecast: it carries the step's clock inside
+        # it. Scored as one it would flatter whichever rung reads elapsed, which is the exact
+        # flattery the ledger exists to prevent, so it is left out and counted instead.
+        if fc.get("late"):
+            late += 1
+            continue
+        for rung in ("shape", "blend", "pace"):
+            try:
+                pred = int(fc.get(rung))
+            except (TypeError, ValueError):
+                continue
+            if pred <= 0:
+                continue
+            out.setdefault(rung, []).append(max(pred / actual, actual / pred))
+    report = {}
+    for rung, fs in out.items():
+        fs = sorted(fs)
+        mid = len(fs) // 2
+        med = fs[mid] if len(fs) % 2 else (fs[mid - 1] + fs[mid]) / 2
+        report[rung] = {
+            "n": len(fs),
+            "med": round(med, 2),
+            "mean": round(sum(fs) / len(fs), 2),
+            "worst": round(max(fs), 1),
+        }
+    if late:
+        report["late"] = {"n": late, "med": 0.0, "mean": 0.0, "worst": 0.0}
+    return report
+
+
 def estimate_error(
     tasks: dict,
     now_ms: int | None = None,
@@ -4781,15 +4880,39 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
         rec = tasks.get(task_key(session, label))
         if isinstance(rec, dict) and rec.get("started_ms"):
             pace = step_pace_ms(times, todos, now_ms, state["task_history"])
+            bucket = step_shape_bucket(times, label)
             value, src = pick_estimate(
                 label,
                 state["task_shapes"],
-                step_shape_bucket(times, label),
+                bucket,
                 pace,
                 state.get("task_calls"),
             )
             rec["est_ms"] = value or pace
             rec["est_src"] = src
+            # The forecast LEDGER, written once, on the first poll that sees this step
+            # running — the moment at which nothing about its size is known yet. `est_ms`
+            # above is restamped every poll and is therefore scored with the answer partly
+            # in hand (the shape rung's key is the calls the step has ALREADY made by the
+            # time it closes), so it cannot say whether the shape rung predicts or merely
+            # recognises. This vector can: every rung is recorded as it stood before the
+            # work started, and `forecast_error` scores them all on every step.
+            if "fc" not in rec:
+                fc = {"at": now_ms, "v": VERSION, "model": state.get("model") or ""}
+                late = now_ms - int(rec.get("started_ms") or now_ms)
+                if late > LEDGER_FRESH_MS:
+                    fc["late"] = late  # seen first at this many ms in — not a forecast
+                entry = state["task_shapes"].get(bucket) if bucket else None
+                if isinstance(entry, dict) and int(entry.get("n") or 0) >= SHAPE_MIN_SAMPLES:
+                    seen = hist_med(entry)
+                    if seen:
+                        fc["shape"] = seen
+                blended = pending_blend_ms(label, pace, state.get("task_calls"))
+                if blended:
+                    fc["blend"] = blended
+                fc["pace"] = pace
+                fc["pick"] = src
+                rec["fc"] = fc
     if persist and json.dumps(log, sort_keys=True) != before:
         try:
             atomic_write_json(TASKS_PATH, log)
@@ -6365,6 +6488,12 @@ def spawn_daemon(args, cwd: str, instance_pid: int, quiet: bool = True) -> int |
         "--nas-project",
         args.nas_project,
     ]
+    # The estimate knobs, forwarded only when the caller actually set them: the watcher is
+    # the process that builds the memories, so a flag it never saw would be silently halved.
+    if args.label_floor is not None:
+        argv += ["--label-floor", str(args.label_floor)]
+    if args.blend_weight is not None:
+        argv += ["--blend-weight", str(args.blend_weight)]
     log = open(LOG_PATH, "ab", buffering=0)
     try:
         proc = subprocess.Popen(
@@ -6828,6 +6957,27 @@ def cmd_status(args) -> int:
             "  estimate error    : — nothing closed yet since estimates were stamped "
             "(a factor of 1.0x would be exact)"
         )
+    # ...and the honest half: the same rungs scored on the forecast each step got on the
+    # FIRST poll that saw it running, before its size was known. The line above scores the
+    # number the pane was showing as the step closed, whose size key is built from calls the
+    # step had already made; this one cannot flatter a rung that recognises.
+    ferr = forecast_error(log.get("tasks") or {}, model=model)
+    fparts = [
+        f"{src} {ferr[src]['med']:.2f}x over {ferr[src]['n']}"
+        for src in ("shape", "blend", "pace")
+        if ferr.get(src)
+    ]
+    skipped = (ferr.get("late") or {}).get("n") or 0
+    tail = f" · {skipped} stamped late, not scored" if skipped else ""
+    if fparts:
+        print(
+            f"  forecast error    : {' · '.join(fparts)}  "
+            f"(first poll, no answer in hand{tail})"
+        )
+    elif skipped:
+        print(f"  forecast error    : — {skipped} step(s) stamped late, not scored")
+    else:
+        print("  forecast error    : — no step has started since the ledger was added")
     # whose steps those are: the memory is per model, so a number without its model is
     # not auditable — a fast model remembered here must not project a slow one
     if model:
@@ -6876,6 +7026,163 @@ def cmd_prune(args) -> int:
     print(f"  temp files swept  : {report['temp_removed']}")
     print(f"  daemon log        : {'truncated ' + str(trunc) + ' bytes' if trunc else 'within cap'}")
     print(f"  scratch after     : {scratch_size()} bytes")
+    return 0
+
+
+def ledger_rows(
+    tasks: dict,
+    now_ms: int | None = None,
+    days: float | None = None,
+    model: str | None = None,
+) -> list[dict]:
+    """One row per step that carries a forecast vector, newest first.
+
+    `fbtodo status` gives the SCOREBOARD; this gives the numbers it was computed from, which
+    is the only way to see why a rung scores what it scores: the vector as it stood before the
+    work started, the span it was scored against, and the factor error of each rung on it.
+    A row carries no errors when there is nothing to score it against — the step is still
+    running, its span is under the evidence floor, or the vector was stamped too late to be a
+    forecast — and `why` says which of those it is rather than letting the row read as a miss.
+    """
+    now_ms = now_ms or int(time.time() * 1000)
+    days = HISTORY_MAX_AGE_DAYS if days is None else days
+    cutoff = now_ms - int(days * 86400 * 1000)
+    rows: list[dict] = []
+    for key, rec in (tasks or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        fc = rec.get("fc")
+        if not isinstance(fc, dict):
+            continue
+        started, stopped = rec.get("started_ms"), rec.get("done_ms")
+        if not started or started < cutoff:
+            continue
+        session, _, label = str(key).partition("\x1f")
+        if model and (rec.get("model") or "") != model:
+            continue
+        span = (stopped - started) if (stopped and stopped > started) else None
+        late = int(fc.get("late") or 0)
+        # How far into the step the vector was written. A step that is ticked, unticked and
+        # worked again restarts its clock while KEEPING the vector it earned on the first
+        # sighting, so the stamp can read as negative — it was written before this run began,
+        # which is the safest kind of forecast there is, but it is not what a reader assumes.
+        stamp_in = (int(fc.get("at") or 0) - started) if fc.get("at") else None
+        preds = {}
+        for rung in ("pace", "blend", "shape"):
+            try:
+                value = int(fc.get(rung) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                preds[rung] = value
+        errs: dict[str, float] = {}
+        why = ""
+        if late:
+            why = f"stamped {short_duration(late, seconds=True)} in — late, not scored"
+        elif span is None:
+            why = "no outcome yet"
+        elif span < MIN_LABEL_MS:
+            why = f"span under the {short_duration(MIN_LABEL_MS)} floor — not scored"
+        else:
+            errs = {r: round(max(p / span, span / p), 2) for r, p in preds.items()}
+        ver = f"v{fc.get('v')}" if fc.get("v") else ""
+        if late or stamp_in is None:
+            # a late row's `why` already says when the stamp landed, so do not say it twice
+            note = ver
+        elif stamp_in < 0:
+            note = f"{ver} · stamped {short_duration(-stamp_in, seconds=True)} before this run"
+        else:
+            note = f"{ver} · stamped {short_duration(stamp_in, seconds=True)} in"
+        rows.append({
+            "session": session, "label": label, "model": rec.get("model") or "",
+            "started_ms": started, "span_ms": span, "fc_at": int(fc.get("at") or 0),
+            "v": fc.get("v") or "", "pick": fc.get("pick") or "",
+            "preds": preds, "errors": errs, "late_ms": late, "stamp_in_ms": stamp_in,
+            "scored": bool(errs), "why": why, "note": note,
+        })
+    rows.sort(key=lambda r: -r["started_ms"])
+    return rows
+
+
+def fmt_ledger(
+    rows: list[dict],
+    now_ms: int,
+    days: float | None = None,
+    limit: int = 20,
+    color: bool = False,
+    empty: str = "",
+) -> str:
+    """The `fbtodo ledger` report as text — split out from the command so a fixture can
+    assert on what a reader would actually see, honesty notes included."""
+    c = paint(color)
+    days = HISTORY_MAX_AGE_DAYS if days is None else days
+    out = [f"{c('1', 'fbtodo ledger')}  {c('2', TASKS_PATH)}"]
+    if not rows:
+        out.append(empty or (
+            "  no step carries a forecast yet — one is written on the first poll "
+            "that finds a step running, and scored when that step closes"
+        ))
+        return "\n".join(out)
+    scored = sum(1 for r in rows if r["scored"])
+    late = sum(1 for r in rows if r["late_ms"])
+    out.append(f"  {len(rows)} step(s) with a forecast · {scored} scored · {late} stamped "
+               f"late (not scored) · evidence floor {short_duration(MIN_LABEL_MS)} · "
+               f"last {days:g}d")
+    shown = rows if not limit else rows[:limit]
+    for r in shown:
+        span = short_duration(r["span_ms"], seconds=True) if r["span_ms"] else "—"
+        label = r["label"] if len(r["label"]) <= 62 else r["label"][:61] + "…"
+        out.append(f"  {span:<8} {label:<62} {c('2', fmt_age(r['started_ms'], now_ms))}")
+        bits = []
+        for rung in ("pace", "blend", "shape"):
+            pred = r["preds"].get(rung)
+            if pred is None:
+                if rung != "pace":
+                    bits.append(f"{rung} —")
+                continue
+            text = f"{rung} {short_duration(pred, seconds=True)}"
+            miss = r["errors"].get(rung)
+            if miss is not None:
+                text += " ×%.2f" % miss
+            bits.append(text)
+        picked = f" · pick {r['pick']}" if r["pick"] else ""
+        detail = " · ".join(x for x in (r["model"], r["note"], r["why"]) if x)
+        suffix = f"  ({detail})" if detail else ""
+        out.append(f"         {c('2', ' · '.join(bits) + picked)}{c('2', suffix)}")
+    if len(shown) < len(rows):
+        out.append(f"  … {len(rows) - len(shown)} more (--limit 0 for all, --days N to widen)")
+    return "\n".join(out)
+
+
+def cmd_ledger(args) -> int:
+    """Every step's forecast vector, next to the outcome it was scored against.
+
+    The ledger is the honest half of the scoreboard: each step's prediction is written once,
+    on the first poll that saw it running, so the rungs are compared before anything about
+    the step's size was known. `fbtodo status` prints the summary; this prints the rows,
+    newest first, with each rung's factor error — and says when a row could not be scored
+    rather than showing it as a miss. Read-only: it changes nothing. `--days N` (default 60),
+    `--limit N` (default 20, 0 for all), `--model M`, `--json` for the same fields.
+    """
+    now_ms = int(time.time() * 1000)
+    rows = ledger_rows(load_tasklog().get("tasks") or {}, now_ms, args.days, args.model)
+    if args.json:
+        json.dump({"at": now_ms, "count": len(rows), "ledger": rows}, sys.stdout,
+                  ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+    if args.quiet:
+        return 0
+    filters = []
+    if args.model:
+        filters.append(f"--model {args.model}")
+    if args.days is not None:
+        filters.append(f"--days {args.days:g}")
+    empty = (f"  no step matches {' '.join(filters)} — drop the filter to see what there is"
+             if filters else "")
+    sys.stdout.write(
+        fmt_ledger(rows, now_ms, args.days, args.limit, use_color(), empty) + "\n"
+    )
     return 0
 
 
@@ -7407,7 +7714,22 @@ def build_parser():
     )
     ap.add_argument("command", nargs="?", default="pane",
                     choices=["pane", "snap", "json", "bar", "daemon", "stop", "status",
-                             "prune", "nas", "pane-watch", "pin", "why"])
+                             "prune", "nas", "pane-watch", "pin", "why", "ledger"])
+    ap.add_argument(
+        "--label-floor", type=float, default=None, metavar="SEC",
+        help="estimates: a finished span under SEC is not evidence — it sets no pace and "
+             "moves no memory (0 = keep every span; FBTODO_LABEL_FLOOR)",
+    )
+    ap.add_argument(
+        "--blend-weight", type=float, default=None, metavar="W",
+        help="estimates: 0..1, how much a WAITING step's wording counts against the list's "
+             "pace (0 = pace only, 1 = wording only; FBTODO_BLEND_WEIGHT)",
+    )
+    ap.add_argument("--days", type=float, metavar="N",
+                    help="ledger: how far back to list (default 60, the retention window)")
+    ap.add_argument("--limit", type=int, default=20, metavar="N",
+                    help="ledger: rows to print, newest first (default 20, 0 = all)")
+    ap.add_argument("--model", metavar="NAME", help="ledger: only this model's steps")
     ap.add_argument("--max-records", type=int, help="prune: cap on kept task records")
     ap.add_argument("--max-age-days", type=float, help="prune: drop records older than this")
     ap.add_argument("--log-cap-kb", type=int, help="prune: truncate the daemon log above this")
@@ -7551,6 +7873,13 @@ def main(argv=None) -> int:
     if args.version:
         print(VERSION)
         return 0
+    # The two estimate knobs, applied to the module constants so every caller sees them:
+    # the env vars are read at import, and a flag beats them, as the precedence promises.
+    global MIN_LABEL_MS, BLEND_WEIGHT
+    if args.label_floor is not None:
+        MIN_LABEL_MS = max(0, int(args.label_floor * 1000))
+    if args.blend_weight is not None:
+        BLEND_WEIGHT = min(1.0, max(0.0, args.blend_weight))
     if args.source == "nas" and args.interval <= 1.0:
         # One ssh per poll, and the pane no longer needs a poll to move its own numbers:
         # the clock and the "N ago" repaint locally (see the pane loop), so the store is
@@ -7575,6 +7904,8 @@ def main(argv=None) -> int:
         return cmd_status(args)
     if args.command == "prune":
         return cmd_prune(args)
+    if args.command == "ledger":
+        return cmd_ledger(args)
     if args.command == "nas":
         return cmd_nas(args)
     if args.command == "pane-watch":

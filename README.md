@@ -323,6 +323,7 @@ fbtodo snap            # one snapshot, plain text
 fbtodo json            # one snapshot, clean JSON
 fbtodo bar             # "todos 3/5", or "todos -" with no list — a tmux status bar
 fbtodo status          # instance, watcher, state file, scratch footprint, pace
+fbtodo ledger          # each step's forecast beside what it actually took
 fbtodo why             # why each pane is where it is
 fbtodo pin --size 9    # pin this window's list pane
 fbtodo stop            # stop the watcher
@@ -335,6 +336,7 @@ fbtodo prune           # enforce retention now
 | `snap` / `json` | the list as text or JSON — script it, or read it once |
 | `bar` | a `todos 3/5` string for your tmux status line, and `todos -` when there is no list yet (`FBTODO_NO_PANE=1` if you only want this) |
 | `status` | everything the tool thinks: which instance, which watcher, which build, which state file, remembered pace, which turn (`turn`) — and, with no list, why there is none and what the session has been doing instead (`last actions`) |
+| `ledger` | the rows behind the scoreboard: every step's forecast vector, what each rung predicted, the span it was scored against and each rung's miss — or why a row could not be scored. `--days N`, `--limit N`, `--model M`, `--json` |
 | `why` | the first thing to run when a pane is somewhere unexpected |
 | `pin` | force a pane's side or size, per window |
 | `daemon` / `pane-watch` | the two background processes, usually started for you (`-f` keeps one in the foreground) |
@@ -638,7 +640,10 @@ Which is where most of the care in this tool has gone.
   for the active one. The number walks a ladder of evidence: what steps of the same **size**
   took — the calls a step has made so far, log-binned (`calls2` is 4-7 calls) — else what
   steps of the same **kind** took, read from the wording (a `run`-ish step's usual number of
-  calls times what a call costs), blended half-and-half with the list's own pace. All of it
+  calls times what a call costs), blended half-and-half with the list's own pace. That blend
+  is a tail-smoother rather than a clear win — measured on your own replay it is a coin flip
+  on the typical step and only plainly better on the worst ones — so `FBTODO_BLEND_WEIGHT`
+  turns it down if you would rather have the pace alone. All of it
   lives in `~/.freebuff/fbtodo-tasks.json`. A step that has made no calls *and* has nothing
   to blend still falls back to the pace, so a fresh log behaves exactly as it always did.
 - **A step under 10 s is a list flip, not work.** It is shown on its row, but it sets no pace
@@ -657,8 +662,21 @@ Which is where most of the care in this tool has gone.
   A factor of 1.0x would be exact; two steps that took twice their estimate and half of it
   count the same. That line is the only honest answer to "are these numbers getting
   better?", and it is also what tells you whether the size memory is pulling its weight on
-  your own work. The memory behind it is kept for 60 days / 2000 records — about a month of
+  your own work.
+- **The score has a second line, and it is the one to trust**: `forecast error`. Each step's
+  prediction is written down **once**, on the first poll that sees it running — before
+  anything about its size is known — and every rung is scored on every step, so the rungs are
+  compared on the same population. The `estimate error` line above scores the number the pane
+  was showing as the step *closed*, whose size key is built from calls the step had already
+  made by then; that can flatter a rung that recognises a step rather than predicting it.
+  A step the watcher only picked up mid-flight (a restart) is flagged and left out of the
+  score rather than counted as a forecast it never was, and `status` says how many were set
+  aside. The memory behind it is kept for 60 days / 2000 records — about a month of
   real use — because the estimates are the one thing here meant to improve with use.
+- **`fbtodo ledger` is those rows themselves**: one per step, newest first, with what each
+  rung predicted, the span it was scored against and each rung's miss — and the honest note
+  when a row could not be scored (still running, too short to be evidence, or stamped after
+  the step had already started). `status` gives the average; `ledger` gives the argument.
 - Past twice the estimate a step is marked `[STUCK?]` — a hint, not a verdict.
 - The **list's own age** rides on `LIST:` (`LIST: #7 · 12m ago`), so a list the agent has
   stopped re-writing is visible while a step's clock is still counting. A narrow strip spends
@@ -746,8 +764,16 @@ Precedence is the usual one: a command-line flag, then the environment, then a f
 | `FBTODO_GRADIENT_START` / `_END` | theme | `#rrggbb`, or a raw SGR code like `1;36` for the accent |
 | `FBTODO_TRUECOLOR` | auto | force 24-bit colour on or off |
 | `FBTODO_TMUX` | `tmux` | the tmux binary/args to drive (a test knob) |
+| `FBTODO_LABEL_FLOOR` | `10` | estimates: a finished span under this many seconds is not evidence — it sets no pace and moves no memory (`0` keeps every span, the pre-4.23.0 behaviour) |
+| `FBTODO_BLEND_WEIGHT` | `0.5` | estimates: how much a *waiting* step's number comes from its wording rather than the list's pace, `0`–`1` (`0` = pace only; `1` = wording only, which drops the pace and mis-sizes the tail) |
 
 </details>
+
+The two estimate knobs above are flags as well, so they can be set per run rather than per
+shell: `--label-floor SEC` and `--blend-weight W`. Both are forwarded to the watcher when it
+is started, so `fbtodo --label-floor 0 daemon` really does keep every span. Raising the floor
+makes the estimates calmer (short flips stop setting the pace); lowering the weight makes the
+pane trust the list's own pace over what a step's wording suggests.
 
 Theming is a file, not a flag: `~/.config/fbtodo/theme.json`, overridden by
 `./.fbtodo-theme.json` in the working directory, overridden by the environment above.

@@ -1068,6 +1068,20 @@ try:
     assert module.pick_estimate("Run the tests", {}, "", 480_000, {}) == (None, "pace")
     assert module.task_estimate_ms("Run the tests", 480_000, {}, "", {}) == 480_000
     assert module.pending_blend_ms("Run the tests", 0, cm) is None
+    # ...and the blend is a knob, not a hardcoded half: 0 is the pace alone (nothing to
+    # blend, so the caller falls through to it), 1 is the wording alone
+    assert module.pending_blend_ms("Run the tests", 480_000, cm, 0.0) is None
+    assert module.pending_blend_ms("Run the tests", 480_000, cm, 1.0) == 120_000
+    assert module.pending_blend_ms("Run the tests", 480_000, cm, 0.25) == int(
+        (120_000 ** 0.25) * (480_000 ** 0.75))
+    # ...as is the label floor: 0 keeps every span, and `step_spans_ms` is where it bites
+    assert module.MIN_LABEL_MS == int(module.LABEL_FLOOR_S * 1000)
+    assert module.step_spans_ms(
+        {"s": {"started_ms": 0, "done_ms": 2_000, "elapsed_ms": 2_000}},
+        [{"task": "s", "completed": True}], 2_000) == []
+    assert module.step_spans_ms(
+        {"s": {"started_ms": 0, "done_ms": 12_000, "elapsed_ms": 12_000}},
+        [{"task": "s", "completed": True}], 12_000) == [12_000]
     say("estimates: a waiting step is priced from its wording, blended with the pace: ok")
 
     # ...which the pane's journal reader has to know in the first place: the model comes
@@ -2334,6 +2348,9 @@ try:
     # ...and the source is named, so the error report knows which rung of the ladder missed:
     # two remembered `calls2` steps at 10s and 30s stand behind this one
     assert e_rec["est_src"] == "shape", e_rec
+    # ...and the first-poll ledger rode along on the same record, with the rungs it saw then
+    assert isinstance(e_rec.get("fc"), dict), e_rec
+    assert e_rec["fc"].get("pace") and e_rec["fc"].get("v") == mod.VERSION, e_rec["fc"]
     assert mod.pick_estimate("anything", {}, "") == (None, "pace")
     assert mod.pick_estimate("e-one", shapes, "calls2") == (20_000, "shape")
     # the retired `own` rung is never a source any more: only size, blend and pace remain
@@ -2362,6 +2379,82 @@ try:
     assert "elsewhere" not in str(err) and err.get("z") is None, err
     assert mod.estimate_error({}, t0) == {}
     say("estimates: the projection is stamped, and scored when the step closes: ok")
+
+    # ---- the forecast LEDGER: the vector written on the FIRST poll that saw a step running,
+    #      when nothing about its size was known yet — the only score that cannot flatter a
+    #      rung which recognises rather than predicts. Every rung is scored on every step.
+    ft = {
+        mod.task_key("E", "a"): {"started_ms": t0, "done_ms": t0 + 100_000, "model": "m/e",
+                                 "fc": {"shape": 50_000, "blend": 200_000, "pace": 100_000}},
+        mod.task_key("E", "b"): {"started_ms": t0, "done_ms": t0 + 100_000, "model": "m/e",
+                                 "fc": {"pace": 200_000}},
+        # a step the watcher never saw start has no vector, and is not scored
+        mod.task_key("E", "c"): {"started_ms": t0, "done_ms": t0 + 100_000, "model": "m/e"},
+    }
+    fe = mod.forecast_error(ft, t0 + 1000, "m/e")
+    assert fe["pace"] == {"n": 2, "med": 1.5, "mean": 1.5, "worst": 2.0}, fe
+    assert fe["shape"] == {"n": 1, "med": 2.0, "mean": 2.0, "worst": 2.0}, fe
+    assert fe["blend"] == {"n": 1, "med": 2.0, "mean": 2.0, "worst": 2.0}, fe
+    assert mod.forecast_error({}, t0) == {}
+    assert "elsewhere" not in str(mod.forecast_error(ft, t0 + 1000, "m/z")), "model-filtered"
+    # ...and a vector stamped after the step had ALREADY been running is not a forecast. That
+    # is what a watcher restarting mid-step produces, and scoring it would credit whichever
+    # rung happens to read elapsed with the answer's own clock. Recorded, flagged, left out.
+    late_log = mod.load_tasklog()
+    late_log["tasks"][mod.task_key("E", "late-one")] = {"started_ms": t0, "model": "m/e"}
+    mod.atomic_write_json(mod.TASKS_PATH, late_log)
+    mod.track_tasks(
+        dict(E, todos=[{"task": "late-one", "completed": False}], **hturn({"edited": 5}, t0)),
+        now_ms=t0 + 300_000)
+    l_rec = mod.load_tasklog()["tasks"][mod.task_key("E", "late-one")]
+    assert l_rec["fc"].get("late") == 300_000, l_rec["fc"]
+    # ...and once flagged it changes no rung's score — only the count of what was set aside
+    ft_late = dict(ft)
+    ft_late[mod.task_key("E", "late-row")] = {
+        "started_ms": t0, "done_ms": t0 + 100_000, "model": "m/e",
+        "fc": {"pace": 100_000, "late": 300_000}}
+    fe_late = mod.forecast_error(ft_late, t0 + 1000, "m/e")
+    assert fe_late["pace"] == fe["pace"] and fe_late["shape"] == fe["shape"], fe_late
+    assert fe_late["late"] == {"n": 1, "med": 0.0, "mean": 0.0, "worst": 0.0}, fe_late
+    say("estimates: the first-poll forecast is kept and scored per rung: ok")
+
+    # ---- `fbtodo ledger` prints the rows behind that scoreboard: each rung's prediction
+    #      beside the span it was scored against, and — the half a bare scoreboard cannot
+    #      carry — why a row that could not be scored is not a miss.
+    lr = mod.ledger_rows(ft_late, t0 + 1000, None, "m/e")
+    assert [r["label"] for r in lr] == ["a", "b", "late-row"], lr
+    assert lr[0]["errors"] == {"shape": 2.0, "blend": 2.0, "pace": 1.0}, lr[0]
+    assert lr[1]["errors"] == {"pace": 2.0}, lr[1]     # only a rung that predicted is scored
+    assert lr[2]["scored"] is False and "late" in lr[2]["why"], lr[2]
+    assert mod.ledger_rows(ft_late, t0 + 1000, None, "m/z") == [], "model-filtered"
+    assert mod.ledger_rows(ft, t0 + 30 * 86_400_000, 7.0) == [], "outside the age window"
+    # a step too short to be evidence is shown and NOT scored, with the reason on the row
+    tiny = mod.ledger_rows({mod.task_key("E", "flip"): {
+        "started_ms": t0, "done_ms": t0 + 2_000, "model": "m/e",
+        "fc": {"at": t0 + 500, "v": "9.9.9", "pace": 100_000}}}, t0 + 1000, None, "m/e")
+    assert tiny[0]["scored"] is False and "floor" in tiny[0]["why"], tiny[0]
+    # a step still in flight has a vector and no outcome yet, and says exactly that
+    inflight = mod.ledger_rows({mod.task_key("E", "going"): {
+        "started_ms": t0, "model": "m/e",
+        "fc": {"at": t0, "v": "9.9.9", "pace": 100_000, "pick": "pace"}}},
+        t0 + 1000, None, "m/e")
+    assert inflight[0]["span_ms"] is None and inflight[0]["why"] == "no outcome yet", inflight[0]
+    # ...and a vector written BEFORE the run it is scored against began (a step ticked,
+    # unticked, then worked again restarts its clock but keeps its first vector) reads as
+    # what it is rather than as a stamp that somehow precedes the work
+    pre = mod.ledger_rows({mod.task_key("E", "pre"): {
+        "started_ms": t0 + 60_000, "done_ms": t0 + 200_000, "model": "m/e",
+        "fc": {"at": t0, "v": "9.9.9", "pace": 100_000}}}, t0 + 1000, None, "m/e")
+    assert pre[0]["stamp_in_ms"] == -60_000, pre[0]
+    text = mod.fmt_ledger(pre, t0 + 1000, None, 0)
+    assert "stamped 1m00s before this run" in text, text
+    assert "pace 1m40s ×1.40" in text, text
+    # the report counts what it set aside, and the tail names the way to widen it
+    text = mod.fmt_ledger(lr, t0 + 1000, None, 2)
+    assert "1 stamped late (not scored)" in text, text
+    assert "1 more (--limit 0 for all" in text, text
+    assert "no step carries a forecast yet" in mod.fmt_ledger([], t0, None, 20)
+    say("estimates: `fbtodo ledger` prints the vector beside the outcome: ok")
 
     # ---- and the memory it is scored against now spans a month, not a week: the old cap
     #      pruned records while they were still the only evidence there was (measured
