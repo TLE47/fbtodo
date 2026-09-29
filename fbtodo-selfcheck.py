@@ -2987,6 +2987,35 @@ try:
                 assert len(rows) <= trial_h, (trial_w, trial_h, len(rows))
     say("render: every frame fits the pane it was asked for, at every size: ok")
 
+    # ---- the pane is repainted on a tick even when nothing moved (its clock does), so clearing
+    #      the screen and painting the whole frame every tick is a flash on every tick — and the
+    #      bytes are written to a pseudo-terminal at 1Hz forever. The repaint is a DIFF: the rows
+    #      that changed, addressed in place, and nothing at all when the frame is identical. A
+    #      frame whose SHAPE changed (a resize, or the first paint) is painted whole, because
+    #      rows have moved and a row-wise rewrite would leave the old ones behind.
+    full = module.render(
+        rich_state, True, width=68, height=18, now_ms=SWEEP_NOW,
+        theme=module.THEME_DEFAULTS, truecolor=True,
+    ).splitlines()
+    assert 6 <= len(full) <= 18, len(full)
+    first = module.pane_repaint(None, full, 24)  # a pane taller than the frame keeps the newline
+    assert first.startswith("\x1b[H\x1b[2J") and first.endswith("\n"), repr(first[-30:])
+    exact = module.pane_repaint(None, full, len(full))  # a frame that FILLS the pane
+    assert not exact.endswith("\n"), "a frame that fills the pane got a newline"
+    assert module.pane_repaint(full, full, 24) == "", "an unchanged frame was written again"
+    moved = list(full)
+    moved[-2] = moved[-2].replace("WORKING", "ALL DONE")
+    row = f"\x1b[{len(full) - 1};1H\x1b[2K{moved[-2]}"
+    diff = module.pane_repaint(full, moved, 24)  # a pane taller than the frame
+    assert diff == row + f"\x1b[{len(full) + 1};1H", repr(diff[-40:])  # ...cursor parked below
+    assert module.pane_repaint(full, moved, len(full)) == row, "a full pane parked the cursor"
+    assert "\x1b[2J" not in diff, "a one-row change cleared the screen"
+    assert len(diff) < len(first) // 3, (len(diff), len(first))
+    for shaped in (full + ["extra row"], full[:-2]):
+        out = module.pane_repaint(full, shaped, 24)
+        assert out.startswith("\x1b[H\x1b[2J"), (len(shaped), repr(out[:24]))
+    say("the pane repaints only the rows that moved, and writes nothing when none did: ok")
+
     # ---- the framed top border: the right slot names the watcher, or — with no watcher
     #      serving the pane — the session it is showing, and it never breaks the frame
     def top_of(state_dict, width, watching=None):
@@ -3074,7 +3103,9 @@ try:
             pass
         chunks = data.split(b"\x1b[2J")
         assert len(chunks) >= 2, data
-        return chunks[1]
+        # ...the FIRST frame only: the pane diffs its later paints (a row-addressed write is
+        # where the next one starts), so what follows the clear is that frame and then a change.
+        return re.split(rb"\x1b\[\d+;1H", chunks[1])[0]
 
     short_paint = first_paint([{"task": f"step {i}", "completed": i < 2} for i in range(3)])
     full_paint = first_paint([{"task": f"step {i}", "completed": i < 2} for i in range(29)])
