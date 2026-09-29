@@ -2952,6 +2952,41 @@ try:
     assert sgr(shallow) == sgr(frozen), "the layout moved with the colour depth"
     say("render: handed a palette and a depth, the frame is a function of its arguments: ok")
 
+    # ---- the pane is a fixed grid, so no frame may be wider than the width it was asked
+    #      for or taller than the height: a row one cell over wraps, and one row too many
+    #      scrolls the top border off the screen — which is exactly what the pane looks like
+    #      when it has gone wrong. Checked across the sizes a pane is actually given, on a
+    #      long, half-finished list (the busy case) and on an empty one (the bare case).
+    long_list = [
+        {"task": f"step {n} of a long list", "completed": n < 6,
+         "started_ms": SWEEP_NOW - (20 - n) * 60_000, "done_ms": SWEEP_NOW - (19 - n) * 60_000}
+        for n in range(14)
+    ]
+    wide_state = dict(rich_state, todos=long_list, done=6, total=14, task_times={
+        f"step {n} of a long list": {"started_ms": SWEEP_NOW - (20 - n) * 60_000,
+                                      "done_ms": SWEEP_NOW - (19 - n) * 60_000}
+        for n in range(14)
+    })
+    for probe_state in (wide_state, dict(wide_state, todos=[], done=0, total=0)):
+        for trial_w in (30, 34, 46, 68, 80, 120, 200):
+            for trial_h in (5, 6, 8, 12, 18, 24, 40):
+                frame = module.render(
+                    probe_state, True, watching=999, width=trial_w, height=trial_h,
+                    now_ms=SWEEP_NOW, theme=module.THEME_DEFAULTS, truecolor=True,
+                )
+                rows = frame.splitlines()
+                over = [(len(r), module._cell_width(r)) for r in rows
+                        if module._cell_width(r) > trial_w][:2]
+                assert not over, (trial_w, trial_h, over, frame[:400])
+                assert len(rows) <= trial_h, (trial_w, trial_h, len(rows), frame[-300:])
+                plain = module.render(
+                    probe_state, False, width=trial_w, height=trial_h, now_ms=SWEEP_NOW,
+                )
+                rows = plain.splitlines()
+                assert all(module._cell_width(r) <= trial_w for r in rows), (trial_w, rows[:2])
+                assert len(rows) <= trial_h, (trial_w, trial_h, len(rows))
+    say("render: every frame fits the pane it was asked for, at every size: ok")
+
     # ---- the framed top border: the right slot names the watcher, or — with no watcher
     #      serving the pane — the session it is showing, and it never breaks the frame
     def top_of(state_dict, width, watching=None):

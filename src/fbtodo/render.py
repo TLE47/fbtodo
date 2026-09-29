@@ -191,6 +191,25 @@ def no_times_note(state: dict) -> str:
 # In plain words: the renderer a script gets — plain text, one line per thing, no frame and
 # no colour unless asked for. It is deliberately the boring one: other programs read it, so it
 # stays stable while the framed pane is free to be pretty.
+def _clamp_rows(rows: list, height: int | None, head: int, tail: int) -> list:
+    """A frame cut to `height` rows, keeping `head` at the top and `tail` at the end.
+
+    A pane is a fixed grid: one row too many scrolls the top border — and the title with it —
+    off the screen, which is what a pane that has gone wrong looks like. The ends are what a
+    frame IS (which store and session, and the bar/state row), so the middle gives way; the
+    count on the bar still says how much list is not being shown. Only a pane short enough
+    for no box at all loses an end: then it gets the top `height` rows.
+    """
+    if not height or len(rows) <= height:
+        return rows
+    if height < 2:
+        return rows[:height]
+    head = min(max(0, head), height - 1)
+    tail = min(max(0, tail), height - head)
+    room = max(0, height - head - tail)
+    return rows[:head] + rows[head:len(rows) - tail][:room] + rows[len(rows) - tail:]
+
+
 def _render_plain(
     state: dict,
     color: bool,
@@ -228,7 +247,7 @@ def _render_plain(
 
     if state.get("error"):
         lines += [c(red, seg) for seg in _wrap(str(state["error"]), width, 2)]
-        return "\n".join(lines)
+        return "\n".join(_clamp_rows(lines, height, head=1, tail=0))
 
     if watching:
         # What is being followed differs by backend: a local pid here, or the remote
@@ -332,7 +351,8 @@ def _render_plain(
         for seg in observed_rows(state, 1 if turn_line else 2, now_ms):
             lines += [c(dim, s) for s in _wrap("  " + seg, width, 1)]
         lines.append(c(dim, f"  live {time.strftime('%H:%M:%S', time.localtime(now_ms / 1000))}"))
-        return "\n".join(lines)
+        # The no-list strip: the last row is the clock, so one of these is always kept.
+        return "\n".join(_clamp_rows(lines, height, head=1, tail=1))
     # No note here, deliberately: a plain snapshot is parsed by scripts, and the suite
     # holds its line count still whatever the timings are (fbtodo-selfcheck: "a snapshot's
     # line count must not move because an estimate exists"). Both notes below are the
@@ -503,6 +523,9 @@ def _render_plain(
         rest = len(blocks) - end
         lines.append(c(dim, f"  … {rest} more step{'s' if rest > 1 else ''}"))
     lines += footer
+    # This path is normally given no height at all — `snap`, `json`, a pipe — so its line count
+    # only follows a pane that asked for a strip with colour turned off or a very narrow width.
+    lines = _clamp_rows(lines, height, head=1, tail=len(footer))
     return "\n".join(lines)
 
 
@@ -938,7 +961,7 @@ def _render_rich(
         for seg in _wrap(str(state["error"]), inner, 0):
             rows.append(_frame_row(c(red, seg), width, frame))
         rows.append(_bottom_row(width, frame))
-        return "\n".join(rows)
+        return "\n".join(_clamp_rows(rows, height, head=1, tail=1))
 
     # The heading is the agent's own `Goal:` line, in muted grey so the steps below it
     # are what the eye lands on. A session that wrote none gets no heading ROW at all —
@@ -1037,7 +1060,7 @@ def _render_rich(
         if refit_row_here:
             rows.append(_frame_row(patch_row_styled(refit_row_here), width, frame))
         rows.append(_bottom_row(width, frame))
-        return "\n".join(rows)
+        return "\n".join(_clamp_rows(rows, height, head=1, tail=1))
 
     times = state.get("task_times") or {}
     history = state.get("task_history") or {}
@@ -1441,6 +1464,7 @@ def _render_rich(
             take = min(over, count)
             del rows[at + count - take:at + count]  # the LAST of them first: NOW, then goal
             over -= take
+    rows = _clamp_rows(rows, height, head=1, tail=2)
     return "\n".join(rows)
 
 
