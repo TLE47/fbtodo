@@ -78,6 +78,10 @@ That is the whole setup. No config file, no hook, nothing to add to a prompt: fb
 the todo list the agent **already keeps for itself**. You need **Python 3.9+** (it is
 already on macOS and most Linux) and **tmux**, and something to watch.
 
+The one thing worth doing on day one is making sure the agent keeps one at all, since a
+session that never writes a list has nothing to draw — that is the first thing in
+[How it works](#getting-a-list-in-the-first-place).
+
 <details>
 <summary><b>The pane did not appear — the four usual reasons</b></summary>
 
@@ -85,7 +89,7 @@ already on macOS and most Linux) and **tmux**, and something to watch.
 |---|---|
 | nothing at all | you are not in tmux: run `tmux new -s work`, then start the agent inside it |
 | `fbtodo: command not found` | `~/.local/bin` is not on your `PATH` — the one line to add is in [Install, in detail](#is-it-on-your-path) |
-| a pane, but no list | the agent has not written a todo list yet; `fbtodo status` says what it sees |
+| a pane, but no list | the agent has not written a todo list yet — [ask it for one](#getting-a-list-in-the-first-place); `fbtodo status` says what it sees |
 | the pane is somewhere odd | `fbtodo why` — it names the pane, the anchor and where the placement came from |
 
 </details>
@@ -440,6 +444,48 @@ Enough to be useful, without the tour of every corner. The genuinely deep detail
 state-file contract, the notifier contracts and the pane
 lifecycle — is in **[docs/INTERNALS.md](docs/INTERNALS.md)**.
 
+### Getting a list in the first place
+
+The list is the agent's own: it calls a tool called `write_todos`, and that call is what
+fbtodo draws. fbtodo never invents a list and cannot add an item to one — so if a session has
+never written one, there is nothing to show, and it is worth setting up before you look at an
+empty pane and wonder what is broken.
+
+**Ask once, in the session:**
+
+```text
+plan this as a todo list, and tick items off as you go
+```
+
+**Or make it a standing rule.** `AGENTS.md` — `~/AGENTS.md` for every project, or one inside a
+project that should behave differently — is read at the start of every session. One bullet
+there means every session keeps a list without being asked:
+
+```md
+## Progress
+- Track every task with a todo list: write it before starting work and tick each step off as
+  it lands — a one-line fix as much as a refactor.
+```
+
+[`examples/AGENTS.md`](examples/AGENTS.md) is that snippet on its own, plus the two smaller
+conventions that make a list worth watching.
+
+**When a session has no list**, the pane says so in words rather than drawing an empty frame,
+and the words differ by cause:
+
+| The pane says | What happened |
+|---|---|
+| `no write_todos call yet in this session` | nothing has been written yet. Early in a session that is normal; a session deep into the work without one is not planning, which is the more interesting thing to notice |
+| `new session — old list dropped, waiting for a new one` | the session changed, so the previous list was dropped rather than left up as if it were current |
+| `called so far: run_terminal_command 20, skill 3` | a second line, on a session that has been busy: what it *has* been doing instead. A pane that only says "no list yet" is shrugging; this one is diagnosing |
+
+**A list with no numbers in it** is the other half of the same case. A step gets a clock only
+if the watcher saw it unfinished, so a list whose steps were never seen that way — every one
+already ticked when it appeared, or a watcher that attached after the work had started — has no
+durations to show. The pane says which of the two happened
+(`no per-step times · the list arrived with every step already ticked`, or `… · no step was
+ever seen running`) instead of looking like a stopped clock.
+
 ### Where the list comes from: two stores
 
 A coding agent's todo list is not a side channel — it is written to whatever transcript
@@ -622,7 +668,7 @@ store · `75` the watcher failed to start.
 
 | Symptom | First thing to try |
 |---|---|
-| Pane is empty | `fbtodo status`. If the backend is `cli` with no list, the agent has not called `write_todos` yet — the pane shows nothing until it does. |
+| Pane is empty | `fbtodo status`. A `cli` session with no list means the agent has not called `write_todos` yet — [ask it for one](#getting-a-list-in-the-first-place), or add the line to your `AGENTS.md` so it never needs asking. |
 | Pane exits immediately | exit `66`: no running instance, or no store found for the cwd. Try `--instance-of PID` or `-p`. |
 | Pane gone after a while | `--stale-after` (default: 60 min of store silence). `0` = never. |
 | Pane not where you want it | `fbtodo why` — read the `source` on the line, it is usually the answer. Then `fbtodo pin`. |
@@ -652,8 +698,10 @@ only if you install it.
 No — it reads files that are being written anyway.
 
 **Why does the pane show nothing?**
-The agent has not written a todo list yet, or the pane is bound to the wrong session. Run
-`fbtodo status`, then `fbtodo why`.
+Two different problems, and the pane tells you which. Either the session has not written a
+todo list yet — the pane says so in those words, and [asking for one](#getting-a-list-in-the-first-place)
+fills it — or the pane is bound to the wrong session. `fbtodo status` answers the first,
+`fbtodo why` the second.
 
 **Can I use it for several sessions at once?**
 Yes — one pane per session, each bound to its own. The keeper manages them all.
@@ -709,8 +757,10 @@ tests to copy). The self-check below is the contract — a change is done when i
 ## Examples
 
 [`examples/`](examples) is a folder of copy-paste-able starting points, none of them
-required: the [`fb` launcher](examples/fb.sh), a tmux status line, and three theme presets
-(Catppuccin, Gruvbox, Nord). See [examples/README.md](examples/README.md).
+required: the [`fb` launcher](examples/fb.sh), a tmux status line, three theme presets
+(Catppuccin, Gruvbox, Nord), and
+[the rule that makes an agent keep a list at all](examples/AGENTS.md). See
+[examples/README.md](examples/README.md).
 
 ---
 

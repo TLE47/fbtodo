@@ -4229,6 +4229,9 @@ def _window_anchor(cur_index: int | None, count: int) -> int:
     return max(0, count - 1)
 
 
+# In plain words: a pane with no list should not just shrug at you. This lists the tools the
+# session has actually called — "called so far: run_terminal_command 20, skill 3" — which turns
+# "no list yet" from a mystery into a diagnosis: it is working, and it is not planning out loud.
 def tools_note(tools: dict, limit: int = 3) -> str:
     """`called so far: run_terminal_command 20, skill 3 +2 more` — what the session has
     actually called. A list-less pane that names the tools is diagnosing; one that only
@@ -4244,6 +4247,12 @@ def tools_note(tools: dict, limit: int = 3) -> str:
     return f"called so far: {head}" + (f" +{more} more" if more > 0 else "")
 
 
+# In plain words: every duration in the pane is measured by watching, never read from the
+# agent. A step gets a clock only if fbtodo saw it unfinished at least once. So a list that
+# turns up already finished — or one fbtodo attached to after the work had started — has no
+# numbers at all, and the pane says which of those happened rather than showing a clock that
+# looks broken.
+#
 # Every per-step number the pane shows — the row's clock, the list's pace, `EST REM`,
 # `ETA` — is measured by WATCHING the list change from one poll to the next, and a step
 # only gets a clock if it was seen *unfinished* at some point. So a list that arrives with
@@ -4256,6 +4265,8 @@ NO_TIMES_TICKED = "no per-step times · the list arrived with every step already
 NO_TIMES_UNSEEN = "no per-step times · no step was ever seen running"
 
 
+# In plain words: why are the numbers missing? There are two honest answers, and the pane
+# names the one that applies; an empty answer means there is nothing to explain.
 def no_times_note(state: dict) -> str:
     """Why the per-step numbers are missing, when they are — or None-ish when they are not."""
     todos = state.get("todos") or []
@@ -4269,6 +4280,9 @@ def no_times_note(state: dict) -> str:
     return NO_TIMES_UNSEEN
 
 
+# In plain words: the renderer a script gets — plain text, one line per thing, no frame and
+# no colour unless asked for. It is deliberately the boring one: other programs read it, so it
+# stays stable while the framed pane is free to be pretty.
 def _render_plain(
     state: dict,
     color: bool,
@@ -4392,6 +4406,9 @@ def _render_plain(
             )
             lines += [c(yellow, seg) for seg in segs]
 
+    # In plain words: a session with no list is the one case where the pane has nothing to
+    # draw, so it says why in words instead — and the words differ by cause rather than being
+    # one catch-all shrug.
     todos = state.get("todos") or []
     if not todos:
         if state.get("first_prompt") and not goal:
@@ -4841,6 +4858,10 @@ def _elision_note(count: int, flags: list, where: str) -> str:
     return f"  │ {count} {where} step{plural} pending"
 
 
+# In plain words: the framed pane. This is the drawing code, and the longest part of the file,
+# because a terminal is not a canvas: every row is measured in screen columns, cut to a frame
+# whose height depends on the pane it is in, and the colours are roles resolved from a theme
+# rather than colours sprinkled through the drawing. Read it as "decide what fits, then draw".
 def _render_rich(
     state: dict,
     color: bool,
@@ -4960,6 +4981,9 @@ def _render_rich(
             len(head), height - 7 - (1 if patch_row_here else 0) - (1 if no_times else 0)
         ))]
 
+    # In plain words: the same situations the plain renderer names, plus the one line the
+    # framed pane can afford and a script's snapshot cannot — what the session has been doing
+    # instead of writing a list.
     todos = state.get("todos") or []
     if not todos:
         rows += [_frame_row(h, width, frame) for h in head]

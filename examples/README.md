@@ -6,10 +6,20 @@ configuration at all — and none of them touches the tool's code.
 | File | What it is |
 |---|---|
 | [`fb.sh`](fb.sh) | the `fb` launcher: agent and its pane in one word |
+| [`AGENTS.md`](AGENTS.md) | the rule that makes an agent keep a todo list at all |
 | [`tmux.conf`](tmux.conf) | `fbtodo bar` in your tmux status line — progress at a glance, no pane |
 | [`theme-catppuccin-mocha.json`](theme-catppuccin-mocha.json) | a theme preset (24-bit colour) |
 | [`theme-gruvbox-dark.json`](theme-gruvbox-dark.json) | a theme preset |
 | [`theme-nord.json`](theme-nord.json) | a theme preset |
+
+## An agent that keeps a list
+
+fbtodo draws a list the agent writes itself, so the one prerequisite is that the agent writes
+one — a session that never calls `write_todos` has nothing for the pane to show.
+[`AGENTS.md`](AGENTS.md) is the snippet to paste into your own: a short section that makes
+every session keep a list without being asked, plus the two smaller conventions (`Goal:` line,
+list written before the work) that make it worth watching. Nothing in the repository depends on
+it, and asking for a list inside a session works too.
 
 ## Themes
 
