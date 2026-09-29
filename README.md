@@ -30,9 +30,9 @@ through — the very list the agent keeps for itself — and draws it in a small
 times each step from the moment the step actually starts, estimates what is left, and can
 ring your phone when a session finishes, stalls, stops on a question, or loses its pane.
 
-Quick links: [What it does](#what-it-does) · [Install](#install-60-seconds) ·
-[Commands](#everyday-commands) · [Settings](#settings) · [FAQ](#faq) ·
-[Ideas & roadmap](#ideas--roadmap)
+Quick links: [What it does](#what-it-does) · [Does it work with my setup?](#does-it-work-with-my-setup) ·
+[Install](#install-60-seconds) · [Commands](#everyday-commands) · [Settings](#settings) ·
+[FAQ](#faq) · [Ideas & roadmap](#ideas--roadmap)
 
 ---
 
@@ -59,6 +59,24 @@ stores, four watches, a pane, and a lot of care about what "the clock" means.
 
 ---
 
+## Does it work with my setup?
+
+fbtodo reads the todo list the agent **already writes for itself**. There is nothing to add
+to your prompt, no `.cursorrules` snippet, no JSON file to maintain and no hook to install —
+if the agent is working through a list, the pane can see it.
+
+| Your setup | What it reads | Live? |
+|---|---|---|
+| **Freebuff CLI**, in a terminal | `~/.config/manicode/projects/<project>/chats/<ISO>/log.jsonl` | **yes — mid-turn** |
+| **Freebuff Desktop** app | the app's own SQLite store | per turn, while the app runs |
+| **Freebuff on another host**, over ssh (a container on a NAS, say) | the remote store, one ssh round trip per poll | per turn |
+| Claude Code, Aider, Cursor, … | — | not yet — a generic source is the [first roadmap item](#ideas--roadmap) worth landing |
+
+`--source auto` (the default) picks the right one for the current directory; `-s
+cli|nas|desktop` says so explicitly.
+
+---
+
 ## Install (60 seconds)
 
 ### Requirements
@@ -77,10 +95,10 @@ sudo apt install tmux        # Debian / Ubuntu
 
 ```sh
 git clone https://github.com/TLE47/fbtodo ~/Projects/fbtodo
-mkdir -p ~/.local/bin
-ln -s ~/Projects/fbtodo/fbtodo ~/.local/bin/fbtodo
-chmod +x ~/Projects/fbtodo/fbtodo
+mkdir -p ~/.local/bin && ln -sf ~/Projects/fbtodo/fbtodo ~/.local/bin/fbtodo
 ```
+
+Two commands — the clone keeps the executable bit, so there is nothing to `chmod`.
 
 Make sure `~/.local/bin` is on your `PATH` (add
 `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` or `~/.bashrc` if it is not), then:
@@ -89,6 +107,19 @@ Make sure `~/.local/bin` is on your `PATH` (add
 fbtodo -V          # prints the version — you are installed
 fbtodo snap        # one plain-text snapshot of the list (works with no tmux)
 ```
+
+### Or try it in 30 seconds, with no tmux at all
+
+With a session running in this directory:
+
+```sh
+fbtodo snap     # the list as plain text
+fbtodo json     # the same state, as clean JSON — pipe it anywhere
+fbtodo bar      # "todos 3/5", what a status line shows
+```
+
+Those three need nothing but Python. The pane is the pretty one; these are the ones you can
+script.
 
 ### Use it
 
@@ -110,6 +141,16 @@ fbtodo --instance-of $$    # the list for the agent running in this pane
 
 `--instance-of` is how a wrapper — or you — attaches a pane to a specific session rather
 than to whatever is newest in the directory.
+
+### See it move
+
+[`docs/demo`](docs/demo) is a demo harness: a fixture session, a driver that replays it, and
+a [vhs](https://github.com/charmbracelet/vhs) tape that records the GIF over the top of the
+real tool — the pane in your recording is `fbtodo pane`, reading a real file.
+
+```sh
+brew install vhs && docs/demo/record.sh     # → docs/demo/demo.gif
+```
 
 <details>
 <summary><b>New to tmux? The four keys you need</b></summary>
@@ -491,8 +532,9 @@ store · `75` the watcher failed to start.
 ## FAQ
 
 **Do I need Freebuff?**
-Yes, today — it reads Freebuff's transcript stores. The same idea generalises to any agent
-that publishes a checklist, which is what [the roadmap](#ideas--roadmap) is for.
+Today, yes — see [Does it work with my setup?](#does-it-work-with-my-setup). The same idea
+generalises to any agent that publishes a checklist, which is what
+[the roadmap](#ideas--roadmap) is for.
 
 **Do I need tmux?**
 Only for the pane. `fbtodo snap`, `json` and `bar` are plain programs that work anywhere —
@@ -532,7 +574,7 @@ welcome; each item below is scoped so one person could land it.
 | **`brew install fbtodo` + `uvx fbtodo` + a one-line installer** | Removing "clone and symlink" is the single biggest adoption lever. |
 | **`fbtodo board` — all live sessions in one pane** | People run two or three agents at once. One pane showing every session, its list and its clock beats switching windows. |
 | **`fbtodo serve` — a read-only web mirror** | Watch from your phone or another machine, no ssh. Pairs with the notify kit you already have. |
-| **Theme presets and `fbtodo theme`** (`catppuccin`, `gruvbox`, `nord`, `dracula`, `--preview`) | Theming is already data — shipping a gallery makes the pane look good in seconds. |
+| **Theme presets and `fbtodo theme`** (`catppuccin`, `gruvbox`, `nord`, `dracula`, `--preview`) | [`examples/`](examples) ships three hand-written presets today; a picker would make it a gallery. |
 | **More transports: Slack, Discord, Telegram, Pushover, native macOS notifications** | iMessage + ntfy covers two platforms; a room of teammates is one webhook away. |
 | **`fbtodo stats` — history and retro** | Per-project step times, slowest step types, a "where did the session actually spend its time" summary. This is the feature that makes people keep it installed. |
 | **Generic sources: a JSON file, an MCP tool, another agent's todo format** | Drops the Freebuff requirement and makes the tool useful to everyone. |
@@ -559,6 +601,14 @@ tests to copy). The self-check below is the contract — a change is done when i
 - **Not included:** the shell wrapper that opens the pane on launch, the remote launch hook,
   and the CLI-patch step whose log the `PATCH` row reads. Each is glue around this tool —
   their contracts are documented above, so you can write your own or ignore them.
+
+---
+
+## Examples
+
+[`examples/`](examples) is a folder of copy-paste-able starting points, none of them
+required: a tmux status line, three theme presets (Catppuccin, Gruvbox, Nord), and the
+remote marker wrapper as a file you can read. See [examples/README.md](examples/README.md).
 
 ---
 
