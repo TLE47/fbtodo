@@ -37,6 +37,11 @@ and new ones are very welcome.
 
 ## `fb`: the launcher
 
+`fb` is a nickname you teach your terminal once, so that one word does the whole dance. In
+plain words: it updates your agent if a new release is out, makes room for the todo list,
+starts the agent in the space you were already in, and closes the list when that session ends.
+Nothing else in this repository depends on it, and skipping it is fine.
+
 Source [`fb.sh`](fb.sh) from your shell startup file and `fb` replaces `freebuff`. It does
 three things in the order that matters: refreshes the released CLI (`npm i -g freebuff`,
 quiet unless the version moved — `FREEBUFF_NO_REFRESH=1` skips it, which scripts and tests

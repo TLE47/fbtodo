@@ -204,12 +204,34 @@ fbtodo --instance-of $$    # the list for the agent running in this pane
 `--instance-of` is how a wrapper — or you — attaches a pane to a specific session rather
 than to whatever is newest in the directory.
 
-### One word: `fb`
+### One word: `fb` — optional, and the easy way in
 
-Typing `freebuff` *and* remembering to open a pane is friction, and friction is what decides
-whether a pane ever gets used. Source [`examples/fb.sh`](examples/fb.sh) from `~/.zshrc` or
-`~/.bashrc` and `fb` does three things in the order that matters: it refreshes the released
-CLI, opens the pane, then starts the agent.
+**In plain words.** `fb` is a nickname you teach your terminal once. After that, typing those
+two letters does four things for you:
+
+1. **Keeps your agent up to date.** If a newer version was released, it installs it. You get a
+   one-line note only when the version actually changed, so most launches look like nothing
+   happened. Without this, you keep running an old version until you remember to update by hand.
+2. **Makes room for the list.** It splits your terminal and puts the checklist in the new
+   space, next to the agent — below it by default, beside it if you prefer (see
+   [size and placement](#size-and-placement)).
+3. **Starts the agent** in the space you were already in — exactly like typing `freebuff`.
+4. **Tidies up after itself.** The list belongs to that one session: it goes away when the
+   session does, and you can close it by hand at any time without losing anything.
+
+**You do not have to do this.** If you are already in tmux, the list opens on its own — `fb`
+only saves you the typing and keeps the agent current. Nothing else in this README depends on
+it.
+
+**To get it:** copy the box below into the file your terminal reads when it opens — `~/.zshrc`
+on most Macs, `~/.bashrc` on many Linux machines — at the very end. Open a new terminal window,
+type `fb`, and you are done. (If you would rather not touch that file, skip this whole
+section.)
+
+<details>
+<summary><b>Show the code, and what each part of it does</b></summary>
+
+This is [`examples/fb.sh`](examples/fb.sh) — the same code, as a file you can source.
 
 ```sh
 fb() {
@@ -267,6 +289,11 @@ Five things in there are worth knowing:
   tool's "never" for store silence, so the session's own lifecycle decides.
 - **`FBTODO_NO_PANE=1`** turns the pane off; `FBTODO_SPLIT=h` and `FBTODO_PANE_SIZE=N` size
   it. A pane killed by hand comes back on its own while the session lives.
+
+Nothing here is required, and every name in it is a switch you can set before launching: if a
+line of it scares you, ignore it — the two defaults do the useful thing already.
+
+</details>
 
 If you would rather have the short name on the tool itself, the alternative is one line:
 `alias ft=fbtodo` — then `ft snap`, `ft bar`, `ft why`. Or `alias fb=fbtodo` if you would
