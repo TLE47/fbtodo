@@ -498,6 +498,18 @@ durations to show. The pane says which of the two happened
 (`no per-step times · the list arrived with every step already ticked`, or `… · no step was
 ever seen running`) instead of looking like a stopped clock.
 
+**A list that stops being re-written** is the third way a pane can look stuck while the agent
+is working — and the reason it is worth understanding is that nothing is wrong with fbtodo. The
+list carries its own age: `fbtodo status` always reports it (`list written : 12m ago`), and the
+pane's strip shows it in the parentheses after the state (`ALL DONE (2h ago)`) whenever nothing
+is counting. When that number grows, the progress on screen is no longer the agent's progress:
+`write_todos` is the only record fbtodo ever sees, so a session that stops publishing leaves its
+last list up, with its last percentages, and nothing can tell that a step has moved on. Two
+things do still move, and both are worth reading: the step that is nominally running keeps its
+clock, so it turns red and gains `[STUCK?]` once it passes twice its estimate, and a `now` or
+`NUDGE` line appears the moment a request is waiting on a list that never answered it. The fix is on the agent's side — ask for the rewrite, or keep the
+rule in your [`AGENTS.md`](examples/AGENTS.md) so it never needs asking.
+
 ### Where the list comes from: two stores
 
 A coding agent's todo list is not a side channel — it is written to whatever transcript
@@ -685,7 +697,7 @@ store · `75` the watcher failed to start.
 | Pane gone after a while | `--stale-after` (default: 60 min of store silence). `0` = never. |
 | Pane not where you want it | `fbtodo why` — read the `source` on the line, it is usually the answer. Then `fbtodo pin`. |
 | Pane killed mid-session | It comes back within ~3 s. If it does not, the pane watch is what tells you. |
-| List looks frozen | Count `write_todos` calls in the journal. A `goal`/`now` pair that disagree is the pane saying the same thing. |
+| List shows old progress | Check the list's own age: `list written` in `fbtodo status` (the pane shows it too, in the strip's parentheses, whenever nothing is counting). If it is growing, the agent has stopped calling `write_todos` — count them in the journal, and [ask for the rewrite](#getting-a-list-in-the-first-place). A `goal`/`now` pair that disagree is the pane saying the same thing about a *request* that is waiting. |
 | A step with no duration | The watcher never saw it running. A step's clock starts at the tick, not at the list's mtime. |
 | Different code running | The pane and the watcher hold what they started with: `fbtodo stop`, then re-open the pane. |
 

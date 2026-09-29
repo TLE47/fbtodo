@@ -5761,6 +5761,15 @@ def cmd_status(args) -> int:
         if view.get("list_version"):
             counts += f", list #{view['list_version']}"
         print(f"  todos             : {counts}")
+        # The list's own age. The pane has this number too, but only in the strip's
+        # parentheses and only while the state is idle — a clock on a step takes that slot,
+        # by design. Said here it is always answered, which is what makes "an agent that
+        # stopped calling `write_todos` leaves the old progress up" a question the command
+        # line can settle.
+        print(
+            "  list written      : "
+            + (fmt_age(view.get("source_updated_ms") or view.get("ts")) or "?")
+        )
     if view and (view.get("goal") or view.get("todos")):
         goal = str(view.get("goal") or "")
         if not goal:
