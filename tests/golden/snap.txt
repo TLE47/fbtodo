@@ -1,0 +1,11 @@
+Freebuff todos  cli · 2026-09-29T11-26-00.000Z
+golden fixture
+big goal · Make the frame a pure function
+now · and add a golden diff to the suite
+  [x] Read the journal tail
+  [x] Strip what a terminal obeys
+  [ ] Write the golden files · 0s… / ~2m
+  [ ] Wire the diff into the suite · ~2m
+  [ ] Say so in the README · ~2m
+  [########------------] 2/5 done | EST REM: 6m00s | ETA 05:06
+  working 0s · 10s ago   live 05:00:00
