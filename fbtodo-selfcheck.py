@@ -4754,8 +4754,8 @@ try:
         #      answer; a role's own half outranks it for that role only, which is what lets
         #      a window holding a session AND a NAS ssh size its two lists differently.
         #      Asserted against the module's own lookup, not through tmux: it is a rule.
-        panes_mod.PINS_PATH = os.path.join(TEST_HOME, "pins-unit.json")
-        panes_mod.LAST_PATH = os.path.join(TEST_HOME, "last-unit.json")
+        set_knob(panes_mod, "PINS_PATH", os.path.join(TEST_HOME, "pins-unit.json"))
+        set_knob(panes_mod, "LAST_PATH", os.path.join(TEST_HOME, "last-unit.json"))
         with open(panes_mod.PINS_PATH, "w") as fh:
             json.dump({window_target: {"side": "h", "size": 10, "nas": {"size": 6}}}, fh)
         shared = panes_mod.pane_layout(window_target, "local")
