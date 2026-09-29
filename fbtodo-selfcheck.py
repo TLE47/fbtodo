@@ -3471,9 +3471,12 @@ try:
         mod.task_key("E", "c"): {"started_ms": t0, "done_ms": t0 + 100_000, "model": "m/e"},
     }
     fe = mod.forecast_error(ft, t0 + 1000, "m/e")
-    assert fe["pace"] == {"n": 2, "med": 1.5, "mean": 1.5, "worst": 2.0}, fe
-    assert fe["shape"] == {"n": 1, "med": 2.0, "mean": 2.0, "worst": 2.0}, fe
-    assert fe["blend"] == {"n": 1, "med": 2.0, "mean": 2.0, "worst": 2.0}, fe
+    assert fe["pace"] == {"n": 2, "med": 1.5, "mean": 1.5, "worst": 2.0,
+                         "lo": 1.0, "hi": 2.0}, fe
+    assert fe["shape"] == {"n": 1, "med": 2.0, "mean": 2.0, "worst": 2.0,
+                           "lo": 2.0, "hi": 2.0}, fe
+    assert fe["blend"] == {"n": 1, "med": 2.0, "mean": 2.0, "worst": 2.0,
+                           "lo": 2.0, "hi": 2.0}, fe
     assert mod.forecast_error({}, t0) == {}
     assert "elsewhere" not in str(mod.forecast_error(ft, t0 + 1000, "m/z")), "model-filtered"
     # ...and a vector stamped after the step had ALREADY been running is not a forecast. That
@@ -3496,6 +3499,65 @@ try:
     assert fe_late["pace"] == fe["pace"] and fe_late["shape"] == fe["shape"], fe_late
     assert fe_late["late"] == {"n": 1, "med": 0.0, "mean": 0.0, "worst": 0.0}, fe_late
     say("estimates: the first-poll forecast is kept and scored per rung: ok")
+
+    # ...and a rung carries the SPREAD of its misses, not only the typical one: a median of
+    # ×1.1 off a tight distribution and the same median off a coin toss are different
+    # predictors, and `lo`/`hi` is what tells them apart. The tails are dropped rather than
+    # reported as the whole story — that is what `worst` is for — and the quantile is a
+    # nearest-rank pick, because with eleven steps an interpolated one would be arithmetic on
+    # nothing.
+    assert (fe["pace"]["lo"], fe["pace"]["hi"]) == (1.0, 2.0), fe   # the two ratios, half each
+    assert (fe["shape"]["lo"], fe["shape"]["hi"]) == (2.0, 2.0), fe  # one sample: no spread
+    spread_ft = {
+        mod.task_key("E", f"s{n}"): {
+            "started_ms": t0, "done_ms": t0 + 100_000, "model": "m/e",
+            "fc": {"pace": 100_000 * (n + 1) if n < 9 else 100_000},
+        }
+        for n in range(10)
+    }
+    span_fe = mod.forecast_error(spread_ft, t0 + 1000, "m/e")
+    assert span_fe["pace"]["n"] == 10 and span_fe["pace"]["lo"] < span_fe["pace"]["med"], span_fe
+    assert span_fe["pace"]["hi"] > span_fe["pace"]["med"], span_fe
+    assert "lo" not in span_fe.get("late", {}), "the count of set-aside rows is not a spread"
+
+    # ---- the verdict: does one rung really beat another? Both are scored on the SAME steps
+    #      (paired, so a rung cannot win by being asked an easier set of them), and the
+    #      resampling is over SESSIONS rather than steps — the steps inside one session are not
+    #      independent, and resampling them separately would treat one session that ran long
+    #      steps as twelve pieces of evidence. 0.5 is a coin toss; 0.98 is a verdict.
+    duel_log = {}
+    for sess, factor in (("S1", 1.0), ("S2", 1.0), ("S3", 1.0), ("S4", 1.0)):
+        for n in range(4):
+            duel_log[mod.task_key(sess, f"step {n}")] = {
+                "started_ms": t0, "done_ms": t0 + 100_000, "model": "m/e",
+                "fc": {"pace": 100_000, "blend": int(100_000 * 3 * factor)},
+            }
+    rows = mod.ledger_rows(duel_log, t0 + 1000, None, "m/e")
+    duel = mod.rung_duel(rows, "pace", "blend")
+    assert duel["steps"] == 16 and duel["sessions"] == 4, duel
+    assert duel["share_steps"] == 1.0 and duel["share_resamples"] >= 0.95, duel
+    assert duel["winner"] == "pace" and duel["resamples"] == mod.DUEL_RESAMPLES, duel
+    # ...and a rung nobody has scored is not a winner by default: no pairing, no verdict
+    odd = mod.rung_duel(rows, "pace", "shape")
+    assert odd["steps"] == 0 and odd["winner"] is None, odd
+    # a coin toss reads as one: the intervals overlap and the shares sit near a half. The split
+    # is written out rather than drawn, because the point of THIS check is that a null result
+    # is reported as a null result — a fixture that hashed its way to 12/4 across four sessions
+    # would be testing the hash, and would fail once in every thirteen runs.
+    tie_log = {}
+    for sess, wins in (("S1", 3), ("S2", 1), ("S3", 3), ("S4", 1)):
+        for n in range(4):
+            tie_log[mod.task_key(sess, f"step {n}")] = {
+                "started_ms": t0, "done_ms": t0 + 100_000, "model": "m/e",
+                "fc": {"pace": 100_000 if n < wins else 200_000, "blend": 150_000},
+            }
+    tie_rows = mod.ledger_rows(tie_log, t0 + 1000, None, "m/e")
+    tied = mod.rung_duel(tie_rows, "pace", "blend")
+    assert tied["steps"] == 16 and tied["share_steps"] == 0.5, tied
+    assert tied["winner"] is None, tied
+    assert 0.2 <= tied["share_resamples"] <= 0.8, tied
+    assert mod.rung_duel([], "pace", "blend")["steps"] == 0
+    say("estimates: a rung's spread is reported, and a duel over sessions resolves it: ok")
 
     # ---- `fbtodo ledger` prints the rows behind that scoreboard: each rung's prediction
     #      beside the span it was scored against, and — the half a bare scoreboard cannot
