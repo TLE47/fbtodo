@@ -277,6 +277,27 @@ try:
     state_path = os.path.join(TEST_HOME, "fbtodo-state.json")
     lock_path = os.path.join(TEST_HOME, "fbtodo-daemon.pid")
 
+    # A CLI root of our own. This block proves the watcher reads a real CLI journal, and it
+    # used to read the OPERATOR's live one — which made it pass or fail with whatever the
+    # owner's session happened to be doing at that second. A session that has just dropped a
+    # finished list is legitimately list-less, and that is not the watcher's fault.
+    cli_root = os.path.join(TEST_HOME, "cliwatch")
+    chat_dir = os.path.join(cli_root, "billthuan1", "chats", "2026-01-01T00-00-00.000Z")
+    os.makedirs(chat_dir, exist_ok=True)
+    with open(os.path.join(chat_dir, "log.jsonl"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "level": "DEBUG",
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "data": {
+                "iteration": 1,
+                "prompt": "watch this session",
+                "toolCalls": [{"toolName": "write_todos", "input": {"todos": [
+                    {"task": "one", "completed": True},
+                    {"task": "two", "completed": False},
+                ]}}],
+            },
+        }) + "\n")
+
     # ---- a fake freebuff instance we are allowed to kill
     victim = spawn_quiet("sleep", "600")
     time.sleep(0.2)
@@ -284,7 +305,8 @@ try:
     # ---- daemon starts, watches the victim, refreshes the state file
     daemon = subprocess.Popen(
         [sys.executable, FB, "daemon", "--foreground", "--quiet",
-         "--instance-pid", str(victim.pid), "--cwd", CWD, "-i", "0.2"],
+         "--instance-pid", str(victim.pid), "--cwd", CWD, "-i", "0.2",
+         "--cli-root", cli_root],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL, start_new_session=True, env=env, cwd=CWD,
     )
@@ -363,11 +385,13 @@ try:
     kill_tree(victim_l)
     say("a removed lock stops the watcher without resurrecting its home: ok")
 
-    # ---- json/bar/snap contracts
-    j = json.loads(run("json").stdout)
+    # ---- json/bar/snap contracts, against the same fixture root the watcher read: the
+    # operator's live session is not a fixture and cannot be asserted about.
+    j = json.loads(run("json", "--cli-root", cli_root).stdout)
     assert j.get("backend") == "cli" and j.get("todos"), j
-    assert run("bar").stdout.strip().startswith("todos "), run("bar").stdout
-    assert "no conversation DB found" not in run("snap").stderr
+    bar_out = run("bar", "--cli-root", cli_root).stdout
+    assert bar_out.strip().startswith("todos "), bar_out
+    assert "no conversation DB found" not in run("snap", "--cli-root", cli_root).stderr
     say("json / bar / snap subcommands: ok")
 
     # ---- new session drops the previous list instead of showing it
@@ -401,6 +425,34 @@ try:
     assert not probe.get("list_version"), probe  # a probe must not invent a counter
     say("new session drops the old list; progress does not renumber it: ok")
     say("a standalone probe reports no list counter instead of guessing #1: ok")
+
+    # ---- a FINISHED list does not belong to the turn after it: it is dropped, not carried
+    done = {"session": "S", "todos": [{"task": "a", "completed": True}], "ts": 1000,
+            "source_updated_ms": 1000, "probed_ms": 3000, "goal": "the old project",
+            "now": None, "nudge": None}
+    was = dict(done, list_version=4, list_id="x")
+    after = module.finish_state(dict(done, turn={"start_ms": 2000}), was)
+    assert after["todos"] == [] and after["total"] == 0 and after["done"] == 0, after
+    assert after["cleared"] is True and after["cleared_turn"] is True, after
+    assert after["goal"] is None, after          # the heading described the dropped list
+    assert after["list_version"] == 4, after     # a drop is not a new list
+    assert "last turn's list is done" in module.no_list_reason(after), after
+    # work LEFT on it is the agent's standing plan, so it stays — heading and all
+    left = dict(
+        done, todos=[{"task": "a", "completed": True}, {"task": "b", "completed": False}],
+        turn={"start_ms": 2000},
+    )
+    held = module.finish_state(left, was)
+    assert len(held["todos"]) == 2 and not held["cleared_turn"], held
+    assert held["goal"] == "the old project", held
+    # a list written INSIDE this turn is this turn's own, however finished it looks
+    inside = dict(done, ts=3000, source_updated_ms=3000, turn={"start_ms": 2000})
+    kept = module.finish_state(inside, was)
+    assert len(kept["todos"]) == 1 and not kept["cleared_turn"], kept
+    # the NAS and desktop paths carry no turn clock; a newer request is enough there
+    nas_ish = module.finish_state(dict(done, now="something new"), was)
+    assert nas_ish["todos"] == [] and nas_ish["cleared_turn"] is True, nas_ish
+    say("a finished list is dropped when the next turn starts, and only then: ok")
 
     # ---- the big goal heading a list: the AGENT's own line, and drift since
     goals = os.path.join(TEST_HOME, "goalstore")
@@ -2416,8 +2468,11 @@ try:
             json.dump(
                 [
                     {"id": "m0", "variant": "user", "content": "wire voicevox to wake on demand"},
+                    # Work LEFT on the list, deliberately: a FINISHED list with a newer request
+                    # is dropped (see finish_state), and this check is about the heading, so it
+                    # needs a list that is still the standing plan.
                     {"id": "m1", "variant": "ai", "content": "Goal: wake voicevox on demand",
-                     "blocks": [tool("write_todos", [{"task": "deploy", "completed": True}])]},
+                     "blocks": [tool("write_todos", [{"task": "deploy", "completed": False}])]},
                     {"id": "m2", "variant": "user", "content": "and also fix the pane timeout"},
                     {"id": "m3", "variant": "ai", "content": "Goal: fix the pane timeout",
                      "blocks": []},

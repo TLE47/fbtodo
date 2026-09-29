@@ -3462,13 +3462,36 @@ def list_fingerprint(state: dict) -> str:
 
 
 def finish_state(state: dict, prev: dict | None, claim_first: bool = False) -> dict:
-    """Apply the replace-on-new-list and drop-on-new-session rules.
+    """Apply the replace-on-new-list, drop-on-new-session and drop-on-new-turn rules.
 
     `claim_first` belongs to the watcher: only it may declare an unseen list to be
     "list #1". A one-shot probe cannot see the list history, so it must borrow the
     counter from the watcher (see `adopt_version`) rather than invent one.
     """
     todos = state.get("todos") or []
+    # In plain words: a list that is FINISHED does not belong to the turn that comes after it.
+    # Left standing, it reads as this turn's progress — the previous project's steps, at 100%,
+    # while the agent is on something else entirely — and it stays that way until a new list
+    # happens to arrive, which can be many minutes. So a finished list is dropped the moment a
+    # newer request or a newer turn shows up. A list with work LEFT on it is never dropped:
+    # that is the agent's standing plan, and `now`/`NUDGE` is how its drift gets reported.
+    written = int(state.get("ts") or state.get("source_updated_ms") or 0)
+    turn_start = int((state.get("turn") or {}).get("start_ms") or 0)
+    after_turn = bool(turn_start and written and turn_start > written)
+    after_request = bool(state.get("now") or state.get("nudge"))
+    drop_turn = bool(
+        todos and all(t.get("completed") for t in todos) and (after_turn or after_request)
+    )
+    if drop_turn:
+        todos = []
+        state["todos"] = []
+        # What goes with the list is the objective it was written FOR — a pane still headed
+        # with the previous turn's goal is the same misreading in prose, and this turn's own
+        # heading arrives with its own list. `now` and `nudge` deliberately stay: they describe
+        # the request that replaced the list, not the list, and with nothing on screen they are
+        # the only thing left naming what this turn is about.
+        for gone in ("goal", "goal_source"):
+            state[gone] = None
     fp = list_fingerprint(state)
     version = int((prev or {}).get("list_version") or 0)
     session_changed = bool(prev) and prev.get("session") != state.get("session")
@@ -3481,6 +3504,10 @@ def finish_state(state: dict, prev: dict | None, claim_first: bool = False) -> d
         version = 0
         if not todos:
             cleared = True
+    if drop_turn:
+        # Note that this does NOT touch the counter: the list number identifies a list, and a
+        # dropped one is still the list it was. The new turn's list is what increments it.
+        cleared = True
     if list_changed and todos:
         version += 1
     elif not prev and claim_first:
@@ -3493,6 +3520,9 @@ def finish_state(state: dict, prev: dict | None, claim_first: bool = False) -> d
     else:
         state["session_changed_ms"] = (prev or {}).get("session_changed_ms")
     state["cleared"] = cleared
+    # Which of the two drops it was decides the sentence the pane prints, so it is carried
+    # rather than inferred: "a new session" and "a finished turn" are different news.
+    state["cleared_turn"] = drop_turn
     state["replaced"] = bool(list_changed and todos and not session_changed)
     state["done"] = sum(1 for t in todos if t.get("completed"))
     state["total"] = len(todos)
@@ -4407,14 +4437,18 @@ def _window_anchor(cur_index: int | None, count: int) -> int:
 
 
 # In plain words: "there is no list, and here is why" — one sentence, in the words the pane
-# shows. Three situations produce no list at all: a session that has not written one yet, a
+# shows. Four situations produce no list at all: a session that has not written one yet, a
 # session that changed (so the old list was dropped rather than left up as if it were
-# current), and a remote session whose pane is open before the session is. Both renderers and
-# `fbtodo status` ask this one function, so the three can never disagree about it.
+# current), a turn that began after the previous list was finished (the same misreading one
+# turn earlier — 100% of work that is already over), and a remote session whose pane is open
+# before the session is. Both renderers and `fbtodo status` ask this one function, so the four
+# can never disagree about it.
 def no_list_reason(state: dict) -> str:
     """Why there is no list to draw, in the pane's own words."""
     if state.get("backend") == "nas" and not state.get("instance_alive"):
         return "waiting for a NAS freebuff session (run `fb` there)"
+    if state.get("cleared_turn"):
+        return "last turn's list is done — waiting for this turn's list"
     if state.get("cleared"):
         return "new session — old list dropped, waiting for a new one"
     return "no write_todos call yet in this session"
@@ -6114,7 +6148,10 @@ def cmd_status(args) -> int:
             print(f"  big goal          : {goal}{note}")
             print(f"  goal source       : agent's `Goal:` line")
     if view and view.get("now"):
-        print(f"  newer request     : {view.get('now')}  — the list has not caught up")
+        # "has not caught up" is a claim about a list: with none on screen (a finished one was
+        # just dropped), the request is simply the newer thing, and nothing is behind it.
+        behind = "  — the list has not caught up" if view.get("todos") else ""
+        print(f"  newer request     : {view.get('now')}{behind}")
     if view:
         # The turn, for both cases: with a list it says which turn the list belongs to, and
         # without one it is the only measured thing there is. Same sentence as the pane's.

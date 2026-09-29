@@ -47,6 +47,7 @@ fields that matter:
 | `todos` | the list, newest `write_todos` only — state is never merged |
 | `observed` | the newest calls the session actually made, `{verb, what, ts_ms}` newest first, capped at `ACTION_KEEP`. The second source: `write_todos` is the only *plan* in the transcript, so a model that skips it leaves `todos` empty — and the calls it did make are a fact, which is what the pane draws instead (`edited fbtodo · 2m ago`). Never a plan, so never a progress bar, an estimate or a tick |
 | `done`, `total`, `list_id`, `list_version` | progress, and the identity of *this* list |
+| `cleared`, `cleared_turn` | no list is drawn, and which drop caused it. `cleared` is a dropped list: a new session, or a **finished** list the next turn replaced. `cleared_turn` names the second and is what `no_list_reason` prints for it. A drop never touches `list_version` — the number identifies a list, and the new turn's list is what increments it |
 | `turn_ended` | the journal's `shouldEndTurn` — the other half of "finished" |
 | `task_times` | per-step `started_ms` / `done_ms` / `elapsed_ms`, from the tick that saw it |
 | `task_history` | per-step remembered span, model-aware |

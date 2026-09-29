@@ -489,6 +489,7 @@ and the words differ by cause:
 |---|---|
 | `no write_todos call yet in this session` | nothing has been written yet. Early in a session that is normal; a session deep into the work without one is not planning, which is the more interesting thing to notice |
 | `new session — old list dropped, waiting for a new one` | the session changed, so the previous list was dropped rather than left up as if it were current |
+| `last turn's list is done — waiting for this turn's list` | the previous turn's list was finished and your next request arrived. A finished list is dropped rather than left standing as *this* turn's 100%: the bar, the steps and the heading it was written under all go at once, and the turn clock and call feed below say what the new turn is doing meanwhile |
 | `called so far: run_terminal_command 20, skill 3` | a second line, on a session that has been busy: what it *has* been doing instead. A pane that only says "no list yet" is shrugging; this one is diagnosing. Drawn when there are no calls it can name, below |
 | `edited fbtodo  ·  2m ago` (up to three rows) | the newest calls the session actually made, newest first — the file it edited, the command it ran. This is the second source: the transcript records every call whether or not a list was written, so the pane has something factual to draw even when the model never calls `write_todos`. It is a record of work done, never a plan, so it carries no bar, no estimate and no ticks — nothing here is guessed |
 
@@ -645,13 +646,16 @@ Which is where most of the care in this tool has gone.
   whether or not one of them was a `write_todos`, so a model that never writes a list costs
   you the plan and the estimates — not the pane. It is a record of work done and never a
   plan, so nothing on it is guessed: no bar, no estimate, no tick.
-- When the list is **finished but the session is not** — every step ticked, and the session
-  has gone on writing for ten minutes past it — the age gains `[STALE?]`, and `fbtodo status`
-  says `list behind : yes`. That is the one case fbtodo can actually prove, and it is stated
-  as a question because it is still a guess: the agent may be tidying up, or it may have
-decided the rest of the work needed no list at all. A list with steps *left* on it is never
-  flagged, because a long step is not a stale list — its own clock, and `[STUCK?]` past twice
-  its estimate, are the record there.
+- A **finished list is dropped the moment the next turn starts**, so it can never be read as
+  the new turn's progress: the bar, the steps and the heading it was written under all go at
+  once, and the pane says `last turn's list is done — waiting for this turn's list` until a new
+  one arrives. What the age can still catch is therefore work continuing *inside* the turn that
+  wrote the list: every step ticked, and the session writing for ten minutes past it. Then the
+  age gains `[STALE?]` and `fbtodo status` says `list behind : yes` — the one case fbtodo can
+  actually prove, and stated as a question because it is still a guess: the agent may be
+  tidying up, or it may have decided the rest of the work needed no list at all. A list with
+  steps *left* on it is never flagged, because a long step is not a stale list — its own clock,
+  and `[STUCK?]` past twice its estimate, are the record there.
 - The bar carries `EST REM` and an `ETA`, and `fbtodo status` shows the remembered pace and
   where each step's number came from.
 
