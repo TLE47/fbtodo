@@ -43,6 +43,25 @@ Entries start at the newest release; each one is a contract change, not a diff.
   global in the self-check answer exactly as before.
 
 ### Added
+- **`fbtodo push`** makes a state JSON on stdin the live state: the object is normalized to the
+  fields a list is made of, put through the same `finish_state` a watched list goes through, and
+  written where the readers look — so a script, a CI job, another agent or a hand-typed JSON
+  needs no watcher to be shown. `--to PATH` writes that file instead, `--dry-run` writes
+  nothing, `--quiet` prints nothing, and a payload that is not an object with a list of
+  `{task, completed}` steps is refused with the state it would have replaced left alone (empty
+  stdin `66`, otherwise `65`).
+- **`-s file:PATH`** reads a state off disk, in every reader: a directory expands to the
+  `fbtodo-state.json` inside it, so `-s file:$FBTODO_HOME` reads that home's own state. It is a
+  re-player, not a re-numberer — the list number the file recorded is what the pane prints — and
+  `instance_alive` is always true, since there is no process behind a file to outlive the pane.
+  The prefix is required: `-s some/dir` stays the usage error it has always been, and any
+  unknown `-s` value now exits `64` rather than being rejected by argparse.
+- Docs: [docs/SOURCES.md](docs/SOURCES.md) (every way a list can arrive),
+  [docs/ESTIMATES.md](docs/ESTIMATES.md) (the estimator's methodology, moved out of the README),
+  [docs/SETTINGS.md](docs/SETTINGS.md) (the variable and exit-code reference),
+  [docs/ROADMAP.md](docs/ROADMAP.md), and [docs/decisions/](docs/decisions/README.md) (the
+  long-form reasoning and the failures behind the mechanisms). The README is 250 lines and links
+  into them.
 - A rung's score carries its **spread**: `lo`/`hi` are the 10th and 90th percentile of its
   ratios by nearest rank, printed beside the median by `status` and `fbtodo ledger` only when
   the samples actually differ — a range of one value is not a range. The `late` count keeps

@@ -6,10 +6,16 @@ is the layer underneath it.
 - [Layout](#layout)
 - [Files under `FBTODO_HOME`](#files-under-fbtodo_home)
 - [The state file](#the-state-file)
+- [The scoreboard, the spread and the duel](#the-scoreboard-the-spread-and-the-duel)
 - [The sources](#the-sources)
+- [`fbtodo push`](#fbtodo-push)
 - [Notifier contracts](#notifier-contracts)
 - [The pane lifecycle](#the-pane-lifecycle)
 - [Conventions worth keeping](#conventions-worth-keeping)
+
+Related, on demand: [ESTIMATES.md](ESTIMATES.md) — the estimator's methodology;
+[SOURCES.md](SOURCES.md) — every way a list can arrive; [decisions/](decisions/README.md) — the
+reasoning and the failures behind the mechanisms here.
 
 ## Layout
 
@@ -40,7 +46,7 @@ scan.py      the CLI journal: its record parsers, the chunk memory, `read_cli`
 desktop.py   the desktop app's SQLite conversation
 nas.py       the remote host: one ssh per poll, carrying the extractor that runs there
 tasks.py     the task log (event stream + folded memo), the clocks, the estimates, the pruning
-sources.py   the `Source` protocol and the loop that asks the three readers in order
+sources.py   the `Source` protocol and the loop that asks the four readers in order
 panes.py     tmux: the pane, its layout and pins, the keeper, and the watcher loops
 render.py    one state -> lines: the plain renderer, the framed pane, the theme
 __init__.py  the front door: the commands, the daemon, and the import of every layer above
@@ -92,9 +98,9 @@ fields that matter:
 | `schema` | state layout version; a state from another build is ignored, not trusted |
 | `instance_pid` | the freebuff process this state describes |
 | `cwd` | the directory the session runs in |
-| `backend` | `cli` \| `desktop` |
-| `target` | the chat directory or database that was read |
-| `source` | how it was read (`cli-journal`, `desktop-db`, `fallback`, `last`) |
+| `backend` | `cli` \| `desktop` \| `nas` \| `file` \| `push` — who the state describes |
+| `target` | the chat directory, database or state file that was read |
+| `source` | how it was read (`cli-journal`, `desktop-db`, `state-file`, `push`, `fallback`, `last`) |
 | `session` | the session/thread identifier |
 | `title`, `first_prompt`, `summary` | what the session is about, when the store carries it |
 | `goal`, `goal_source` | the agent's `Goal:` line and where it was found |
@@ -119,9 +125,11 @@ fields that matter:
 | `status`, `stop_reason` | why the watcher is where it is |
 | `tool_version` | the build that wrote it |
 
-`snap` / `json` / `bar` read this file when a watcher is live and re-derive it otherwise,
-and an explicit `-s cli|desktop` is never answered from it unless the state describes
-that backend.
+`snap` / `json` / `bar` read this file when a watcher is live and re-derive it otherwise, and
+an explicit `-s X` is never answered from it unless the state describes that backend — compared
+as a **word**, so `-s file:PATH` is `file` (`source_kind`) and never matches the live `push`
+state. A `-s file:PATH` probe is finished against itself (`finish_probe`), so the file's recorded
+list number is printed rather than incremented.
 
 ## The scoreboard, the spread and the duel
 
@@ -173,16 +181,17 @@ so a rung's spread cannot read differently in two places.
 ## The sources
 
 Every reader downstream — the pane, `snap`, `json`, the estimates — reads **one** state,
-and a list can come from three different machines' worth of transcript. That seam is
+and a list can come from a journal, a database, a remote host, or a plain file. That seam is
 `Source`: each one answers "is there anything of this kind here?" in its own vocabulary and
 then translates what it found into the state's fields, so `_snapshot` is a loop rather than
-three branches.
+four branches.
 
 | Class | `-s` / `backend` | `find()` reads | `miss()` says |
 |---|---|---|---|
 | `CliSource` | `cli` | this directory's chat journal (`log.jsonl`) | `no CLI chat for this directory` |
 | `DesktopSource` | `desktop` | one thread of the desktop app's sqlite store | `no conversation DB found` |
 | `NasSource` | `nas` | a session on the NAS, over ssh | `no NAS session` (a probe never misses) |
+| `FileSource` | `file:PATH` | the state JSON at `PATH` (a directory means `fbtodo-state.json` inside it) | `no state file at PATH` |
 
 The contract is three methods: `find(args, cwd)` fetches and returns the raw observation
 or `None`; `describe(args, cwd, ob)` maps that observation onto the state; `miss()` is that
@@ -191,10 +200,35 @@ word for a source, `backend` is the state's.
 
 `-s auto` asks `cli` then `desktop`; every other value asks exactly one source, and the
 **last source asked** speaks for the chain when none found anything (`-s cli` in a
-directory with no journal is an error, never a fall-through into the desktop store). Where
-this is going: the same seam is the boundary the package split moves — the classes and the
-registry are already the only thing that knows the differences, and `read_cli` /
-`read_desktop` / `read_nas` are the only functions they call to fetch.
+directory with no journal is an error, never a fall-through into the desktop store).
+
+`-s` is a word or a `file:PATH`, so the word set is validated by `main` rather than by
+argparse's `choices`: a typo exits `64` (a usage error), and the `file:` prefix has to reach
+`sources_for`. `source_path()` splits the prefix off, `source_kind()` is what a cached state is
+compared against (a state's `backend` is a word, so `file:/tmp/s.json` has to compare as
+`file`), and `state_file_in()` expands a directory. `SOURCE_ORDER` is unchanged.
+
+A file source is a **re-player, not a re-numberer**: `finish_probe` gives it its own
+`list_id`/`list_version` (from what it recorded, else the list's first) and finishes it against
+itself, so `#7` prints `#7` instead of being incremented by a fingerprint mismatch. It also
+sets `instance_alive: true`, because there is no process behind a file to outlive the pane.
+
+## `fbtodo push`
+
+The writer that has no watcher: `push` reads one JSON object from stdin, normalizes it through
+`state_from_push` (only the fields a list is made of — `PUSH_FIELDS` — with everything else
+stamped by the tool), and puts it through the **same** `finish_state` a watched list goes
+through, with `claim_first=True` so an unseen list is `#1`. So a pusher cannot lie about the
+counts, the session or the list number; a second push of the same list does not renumber it,
+and a different list increments it.
+
+`--to PATH` writes that file instead of the live state (what `-s file:PATH` then reads back),
+`--dry-run` writes nothing, `--quiet` prints nothing, and every refusal — empty stdin (`66`),
+not JSON (`65`), not an object (`65`), `todos` not a list of `{task, completed}` objects (`65`)
+— returns before the write, so the state it refused to replace is untouched. `--source
+file:PATH` makes the readers answer from it: because the pushed state carries `backend: push`,
+a cached live state never satisfies a `file:` request, so a hand-pushed list needs no watcher to
+be shown.
 
 ## Notifier contracts
 
