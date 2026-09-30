@@ -1386,6 +1386,52 @@ def current_index(todos: list) -> int | None:
     return None
 
 
+# The desktop app runs several threads at once, and the pane can be asked to show them all
+# (`--threads N`): the state then carries `threads`, ONE of which is the thread the pane is
+# following (`current`) and the rest are the others still live. Nothing else produces more
+# than one, so a renderer has exactly two jobs: draw the single list it always drew, or draw
+# a heading per thread and that thread's steps under it. This is the shape both renderers
+# iterate, so "how many lists are there" is answered once.
+def list_groups(state: dict) -> list:
+    """The lists a state carries, as the groups a renderer draws: one, or one per thread.
+
+    A group is `{title, todos, current, running, source_updated_ms}`. With fewer than two
+    threads — every state a CLI journal, a NAS session or a file can produce — the answer is
+    the state's own list with no title, which is why a single-list frame is unchanged to the
+    byte. A thread with no steps of its own is KEPT: `0/0` under its own name is the honest
+    answer for a thread that has just been opened, and the number of groups is what tells a
+    renderer to draw headings at all — so dropping one would silently turn a stacked frame
+    back into a single-list one with an unlabelled list in it.
+    """
+    threads = [t for t in (state.get("threads") or []) if isinstance(t, dict)]
+    if len(threads) < 2:
+        return [{
+            "title": "",
+            "todos": state.get("todos") or [],
+            "current": True,
+            "running": True,
+            "source_updated_ms": state.get("source_updated_ms"),
+        }]
+    groups = [
+        {
+            "title": str(t.get("title") or "") or str(t.get("id") or "")[:8],
+            # The FOLLOWED thread's list is the state's own `todos`, never that thread's own
+            # copy of it: `finish_state` drops a finished list from a turn that has moved
+            # on, and a frame that read the copy back would resurrect exactly the list the
+            # state just decided to forget — at 100%, under a heading from the last turn.
+            "todos": (state.get("todos") or []) if t.get("current") else (t.get("todos") or []),
+            "current": bool(t.get("current")),
+            # A thread the store says moved a moment ago is the one to watch: the app writes
+            # a list per turn, so a list written in the last couple of minutes is what
+            # "running now" means for a store with no process to ask.
+            "running": bool(t.get("running")),
+            "source_updated_ms": t.get("source_updated_ms"),
+        }
+        for t in threads
+    ]
+    return groups
+
+
 # In plain words: a number written down is not the same as work happening. A step with a
 # recorded start and no recorded finish is, as far as this record knows, still running —
 # and that is all this answers. Whether it is running *now* is a different question; the
@@ -1719,6 +1765,7 @@ __all__ = [
     "remaining_estimate_ms", "elapsed_total_ms", "total_estimate_ms", "run_variance_ms",
     "fmt_estimate", "fmt_variance", "fmt_eta", "task_key", "_task_event", "_events_size",
     "_stamp_events_cursor", "append_task_events", "fold_task_events", "compact_task_events",
-    "load_tasklog", "current_index", "live_clock", "step_is_running", "live_elapsed",
+    "load_tasklog", "current_index", "list_groups", "live_clock", "step_is_running",
+    "live_elapsed",
     "has_running_clock", "track_tasks",
 ]

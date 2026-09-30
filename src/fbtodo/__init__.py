@@ -403,6 +403,13 @@ def spawn_daemon(args, cwd: str, instance_pid: int, quiet: bool = True) -> int |
         args.db,
         "--state",
         args.state,
+        # The pane draws what the WATCHER wrote, so how many threads to stack has to reach
+        # it: a daemon that fell back to the module default would quietly unstack a pane
+        # that asked for two.
+        "--threads",
+        str(getattr(args, "threads", DESKTOP_MAX_THREADS)),
+        "--thread-live",
+        str(getattr(args, "thread_live", DESKTOP_LIVE_MS // 60_000)),
         # Passed on for the same reason as the NAS knobs below: a daemon that inherited
         # the module default would keep a killed pane reopened for a caller who asked it
         # not to (or never notice one, for a caller who asked it to be quicker).
@@ -1997,6 +2004,13 @@ def build_parser():
     ap.add_argument("-t", "--thread")
     ap.add_argument("--last", action="store_true")
     ap.add_argument("-A", "--follow-app", action="store_true")
+    # The desktop store holds every thread of a project, and the app can have several of
+    # them running at once: `--threads` is how many the pane stacks (the one it follows
+    # included, 0 for that one alone) and `--thread-live` how quiet a thread's own list may
+    # be and still be one of them (0 = no window at all). Neither means anything to a
+    # journal, a NAS session or a file, which have exactly one list by construction.
+    ap.add_argument("--threads", type=int, default=DESKTOP_MAX_THREADS)
+    ap.add_argument("--thread-live", type=int, default=DESKTOP_LIVE_MS // 60_000)
     ap.add_argument("-f", "--foreground", action="store_true", help="daemon: don't detach")
     ap.add_argument("--force", action="store_true", help="daemon: start even if one runs")
     ap.add_argument("--quiet", action="store_true")

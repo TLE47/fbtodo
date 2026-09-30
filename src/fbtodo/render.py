@@ -348,8 +348,9 @@ def _render_plain(
     # In plain words: a session with no list is the one case where the pane has nothing to
     # draw, so it says why in words instead — and the words differ by cause rather than being
     # one catch-all shrug.
+    groups = list_groups(state)
     todos = state.get("todos") or []
-    if not todos:
+    if not any(g["todos"] for g in groups):
         if state.get("first_prompt") and not goal:
             lines += [c(dim, seg) for seg in _wrap(str(state["first_prompt"]), width, 2)]
         why = no_list_reason(state)
@@ -377,7 +378,26 @@ def _render_plain(
     blocks: list[list[str]] = []
     cur_index = current_index(todos)
     pace_ms = step_pace_ms(times, todos, now_ms, history)
-    for i, t in enumerate(todos):
+    # The same grouping the frame draws: one list for every state but a desktop store asked
+    # to stack its live threads, and a heading row riding on each thread's first step. The
+    # strip is the machine-readable path, but it is also what a narrow pane falls back to,
+    # so it says the same thing in its own ink rather than dropping the other threads.
+    multi = len(groups) > 1
+    prefer = 0
+    plan: list[tuple] = []
+    for group in groups:
+        heading = (
+            _thread_heading(
+                group, width, c,
+                dim if not group["current"] else yellow,
+                yellow if group["running"] else dim,
+            ) if multi else None
+        )
+        for i, t in enumerate(group["todos"]):
+            if group["current"] and i == cur_index:
+                prefer = len(plan)
+            plan.append((group, i, t, heading if i == 0 else None))
+    for group, i, t, heading in plan:
         task = str(t.get("task", ""))
         done_flag = bool(t.get("completed"))
         active = i == cur_index and not done_flag
@@ -432,6 +452,8 @@ def _render_plain(
             # full text is always in `fbtodo json` (and in any piped `snap`).
             block = block[:TASK_MAX_LINES]
             block[-1] += c(dim, " …")
+        if heading:
+            block = [heading] + block
         blocks.append(block)
 
     # The footer is built first so the list can be given exactly the room that is left
@@ -526,7 +548,7 @@ def _render_plain(
     # run that gets collapsed is then the EARLIER, completed work, so its marker sits at the
     # top of the list body, above the visible steps, in list order. Anchored at the top it
     # collapsed the tail instead and put a completed marker under the steps it belonged to.
-    start, end = _fit_blocks(blocks, avail, _window_anchor(cur_index, len(blocks)))
+    start, end = _fit_blocks(blocks, avail, _window_anchor(prefer if multi else cur_index, len(blocks)))
     if start:
         lines.append(c(dim, f"  … {start} earlier step{'s' if start > 1 else ''}"))
     for block in blocks[start:end]:
@@ -869,6 +891,28 @@ def _progress_bar(
     return "".join(out)
 
 
+def _thread_heading(group: dict, width: int, c, ink, count_ink) -> str:
+    """One row saying whose steps follow: the thread's title, and how far that list got.
+
+    Drawn only when a pane stacks several threads (`list_groups`): the heading carries the
+    same five cells of indent a step row does, so a thread's steps read as a list under its
+    own name, and its `done/total` sits in the column the steps' clocks are right-aligned in.
+
+    Two markers, in the same voice the step rows use: `\u2794` for a thread that wrote a list
+    in the last few minutes (it is working), `\u25cb` for one that is merely still open. The ink
+    says the rest — the followed thread's heading is the bright one, so "which of these is my
+    pane about" is answerable at a glance — and the count is bright on a running thread for
+    the same reason the active step's number is.
+    """
+    todos = group.get("todos") or []
+    done = sum(1 for t in todos if t.get("completed"))
+    count = f"{done}/{len(todos)}"
+    marker = "\u2794" if group.get("running") else "\u25cb"
+    room = max(4, width - 5 - _cell_width(count) - 2)
+    line = "  " + c(ink, marker) + "  " + c(ink, _clip_cells(str(group.get("title") or ""), room))
+    return line + " " * max(1, width - _cell_width(line) - _cell_width(count)) + c(count_ink, count)
+
+
 def _elision_note(count: int, flags: list, where: str) -> str:
     """The marker for steps the window left out, worded from THOSE steps.
 
@@ -1037,8 +1081,13 @@ def _render_rich(
     # In plain words: the same situations the plain renderer names, plus the one line the
     # framed pane can afford and a script's snapshot cannot — what the session has been doing
     # instead of writing a list.
+    # The lists this state carries: one for a journal, a NAS session or a file, and one per
+    # live thread for a desktop store asked to stack them (`--threads`). `todos` stays the
+    # list the pane FOLLOWS — the bar, the totals and the footer are about it — while the
+    # groups are what the step area draws (`list_groups`).
+    groups = list_groups(state)
     todos = state.get("todos") or []
-    if not todos:
+    if not any(g["todos"] for g in groups):
         rows += [_frame_row(h, width, frame) for h in head]
         rows.append(_divider_row(width, frame))
         why = no_list_reason(state)
@@ -1083,8 +1132,30 @@ def _render_rich(
     # and from what those steps took in earlier sessions.
     pace_ms = step_pace_ms(times, todos, now_ms, history)
     blocks: list[list[str]] = []
-    flags: list[bool] = []  # per block: was that step already done, for the elision notes
-    for i, t in enumerate(todos):
+    steps: list[dict] = []  # per block: the step it draws, for the notes ABOUT steps
+    # Which block the elided window keeps on screen. With one list that is the step being
+    # worked on (`_window_anchor`); with several, it is that step in the thread the pane
+    # follows — or the top, when that thread has nothing in flight, because the other
+    # threads are drawn BELOW it and anchoring on a tail would elide exactly the threads the
+    # pane was asked to show. A thread's heading rides on the block of its FIRST step rather
+    # than being a block of its own: the fit works in whole blocks, and a heading the window
+    # could leave behind would leave steps standing under somebody else's name.
+    multi = len(groups) > 1
+    prefer = 0
+    plan: list[tuple] = []
+    for group in groups:
+        heading = (
+            _thread_heading(
+                group, inner, c,
+                accent if group["current"] else muted,
+                accent if group["running"] else muted,
+            ) if multi else None
+        )
+        for i, t in enumerate(group["todos"]):
+            if group["current"] and i == current_index(group["todos"]):
+                prefer = len(plan)
+            plan.append((group, i, t, heading if i == 0 else None))
+    for group, i, t, heading in plan:
         task = str(t.get("task", ""))
         done_flag = bool(t.get("completed"))
         rec = times.get(task) or {}
@@ -1172,10 +1243,15 @@ def _render_rich(
                     line = " " * indent + c(muted, seg)
             block.append(line)
         if height and len(block) > TASK_MAX_LINES:
+            # The cap is on the STEP's lines: a heading is never one of them, because it is
+            # prepended after the cap (`heading`), and one that could be cut would leave a
+            # thread's steps unnamed.
             block = block[:TASK_MAX_LINES]
             block[-1] += c(muted, " …")
+        if heading:
+            block = [heading] + block
         blocks.append(block)
-        flags.append(done_flag)
+        steps.append(t)
 
     # Six rows of chrome, plus the optional ones this frame is actually carrying: the patch
     # and refit facts, and the no-times explanation. That last one was missing here — it was
@@ -1185,7 +1261,7 @@ def _render_rich(
         1, height - len(head) - 6 - (1 if patch_row_here else 0)
         - (1 if refit_row_here else 0) - (1 if no_times else 0)
     )
-    anchor = _window_anchor(cur_index, len(blocks))
+    anchor = _window_anchor(prefer if multi else cur_index, len(blocks))
     start, end = _fit_blocks(blocks, avail, anchor)
 
     def _rows_used(s: int, e: int) -> int:
@@ -1412,20 +1488,26 @@ def _render_rich(
         else:
             show_below = False
     if show_above:
-        note = _elision_note(start, flags[:start], "earlier")
+        # The note counts STEPS, so it is worded from the steps those blocks drew rather
+        # than from the blocks: a thread's heading is a row in a block, not a step, and a
+        # count that included one would be a count of rows.
+        hidden = steps[:start]
+        note = _elision_note(len(hidden), [bool(s.get("completed")) for s in hidden], "earlier")
         # A run of finished work that collapses away can carry its net variance — how far
         # those steps ran from the pace — when there is one to speak of. It rides in the
         # same parentheses the idle age uses, so the row keeps its shape.
-        if all(flags[:start]):
-            variance = run_variance_ms(times, todos[:start], now_ms, pace_ms)
+        if hidden and all(s.get("completed") for s in hidden):
+            variance = run_variance_ms(times, hidden, now_ms, pace_ms)
             if variance:
                 note += f" ({fmt_variance(variance)})"
         rows.append(_frame_row(c(muted, note), width, frame))
     for block in blocks[start:end]:
         rows += [_frame_row(line, width, frame) for line in block]
     if show_below:
+        rest = steps[end:]
         rows.append(_frame_row(
-            c(muted, _elision_note(len(blocks) - end, flags[end:], "more")), width, frame,
+            c(muted, _elision_note(len(rest), [bool(s.get("completed")) for s in rest], "more")),
+            width, frame,
         ))
     rows.append(_divider_row(width, frame))
     rows.append(_frame_row(progress, width, frame))
@@ -1552,6 +1634,7 @@ __all__ = [
     "_top_border", "THEME_DEFAULTS", "THEME_KEYS", "THEME_FILE_LOCAL", "THEME_FILE_GLOBAL",
     "_hex_rgb", "_rgb_256", "_color_sgr", "_theme_stamp", "_THEME_CACHE", "THEME_VALUE_RE",
     "THEME_PROBLEMS", "_theme_value", "read_theme", "_theme_gradient", "_supports_truecolor",
-    "_styles", "BAR_EIGHTHS", "SPINNER", "_progress_bar", "_elision_note", "_render_rich",
+    "_styles", "BAR_EIGHTHS", "SPINNER", "_progress_bar", "_elision_note", "_thread_heading",
+    "_render_rich",
     "render", "width_of_default", "adopt_version", "bar_text",
 ]

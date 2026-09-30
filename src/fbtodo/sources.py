@@ -167,10 +167,15 @@ class DesktopSource(Source):
         return {"db": db, "thread": thread_id, "mode": source}
 
     def describe(self, args, cwd: str, ob: dict) -> dict:
+        # `--threads` is how many of the store's live threads a pane shows, the one being
+        # followed included; `--thread-live` is how quiet a thread's own list may be and
+        # still count (0 = no window, so every open thread with a list is shown).
         st = read_desktop(
-            ob["db"], thread_id=ob["thread"], source=ob["mode"], state_path=args.state
+            ob["db"], thread_id=ob["thread"], source=ob["mode"], state_path=args.state,
+            others=max(0, int(getattr(args, "threads", 0) or 0) - 1),
+            window_ms=max(0, int(getattr(args, "thread_live", 90) or 0)) * 60_000,
         )
-        return {
+        out = {
             "backend": "desktop",
             "target": ob["db"],
             "store_mtime_ms": store_mtime_ms(ob["db"], "desktop"),
@@ -181,6 +186,12 @@ class DesktopSource(Source):
             "todos": st.get("todos") or [],
             "source": st.get("source"),
         }
+        # Only when there is more than one: a state that describes ONE list must stay the
+        # shape every other source produces, which is what keeps a single-list frame and the
+        # recorded goldens byte for byte what they were.
+        if st.get("threads"):
+            out["threads"] = st["threads"]
+        return out
 
     def miss(self) -> dict:
         return {"backend": None, "todos": [], "error": "no conversation DB found"}
