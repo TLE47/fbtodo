@@ -1,7 +1,13 @@
-# docs/demo/demo.tape — the README's demo GIF, recorded with vhs.
+# docs/demo/demo.tape — the master recording behind the README's demo.
 #
 #     brew install vhs
-#     docs/demo/record.sh          # writes docs/demo/demo.gif
+#     docs/demo/record.sh          # writes demo.gif, demo.mp4 and the stills
+#
+# This tape writes the MP4, in full colour and at the frame size the pane actually needs;
+# record.sh derives the GIF and the stills from it, so the GIF never has to be good enough to
+# be the source of anything. The geometry matters and is worth keeping honest: the font is big
+# enough to read at README width, and the height is the pane's own height plus the padding —
+# a taller frame is mostly empty terminal, which is what the first recording wasted.
 #
 # What is on screen is the real tool: `fbtodo pane` rendering the fixture journal in
 # docs/demo/fixture, while drive.sh replays a scripted session into that same file. Nothing
@@ -9,15 +15,16 @@
 # scratch directory so the demo's synthetic steps never end up in your pace history, and the
 # PATCH/ALERT rows are read from fixture logs rather than from yours.
 
-Output docs/demo/demo.gif
+Output docs/demo/.demo-raw.mp4
 
 Set Shell bash
 Set FontFamily "Menlo"
-Set FontSize 13
-Set Width 1080
-Set Height 460
+Set FontSize 16
+Set Width 1000
+Set Height 398
 Set Padding 16
 Set Margin 0
+Set Framerate 20
 Set TypingSpeed 0ms
 Set Theme "Catppuccin Mocha"
 

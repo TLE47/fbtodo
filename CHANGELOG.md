@@ -85,10 +85,14 @@ Entries start at the newest release; each one is a contract change, not a diff.
   `instance_alive` is always true, since there is no process behind a file to outlive the pane.
   The prefix is required: `-s some/dir` stays the usage error it has always been, and any
   unknown `-s` value now exits `64` rather than being rejected by argparse.
-- The README's demo is **recorded, not drawn**: [`docs/demo/demo.gif`](docs/demo/demo.gif)
-  (1080×460, ~21 s, ~150 KB), the same frames as [`docs/demo/demo.mp4`](docs/demo/demo.mp4), and
-  three stills from it, all of the real pane reading the `docs/demo/fixture` transcript —
-  `docs/demo/record.sh` reproduces all five from [`demo.tape`](docs/demo/demo.tape) in one command.
+- The README's demo is **recorded, not drawn**: two clips of the real pane reading the
+  `docs/demo/fixture` transcript — [`demo.gif`](docs/demo/demo.gif) (~990×354, ~21 s) for the pane
+  on its own, and [`side-by-side.gif`](docs/demo/side-by-side.gif) (~1396×352, ~18 s) for the pane
+  beside the scripted session that writes the list — with both as MP4s and three stills.
+  `docs/demo/record.sh` reproduces all of it from the two tapes in one command, and each frame is
+  trimmed to the box the pane actually drew ([`frame.py`](docs/demo/frame.py) measures it, because
+  a frame short enough to have no empty row under the box is a frame that collapses the list). The
+  GIFs and stills are derived from the trimmed master, never the other way round.
 - Docs: [docs/SOURCES.md](docs/SOURCES.md) (every way a list can arrive),
   [docs/ESTIMATES.md](docs/ESTIMATES.md) (the estimator's methodology, moved out of the README),
   [docs/SETTINGS.md](docs/SETTINGS.md) (the variable and exit-code reference),

@@ -34,8 +34,14 @@ No setup needed. Works with any agent that keeps a todo list.
 
 That clip is the real pane — `fbtodo pane`, drawing a scripted session as it ticks through eight
 steps and finishes with the list done *and* the turn ended, which is the pair the bell waits for.
-The recording, three stills from it and the same frames as an MP4 are in
-[`docs/demo`](docs/demo), and `docs/demo/record.sh` reproduces them all.
+
+The pane goes beside the session it is following, so here is the pairing too — the scripted session
+on the left, the pane reading it on the right:
+
+![the scripted session and the pane, side by side](docs/demo/side-by-side.gif)
+
+Both clips, three stills, the same frames as MP4s and the one command that reproduces all of it are
+in [`docs/demo`](docs/demo).
 
 ---
 
