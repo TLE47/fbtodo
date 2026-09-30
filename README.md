@@ -220,16 +220,19 @@ The state-file contract, the frame's guarantees and the pane's lifecycle are in
 
 ## FAQ
 
-**Do I need Freebuff?** For the built-in stores, yes — but a state JSON is enough: `fbtodo push`
-and `-s file:PATH` take any agent or job that can write one file ([docs/SOURCES.md](docs/SOURCES.md)).
+**Do I need Freebuff?** 
+    For the built-in stores, yes — but a state JSON is enough: `fbtodo push`
+    and `-s file:PATH` take any agent or job that can write one file ([docs/SOURCES.md](docs/SOURCES.md)).
 
-**Does this send my code or my data anywhere?** No — it reads local transcript files; the only
-outbound traffic is the notification kit, and only if you install it. 
+**Does this send my code or my data anywhere?** 
+    No — it reads local transcript files; the only outbound traffic is the notification kit, and only if you install it. 
 
-**Will it slow the agent down?** No: it reads files that are being written anyway.
+**Will it slow the agent down?** 
+    No: it reads files that are being written anyway.
 
-**Why does the pane show nothing?** Either the session has not written a todo list yet (`fbtodo
-status`), or the pane is bound to the wrong session (`fbtodo why`).
+**Why does the pane show nothing?** 
+    Either the session has not written a todo list yet (`fbtodo status`), 
+    or the pane is bound to the wrong session (`fbtodo why`).
 
 **Several sessions at once?** Yes — one pane per session, each bound to its own. 
 
