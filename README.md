@@ -224,14 +224,18 @@ The state-file contract, the frame's guarantees and the pane's lifecycle are in
 and `-s file:PATH` take any agent or job that can write one file ([docs/SOURCES.md](docs/SOURCES.md)).
 
 **Does this send my code or my data anywhere?** No — it reads local transcript files; the only
-outbound traffic is the notification kit, and only if you install it. **Will it slow the agent
-down?** No: it reads files that are being written anyway.
+outbound traffic is the notification kit, and only if you install it. 
+
+**Will it slow the agent down?** No: it reads files that are being written anyway.
 
 **Why does the pane show nothing?** Either the session has not written a todo list yet (`fbtodo
 status`), or the pane is bound to the wrong session (`fbtodo why`).
 
-**Several sessions at once?** Yes — one pane per session, each bound to its own. **Windows?** Not
-today; tmux is the missing piece (WSL works). **Just want a status-bar number?** `fbtodo bar`
+**Several sessions at once?** Yes — one pane per session, each bound to its own. 
+
+**Windows?** WSL only; tmux is the missing piece.'
+
+**Just want a status-bar number?** `fbtodo bar`
 prints `todos 3/5`; set `FBTODO_NO_PANE=1`.
 
 ---
