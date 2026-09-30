@@ -3760,6 +3760,90 @@ try:
     assert mod.rung_duel(shadow_rows, "pace", "recent")["steps"] == 1, shadow_rows
     say("estimates: a shadow rung is scored beside the shipped ones and never picked: ok")
 
+    # ---- a GENERIC source: anything that can write a state JSON can drive the pane.
+    #      `fbtodo push` takes one on stdin and makes it the live state — through the same
+    #      `finish_state` a watched list goes through, so its counts, its session and its list
+    #      number are the tool's, not the pusher's — and `-s file:PATH` reads a state back off
+    #      disk. Together they are the seam that does not go through a Freebuff at all.
+    live_state = mod.STATE_PATH
+    try:
+        os.unlink(live_state)     # a probe with no state file is the honest starting point
+    except OSError:
+        pass
+    pushed = {"session": "PUSH1", "goal": "pushed by hand",
+              "todos": [{"task": "one", "completed": True}, {"task": "two"}]}
+
+    def push(payload, *argv, **kw):
+        body = kw.pop("body", json.dumps(payload) if payload is not None else "")
+        return subprocess.run(
+            [sys.executable, FB, "push", *argv], input=body, text=True, capture_output=True,
+            cwd=CWD, env=env, timeout=30,
+        )
+
+    pr = push(pushed)
+    assert pr.returncode == 0, (pr.returncode, pr.stderr)
+    back = json.loads(pr.stdout)
+    assert back["backend"] == "push" and back["source"] == "push", back
+    assert back["tool_version"] == mod.VERSION and back["session"] == "PUSH1", back
+    assert (back["done"], back["total"]) == (1, 2), back
+    assert back["list_version"] == 1 and back["list_id"], back
+    # ...and the pushed list is what the machine now reports: the readers that prefer a live
+    # state file answer from it, so a hand-pushed list needs no watcher to be shown
+    assert run("bar").stdout.strip() == "todos 1/2", run("bar").stdout
+    assert json.loads(run("json").stdout)["session"] == "PUSH1"
+    # a second push of the SAME list does not renumber it; a different list does
+    again = json.loads(push(pushed).stdout)
+    assert again["list_version"] == 1, again
+    other = json.loads(push({"session": "PUSH1",
+                             "todos": [{"task": "fresh", "completed": True}]}).stdout)
+    assert other["list_version"] == 2 and other["total"] == 1, other
+    # what it will not take: no JSON, not an object, no list where a list goes, nothing at all
+    for bad, code in ((None, 66), ("oops", 65), ('[1, 2]', 65),
+                      (json.dumps({"todos": "nope"}), 65)):
+        r = push(None, body=bad if isinstance(bad, str) else "")
+        assert r.returncode == code, (bad, r.returncode, r.stderr[-200:])
+    # ...and the failure leaves the state it refused to replace alone
+    assert run("bar").stdout.strip() == "todos 1/1", run("bar").stdout
+    say("push: a state JSON on stdin becomes the live state, and a bad one does not: ok")
+
+    # ---- `-s file:PATH`: the same state, read back off disk. A directory means the state
+    #      file inside it, so `-s file:$FBTODO_HOME` reads that home's own state.
+    fdir = os.path.join(TEST_HOME, "pushed")
+    shutil.rmtree(fdir, ignore_errors=True)
+    os.makedirs(fdir, mode=0o700, exist_ok=True)
+    fpath = os.path.join(fdir, "mine.json")
+    pr = push({"session": "FILE1", "goal": "from a file",
+               "todos": [{"task": "a", "completed": True}, {"task": "b", "completed": True}]},
+              "--to", fpath)
+    assert pr.returncode == 0, (pr.returncode, pr.stderr)
+    assert json.loads(pr.stdout)["total"] == 2, pr.stdout
+    assert run("bar", "-s", f"file:{fpath}").stdout.strip() == "todos 2/2"
+    assert json.loads(run("json", "-s", f"file:{fpath}").stdout)["session"] == "FILE1"
+    # --to did not touch the live state: the machine still reports the state it had
+    assert run("bar").stdout.strip() == "todos 1/1", run("bar").stdout
+    # a directory is that home's state file, and a recorded list number is left alone
+    homedir = os.path.join(TEST_HOME, "file-home")
+    os.makedirs(homedir, mode=0o700, exist_ok=True)
+    mod.atomic_write_json(os.path.join(homedir, "fbtodo-state.json"), {
+        "schema": 1, "backend": "cli", "session": "INFILE", "list_version": 7,
+        "list_id": "abc123", "goal": "recorded", "todos": [{"task": "x", "completed": True}],
+    })
+    fjson = json.loads(run("json", "-s", f"file:{homedir}").stdout)
+    assert fjson["session"] == "INFILE" and fjson["list_version"] == 7, fjson
+    assert run("bar", "-s", f"file:{homedir}").stdout.strip() == "todos 1/1"
+    # a file that is not there says so, rather than reading this machine's own list
+    missing = os.path.join(fdir, "not-here.json")
+    assert run("bar", "-s", f"file:{missing}").stdout.strip() == "todos -", missing
+    assert "no state file" in run("json", "-s", f"file:{missing}").stdout
+    # ...and the flag is still a usage error when it names neither a source nor a path
+    for bad in ("file:", "nonsense"):
+        assert run("bar", "-s", bad).returncode == 64, bad
+    say("source: `-s file:PATH` reads a state off disk, and a bad one is a usage error: ok")
+    try:
+        os.unlink(live_state)
+    except OSError:
+        pass
+
     # ---- and how far the log is from re-choosing its own constants: the clip is consulted
     #      only on a young list, and moves the number only sometimes, so the count that
     #      governs it is the second one. Measured over the 161-span replay, 157 of those spans
