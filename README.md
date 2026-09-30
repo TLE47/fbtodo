@@ -64,10 +64,15 @@ If you would rather not keep a checkout on your PATH, install it as an isolated 
 pipx install git+https://github.com/TLE47/fbtodo
 ```
 
-> [pipx](https://pipx.pypa.io) builds `fbtodo` in its own virtualenv and puts the console
-script on your PATH; update it later with `pipx install --force git+https://github.com/TLE47/fbtodo`,
-or pin a tag with `pipx install "git+https://github.com/TLE47/fbtodo@4.29.0"`. The package has no
-runtime dependencies, but the pane still needs **tmux** (`brew install tmux`).
+> pipx installs fbtodo into an isolated environment on your PATH. No Python dependencies are required, though displaying the pane still needs tmux (brew install tmux).
+># Update
+```sh
+pipx install --force git+https://github.com/TLE47/fbtodo
+```
+># Pin version
+```sh
+pipx install "git+https://github.com/TLE47/fbtodo@4.29.0"
+```
 
 ### Using the `fb` shortcut (optional)
 
