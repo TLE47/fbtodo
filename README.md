@@ -32,17 +32,14 @@ No setup needed. Works with any agent that keeps a todo list.
 
 ![fbtodo's pane working through a scripted session](docs/demo/demo.webp)
 
-That clip is the real pane — `fbtodo pane`, drawing a scripted session as it ticks through eight
-steps and finishes with the list done *and* the turn ended, which is the pair the bell waits for.
+The clip above shows - `fbtodo pane` in real time. It monitors a scripted session through eight steps, updating continuously until all tasks are marked complete *and* the session ends—the exact trigger required for the notification bell.
 
-The pane goes beside the session it is following, so here is the pairing too — the scripted session
-on the left, the pane reading it on the right:
+### Side-by-Side View 
+To see how the pane mirrors the active session, here is the side-by-side pairing: the scripted session on the left, and the fbtodo pane tracking it on the right:
 
 ![the scripted session and the pane, side by side](docs/demo/side-by-side.webp)
 
-Both clips, three stills and the one command that reproduces all of them — `docs/demo/record.sh`,
-which exports the animation as a lossless WebP rather than a video, so it renders inline at pixel
-for pixel — are in [`docs/demo`](docs/demo).
+>**Note**: The recording script exports animations as lossless WebP files rather than standard video formats. This ensures crisp, pixel-perfect inline rendering directly within GitHub Markdown.
 
 ---
 
