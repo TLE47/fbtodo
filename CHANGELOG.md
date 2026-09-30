@@ -76,12 +76,12 @@ Entries start at the newest release; each one is a contract change, not a diff.
   the samples actually differ — a range of one value is not a range. The `late` count keeps
   its bare shape, because rounding a set-aside fault into an interval is the flattery that
   flag exists to prevent.
-- `rung_duel` — the verdict the scoreboard cannot give: paired over the same steps, resampled
-  over **sessions** (the steps in one session are not independent), and silent (`winner` is
-  None) unless the draws are past 0.95 in either direction **and** there are at least four
-  sessions to draw from, since a bootstrap over one session can only redraw the sample it
-  started from. `status` prints one `rung duel` line per pair it can judge and `fbtodo ledger`
-  the same sentence above the rows it came from.
+- `rung_duel` — the verdict the scoreboard cannot give: paired over the same steps, reduced to
+  one mean log-ratio difference per **session** (the steps in one session are not independent),
+  and judged by the **exact sign-flip test** over those session differences (`2^n` sign
+  assignments, no bootstrap and no seed), silent (`winner` is None) unless `p <= 0.05` **and**
+  there are at least six sessions. `status` prints one `rung duel` line per pair it can judge
+  and `fbtodo ledger` the same sentence above the rows it came from.
 - A **shadow rung**: scored, dueled, and pickable by nothing. `recent` — the median of the
   current list's own last three finished spans — is stamped into the same forecast vector as
   the shipped rungs, shown on its own `shadow rungs` line tagged *scored, never picked*, and

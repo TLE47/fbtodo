@@ -9,6 +9,7 @@ last forecast was — is derived here from spans that were actually seen running
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import re
@@ -179,13 +180,14 @@ SPREAD_LO_PCT = 10              # percentile a rung's low end is read at
 SPREAD_HI_PCT = 90              # ...and its high end
 
 # Judging a duel. Both rungs are scored on the SAME steps — paired, so neither can win by
-# being asked an easier set of them — and the resampling is over SESSIONS rather than steps:
-# the steps inside one session are not independent, and drawing them separately would treat
-# one session of long steps as a dozen pieces of evidence. `DUEL_RESOLVED` is how lopsided
-# the resampled share has to be before the gap is called rather than reported.
-DUEL_RESAMPLES = 4_000          # session-level bootstrap draws
-DUEL_RESOLVED = 0.95            # share of draws one side must take to be the winner
-DUEL_MIN_SESSIONS = 4           # below this there is nothing to resample: every draw is the sample
+# being asked an easier set of them — and the evidence is reduced to ONE number per SESSION:
+# the steps inside one session are not independent, and counting them separately would treat
+# one session of long steps as a dozen pieces of evidence. `DUEL_RESOLVED` is how small the
+# exact sign-flip p has to be before the gap is called rather than reported, and
+# `DUEL_MIN_SESSIONS` is the floor below which the sign test has too few signs to resolve.
+DUEL_RESOLVED = 0.95            # confidence a winner must clear: p <= 1 - DUEL_RESOLVED
+DUEL_MIN_SESSIONS = 6           # below this there are too few session signs to resolve
+DUEL_EXACT_MAX = 20             # 2^20 sign flips is the ceiling of an exact enumeration
 
 # The rungs the pane may PICK from, and the ones it only keeps score for. A shadow rung is
 # stamped into the same forecast vector and judged by the same functions, and no code path may
@@ -847,33 +849,35 @@ def rung_duel(
     rows: list[dict],
     a: str,
     b: str,
-    resamples: int | None = None,
+    exact_max: int = DUEL_EXACT_MAX,
 ) -> dict:
     """Does rung `a` really beat rung `b`, or does this log not say?
 
     The scoreboard answers "which rung is closest on the median". That is not the same
     question as "is one of them better", because a median gap of a few percent on twenty
     steps is as likely to be the sample as the rung. This pairs the two rungs over the SAME
-    steps — a rung cannot win by being asked an easier set of them — and resamples to see
-    how much the answer depends on WHICH steps happened to be logged.
+    steps — a rung cannot win by being asked an easier set of them — and reduces each
+    session to ONE number: the mean of `log(err_a) - log(err_b)` over that session's paired
+    steps. The steps inside one session are not independent (one session that ran twelve long
+    steps is one story, not twelve pieces of evidence), so the session is the unit, and the
+    effect is a mean LOG-RATIO difference — a factor, symmetric in the two rungs.
 
-    The resampling is over SESSIONS, not steps. The steps inside one session are not
-    independent: one session that ran twelve long steps is one story, not twelve pieces of
-    evidence, and drawing steps separately would let it vote twelve times. So whole sessions
-    are drawn with replacement, which is the coarsest unit the log actually has.
+    The test is the EXACT sign-flip (Fisher randomization) test on those session means. Under
+    the null the sign of each session's difference is a fair coin, so all `2^n` sign
+    assignments are enumerated and `p` is the share whose mean is at least as far from zero
+    as the observed one. Exact rather than asymptotic, and with no bootstrap and no seed in
+    it: the same log reports the same `p` and the same winner on every run and every machine,
+    which is what `--twice` and the goldens need.
 
-    `share_steps` is the raw share of paired steps `a` won; `share_resamples` is the share of
-    bootstrap draws it won, and that is the number that decides. `winner` is None unless the
-    draws are lopsided past `DUEL_RESOLVED` over at least `DUEL_MIN_SESSIONS` sessions, which
-    is the whole point: a duel that does not resolve says the log is too small, rather than
-    crowning the rung that leads today. A rung with nothing to score it against is not a
-    winner by default — no pairing, no verdict.
+    `share_steps` is the raw share of paired steps `a` won, kept for the reader; the decision
+    is the sign test's. `winner` is None unless `p <= 1 - DUEL_RESOLVED` over at least
+    `DUEL_MIN_SESSIONS` sessions — a duel that does not resolve says the log is too small,
+    rather than crowning the rung that leads today. A rung with nothing to score it against
+    is not a winner by default: no pairing, no verdict.
 
-    The draws are seeded from the two rung names and the sample shape, so the same log
-    reports the same verdict twice in a row (`--twice` and the goldens depend on it) without
-    the answer being a constant.
+    Past `DUEL_EXACT_MAX` sessions `2^n` stops being a walk anybody wants to take, so the
+    sign assignments are sampled instead and `exact` says so. Real logs sit far below it.
     """
-    resamples = DUEL_RESAMPLES if resamples is None else max(1, int(resamples))
     pairs: list[tuple[str, float, float]] = []
     for row in rows or []:
         if not isinstance(row, dict):
@@ -887,38 +891,54 @@ def rung_duel(
     steps = len(pairs)
     if not steps or not sessions:
         return {"steps": steps, "sessions": len(sessions), "share_steps": None,
-                "share_resamples": None, "winner": None, "resamples": resamples}
+                "effect": None, "p": None, "winner": None, "flips": 0, "exact": True}
     by_session: dict[str, list[tuple[float, float]]] = {}
     for session, ea, eb in pairs:
         by_session.setdefault(session, []).append((ea, eb))
     share_steps = sum(1 for _s, ea, eb in pairs if ea < eb) / steps
-    rng = random.Random(zlib.crc32(f"{a}\x1f{b}\x1f{steps}\x1f{len(sessions)}".encode()))
-    wins = 0
-    for _ in range(resamples):
-        drew = took = 0
-        for session in rng.choices(sessions, k=len(sessions)):
-            for ea, eb in by_session[session]:
-                drew += 1
-                took += ea < eb
-        if took * 2 >= drew:  # a draw won by a half or better goes to `a`
-            wins += 1
-    share_resamples = wins / resamples
-    # A bootstrap over ONE session cannot resample anything: every draw is the sample it
-    # started from, so the share comes back at 1.0 and would crown whichever rung happened to
-    # lead in that one session. Below the floor the duel reports the sample instead.
+    # One number per session: its mean log-ratio difference. A non-positive error is not a
+    # ratio, so such a pair is dropped rather than allowed to poison the log.
+    diffs = []
+    for session in sessions:
+        ds = [math.log(ea) - math.log(eb) for ea, eb in by_session[session]
+              if ea > 0 and eb > 0]
+        if ds:
+            diffs.append(sum(ds) / len(ds))
+    n = len(diffs)
+    observed = sum(diffs) / n
+    compare = abs(observed) * n - 1e-9   # compare SUMS: |sum(s_i d_i)| >= |sum(d_i)|
+    if n <= exact_max:
+        flips, extreme, exact = 1 << n, 0, True
+        for bits in range(flips):
+            stat = 0.0
+            for i, d in enumerate(diffs):
+                stat += d if (bits >> i) & 1 else -d
+            if abs(stat) >= compare:
+                extreme += 1
+    else:
+        flips, extreme, exact = 1 << exact_max, 0, False
+        rng = random.Random(zlib.crc32(f"{a}\x1f{b}\x1f{steps}\x1f{n}".encode()))
+        for _ in range(flips):
+            stat = 0.0
+            for d in diffs:
+                stat += d if rng.getrandbits(1) else -d
+            if abs(stat) >= compare:
+                extreme += 1
+    p = extreme / flips
+    # A's error is the smaller one when its mean log-ratio is negative. The interval is
+    # two-sided; the DIRECTION comes from the sign of the observed effect.
     winner = None
-    if len(sessions) >= DUEL_MIN_SESSIONS:
-        if share_resamples >= DUEL_RESOLVED:
-            winner = a
-        elif share_resamples <= 1 - DUEL_RESOLVED:
-            winner = b
+    if n >= DUEL_MIN_SESSIONS and p <= 1 - DUEL_RESOLVED and observed != 0:
+        winner = a if observed < 0 else b
     return {
         "steps": steps,
-        "sessions": len(sessions),
+        "sessions": n,
         "share_steps": round(share_steps, 4),
-        "share_resamples": round(share_resamples, 4),
+        "effect": round(observed, 4),
+        "p": round(p, 4),
         "winner": winner,
-        "resamples": resamples,
+        "flips": flips,
+        "exact": exact,
     }
 
 
@@ -944,17 +964,17 @@ def duel_note(a: str, b: str, verdict: dict) -> str:
     """
     steps = verdict.get("steps") or 0
     sessions = verdict.get("sessions") or 0
-    resamples = verdict.get("resamples") or 0
-    share = verdict.get("share_resamples") or 0.0
+    flips = verdict.get("flips") or 0
+    p = verdict.get("p")
     where = f"{steps} step(s) in {sessions} session(s)"
     if sessions < DUEL_MIN_SESSIONS:
         return f"{a} vs {b} — unresolved, {where}, needs {DUEL_MIN_SESSIONS} session(s)"
+    tail = f"p={p:.2f} over {flips:,} sign flips, {where}"
     winner = verdict.get("winner")
     if winner:
         loser = b if winner == a else a
-        won = share if winner == a else 1 - share
-        return f"{winner} beats {loser} — {won:.2f} of {resamples:,} draws over {where}"
-    return f"{a} vs {b} — unresolved, {share:.2f} of {resamples:,} draws over {where}"
+        return f"{winner} beats {loser} — {tail}"
+    return f"{a} vs {b} — unresolved, {tail}"
 
 
 def refit_readiness(
@@ -1757,7 +1777,7 @@ __all__ = [
     "STOP_WORDS", "label_class", "call_memory_from_log", "pending_blend_ms", "hist_med",
     "step_pace_ms", "estimate_for", "pick_estimate", "task_estimate_ms", "_spread_ms",
     "fmt_range", "is_wide", "fmt_estimate_spread", "pace_spread_ms", "entry_spread",
-    "forecast_error", "rung_duel", "DUEL_RESAMPLES", "DUEL_RESOLVED", "rank_quantile",
+    "forecast_error", "rung_duel", "DUEL_EXACT_MAX", "DUEL_RESOLVED", "rank_quantile",
     "SPREAD_LO_PCT", "SPREAD_HI_PCT", "DUEL_MIN_SESSIONS", "duel_note", "fmt_rung",
     "SHIPPED_RUNGS", "SHADOW_RUNGS", "SCORED_RUNGS", "SHADOW_SAMPLES", "recent_pace_ms",
     "refit_readiness",

@@ -3873,7 +3873,8 @@ try:
     #      independent, and resampling them separately would treat one session that ran long
     #      steps as twelve pieces of evidence. 0.5 is a coin toss; 0.98 is a verdict.
     duel_log = {}
-    for sess, factor in (("S1", 1.0), ("S2", 1.0), ("S3", 1.0), ("S4", 1.0)):
+    for sess, factor in (("S1", 1.0), ("S2", 1.0), ("S3", 1.0), ("S4", 1.0), ("S5", 1.0),
+                         ("S6", 1.0)):
         for n in range(4):
             duel_log[mod.task_key(sess, f"step {n}")] = {
                 "started_ms": t0, "done_ms": t0 + 100_000, "model": "m/e",
@@ -3881,9 +3882,12 @@ try:
             }
     rows = mod.ledger_rows(duel_log, t0 + 1000, None, "m/e")
     duel = mod.rung_duel(rows, "pace", "blend")
-    assert duel["steps"] == 16 and duel["sessions"] == 4, duel
-    assert duel["share_steps"] == 1.0 and duel["share_resamples"] >= 0.95, duel
-    assert duel["winner"] == "pace" and duel["resamples"] == mod.DUEL_RESAMPLES, duel
+    assert duel["steps"] == 24 and duel["sessions"] == 6, duel
+    assert duel["share_steps"] == 1.0 and duel["p"] <= 0.05, duel
+    assert duel["winner"] == "pace" and duel["flips"] == 64 and duel["exact"], duel
+    assert duel["effect"] < 0, duel
+    # ...and the exact sign test has no seed: the same rows give the same p and winner twice
+    assert mod.rung_duel(rows, "pace", "blend") == duel, "the duel is not reproducible"
     # ...and a rung nobody has scored is not a winner by default: no pairing, no verdict
     odd = mod.rung_duel(rows, "pace", "shape")
     assert odd["steps"] == 0 and odd["winner"] is None, odd
@@ -3892,7 +3896,7 @@ try:
     # is reported as a null result — a fixture that hashed its way to 12/4 across four sessions
     # would be testing the hash, and would fail once in every thirteen runs.
     tie_log = {}
-    for sess, wins in (("S1", 3), ("S2", 1), ("S3", 3), ("S4", 1)):
+    for sess, wins in (("S1", 3), ("S2", 1), ("S3", 3), ("S4", 1), ("S5", 3), ("S6", 1)):
         for n in range(4):
             tie_log[mod.task_key(sess, f"step {n}")] = {
                 "started_ms": t0, "done_ms": t0 + 100_000, "model": "m/e",
@@ -3900,9 +3904,9 @@ try:
             }
     tie_rows = mod.ledger_rows(tie_log, t0 + 1000, None, "m/e")
     tied = mod.rung_duel(tie_rows, "pace", "blend")
-    assert tied["steps"] == 16 and tied["share_steps"] == 0.5, tied
+    assert tied["steps"] == 24 and tied["share_steps"] == 0.5, tied
     assert tied["winner"] is None, tied
-    assert 0.2 <= tied["share_resamples"] <= 0.8, tied
+    assert tied["p"] > 0.2, tied
     assert mod.rung_duel([], "pace", "blend")["steps"] == 0
     say("estimates: a rung's spread is reported, and a duel over sessions resolves it: ok")
 
@@ -3957,10 +3961,10 @@ try:
     #      `fbtodo ledger` prints the same sentence over the rows underneath it. A pair nobody
     #      has scored is left out rather than printed as a draw.
     note = mod.duel_note("pace", "blend", duel)
-    assert note == ("pace beats blend — 1.00 of 4,000 draws over 16 step(s) in 4 session(s)"), note
+    assert note == ("pace beats blend — p=0.03 over 64 sign flips, 24 step(s) in 6 session(s)"), note
     assert mod.duel_note("pace", "blend", tied).startswith("pace vs blend — unresolved, "), note
-    assert mod.duel_note("pace", "blend", tied).endswith("16 step(s) in 4 session(s)"), note
-    assert "4,000" in note and mod.DUEL_RESAMPLES == 4_000, note
+    assert mod.duel_note("pace", "blend", tied).endswith("24 step(s) in 6 session(s)"), note
+    assert "64 sign flips" in note and mod.DUEL_EXACT_MAX == 20, note
     # ...and a bootstrap over ONE session cannot resample anything: every draw is the sample
     # it started from, so the share comes back at 1.0 and would crown whichever rung led by
     # an accident of one session. Below the floor the duel reports the sample, not a winner.
@@ -3989,7 +3993,7 @@ try:
     # correctly invisible to it — which is exactly how this check first failed.
     fresh = int(time.time() * 1000)
     duel_log_rows = {}
-    for sess in ("D1", "D2", "D3", "D4"):
+    for sess in ("D1", "D2", "D3", "D4", "D5", "D6"):
         for n in range(4):
             duel_log_rows[mod.task_key(sess, f"step {n}")] = {
                 "started_ms": fresh - 100_000, "done_ms": fresh, "model": "m/e",
@@ -4007,18 +4011,18 @@ try:
         env=dict(env, FBTODO_HOME=duel_home), timeout=90,
     )
     sout = sproc.stdout
-    assert "task records      : 16 kept" in sout, sout[-800:]
+    assert "task records      : 24 kept" in sout, sout[-800:]
     # the spread of the pace rung — ratios 1..4, so the 10th percentile is its own sample's
     # smallest and the 90th its largest — printed beside the median it belongs to, while a
     # rung whose every sample is the same ratio prints no bracket at all
     assert "[1.00–4.00]" in sout, sout[-800:]
-    assert "blend 5.00x over 16" in sout, sout[-800:]
+    assert "blend 5.00x over 24" in sout, sout[-800:]
     assert "rung duel         : pace beats blend" in sout, sout[-800:]
     # ...and the rung that is scored but never picked: its own line, so a reader can see that
     # the pane is carrying an experiment and that nothing about it moves a number on screen
     # the score is a symmetric factor, so a rung predicting half the span is as wrong as one
     # predicting double: 60s/80s/100s/120s against a 100s span read 1.67/1.25/1.00/1.20
-    assert "shadow rungs      : recent 1.23x [1.00–1.67] over 16" in sout, sout[-800:]
+    assert "shadow rungs      : recent 1.23x [1.00–1.67] over 24" in sout, sout[-800:]
     assert "(scored, never picked)" in sout, sout[-800:]
     assert "rung duel         : recent beats pace" in sout, sout[-800:]
     say("estimates: `status` shows each rung's spread, and who won the duel: ok")

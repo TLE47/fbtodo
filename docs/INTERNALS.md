@@ -153,15 +153,16 @@ the whole design.
   `late` pseudo-rung is a count, not a spread, and carries no `lo`/`hi`.
 * `rung_duel(rows, a, b)` — is `a` actually better than `b`, or is this the sample? Both are
   scored on the **same** steps (paired, so neither can win by being asked an easier set), and
-  the resampling is over **sessions**: the steps inside one session are not independent, and
-  drawing them separately would let one long session vote twelve times. `share_steps` is the
-  raw share of paired steps won; `share_resamples` is the share of `DUEL_RESAMPLES` draws won,
-  and that is the number that decides. `winner` stays `None` unless the draws are past
-  `DUEL_RESOLVED` (0.95) in either direction **and** there are at least `DUEL_MIN_SESSIONS`
-  (4) sessions to draw from — a bootstrap over one session redraws the sample it started from,
-  so its share comes back at 1.0 and would crown whoever led in that session. The draws are
-  seeded from the two rung names and the sample shape, so a re-run reports the same verdict
-  without the answer being a constant (`--twice` and the goldens depend on it).
+  the evidence is reduced to **one mean log-ratio difference per session**: the steps inside
+  one session are not independent, and counting them separately would let one long session
+  vote twelve times. The test is the **exact sign-flip (Fisher randomization) test** over
+  those session differences — all `2^n` sign assignments, no bootstrap and no seed, so `p` is
+  a property of the log rather than of a draw. `share_steps` is the raw share of paired steps
+  won and `effect` the mean difference; `p` and `flips` are what decide. `winner` stays `None`
+  unless `p <= 1 - DUEL_RESOLVED` (0.05) **and** there are at least `DUEL_MIN_SESSIONS` (6)
+  sessions — below that the sign test has too few signs to resolve anything. Past
+  `DUEL_EXACT_MAX` (20) sessions the signs are sampled and `exact` says so. The result is fully
+  deterministic, so a re-run reports the same verdict (`--twice` and the goldens depend on it).
 * `SHIPPED_RUNGS` / `SHADOW_RUNGS` — which rungs the pane may **pick**, and which it only
   keeps score for. `pick_estimate` and everything downstream of it may return a shipped rung
   and nothing else; a shadow rung is stamped into the same vector, scored by the same two

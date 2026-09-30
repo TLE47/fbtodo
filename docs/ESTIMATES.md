@@ -107,18 +107,27 @@ Comparing two rungs by their medians alone would be wrong twice over. Two runs o
 strategy produce different medians by luck, and **steps inside one session are not
 independent** — the same list, the same model, the same day. `rung_duel(rows, a, b)` pairs
 the two rungs over the *same steps* (a step is only in the comparison if both rungs have a
-score for it) and then resamples over **sessions**, not steps: it draws whole sessions with
-replacement, `DUEL_RESAMPLES` times, and asks how often rung `a` beat rung `b` on the paired
-miss. It reports `steps`, `sessions`, `share_steps` (the raw paired win rate), `share_resamples`
-(the interval-robust one), `resamples`, and `winner` — which stays `None` unless the interval
-actually resolves (the share is at or above ~0.95, or at or below ~0.05). A duel with no
-pairing reports `steps == 0, winner is None`, which is the honest answer rather than a coin
-flip dressed as a result.
+score for it) and then reduces each **session** to one number: the mean of
+`log(err_a) - log(err_b)` over that session's paired steps. Session, not step, because a
+session that ran twelve long steps is one story and not twelve pieces of evidence.
+
+The test is the **exact sign-flip (Fisher randomization) test** on those session means. Under
+the null each session's difference is a fair coin, so all `2^n` sign assignments are
+enumerated and `p` is the share whose mean is at least as far from zero as the observed one.
+Exact rather than asymptotic, and with no bootstrap and no seed: the same log reports the same
+`p` and the same winner on every run and every machine. It reports `steps`, `sessions`,
+`share_steps` (the raw paired win rate, kept for the reader), `effect` (the mean log-ratio
+difference), `p`, `flips`, and `winner` — which stays `None` unless `p <= 0.05` **and** there
+are at least `DUEL_MIN_SESSIONS` (six): below that the sign test has too few signs to resolve
+anything, and a duel that does not resolve says the log is too small rather than crowning the
+rung that leads today. A duel with no pairing reports `steps == 0, winner is None`, which is the
+honest answer rather than a coin flip dressed as a result. Past `DUEL_EXACT_MAX` (20) sessions
+`2^n` stops being a walk anybody wants to take, so the signs are sampled and `exact` says so;
+real logs sit far below it.
 
 `fbtodo status` shows the duel's winner beside the rungs' spreads; `fbtodo ledger` prints the
-paired vector next to each step's outcome. The resample is deterministic (the draw is seeded
-from the sessions, not from `random`'s global state), so a run is reproducible and the golden
-frames do not move.
+paired vector next to each step's outcome. The whole thing is deterministic, so a run is
+reproducible and the golden frames do not move.
 
 ## Shadow rungs: scoring a strategy that is not shipped
 
@@ -130,3 +139,35 @@ today: the list's own recent pace, asked beside the shipped rungs and never sele
 score is visible in exactly the places a shipped rung's is, which is the point — a strategy
 earns a place in the ladder by beating the ladder in the ledger, not by being added and
 hoped for.
+
+## Re-scoring the size floor on the ledger (2026-09-30)
+
+The size floor `SHAPE_MIN_BUCKET = 4` (`calls4`, 16 calls so far) was chosen on 2026-09-29 by
+replaying the CLI journals over 171 ticked steps. Re-scored on the **forecasts written after
+that refit** — the honest ledger rather than the harness — the picture is thinner and less
+flattering, and it is reported here rather than smoothed away.
+
+Method: every `fc` vector whose `at` falls on or after 2026-09-29, its session's journal, the
+calls the journal records between the turn's start and `fc.at`, less the calls already
+credited to earlier finished steps of the same turn (what `track_tasks` calls `left`); the
+size memory rebuilt from every step finished before `fc.at`; the rung scored against the
+actual span and against the `pace` that same vector recorded. As a control, the replay
+reproduces the one row the runtime did size (`fc.shape = 372793` at 13:42 on 09-29) exactly.
+
+- 25 post-refit forecasts carry a journal. On the first poll a step has made a median of
+  **1 call**, so the rung stands aside on 20 of the 25.
+- At the shipped floor **4**, it fires on **5** of them: median **2.30×** / mean **2.36×** off,
+  worst 3.9×, and it beats the pace that rode the same vector on **1 of 5** (that pace's median
+  is **1.51×**).
+- Lower floors fire on more rows and score no better: floors 1–3 fire on 6, median 2.40×, a win
+  on 2 of 6; floor 5 fires on 4, median 2.13×, 1 of 4; floor 6 on 2, median 2.95×, 0 of 2.
+
+So the ledger does **not** reproduce the earlier replay's advantage for the rung at any floor,
+and the sample (five scorable rows) is too small to move a shipped constant. The floor is left
+at 4. The two readings are not in contradiction: the ledger samples the **first poll**, which
+is exactly the regime the earlier replay measured the rung to be at its worst in (at the first
+call it misses by a median 14.1×; only past half the clock does it draw level). The rung is a
+mid-flight tool and the first-poll ledger is the wrong clock to judge it on; the journal replay
+samples the whole clock instead. What would settle it is a ledger that records the running tally
+at each poll, not only at the first — until then the journal replay stands and this re-score is
+the caveat on it.

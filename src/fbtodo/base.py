@@ -675,8 +675,12 @@ SHAPE_MIN_SAMPLES = 2    # remembered steps a size needs before it may set anyon
 # answer: the number it sets is then a median 1.96x / 3.38x mean off against the pace's 2.45x /
 # 4.39x, beating that same pace on 79% of the steps it fires on, and it scores better in 100%
 # of session bootstraps (2000 resamples over 14 sessions) where every floor below it loses
-# outright (2, 4) or merely ties (8, 12). Below the floor the rung stands aside and the blend or
-# the pace answers — the pace is the floor of the ladder, so standing aside costs nothing.
+# outright (2, 4) or merely ties (8, 12). Re-scored 2026-09-30 on the post-refit forecast
+# LEDGER instead of the journal replay, the advantage does not appear (floor 4 fires on 5 rows,
+# median 2.30x against that pace's 1.51x) — because the ledger samples the FIRST poll, where
+# the rung is known to be at its worst; see docs/ESTIMATES.md, "Re-scoring the size floor".
+# Below the floor the rung stands aside and the blend or the pace answers — the pace is the
+# floor of the ladder, so standing aside costs nothing.
 SHAPE_MIN_BUCKET = 4     # `calls4` = 16 calls: the youngest tally a running step may be sized at
 
 
