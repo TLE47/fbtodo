@@ -3119,9 +3119,23 @@ try:
             os.execv(sys.executable, [sys.executable, PANES, "pane", "--watch-pid",
                                       str(victim.pid), "--no-daemon", "-i", "0.2"])
         os.set_blocking(fd, False)
-        time.sleep(1.0)  # the first paint lands immediately; let it finish
+        # Wait for the frame and ONE diffed row rather than for a fixed second. The split
+        # below cuts the first frame at its first row-addressed write; a fixed sleep assumed
+        # that write had happened by then, and under load a pane whose first paint was late
+        # had the instance killed before it — the closing notice then landed inside the
+        # "frame" and the check failed on a pane that had drawn perfectly. Measured
+        # 2026-09-29 on a loaded machine; the same pane passes instantly when idle.
+        early, deadline = b"", time.time() + 10
+        while time.time() < deadline:
+            try:
+                early += os.read(fd, 65536)
+            except (BlockingIOError, OSError):
+                pass
+            if re.search(rb"\x1b\[\d+;1H", early):
+                break
+            time.sleep(0.05)
         kill_tree(victim)
-        data, deadline = b"", time.time() + 8
+        data, deadline = early, time.time() + 8
         while time.time() < deadline:
             try:
                 chunk = os.read(fd, 65536)
