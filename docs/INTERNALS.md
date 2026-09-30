@@ -273,7 +273,12 @@ back.
 A layout's `side` fixes the **axis** the list hangs off, never the edge of it. `placed_beside`
 accepts a strip above its session as `v` and a column to the left of it as `h` exactly as it
 accepts the two the splitter would have chosen, and `place_pane_beside` sends a drifted pane
-back to the edge it was already on (`pane_before`, `move-pane -b`). Only the axis is policy.
+back to the edge it was already on (`pane_before`, `move-pane -b`) — but only when it was
+already on that axis, because `pane_before` asked about a pane on the *other* one answers from
+a position with nothing to do with the side being applied. Only the axis is policy. The edge
+travels with the side into the remembered layout (`before`), because the splitter only knows
+how to open a pane on the trailing edge: `split-window -h` puts it on the right, so a list the
+owner keeps in the left column comes back there on the strength of that one flag.
 
 Where that axis comes from is the second half, and it is where a keeper used to argue with its
 owner: `pane_layout` gives the side the pane was **opened** on (pin, remembered, `FBTODO_SPLIT`,
