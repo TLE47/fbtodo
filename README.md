@@ -56,6 +56,20 @@ fbtodo                           # opens the pane automatically
 
 That's it. Requirements: **Python 3.9+** and **tmux**.
 
+### Using the `fb` shortcut (optional)
+
+For a one-word launcher that updates and manages everything:
+
+```sh
+. ~/Projects/fbtodo/examples/fb.sh    # add this line to ~/.zshrc or ~/.bashrc
+fb                                    # now use 'fb' instead of 'fbtodo'
+```
+
+One lazy command:
+```sh
+echo '. ~/Projects/fbtodo/examples/fb.sh' >> ~/.bashrc && source ~/.bashrc && fb
+```
+
 ### Install with pipx (no clone to manage)
 
 If you would rather not keep a checkout on your PATH, install it as an isolated app:
@@ -73,21 +87,6 @@ pipx install --force git+https://github.com/TLE47/fbtodo
 #### Pin version
 ```sh
 pipx install "git+https://github.com/TLE47/fbtodo@4.29.0"
-```
-
-
-### Using the `fb` shortcut (optional)
-
-For a one-word launcher that updates and manages everything:
-
-```sh
-. ~/Projects/fbtodo/examples/fb.sh    # add this line to ~/.zshrc or ~/.bashrc
-fb                                    # now use 'fb' instead of 'fbtodo'
-```
-
-One lazy command:
-```sh
-echo '. ~/Projects/fbtodo/examples/fb.sh' >> ~/.bashrc && source ~/.bashrc && fb
 ```
 
 ---
