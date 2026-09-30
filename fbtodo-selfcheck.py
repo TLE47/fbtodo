@@ -3797,6 +3797,16 @@ try:
     other = json.loads(push({"session": "PUSH1",
                              "todos": [{"task": "fresh", "completed": True}]}).stdout)
     assert other["list_version"] == 2 and other["total"] == 1, other
+    # a dry run says what it would write and writes nothing: the live state is untouched
+    dry = push({"session": "DRY", "todos": [{"task": "nope"}]}, "--dry-run")
+    assert dry.returncode == 0 and json.loads(dry.stdout)["session"] == "DRY", dry.stdout
+    assert run("bar").stdout.strip() == "todos 1/1", run("bar").stdout
+    assert json.loads(run("json").stdout)["session"] == "PUSH1", run("json").stdout
+    # --quiet writes the state and prints nothing at all; the readers still see it
+    quiet = push({"session": "QUIET1", "todos": [{"task": "q", "completed": True}]}, "--quiet")
+    assert quiet.returncode == 0 and quiet.stdout == "", (quiet.returncode, quiet.stdout)
+    assert json.loads(run("json").stdout)["session"] == "QUIET1", run("json").stdout
+    assert run("bar").stdout.strip() == "todos 1/1", run("bar").stdout
     # what it will not take: no JSON, not an object, no list where a list goes, nothing at all
     for bad, code in ((None, 66), ("oops", 65), ('[1, 2]', 65),
                       (json.dumps({"todos": "nope"}), 65)):
