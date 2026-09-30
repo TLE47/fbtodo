@@ -85,6 +85,10 @@ Entries start at the newest release; each one is a contract change, not a diff.
   `instance_alive` is always true, since there is no process behind a file to outlive the pane.
   The prefix is required: `-s some/dir` stays the usage error it has always been, and any
   unknown `-s` value now exits `64` rather than being rejected by argparse.
+- The README's demo is **recorded, not drawn**: [`docs/demo/demo.gif`](docs/demo/demo.gif)
+  (1080×460, ~21 s, ~150 KB), the same frames as [`docs/demo/demo.mp4`](docs/demo/demo.mp4), and
+  three stills from it, all of the real pane reading the `docs/demo/fixture` transcript —
+  `docs/demo/record.sh` reproduces all five from [`demo.tape`](docs/demo/demo.tape) in one command.
 - Docs: [docs/SOURCES.md](docs/SOURCES.md) (every way a list can arrive),
   [docs/ESTIMATES.md](docs/ESTIMATES.md) (the estimator's methodology, moved out of the README),
   [docs/SETTINGS.md](docs/SETTINGS.md) (the variable and exit-code reference),

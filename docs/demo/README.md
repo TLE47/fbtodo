@@ -5,23 +5,47 @@ can record that demo themselves in one command.
 
 | File | What it is |
 |---|---|
-| [`demo.tape`](demo.tape) | the [vhs](https://github.com/charmbracelet/vhs) script for the GIF |
-| [`record.sh`](record.sh) | `brew install vhs` then `docs/demo/record.sh` → `demo.gif` |
+| [`demo.gif`](demo.gif) | the recording: 1080×460, ~21 s, ~150 KB, rendered inline by GitHub |
+| [`demo.mp4`](demo.mp4) | the same frames as a video, for a real player |
+| [`demo-start.png`](demo-start.png) · [`demo-mid.png`](demo-mid.png) · [`demo-done.png`](demo-done.png) | three stills from it ([below](#the-stills)) |
+| [`demo.tape`](demo.tape) | the [vhs](https://github.com/charmbracelet/vhs) script that records all five |
+| [`record.sh`](record.sh) | `brew install vhs` then `docs/demo/record.sh` → the GIF, the MP4 and the stills |
 | [`drive.sh`](drive.sh) | replays a scripted session into the fixture (~20 s) |
 | [`fixture/`](fixture) | the transcript the pane reads: `head.jsonl` (the committed start), `log.jsonl` (what the driver writes), `chat-meta.json`, and the two logs the `PATCH`/`ALERT` rows read |
 
 ## Record it
 
 ```sh
-brew install vhs
-docs/demo/record.sh
+brew install vhs                # pulls ttyd and ffmpeg
+docs/demo/record.sh             # -> demo.gif, demo.mp4, demo-start/mid/done.png
 ```
+
+The tape writes the GIF; the MP4 and the three stills are transcoded from that same GIF, so there
+is one renderer to keep honest rather than two.
 
 The tape points `FBTODO_HOME` at a scratch directory (`/tmp/fbtodo-demo`) on purpose: the
 driver's synthetic steps would otherwise be remembered as this project's pace history and
 skew the real estimates. It also points `FBTODO_PATCH_LOG` and `FBTODO_ALERT_LOG` at the
 fixture logs — without that, those two rows would read **your** notifier log, and your own
 name or handle would be published in the GIF.
+
+## The stills
+
+The three PNGs are frames of the recording — 1080×460, straight out of the GIF — so they show the
+pane exactly as the animation does.
+
+![the pane one step in](demo-start.png)
+
+*One step in: the first row ticked, the second running, the bar at 12% of its eight steps.*
+
+![the pane with six of the eight steps done](demo-mid.png)
+
+*Six of the eight ticked, with a clock on every row that finished and an estimate on the rest.*
+
+![the pane done, with the turn ended](demo-done.png)
+
+*The last frame: `done/total` full, `ALL DONE` in the status line — the list finishing **and** its
+turn ending, which is what the bell waits for.*
 
 ## Watch it without vhs
 

@@ -28,6 +28,20 @@ session finishes, stalls, stops on a question, or loses its pane.
 
 ---
 
+## Watch it
+
+![The fbtodo pane working through a scripted session](docs/demo/demo.gif)
+
+That is the real pane — `fbtodo pane`, drawing a fixture journal that
+[`docs/demo/drive.sh`](docs/demo/drive.sh) appends to one tick at a time: a fresh list, its steps
+ticking off, and a last frame where the list is done **and** the turn ended, which is the pair the
+bell waits for. Nothing in it is a mock-up: the clocks, the estimates, the bar and the `done/total`
+count are the tool's own. The recording, three stills from it, and the one command that reproduces
+them are in [`docs/demo`](docs/demo) — and
+[`demo.mp4`](docs/demo/demo.mp4) is the same frames for a real player.
+
+---
+
 ## Start here
 
 Two commands and one habit. Only the pane needs tmux.
