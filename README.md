@@ -73,6 +73,11 @@ For a one-word launcher that updates and manages everything:
 fb                                    # now use 'fb' instead of 'fbtodo'
 ```
 
+One lazy command:
+```sh
+echo '. ~/Projects/fbtodo/examples/fb.sh' >> ~/.bashrc && source ~/.bashrc && fb
+```
+
 ---
 
 ## How it works
