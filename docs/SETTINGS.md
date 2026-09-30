@@ -9,7 +9,7 @@ Precedence is the usual one: a command-line flag, then the environment, then a f
 | `FBTODO_NOTIFY` / `_DROP` / `_ASK` / `_PAUSE` / `_PANE_BELL` | `~/.config/freebuff-notify/*.py` | the five watches |
 | `FBTODO_ASK_SECONDS` / `_PAUSE_SECONDS` / `_PANE_BELL_SECONDS` | 3 / 30 / 60 | their cadences (0 = never) |
 | `FBTODO_PANE_SECONDS` | 3 | how often the keeper looks |
-| `FBTODO_SPLIT` / `FBTODO_PANE_SIZE` | `v` / `12` | default pane geometry |
+| `FBTODO_SPLIT` / `FBTODO_PANE_SIZE` | `v` / `12` | where the pane opens — `left`/`right`/`top`/`bottom` (which fix the edge), or `h`/`v` for the splitter's own trailing edge (right / below) — and its size |
 | `FBTODO_NO_PANE` | — | set to disable panes entirely |
 | `FBTODO_PATCH_LOG` / `_META` / `_ALERT_LOG` | `~/.config/freebuff-patch-watch/watch.log`, `~/.config/manicode/freebuff-metadata.json`, `~/.config/freebuff-notify/phone.log` | the optional `PATCH`/`ALERT` row |
 | `FBTODO_ACCENT` / `_ACTIVE` / `_SUCCESS` / `_FAINT` / `_MUTED` / `_TRACK` | theme | palette overrides |

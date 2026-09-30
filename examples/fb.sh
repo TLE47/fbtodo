@@ -23,7 +23,9 @@
 #     FREEBUFF_NO_REFRESH=1  skip the npm refresh. Set this in scripts and tests: the
 #                            refresh is a network round trip on every launch.
 #     FBTODO_NO_PANE=1       launch with no pane at all (the status-line-only setup).
-#     FBTODO_SPLIT=h|v       open the pane beside (h) or below (v, the default).
+#     FBTODO_SPLIT=PLACE     where the pane opens: left|right|top|bottom (which fix the
+#                            edge too), or h|v for the splitter's own trailing edge
+#                            (right / below). The default is v — below the session.
 #     FBTODO_PANE_SIZE=N     how many lines (or columns) the pane gets (12).
 #
 # The refresh is best-effort on purpose: no npm, or a registry having a bad day, still
@@ -42,8 +44,15 @@ fb() {
         # -d splits without stealing the cursor, so the agent still starts in this pane.
         # A pane killed by hand comes back on its own: the keeper `fbtodo pane-watch`
         # re-opens it while the session lives.
-        tmux split-window "-${FBTODO_SPLIT:-v}" -l "${FBTODO_PANE_SIZE:-12}" -d \
-            "fbtodo --instance-of $$ --stale-after 0"
+        case "${FBTODO_SPLIT:-v}" in
+            left)    _fb_split="-h -b" ;;
+            right|h) _fb_split="-h" ;;
+            top)     _fb_split="-v -b" ;;
+            *)       _fb_split="-v" ;;   # bottom, v, and anything unknown
+        esac
+        # The place rides into the pane, so the keeper reopens in the same corner.
+        tmux split-window $_fb_split -l "${FBTODO_PANE_SIZE:-12}" -d \
+            "FBTODO_SPLIT=${FBTODO_SPLIT:-v} fbtodo --instance-of $$ --stale-after 0"
     fi
 
     # `command` so the function does not recurse into itself.

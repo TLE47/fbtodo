@@ -688,10 +688,23 @@ def pane_layout(window: str | None, role: str, pins: dict | None = None,
     side, side_source = pin_value(window, role, "side", pins)
     if not side and seen.get("side") in ("v", "h"):
         side, side_source = seen["side"], "last"
+    env_before: bool | None = None
     if not side:
-        env_side = os.environ.get("FBTODO_SPLIT")
-        side = env_side if env_side in ("v", "h") else "v"
-        side_source = "env" if env_side in ("v", "h") else "default"
+        # FBTODO_SPLIT names the SIDE (`v`/`h` — the splitter's own trailing edge, as it
+        # always has) or the PLACE, which fixes the edge too: `left`/`top` put the list on
+        # the leading edge a bare `split-window` would not pick, `right`/`bottom` on the
+        # trailing one it would. The place is how a default of "the list on the left" is
+        # typed, and it has to reach the keeper as well as the opener — the wrapper passes
+        # it into the pane's command line, and the pane's own watcher inherits it.
+        place = {
+            "v": ("v", False), "h": ("h", False),
+            "left": ("h", True), "right": ("h", False),
+            "top": ("v", True), "bottom": ("v", False),
+        }.get(os.environ.get("FBTODO_SPLIT") or "")
+        if place:
+            (side, env_before), side_source = place, "env"
+        else:
+            side, side_source = "v", "default"
     size, size_source = pin_value(window, role, "size", pins)
     if not size and isinstance(seen.get("size"), int) and seen["size"] > 0:
         size, size_source = seen["size"], "last"
@@ -701,14 +714,18 @@ def pane_layout(window: str | None, role: str, pins: dict | None = None,
         except ValueError:
             env_size = 0
         size, size_source = env_size or 12, "env" if env_size else "default"
-    # The EDGE on that side, remembered with it: `split-window -h` puts a new pane on the
-    # right and `-v` under, so the opener has to be told when the owner keeps the list on
-    # the leading edge. Not a knob and not a pin half — there is nothing to type it with,
-    # because the file is written from where the pane actually is.
+    # The EDGE on that side: where the pane actually is, when that has been written down
+    # (`remember_layout` files it after two passes, so it wins over any default), else the
+    # edge FBTODO_SPLIT's place named, else `split-window`'s own — right for `h`, below for
+    # `v`. A place in the environment therefore decides a BRAND-NEW pane's edge, and once
+    # the owner drags it the file takes over; there is no pin half to type it with because
+    # the file is the record of what the pane really is.
+    seen_before = seen.get("before")
+    before = seen_before if isinstance(seen_before, bool) else bool(env_before)
     return {
         "side": side, "side_source": side_source,
         "size": size, "size_source": size_source,
-        "before": seen.get("before") is True,
+        "before": before,
         "window": key, "role": role,
     }
 
