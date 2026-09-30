@@ -29,6 +29,26 @@ Entries start at the newest release; each one is a contract change, not a diff.
   `fc` is no longer exactly the three shipped rungs; readers iterate `SCORED_RUNGS` instead of
   a literal list. `status` gains two lines (`shadow rungs`, and one `rung duel` per judged
   pair) and `forecast error` prints a rung's bracket when its samples differ.
+- The text filter is a **recursive walk over every string** in a state, not an allow-list of
+  remembered prose keys: a thread's title, a NAS `fb_dir`, a tool name in `tool_calls` and
+  every `turn` field are cleaned too. The walk runs at each source's ingest (desktop,
+  file/push, NAS, CLI) as well as at the top of `render()`, and only the tool's own enum
+  fields (`backend`, `source`, `status`, `goal_source`, `schema`) are left alone. The drop
+  set gains U+061C, U+2028/29, U+2060-2064 and the tag characters, and a tab becomes one
+  space.
+- The `push` / `-s file:PATH` ingress is capped: **1 MiB** of stdin, **200** steps, **500**
+  characters per string, and a `task` must be a string. Over a cap is the data error (`65`),
+  never a truncation; the `file:PATH` source is refused at the front door the same way.
+- The state root is chosen at **import** but acted on by `main()` (`init_state_root`), so a
+  module import creates no directory and moves no file; the legacy `~/.freebuff` migration
+  happens on the first command.
+
+### Fixed
+- `phone.sh` sends the ntfy body with `--data-raw`, so a message that starts with `@` is text
+  rather than a file curl would read and POST; `--title`/`--tags`/`--priority` lose any CR/LF,
+  which would otherwise inject a header.
+- `render` no longer crashes on a goal or `now` that wraps to nothing (a single space, which
+  the filter leaves of a lone tab) — the heading is drawn or skipped, never indexed.
 
 ### Moved
 - The program is a package (`src/fbtodo/`) behind a thin launcher (`fbtodo`). Nothing

@@ -2134,6 +2134,10 @@ def build_parser():
 
 
 def main(argv=None) -> int:
+    # The state root is chosen at import but ACTED ON only here: importing the package must
+    # not create a directory or move the legacy store (see `init_state_root`). Before the
+    # parser is built, so a flag whose default is a path defaults to the real one.
+    init_state_root()
     ap = build_parser()
     try:
         args, extra = ap.parse_known_args(argv)

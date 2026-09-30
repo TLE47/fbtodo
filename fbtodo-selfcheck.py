@@ -1050,6 +1050,44 @@ try:
     assert os.path.exists(os.path.join(d_home, ".freebuff", "fbtodo-pane-keeper.pid")), "moved anyway"
     say("state root: a live watcher or keeper keeps the old root, and the move waits: ok")
 
+    # ---- and importing the package is not an action: the root is CHOSEN at import (the move
+    #      is left for `main`), so a plain `import fbtodo` creates no directory and moves
+    #      nothing. A fresh home (nothing may appear) and a home with a legacy store (it must
+    #      stay exactly where it is) — the second is the case a module-level migration would
+    #      have quietly acted on.
+    imp_base = {k: v for k, v in no_fbhome.items() if k != "XDG_STATE_HOME"}
+    for label, seed in (("fresh", None),
+                        ("legacy", {"fbtodo-state.json": '{"todos": [], "instance_pid": 1}'})):
+        imp_home = os.path.join(root, "import-%s" % label)
+        shutil.rmtree(imp_home, ignore_errors=True)
+        os.makedirs(imp_home, mode=0o700, exist_ok=True)
+        if seed:
+            os.makedirs(os.path.join(imp_home, ".freebuff"), exist_ok=True)
+            for name, blob in seed.items():
+                with open(os.path.join(imp_home, ".freebuff", name), "w") as fh:
+                    fh.write(blob)
+        proc = subprocess.run(
+            [sys.executable, "-c", "import fbtodo"], capture_output=True, text=True,
+            env=dict(imp_base, HOME=imp_home, PYTHONPATH=SRC), cwd=CWD, timeout=90,
+        )
+        assert proc.returncode == 0, (label, proc.returncode, proc.stderr[-300:])
+        assert not os.path.exists(os.path.join(imp_home, ".local")), (
+            "importing the package created the state root (%s)" % label)
+        if seed:
+            assert os.path.exists(
+                os.path.join(imp_home, ".freebuff", "fbtodo-state.json")
+            ), "importing the package moved the legacy store"
+    # ...and an FBTODO_HOME that does not exist yet is not created by the import either
+    imp_env = os.path.join(root, "import-env-home")
+    proc = subprocess.run(
+        [sys.executable, "-c", "import fbtodo"], capture_output=True, text=True,
+        env=dict(imp_base, HOME=os.path.join(root, "import-env-base"),
+                 FBTODO_HOME=imp_env, PYTHONPATH=SRC), cwd=CWD, timeout=90,
+    )
+    assert proc.returncode == 0 and not os.path.exists(imp_env), (proc.returncode,
+                                                                  proc.stderr[-300:])
+    say("state root: importing the package chooses a root but touches no files: ok")
+
     # ---- the source seam: three readers of three machines' transcripts, one protocol, and
     #      a dispatch that is a loop. What matters is not that the loop exists but that the
     #      contract holds for every source — a name, the backend it reports, its own answer

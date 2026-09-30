@@ -110,13 +110,18 @@ def _legacy_claim_live() -> bool:
     )
 
 
-def _state_root():
+def _state_root(migrate: bool = True):
     """(root, note) — where this run keeps its state, and how it got there.
 
     The note is one of `None` (nothing to move), `"moved"`, or a reason the run stayed on
     the legacy root: `"live"` (a watcher there still owns the store, so moving out from
     under it would leave the pane reading a file nobody updates) or `"failed"` (the move
     was refused; the old root still works, so it is what we use).
+
+    `migrate=False` is the IMPORT-time answer: the same root chosen from the same facts,
+    but with the move (and the `makedirs`, and the pid-file reads that decide it) left for
+    `init_state_root()`. Importing a module is not an action, so the module picks a root
+    and touches nothing; `main()` runs the move before any command reads a path.
     """
     env_home = os.environ.get("FBTODO_HOME")
     if env_home:
@@ -126,6 +131,10 @@ def _state_root():
     if not os.path.exists(os.path.join(LEGACY_SCRATCH, "fbtodo-state.json")):
         return STATE_DIR, None
     if os.path.exists(os.path.join(STATE_DIR, "fbtodo-state.json")):
+        return STATE_DIR, None
+    if not migrate:
+        # There IS something to move, but deciding whether to (a live watcher?) would mean
+        # reading (and locking) pid files. Take the destination now; `init` decides.
         return STATE_DIR, None
     if _legacy_claim_live():
         return LEGACY_SCRATCH, "live"
@@ -140,7 +149,8 @@ def _state_root():
     return STATE_DIR, "moved"
 
 
-SCRATCH, STATE_NOTE = _state_root()
+# The root is CHOSEN here, without side effects; the move waits for `init_state_root()`.
+SCRATCH, STATE_NOTE = _state_root(migrate=False)
 
 
 STATE_FILE_NAME = "fbtodo-state.json"
@@ -228,6 +238,57 @@ NAS_STATE_PATH = os.path.join(SCRATCH, "fbtodo-nas-pane.json")
 
 
 NAS_LOG_PATH = os.path.join(SCRATCH, "fbtodo-nas-pane.log")
+
+
+def _state_paths(root: str) -> dict:
+    """The `{name: path}` bundle above, for one root."""
+    return {
+        "SCRATCH": root,
+        "STATE_PATH": os.path.join(root, STATE_FILE_NAME),
+        "TASKS_PATH": os.path.join(root, "fbtodo-tasks.json"),
+        "LOCK_PATH": os.path.join(root, "fbtodo-daemon.pid"),
+        "LOG_PATH": os.path.join(root, "fbtodo-daemon.log"),
+        "NAS_LOCK_PATH": os.path.join(root, "fbtodo-nas-pane.pid"),
+        "PANE_KEEPER_PATH": os.path.join(root, "fbtodo-pane-keeper.pid"),
+        "PANE_LOG_PATH": os.path.join(root, "fbtodo-pane.log"),
+        "PINS_PATH": os.path.join(root, "fbtodo-pins.json"),
+        "LAST_PATH": os.path.join(root, "fbtodo-last.json"),
+        "NAS_STATE_PATH": os.path.join(root, "fbtodo-nas-pane.json"),
+        "NAS_LOG_PATH": os.path.join(root, "fbtodo-nas-pane.log"),
+    }
+
+
+def _install_paths(bundle: dict, note) -> None:
+    """Rebind the state paths (and the note) here and in every module that star-imported them.
+
+    `from .base import *` gave each module its OWN copy of these names, so patching the
+    package alone would leave an owner's copy — the one its code reads — at the old root.
+    The write goes to every loaded module of this package that holds the name, which is
+    what "the module's global" meant when all of it was one file (the self-check's
+    `set_knob` does the same thing for its knobs).
+    """
+    bundle = dict(bundle, STATE_NOTE=note)
+    me = sys.modules.get(__name__)
+    owners = [m for n, m in list(sys.modules.items())
+              if (n == "fbtodo" or n.startswith("fbtodo.")) and m is not None]
+    if me is not None and me not in owners:
+        owners.append(me)
+    for owner in owners:
+        for name, value in bundle.items():
+            if hasattr(owner, name):
+                setattr(owner, name, value)
+
+
+def init_state_root():
+    """Choose the state root for real, moving the legacy store if that is what it takes.
+
+    Called from `main()` before anything reads a path. Import time picks the SAME root from
+    the same facts but performs nothing, so a module import never creates a directory or
+    moves a file; this is the one place the migration happens.
+    """
+    root, note = _state_root(migrate=True)
+    _install_paths(_state_paths(root), note)
+    return root
 
 
 # The phone notifier (the finish notification's sender), asked once per interval while a
@@ -1416,7 +1477,8 @@ def state_is_fresh(state: dict | None, max_age: float = HEARTBEAT_GRACE) -> bool
 
 __all__ = [
     "VERSION", "HOME", "LEGACY_SCRATCH", "STATE_DIR", "LEGACY_NAMES", "LEGACY_CLAIMS",
-    "_claim_live", "_legacy_claim_live", "_state_root", "SCRATCH", "STATE_NOTE", "STATE_PATH",
+    "_claim_live", "_legacy_claim_live", "_state_root", "init_state_root", "SCRATCH",
+    "STATE_NOTE", "STATE_PATH",
     "STATE_FILE_NAME",
     "TASKS_PATH", "events_path", "self_argv", "LOCK_PATH", "LOG_PATH", "NAS_LOCK_PATH",
     "PANE_KEEPER_PATH", "PANE_LOG_PATH", "PINS_PATH", "LAST_PATH", "NAS_STATE_PATH",
