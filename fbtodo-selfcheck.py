@@ -17,6 +17,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import shutil
 import sys
@@ -1126,6 +1127,152 @@ try:
     nas_ish = module.finish_state(dict(done, now="something new"), was)
     assert nas_ish["todos"] == [] and nas_ish["cleared_turn"] is True, nas_ish
     say("a finished list is dropped when the next turn starts, and only then: ok")
+
+    # ---- the desktop app runs SEVERAL threads per project (each tab is one, and a thread
+    #      can be left working while you open another), but its store only holds transcripts:
+    #      "is this thread live?" is a question about how recently it wrote a list, and the
+    #      app's own marks (closed, archived) are answers too. `--threads N` is how many a
+    #      pane stacks, so the rule is checked against a store built by hand: the followed
+    #      thread, the live ones, and the kinds that must NOT be drawn.
+    desk = os.path.join(TEST_HOME, "deskstore")
+    os.makedirs(desk, exist_ok=True)
+    desk_db = os.path.join(desk, "desktop-v2.db")
+    if os.path.exists(desk_db):
+        os.remove(desk_db)
+    with open(os.path.join(desk, "project.json"), "w", encoding="utf-8") as fh:
+        json.dump({"projectPath": "/tmp/deskproj"}, fh)
+    # The windows below are relative to the CLOCK the CLI reads, so the fixture's "now" has
+    # to be the real one: a frozen 2026 date is 11 hours old by the time a `--thread-live 90`
+    # window is applied through the command (found live: the threads were dropped as stale).
+    DESK_NOW = int(time.time() * 1000)
+
+    def desk_todos(*steps):
+        return json.dumps([{"task": t, "completed": d} for t, d in steps])
+
+    def desk_parts(todos):
+        if not todos:
+            return json.dumps([{"toolName": "read_file"}])
+        return json.dumps([
+            {"toolName": "write_todos", "input": {"todos": json.loads(todos)}}
+        ])
+
+    con = sqlite3.connect(desk_db)
+    con.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, status TEXT,"
+        " sidebar_archived_at INTEGER)"
+    )
+    con.execute("CREATE TABLE messages (seq INTEGER, thread_id TEXT, parts_json TEXT, ts INTEGER)")
+    desk_rows = [
+        # the thread the pane was pointed at (30s ago: that is a thread that is working)
+        ("T0", "Followed thread", "open", None,
+         desk_todos(("its first step", True), ("its second step", False)), DESK_NOW - 30_000),
+        # live, and quiet enough to be neither: 5 minutes is outside `DESKTOP_RUNNING_MS`
+        ("T1", "Other live thread", "open", None,
+         desk_todos(("other one", True), ("other two", True), ("other three", False)),
+         DESK_NOW - 300_000),
+        # outside the live window (which the flag can widen)
+        ("T2", "Quiet thread", "open", None, desk_todos(("older step", False)),
+         DESK_NOW - 200 * 60_000),
+        # the app has been told to put these two away
+        ("T3", "Closed thread", "closed", None, desk_todos(("closed step", False)),
+         DESK_NOW - 1_000),
+        ("T4", "Archived thread", "open", DESK_NOW - 1_000, desk_todos(("archived step", False)),
+         DESK_NOW - 1_000),
+        # never wrote a list at all: nothing to draw under a heading
+        ("T5", "Listless thread", "open", None, None, DESK_NOW),
+    ]
+    for seq, (tid, title, status, archived, todos, ts) in enumerate(desk_rows):
+        con.execute("INSERT INTO threads VALUES (?, ?, ?, ?)", (tid, title, status, archived))
+        con.execute(
+            "INSERT INTO messages VALUES (?, ?, ?, ?)", (seq, tid, desk_parts(todos), ts)
+        )
+    con.commit()
+    con.close()
+
+    one = module.read_desktop(desk_db, thread_id="T0", source="pinned", now_ms=DESK_NOW)
+    assert one["session"] == "T0" and len(one["todos"]) == 2, one
+    assert not one.get("threads"), "a single-thread answer must not carry the key at all"
+    many = module.read_desktop(desk_db, thread_id="T0", source="pinned", others=3,
+                               now_ms=DESK_NOW)
+    assert [t["id"] for t in many["threads"]] == ["T0", "T1"], many["threads"]
+    assert many["threads"][0]["current"] is True, many["threads"][0]
+    assert many["threads"][0]["todos"] == many["todos"], many["threads"][0]
+    assert (many["threads"][0]["running"], many["threads"][1]["running"]) == (True, False), (
+        many["threads"]
+    )
+    assert [t["id"] for t in module.read_desktop(
+        desk_db, thread_id="T0", source="pinned", others=1, now_ms=DESK_NOW
+    )["threads"]] == ["T0", "T1"], "the cap is how many threads are SHOWN"
+    no_window = module.read_desktop(desk_db, thread_id="T0", source="pinned", others=3,
+                                    now_ms=DESK_NOW, window_ms=0)
+    assert [t["id"] for t in no_window["threads"]] == ["T0", "T1", "T2"], no_window["threads"]
+    say("desktop: the live threads ride on the state, filed-away and quiet ones do not: ok")
+
+    # ---- through the CLI, because that is where the flags are read: `--threads` is how
+    #      many, `--thread-live 0` widens the window to every thread with a list.
+    desk_state = os.path.join(desk, "workspace.json")
+    cli = run("json", "-s", "desktop", "--db", desk_db, "--state", desk_state, "-t", "T0")
+    doc = json.loads(cli.stdout)
+    assert doc["backend"] == "desktop" and doc["session"] == "T0", doc
+    assert [t["id"] for t in doc["threads"]] == ["T0", "T1"], doc.get("threads")
+    widened = json.loads(run(
+        "json", "-s", "desktop", "--db", desk_db, "--state", desk_state, "-t", "T0",
+        "--threads", "4", "--thread-live", "0",
+    ).stdout)
+    assert [t["id"] for t in widened["threads"]] == ["T0", "T1", "T2"], widened.get("threads")
+    off = json.loads(run(
+        "json", "-s", "desktop", "--db", desk_db, "--state", desk_state, "-t", "T0",
+        "--threads", "0",
+    ).stdout)
+    assert not off.get("threads"), "--threads 0 is the one-list answer"
+    say("desktop: --threads and --thread-live reach the state through the CLI: ok")
+
+    # ---- and the frame stacks them: a heading row per thread (its title, its own
+    #      done/total, and whether it is the one being worked in), that thread's steps under
+    #      it, and the frame still inside the height it was asked for.
+    # Built by hand, not out of the reader above: this half is the RENDERER's, and it should
+    # fail on its own if a stacked state ever stops drawing headings (a reader-only check
+    # would pass a frame that quietly drew one list).
+    pair = [
+        {"id": "T0", "title": "Followed thread", "current": True, "running": True,
+         "todos": [{"task": "its first step", "completed": True},
+                   {"task": "its second step", "completed": False}],
+         "source_updated_ms": DESK_NOW - 30_000},
+        {"id": "T1", "title": "Other live thread", "current": False, "running": False,
+         "todos": [{"task": "other one", "completed": True},
+                   {"task": "other two", "completed": True},
+                   {"task": "other three", "completed": False}],
+         "source_updated_ms": DESK_NOW - 300_000},
+    ]
+    stacked = {"backend": "desktop", "session": "T0", "goal": "the followed thread's goal",
+               "todos": pair[0]["todos"], "threads": pair, "list_version": 3,
+               "source_updated_ms": DESK_NOW - 30_000}
+    frame = module.render(stacked, True, watching=None, width=68, now_ms=DESK_NOW, height=18,
+                          theme={}, truecolor=False)
+    plain = module.render(stacked, False, width=68, now_ms=DESK_NOW)
+    for text in ("Followed thread", "Other live thread", "its first step", "other three"):
+        assert text in frame, (text, frame)
+        assert text in plain, (text, plain)
+    assert "1/2" in frame and "2/3" in frame, frame          # each thread's own count
+    assert len(frame.splitlines()) <= 18, frame
+    short = module.render(stacked, True, watching=None, width=40, now_ms=DESK_NOW, height=9,
+                          theme={}, truecolor=False)
+    assert len(short.splitlines()) <= 9, short
+    # ...and a state with ONE thread renders exactly as the same state without the key, so
+    # nothing about a single list moved: the goldens are the other half of that promise.
+    alone = {k: v for k, v in stacked.items() if k != "threads"}
+    assert module.render({**alone, "threads": [pair[0]]}, False, width=68,
+                         now_ms=DESK_NOW) == module.render(alone, False, width=68, now_ms=DESK_NOW)
+    # The followed thread's list is the state's own, not the thread entry's copy: a finished
+    # list dropped for a newer request must not come back from under a heading.
+    finished = dict(stacked, todos=[{"task": "the finished step", "completed": True}],
+                    now="a newer request")
+    module.finish_state(finished, {"session": "T0", "list_version": 1, "list_id": "x"})
+    assert finished["todos"] == [], finished
+    after_frame = module.render(finished, False, width=68, now_ms=DESK_NOW)
+    assert "the finished step" not in after_frame, after_frame
+    assert "Other live thread" in after_frame and "other three" in after_frame, after_frame
+    say("desktop: a pane stacks the live threads, each under its own heading: ok")
 
     # ---- the big goal heading a list: the AGENT's own line, and drift since
     goals = os.path.join(TEST_HOME, "goalstore")
