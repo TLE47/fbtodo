@@ -1701,7 +1701,9 @@ check_match "a pane the keeper never put back is reported" \
 pn_run 0 --quiet >/dev/null
 check "it pushes once" "$(pn_sends)" "1"
 check_match "...through phone.sh, high priority" "$(cat "$PN/sends.log")" 'priority high'
-check_match "...naming the window it is missing from" "$(cat "$PN/sends.log")" 'fbtodo pane missing . main'
+# `.*` rather than `.`: the title carries a `·`, which under a C locale grep sees as two
+# bytes and a single-dot pattern cannot match. The assertion is about the window name.
+check_match "...naming the window it is missing from" "$(cat "$PN/sends.log")" 'fbtodo pane missing .* main'
 check_match "...and saying what to run" "$(cat "$PN/sends.log")" 'pane-watch --once'
 check_match "...and the log beside the claim it read, not a legacy path" \
   "$(cat "$PN/sends.log")" 'its log: .*pane-watch/fbtodo-pane.log'

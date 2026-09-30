@@ -53,3 +53,78 @@ jobs:
 
       - name: notify suite
         run: bash notify/test-freebuff-notify.sh
+
+  # Two ordinary conditions the main matrix masks. A Linux host with no `lsof` is every
+  # container and busybox box: `/proc` answers cwd on its own there, and `doctor` must
+  # warn about the missing binary rather than fail. A C locale is a cron job or a service
+  # unit: the frame still draws, so neither suite may depend on the runner's locale.
+  no-lsof:
+    name: ubuntu · py3.x · no lsof
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      TERM: xterm-256color
+      FBTODO_NO_AUTOSTART: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: install tmux, and make sure lsof is gone
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tmux
+          sudo apt-get remove -y -qq lsof || true
+
+      - name: prove lsof is absent
+        run: |
+          if command -v lsof >/dev/null; then
+            echo "lsof is on PATH but this leg needs it absent" >&2
+            exit 1
+          fi
+          echo "lsof: absent; /proc is present"
+
+      - name: doctor warns about the missing lsof, not fails
+        run: |
+          python3 fbtodo doctor --json > /tmp/doctor.json
+          python3 -c 'import json,sys; d=json.load(open("/tmp/doctor.json")); sys.exit(0 if d["fail"]==0 else 1)'
+
+      - name: self-check
+        run: python3 fbtodo-selfcheck.py
+
+      - name: notify suite
+        run: bash notify/test-freebuff-notify.sh
+
+  c-locale:
+    name: ubuntu · py3.x · LANG=C
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LANG: C
+      LC_ALL: C
+      TERM: xterm-256color
+      FBTODO_NO_AUTOSTART: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: install tmux and lsof
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux lsof
+
+      - name: where the locale is now
+        run: |
+          locale || true
+          python3 -c 'import sys; print("stdout encoding:", sys.stdout.encoding)'
+
+      - name: self-check
+        run: python3 fbtodo-selfcheck.py
+
+      - name: notify suite
+        run: bash notify/test-freebuff-notify.sh
