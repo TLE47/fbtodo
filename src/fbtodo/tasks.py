@@ -187,6 +187,17 @@ DUEL_RESAMPLES = 4_000          # session-level bootstrap draws
 DUEL_RESOLVED = 0.95            # share of draws one side must take to be the winner
 DUEL_MIN_SESSIONS = 4           # below this there is nothing to resample: every draw is the sample
 
+# The rungs the pane may PICK from, and the ones it only keeps score for. A shadow rung is
+# stamped into the same forecast vector and judged by the same functions, and no code path may
+# ever return it as an estimate: an idea has to earn its place from the log before it is
+# allowed to move a number somebody is looking at. `recent` is the list's own last few spans —
+# the pace that has just delivered — which is the one thing the whole-list pace cannot be
+# compared against by itself.
+SHIPPED_RUNGS = ("shape", "blend", "pace")
+SHADOW_RUNGS = ("recent",)
+SCORED_RUNGS = SHIPPED_RUNGS + SHADOW_RUNGS
+SHADOW_SAMPLES = 3              # finished spans of the current list that `recent` is read from
+
 
 def step_spans_ms(times: dict, todos: list, now_ms: int) -> list[int]:
     """The measured duration of every finished step that was actually seen running."""
@@ -213,6 +224,28 @@ def _median_ms(values: list[int]) -> int | None:
     spans = sorted(values)
     mid = len(spans) // 2
     return spans[mid] if len(spans) % 2 else (spans[mid - 1] + spans[mid]) // 2
+
+
+# In plain words: the pace of the last few steps rather than of the whole list. A list that
+# started with two slow steps and has settled has a whole-list pace that lags what is actually
+# happening; a list that is slowing down has one that flatters it. This is the shadow rung's
+# whole content, and it reads the tail of the CURRENT list only — another list's steps are not
+# this list's pace.
+def recent_pace_ms(
+    times: dict,
+    todos: list,
+    now_ms: int,
+    samples: int | None = None,
+) -> int | None:
+    """The median of the list's own last few finished spans, or None if there are not two.
+
+    Two, not one: a single span is that step's own time rather than a pace, and a rung built
+    on it would just be the last outcome quoted back as a forecast. Nothing here is exported
+    — the value is stamped into the ledger's vector and scored there; see `SHADOW_RUNGS`.
+    """
+    keep = SHADOW_SAMPLES if samples is None else max(1, int(samples))
+    tail = [s for s in step_spans_ms(times, todos, now_ms) if s >= label_floor_ms()][-keep:]
+    return _median_ms(tail) if len(tail) >= 2 else None
 
 
 def rank_quantile(values: list[float], pct: int) -> float:
@@ -781,7 +814,7 @@ def forecast_error(
         if fc.get("late"):
             late += 1
             continue
-        for rung in ("shape", "blend", "pace"):
+        for rung in SCORED_RUNGS:
             try:
                 pred = int(fc.get(rung))
             except (TypeError, ValueError):
@@ -887,6 +920,18 @@ def rung_duel(
         "winner": winner,
         "resamples": resamples,
     }
+
+
+def fmt_rung(stat: dict) -> str:
+    """`1.05x [0.98–1.30] over 22` — one rung's median with its spread and its sample size.
+
+    The bracket is dropped when every sample gave the same ratio. A range of one value is not
+    a range, and printing `[1.05–1.05]` would suggest a spread the samples do not have.
+    """
+    text = f"{stat['med']:.2f}x"
+    if stat.get("hi") != stat.get("lo"):
+        text += f" [{stat['lo']:.2f}–{stat['hi']:.2f}]"
+    return f"{text} over {stat['n']}"
 
 
 def duel_note(a: str, b: str, verdict: dict) -> str:
@@ -1622,6 +1667,11 @@ def track_tasks(state: dict, now_ms: int | None = None, persist: bool = True) ->
                 blended = pending_blend_ms(label, pace, state.get("task_calls"))
                 if blended:
                     fc["blend"] = blended
+                # ...and the shadow rung, scored beside them and never returned by any rung
+                # chooser: this stamp is the whole of its contract with the pane.
+                shadow = recent_pace_ms(times, todos, now_ms)
+                if shadow:
+                    fc["recent"] = shadow
                 fc["pace"] = pace
                 fc["pick"] = src
                 rec["fc"] = fc
@@ -1662,7 +1712,9 @@ __all__ = [
     "step_pace_ms", "estimate_for", "pick_estimate", "task_estimate_ms", "_spread_ms",
     "fmt_range", "is_wide", "fmt_estimate_spread", "pace_spread_ms", "entry_spread",
     "forecast_error", "rung_duel", "DUEL_RESAMPLES", "DUEL_RESOLVED", "rank_quantile",
-    "SPREAD_LO_PCT", "SPREAD_HI_PCT", "DUEL_MIN_SESSIONS", "duel_note", "refit_readiness",
+    "SPREAD_LO_PCT", "SPREAD_HI_PCT", "DUEL_MIN_SESSIONS", "duel_note", "fmt_rung",
+    "SHIPPED_RUNGS", "SHADOW_RUNGS", "SCORED_RUNGS", "SHADOW_SAMPLES", "recent_pace_ms",
+    "refit_readiness",
     "estimate_error", "estimate_spread_ms",
     "remaining_estimate_ms", "elapsed_total_ms", "total_estimate_ms", "run_variance_ms",
     "fmt_estimate", "fmt_variance", "fmt_eta", "task_key", "_task_event", "_events_size",

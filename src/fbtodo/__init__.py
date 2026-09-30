@@ -963,18 +963,9 @@ def cmd_status(args) -> int:
     # number the pane was showing as the step closed, whose size key is built from calls the
     # step had already made; this one cannot flatter a rung that recognises.
     ferr = forecast_error(log.get("tasks") or {}, model=model)
-    fparts = []
-    for src in ("shape", "blend", "pace"):
-        stat = ferr.get(src)
-        if not stat:
-            continue
-        # The interval rides beside the median, because the median alone cannot tell a rung
-        # that misses by a tenth every time from one that misses by a tenth on average. A
-        # rung whose spread is one sample prints no bracket: a range of one value is not one.
-        text = f"{src} {stat['med']:.2f}x"
-        if stat.get("hi") != stat.get("lo"):
-            text += f" [{stat['lo']:.2f}–{stat['hi']:.2f}]"
-        fparts.append(f"{text} over {stat['n']}")
+    # The interval rides beside the median, because the median alone cannot tell a rung that
+    # misses by a tenth every time from one that misses by a tenth on average.
+    fparts = [f"{src} {fmt_rung(ferr[src])}" for src in SHIPPED_RUNGS if ferr.get(src)]
     skipped = (ferr.get("late") or {}).get("n") or 0
     tail = f" · {skipped} stamped late, not scored" if skipped else ""
     if fparts:
@@ -986,6 +977,14 @@ def cmd_status(args) -> int:
         print(f"  forecast error    : — {skipped} step(s) stamped late, not scored")
     else:
         print("  forecast error    : — no step has started since the ledger was added")
+    # ...and the rungs that are scored but never picked. Their own line, because it has to be
+    # visible that the pane is carrying an experiment and that none of it moves a row on
+    # screen: `recent` is judged here and can be picked by nothing.
+    sparts = [f"{src} {fmt_rung(ferr[src])}" for src in SHADOW_RUNGS if ferr.get(src)]
+    if sparts:
+        print(f"  shadow rungs      : {' · '.join(sparts)}  (scored, never picked)")
+    else:
+        print("  shadow rungs      : — nothing scored yet (stamped into the vector, never picked)")
     # ...and whether a gap between two of those rungs is the rung or the sample. Only pairs
     # the log can actually judge are printed: a duel nobody has the steps for is not a draw,
     # and showing it as one would read as "these two rungs are equivalent".
@@ -1082,7 +1081,8 @@ def cmd_prune(args) -> int:
 # Which rungs are worth judging against each other, in the order a reader reads them. The
 # three the pane can pick between, paired: the question "is this one better" only has a
 # meaning between two rungs that were both asked the same steps.
-DUEL_PAIRS = (("pace", "blend"), ("pace", "shape"), ("blend", "shape"))
+DUEL_PAIRS = (("pace", "blend"), ("pace", "shape"), ("blend", "shape"),
+              ("pace", "recent"))  # ...and the shadow rung against the one it would replace
 
 
 def ledger_rows(
@@ -1124,7 +1124,7 @@ def ledger_rows(
         # which is the safest kind of forecast there is, but it is not what a reader assumes.
         stamp_in = (int(fc.get("at") or 0) - started) if fc.get("at") else None
         preds = {}
-        for rung in ("pace", "blend", "shape"):
+        for rung in SCORED_RUNGS:
             try:
                 value = int(fc.get(rung) or 0)
             except (TypeError, ValueError):
@@ -1214,7 +1214,11 @@ def fmt_ledger(
         label = r["label"] if len(r["label"]) <= 62 else r["label"][:61] + "…"
         out.append(f"  {span:<8} {label:<62} {c('2', fmt_age(r['started_ms'], now_ms))}")
         bits = []
-        for rung in ("pace", "blend", "shape"):
+        # the shipped rungs in their reading order, then any shadow rung the row actually
+        # carries: a row recorded before the shadow rung existed is not shown a `recent —` it
+        # never had, and a row that has one shows it beside the rungs it is competing with
+        shown_rungs = list(SHIPPED_RUNGS) + [x for x in SHADOW_RUNGS if x in r["preds"]]
+        for rung in shown_rungs:
             pred = r["preds"].get(rung)
             if pred is None:
                 if rung != "pace":
