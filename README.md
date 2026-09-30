@@ -28,6 +28,17 @@ No setup needed. Works with any agent that keeps a todo list.
 
 ---
 
+## See it work
+
+![fbtodo's pane working through a scripted session](docs/demo/demo.gif)
+
+That clip is the real pane — `fbtodo pane`, drawing a scripted session as it ticks through eight
+steps and finishes with the list done *and* the turn ended, which is the pair the bell waits for.
+The recording, three stills from it and the same frames as an MP4 are in
+[`docs/demo`](docs/demo), and `docs/demo/record.sh` reproduces them all.
+
+---
+
 ## Installation
 
 ### Quick start
