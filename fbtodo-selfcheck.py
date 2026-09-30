@@ -94,6 +94,60 @@ for _key, _val in (
     os.environ[_key] = _val
     env[_key] = _val
 PATCH_FIXTURE_STAMP = ""  # filled in with the fixtures themselves, below
+
+
+def keeper_aim() -> dict:
+    """Live `pane-watch` processes → the tmux server each one is aimed at, from its own env.
+
+    The environment is the only place that decision is written down (`tmux_identity()`
+    takes FBTODO_TMUX, then TMUX, then the default server), and it is what makes a keeper
+    started by a TEST hook inside the owner's own pane dangerous: it goes off keeping the
+    OWNER's panes with the test state root — invisible (its log is a file in a home the
+    suite wipes) and immortal (the owner's server always has panes and a freebuff, so it
+    never reaches the pass that would let go), so it went on moving the owner's list pane
+    back to the default side for as long as it lived. Keyed by pid, so a caller can tell
+    what THIS run added from what was already on the machine.
+    """
+    aims = {}
+    listing = subprocess.run(
+        ["ps", "-eo", "pid=,args="], capture_output=True, text=True
+    ).stdout or ""
+    for line in listing.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if not pid.isdigit() or "pane-watch" not in args or "grep" in args:
+            continue
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as handle:  # linux
+                blob = handle.read().decode("utf-8", "replace")
+        except OSError:  # macOS: `ps -E` appends the environment to the args column
+            blob = subprocess.run(
+                ["ps", "-Eww", "-p", pid], capture_output=True, text=True
+            ).stdout
+        fields = {}
+        for token in blob.replace("\0", " ").split():
+            key, _, value = token.partition("=")
+            if value and key in ("FBTODO_HOME", "FBTODO_TMUX", "TMUX"):
+                fields[key] = value
+        aims[pid] = fields
+    return aims
+
+
+def keeper_leaks(before: dict, home: str, server: str | None) -> list:
+    """Keepers this run ADDED that keep `server`'s panes while running with `home`.
+
+    Nothing should ever be one: a keeper reads the state root it was given and it keeps
+    whatever panes the tmux server in its environment has, so a test home pointed at a
+    live server is a keeper that edits the owner's layout from a scratch file.
+    """
+    out = []
+    for pid, fields in keeper_aim().items():
+        if pid in before or fields.get("FBTODO_HOME") != home:
+            continue
+        if (fields.get("FBTODO_TMUX") or fields.get("TMUX") or None) == server:
+            out.append((pid, fields.get("TMUX"), fields.get("FBTODO_TMUX")))
+    return out
+
+
 ok = []
 START = time.monotonic()  # the suite's clock; `say()` reports each check's cost against it
 
@@ -4070,10 +4124,22 @@ try:
     assert os.waitstatus_to_exitcode(status_s) == 0, os.waitstatus_to_exitcode(status_s)
     say("a stale list closes the pane: ok (exit 0, 'idle … closing')")
 
-    # ---- shell integration: PATH alias-free command + watcher autostart hook
+    # ---- shell integration: PATH alias-free command + watcher autostart hook. The keepers
+    #      alive before it are remembered, so what the hook adds can be told from what the
+    #      machine already had (an old build's stray is a real thing to report, but not a
+    #      failure of this run — see the check below the hook).
+    keepers_before = keeper_aim()
     ptypid, ptyfd = pty.fork()
     if ptypid == 0:
         os.environ["FBTODO_HOME"] = TEST_HOME
+        # ...and no pane keeper. The hook's `fbtodo daemon` asks for one, and a keeper keeps
+        # the panes of the tmux server in ITS environment — this child runs inside whatever
+        # pane the suite was started from, so that server is the owner's. The keeper it left
+        # behind was therefore aimed at the owner's real panes with the throwaway root: it
+        # moved the owner's list pane back to the default side every 3s, forever, and its
+        # log lived in a home this suite wipes (found 2026-09-29, from the pane that would
+        # not stay where the owner dragged it). The watcher this check is about still starts.
+        os.environ["FBTODO_NO_PANE"] = "1"
         os.execv("/bin/zsh", ["/bin/zsh", "-i", "-c", "command -v fbtodo && fbtodo bar"])
     out = b""
     os.set_blocking(ptyfd, False)
@@ -4106,6 +4172,18 @@ try:
     assert lock.get("instance_pid"), lock
     run("stop")
     say("zshrc hook auto-starts a watcher for the live instance: ok")
+    # ---- ...and it must start a WATCHER and nothing else. `fbtodo daemon` asks for a pane
+    #      keeper as well, and a keeper is aimed at the tmux server in its environment: this
+    #      hook runs inside the owner's own pane, so the keeper it used to leave behind went
+    #      off keeping the owner's panes with the test state root — the pane that would not
+    #      stay where the owner put it. `FBTODO_NO_PANE=1` in the child is the fix; this is
+    #      the check that it holds.
+    stray = keeper_leaks(keepers_before, TEST_HOME, os.environ.get("TMUX"))
+    assert not stray, (
+        "the zshrc hook's autostart left a pane keeper keeping THIS server's panes with "
+        f"the test state root: {stray}"
+    )
+    say("the zshrc hook keeps no pane keeper of its own (FBTODO_NO_PANE): ok")
 
     # ---- retention: old records, the count cap, temp files, the log cap
     saved_home = os.environ.get("FBTODO_HOME")
@@ -5151,6 +5229,134 @@ try:
             capture_output=True, text=True,
         ).stdout.strip()
         assert window_target, panes_detail()
+
+        # ---- the side is the owner's answer too, not only the size. A list dragged off the
+        #      bottom of its session and into the column beside it — the LEFT column, which is
+        #      the move this was reported with — used to be back under the session inside one
+        #      keeper pass, and could never be remembered, because the keeper wrote down the
+        #      side IN FORCE rather than the side it saw. Two rules instead: a side fixes the
+        #      AXIS and not the edge of it, and a pane found on the other axis is an owner's
+        #      arrangement rather than a drift to repair (only a pin still decides a side).
+        def rect(left, top, width, height):
+            return {"window": "@w", "left": left, "top": top, "width": width, "height": height}
+
+        above = rect(60, -10, 40, 10)
+        anchor = rect(60, 1, 40, 10)
+        diagonal = rect(101, 12, 40, 8)
+        left_of = rect(19, 1, 40, 10)
+        right_of = rect(101, 1, 40, 10)
+        under = rect(60, 12, 40, 8)
+        geom = {"%d": diagonal, "%l": left_of, "%r": right_of, "%u": anchor,
+                "%o": above, "%n": under}
+        assert panes_mod.placed_beside("%u", "%r", geom, "h")
+        assert panes_mod.placed_beside("%u", "%l", geom, "h"), (
+            "a list to the LEFT of its session is not accepted as beside it"
+        )
+        assert not panes_mod.placed_beside("%u", "%n", geom, "h")
+        assert panes_mod.placed_beside("%u", "%o", geom, "v"), (
+            "a strip ABOVE its session is not accepted as under it"
+        )
+        assert not panes_mod.placed_beside("%u", "%l", geom, "v")
+        assert panes_mod.pane_before(anchor, left_of, "h") and panes_mod.pane_before(
+            anchor, above, "v"
+        )
+        assert not panes_mod.pane_before(anchor, right_of, "h") and not (
+            panes_mod.pane_before(anchor, under, "v")
+        )
+        assert panes_mod.pane_axis(anchor, left_of) == "h"
+        assert panes_mod.pane_axis(anchor, under) == "v"
+        assert panes_mod.pane_axis(anchor, diagonal) is None, (
+            "a pane in the far corner of a grid is on no axis of its anchor"
+        )
+        # A side in force that nobody pinned stops being enforced on its axis — the pane is
+        # `seen` there — and a pin keeps every tooth it had.
+        laid = {"side": "v", "side_source": "last", "size": 8, "size_source": "last"}
+        kept = panes_mod.kept_layout("%l", "%u", geom, laid)
+        assert (kept["side"], kept["side_source"]) == ("h", "seen"), kept
+        pinned = dict(laid, side_source="pin:local")
+        assert panes_mod.kept_layout("%l", "%u", geom, pinned)["side"] == "v", (
+            "a pin no longer decides the side"
+        )
+        assert panes_mod.kept_layout("%n", "%u", geom, laid)["side_source"] == "last", (
+            "a pane still on the side in force was treated as an arrangement"
+        )
+        assert panes_mod.source_note("seen", "main:1") == "seen (kept, not filed yet)", (
+            "the side a pane is kept on has no wording of its own in `why`"
+        )
+        say("a side fixes the axis, not the edge of it; a pin decides, a kept side is kept: ok")
+
+        # ...and it holds on a real server: the list goes to the LEFT column, and the
+        # keeper's next passes have to leave it there — and file it, so the pane a later pass
+        # opens in that window opens on the same side.
+        moved_left = subprocess.run(
+            tmux + ["move-pane", "-d", "-b", "-h", "-s", pane, "-t", inst_pane],
+            capture_output=True,
+        )
+        assert moved_left.returncode == 0, f"could not move the list to the left: {moved_left.stderr}"
+
+        def kept_left() -> bool:
+            rects_now = panes_mod.pane_rects()
+            a = rects_now.get(inst_pane)
+            b = rects_now.get(pane)
+            return bool(
+                a and b and b["left"] + b["width"] + 1 == a["left"]
+                and panes_mod.pane_axis(a, b) == "h"
+            )
+
+        assert kept_left(), f"tmux did not put the pane left of its session: {placement()}"
+
+        def filed_side() -> str | None:
+            try:
+                with open(os.path.join(TEST_HOME, "fbtodo-last.json")) as handle:
+                    doc = json.load(handle)
+            except (OSError, ValueError):
+                return None
+            for key, entry in (doc if isinstance(doc, dict) else {}).items():
+                local = entry.get("local") if isinstance(entry, dict) else None
+                if key.startswith(f"{sess}:") and isinstance(local, dict):
+                    return local.get("side")
+            return None
+
+        deadline = time.time() + 15
+        while time.time() < deadline and not (kept_left() and filed_side() == "h"):
+            time.sleep(0.3)
+        assert kept_left(), (
+            f"the keeper put a hand-moved list pane back where it was opened: {placement()}"
+        )
+        assert filed_side() == "h", (
+            f"the other side was kept but never filed for the next pane: {filed_side()!r}"
+        )
+        why_left = run("why", "--window", window_target).stdout
+        assert f"side=h (remembered)" in why_left and "MISPLACED" not in why_left, why_left
+        rows_left = json.loads(run("why", "--json", "--window", window_target).stdout)
+        mine_left = [rec for rec in rows_left["panes"] if rec["pane"] == pane]
+        assert mine_left and mine_left[0]["placed"] is True, mine_left
+        assert (mine_left[0]["side"], mine_left[0]["side_source"]) == ("h", "last"), mine_left
+        say("a list pane moved to the other side of its session stays there and is filed: ok")
+
+        # ...and when a pass DOES have to move it back, it returns the pane to the edge it was
+        # already on: a pane split in BETWEEN it and its session pushes it off the anchor, and
+        # the repair has to bring it back to the left rather than to the right, which is where
+        # a fresh `split-window` would have put it.
+        between = subprocess.run(
+            tmux + ["split-window", "-b", "-h", "-l", "10", "-d", "-t", inst_pane,
+                    "sleep", "60"],
+            capture_output=True,
+        )
+        assert between.returncode == 0, f"could not split a pane in between: {between.stderr}"
+        assert not kept_left(), f"the pane was still placed — nothing to repair: {placement()}"
+        deadline = time.time() + 12
+        while time.time() < deadline and not kept_left():
+            time.sleep(0.3)
+        assert kept_left(), (
+            f"the repair did not keep the edge the pane was on: {placement()}"
+        )
+        say("a repair puts the pane back on the edge it was on, not on the default one: ok")
+        # ...and the fixture goes back to the arrangement the rest of the block expects. The
+        # remembered side follows it on its own (nothing here waits for that).
+        subprocess.run(
+            tmux + ["move-pane", "-d", "-v", "-s", pane, "-t", inst_pane], capture_output=True
+        )
 
         def pinned_ok(side: str, size: int) -> bool:
             inst_pane_now = panes_mod.freebuff_pane_id(inst)
