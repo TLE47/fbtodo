@@ -8,6 +8,7 @@ last forecast was — is derived here from spans that were actually seen running
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
 import os
@@ -187,7 +188,10 @@ SPREAD_HI_PCT = 90              # ...and its high end
 # `DUEL_MIN_SESSIONS` is the floor below which the sign test has too few signs to resolve.
 DUEL_RESOLVED = 0.95            # confidence a winner must clear: p <= 1 - DUEL_RESOLVED
 DUEL_MIN_SESSIONS = 6           # below this there are too few session signs to resolve
-DUEL_EXACT_MAX = 20             # 2^20 sign flips is the ceiling of an exact enumeration
+# 2^40 sign assignments is not a walk anybody takes, but `rung_duel` does not take it: it
+# counts them by halves, so the ceiling is where the two sorted half-lists of sums get big
+# (2^20 apiece) rather than where the enumeration does.
+DUEL_EXACT_MAX = 40             # ceiling on the exact count: 2^(n/2) per half, not 2^n
 
 # The rungs the pane may PICK from, and the ones it only keeps score for. A shadow rung is
 # stamped into the same forecast vector and judged by the same functions, and no code path may
@@ -845,6 +849,43 @@ def forecast_error(
     return report
 
 
+def _signed_sums(values: list[float]) -> list[float]:
+    """Every `sum(±v)` over `values` — all `2^len(values)` of them, built by doubling."""
+    sums = [0.0]
+    for value in values:
+        sums = [s + value for s in sums] + [s - value for s in sums]
+    return sums
+
+
+def _sign_flip_extreme(diffs: list[float], compare: float) -> int:
+    """How many sign assignments give `|sum(±d)| >= compare` — exactly, by meet-in-the-middle.
+
+    The walk this replaces built all `2^n` signed sums one sign at a time: fine at twenty
+    sessions, a trillion at forty. Split `diffs` in two, enumerate each half's `2^(n/2)`
+    signed sums, sort one of them, and the count becomes a binary search per sum of the other
+    half — `left + right >= compare` is `right >= compare - left`, with the same again below
+    zero. The answer is the same integer the walk would have returned, from two lists of a
+    million instead of one of a trillion.
+
+    The two `>=`/`<=` tails can meet (only when `compare` is not positive, i.e. an observed
+    effect of exactly zero), and then every assignment qualifies; counting them separately
+    would count the overlap twice.
+    """
+    half = len(diffs) // 2
+    left = _signed_sums(diffs[:half])
+    right = sorted(_signed_sums(diffs[half:]))
+    total = 0
+    for value in left:
+        high = compare - value          # right >= high qualifies
+        low = -compare - value          # ...and right <= low does too
+        if high <= low:
+            total += len(right)         # the tails cover everything between them
+        else:
+            total += (len(right) - bisect.bisect_left(right, high))
+            total += bisect.bisect_right(right, low)
+    return total
+
+
 def rung_duel(
     rows: list[dict],
     a: str,
@@ -864,10 +905,12 @@ def rung_duel(
 
     The test is the EXACT sign-flip (Fisher randomization) test on those session means. Under
     the null the sign of each session's difference is a fair coin, so all `2^n` sign
-    assignments are enumerated and `p` is the share whose mean is at least as far from zero
-    as the observed one. Exact rather than asymptotic, and with no bootstrap and no seed in
-    it: the same log reports the same `p` and the same winner on every run and every machine,
-    which is what `--twice` and the goldens need.
+    assignments are counted and `p` is the share whose mean is at least as far from zero as
+    the observed one. Exact rather than asymptotic, and with no bootstrap and no seed in it:
+    the same log reports the same `p` and the same winner on every run and every machine,
+    which is what `--twice` and the goldens need. The counting is meet-in-the-middle (see
+    `_sign_flip_extreme`), which is why the ceiling is forty sessions and not twenty: the
+    work is `2^(n/2)` per half, and the number it returns is the one the plain walk returned.
 
     `share_steps` is the raw share of paired steps `a` won, kept for the reader; the decision
     is the sign test's. `winner` is None unless `p <= 1 - DUEL_RESOLVED` over at least
@@ -875,8 +918,10 @@ def rung_duel(
     rather than crowning the rung that leads today. A rung with nothing to score it against
     is not a winner by default: no pairing, no verdict.
 
-    Past `DUEL_EXACT_MAX` sessions `2^n` stops being a walk anybody wants to take, so the
-    sign assignments are sampled instead and `exact` says so. Real logs sit far below it.
+    Past `DUEL_EXACT_MAX` sessions even the halves stop being cheap, so the sign assignments
+    are sampled instead and `exact` says so. A sampled `p` is `(k+1)/(m+1)` rather than
+    `k/m`: with a few hundred draws a raw share can land on zero, and "no draw was this
+    extreme" is not the same claim as "no assignment is". Real logs sit far below the ceiling.
     """
     pairs: list[tuple[str, float, float]] = []
     for row in rows or []:
@@ -908,15 +953,11 @@ def rung_duel(
     observed = sum(diffs) / n
     compare = abs(observed) * n - 1e-9   # compare SUMS: |sum(s_i d_i)| >= |sum(d_i)|
     if n <= exact_max:
-        flips, extreme, exact = 1 << n, 0, True
-        for bits in range(flips):
-            stat = 0.0
-            for i, d in enumerate(diffs):
-                stat += d if (bits >> i) & 1 else -d
-            if abs(stat) >= compare:
-                extreme += 1
+        flips, exact = 1 << n, True
+        extreme = _sign_flip_extreme(diffs, compare)
     else:
-        flips, extreme, exact = 1 << exact_max, 0, False
+        flips, exact = 1 << exact_max, False
+        extreme = 0
         rng = random.Random(zlib.crc32(f"{a}\x1f{b}\x1f{steps}\x1f{n}".encode()))
         for _ in range(flips):
             stat = 0.0
@@ -924,7 +965,9 @@ def rung_duel(
                 stat += d if rng.getrandbits(1) else -d
             if abs(stat) >= compare:
                 extreme += 1
-    p = extreme / flips
+    # Exact: the share of all 2^n assignments. Sampled: (k+1)/(m+1), so a draw that never came
+    # out extreme reports a small p rather than a zero the sample cannot support.
+    p = extreme / flips if exact else (extreme + 1) / (flips + 1)
     # A's error is the smaller one when its mean log-ratio is negative. The interval is
     # two-sided; the DIRECTION comes from the sign of the observed effect.
     winner = None

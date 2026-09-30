@@ -10,6 +10,11 @@ Entries start at the newest release; each one is a contract change, not a diff.
   when they are left out), so a frame is a function of the state, the clock and the size it was
   asked for — what a recorded frame and a row-by-row repaint both need. The depth still changes
   only the ink.
+- `rung_duel`'s exact arm counts the `2^n` sign assignments **meet-in-the-middle** instead of walking
+  them: two halves of signed sums, one sorted and binary-searched, giving the same `p` and the same
+  winner for `2^(n/2)` work — so `DUEL_EXACT_MAX` rises from 20 sessions to 40. Past it the signs are
+  sampled as before, and a sampled `p` is `(k+1)/(m+1)` rather than `k/m`, because a few hundred draws
+  that all land on one side is not evidence that no assignment could.
 - The task log is an **append-only stream** (`fbtodo-tasks.jsonl`); `fbtodo-tasks.json` is a
   fold of it carrying the offset it was folded to (`events`). A poll appends the records it
   actually changed instead of rewriting the log, and an append that lands without the rewrite

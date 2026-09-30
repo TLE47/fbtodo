@@ -156,12 +156,14 @@ the whole design.
   the evidence is reduced to **one mean log-ratio difference per session**: the steps inside
   one session are not independent, and counting them separately would let one long session
   vote twelve times. The test is the **exact sign-flip (Fisher randomization) test** over
-  those session differences — all `2^n` sign assignments, no bootstrap and no seed, so `p` is
-  a property of the log rather than of a draw. `share_steps` is the raw share of paired steps
-  won and `effect` the mean difference; `p` and `flips` are what decide. `winner` stays `None`
-  unless `p <= 1 - DUEL_RESOLVED` (0.05) **and** there are at least `DUEL_MIN_SESSIONS` (6)
-  sessions — below that the sign test has too few signs to resolve anything. Past
-  `DUEL_EXACT_MAX` (20) sessions the signs are sampled and `exact` says so. The result is fully
+  those session differences — all `2^n` sign assignments counted, no bootstrap and no seed, so
+  `p` is a property of the log rather than of a draw. `share_steps` is the raw share of paired
+  steps won and `effect` the mean difference; `p` and `flips` are what decide. `winner` stays
+  `None` unless `p <= 1 - DUEL_RESOLVED` (0.05) **and** there are at least `DUEL_MIN_SESSIONS`
+  (6) sessions — below that the sign test has too few signs to resolve anything. The count is
+  meet-in-the-middle (`_sign_flip_extreme`: two halves of signed sums, one sorted and
+  binary-searched), so the exact arm is `2^(n/2)` work and `DUEL_EXACT_MAX` is 40; past that
+  the signs are sampled, `p` is `(k+1)/(m+1)`, and `exact` says so. The result is fully
   deterministic, so a re-run reports the same verdict (`--twice` and the goldens depend on it).
 * `SHIPPED_RUNGS` / `SHADOW_RUNGS` — which rungs the pane may **pick**, and which it only
   keeps score for. `pick_estimate` and everything downstream of it may return a shipped rung

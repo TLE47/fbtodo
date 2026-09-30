@@ -14,6 +14,7 @@ import ast
 import builtins
 import importlib
 import json
+import math
 import os
 import re
 import signal
@@ -3943,6 +3944,69 @@ try:
     assert tied["steps"] == 24 and tied["share_steps"] == 0.5, tied
     assert tied["winner"] is None, tied
     assert tied["p"] > 0.2, tied
+    # ...and the exact count is meet-in-the-middle now: two halves of signed sums, one sorted
+    #     and searched, instead of a walk over all 2^n. The walk is kept here — written out the
+    #     way it was — and both counts run over the same logs, six sessions up to twenty. The
+    #     ceiling moved with the method (`DUEL_EXACT_MAX` 20 -> 40); the numbers did not. A
+    #     count one low would move a p, and at the floor a p moves a verdict.
+    def walk_duel(rows, a, b):
+        """The `2^n` enumeration `rung_duel` used to run, as the reference to check against."""
+        pairs = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            errs = row.get("errors") or {}
+            ea, eb = errs.get(a), errs.get(b)
+            if ea is None or eb is None or a == b:
+                continue
+            pairs.append((row.get("session") or "", ea, eb))
+        by_session = {}
+        for session, ea, eb in pairs:
+            by_session.setdefault(session, []).append((ea, eb))
+        diffs = []
+        for session in sorted(by_session):
+            ds = [math.log(ea) - math.log(eb) for ea, eb in by_session[session]
+                  if ea > 0 and eb > 0]
+            if ds:
+                diffs.append(sum(ds) / len(ds))
+        n = len(diffs)
+        observed = sum(diffs) / n
+        compare = abs(observed) * n - 1e-9
+        flips, extreme = 1 << n, 0
+        for bits in range(flips):
+            stat = 0.0
+            for i, d in enumerate(diffs):
+                stat += d if (bits >> i) & 1 else -d
+            if abs(stat) >= compare:
+                extreme += 1
+        p = extreme / flips
+        winner = None
+        if n >= mod.DUEL_MIN_SESSIONS and p <= 1 - mod.DUEL_RESOLVED and observed != 0:
+            winner = a if observed < 0 else b
+        return {"p": round(p, 4), "flips": flips, "winner": winner,
+                "diffs": diffs, "compare": compare, "extreme": extreme}
+
+    for n_sessions in (6, 9, 12, 17, 20):
+        walk_log = {}
+        for s in range(n_sessions):
+            # a deterministic mix, not a uniform effect: some sessions favour one rung and some
+            # the other, by different factors, so the count cannot be right by symmetry alone
+            factor = (2, 3, 0.5, 4)[s % 4]
+            for k in range(3):
+                walk_log[mod.task_key(f"W{s}", f"step {k}")] = {
+                    "started_ms": t0, "done_ms": t0 + 100_000, "model": "m/e",
+                    "fc": {"pace": 100_000, "blend": int(100_000 * factor)},
+                }
+        walk_rows = mod.ledger_rows(walk_log, t0 + 1000, None, "m/e")
+        want = walk_duel(walk_rows, "pace", "blend")
+        got = mod.rung_duel(walk_rows, "pace", "blend")
+        assert len(want["diffs"]) == n_sessions, (n_sessions, len(want["diffs"]))
+        assert got["flips"] == want["flips"] and got["p"] == want["p"], (n_sessions, got, want)
+        assert got["winner"] == want["winner"], (n_sessions, got, want)
+        # the counts themselves rather than the rounded share: one assignment in a million
+        # rounds away to the same four places
+        assert mod.tasks._sign_flip_extreme(want["diffs"], want["compare"]) == want["extreme"], \
+            (n_sessions, "the meet-in-the-middle count differs from the walk")
     assert mod.rung_duel([], "pace", "blend")["steps"] == 0
     say("estimates: a rung's spread is reported, and a duel over sessions resolves it: ok")
 
@@ -4000,7 +4064,7 @@ try:
     assert note == ("pace beats blend — p=0.03 over 64 sign flips, 24 step(s) in 6 session(s)"), note
     assert mod.duel_note("pace", "blend", tied).startswith("pace vs blend — unresolved, "), note
     assert mod.duel_note("pace", "blend", tied).endswith("24 step(s) in 6 session(s)"), note
-    assert "64 sign flips" in note and mod.DUEL_EXACT_MAX == 20, note
+    assert "64 sign flips" in note and mod.DUEL_EXACT_MAX == 40, note
     # ...and a bootstrap over ONE session cannot resample anything: every draw is the sample
     # it started from, so the share comes back at 1.0 and would crown whichever rung led by
     # an accident of one session. Below the floor the duel reports the sample, not a winner.

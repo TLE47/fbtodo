@@ -112,18 +112,22 @@ score for it) and then reduces each **session** to one number: the mean of
 session that ran twelve long steps is one story and not twelve pieces of evidence.
 
 The test is the **exact sign-flip (Fisher randomization) test** on those session means. Under
-the null each session's difference is a fair coin, so all `2^n` sign assignments are
-enumerated and `p` is the share whose mean is at least as far from zero as the observed one.
-Exact rather than asymptotic, and with no bootstrap and no seed: the same log reports the same
+the null each session's difference is a fair coin, so all `2^n` sign assignments are counted
+and `p` is the share whose mean is at least as far from zero as the observed one. Exact rather
+than asymptotic, and with no bootstrap and no seed: the same log reports the same
 `p` and the same winner on every run and every machine. It reports `steps`, `sessions`,
 `share_steps` (the raw paired win rate, kept for the reader), `effect` (the mean log-ratio
 difference), `p`, `flips`, and `winner` — which stays `None` unless `p <= 0.05` **and** there
 are at least `DUEL_MIN_SESSIONS` (six): below that the sign test has too few signs to resolve
 anything, and a duel that does not resolve says the log is too small rather than crowning the
 rung that leads today. A duel with no pairing reports `steps == 0, winner is None`, which is the
-honest answer rather than a coin flip dressed as a result. Past `DUEL_EXACT_MAX` (20) sessions
-`2^n` stops being a walk anybody wants to take, so the signs are sampled and `exact` says so;
-real logs sit far below it.
+honest answer rather than a coin flip dressed as a result. The assignments are not walked one
+by one: `_sign_flip_extreme` splits the session differences in two, enumerates each half's
+`2^(n/2)` signed sums and binary-searches one against the other, which is the same integer for
+`2^(n/2)` work instead of `2^n` — so the exact arm reaches `DUEL_EXACT_MAX` (40) sessions
+rather than 20. Past that even the halves stop being cheap, the signs are sampled and `exact`
+says so; a sampled `p` is `(k+1)/(m+1)` rather than `k/m`, so a share that landed on zero
+reports a small probability instead of an impossible one. Real logs sit far below the ceiling.
 
 `fbtodo status` shows the duel's winner beside the rungs' spreads; `fbtodo ledger` prints the
 paired vector next to each step's outcome. The whole thing is deterministic, so a run is
