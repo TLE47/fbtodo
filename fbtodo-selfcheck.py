@@ -328,6 +328,23 @@ selector_run()
 if os.path.exists(TEST_HOME):
     shutil.rmtree(TEST_HOME)
 os.makedirs(TEST_HOME, mode=0o700)
+# ...but a wiped test home is not a fresh machine: a NAS pane watcher started by an earlier
+# run's fixture ssh is not tied to the directory, and a run that dies before that phase's own
+# cleanup leaves it polling forever against a path this run has just recreated. Found
+# 2026-09-29: an 8-minute-old `fbtodo nas -f` (pid 15961, fixture ssh under the test home) was
+# still rewriting fbtodo-nas-pane.json on every poll, so `nas --stop` said "not running" while
+# `--status` read a live-looking state and the nas-live phase went red on a healthy machine —
+# with four runs spent proving it was not the code under test. Only watchers whose argv names
+# the fixture ssh are touched; the owner's real nas watcher does not mention this path.
+for _line in subprocess.run(
+    ["ps", "-Ao", "pid=,args="], capture_output=True, text=True
+).stdout.splitlines():
+    _pid, _, _args = _line.strip().partition(" ")
+    if TEST_HOME in _args and "fbtodo nas" in _args:
+        try:
+            os.kill(int(_pid), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
 # The patch row's fixtures: written HERE rather than with the paths above, because the
 # wipe just above takes the whole test home with it — and read by the module when it is
 # imported below, which is why the paths are set before this point.
