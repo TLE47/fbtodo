@@ -25,6 +25,10 @@ Entries start at the newest release; each one is a contract change, not a diff.
   misses, because the remembered bytes are checked rather than trusted.
 - Scan keys are `(chunk, -line index)` with chunks numbered from the **start** of the journal
   (`journal_scan`), because an append moves every boundary counted back from the end.
+- The forecast vector gains a `recent` key (a shadow rung's value — see Added), so a step's
+  `fc` is no longer exactly the three shipped rungs; readers iterate `SCORED_RUNGS` instead of
+  a literal list. `status` gains two lines (`shadow rungs`, and one `rung duel` per judged
+  pair) and `forecast error` prints a rung's bracket when its samples differ.
 
 ### Moved
 - The program is a package (`src/fbtodo/`) behind a thin launcher (`fbtodo`). Nothing
@@ -39,6 +43,22 @@ Entries start at the newest release; each one is a contract change, not a diff.
   global in the self-check answer exactly as before.
 
 ### Added
+- A rung's score carries its **spread**: `lo`/`hi` are the 10th and 90th percentile of its
+  ratios by nearest rank, printed beside the median by `status` and `fbtodo ledger` only when
+  the samples actually differ — a range of one value is not a range. The `late` count keeps
+  its bare shape, because rounding a set-aside fault into an interval is the flattery that
+  flag exists to prevent.
+- `rung_duel` — the verdict the scoreboard cannot give: paired over the same steps, resampled
+  over **sessions** (the steps in one session are not independent), and silent (`winner` is
+  None) unless the draws are past 0.95 in either direction **and** there are at least four
+  sessions to draw from, since a bootstrap over one session can only redraw the sample it
+  started from. `status` prints one `rung duel` line per pair it can judge and `fbtodo ledger`
+  the same sentence above the rows it came from.
+- A **shadow rung**: scored, dueled, and pickable by nothing. `recent` — the median of the
+  current list's own last three finished spans — is stamped into the same forecast vector as
+  the shipped rungs, shown on its own `shadow rungs` line tagged *scored, never picked*, and
+  dueled against the pace it would replace; `pick_estimate` may return a shipped rung and
+  nothing else, so an idea has to earn its place from the log first.
 - `tests/golden.py` plus recorded `json` / `bar` / `snap` / frame output: the display
   contract, checked against fixtures with a frozen clock, and the checker itself checked by
   the suite pointing it at a mutated copy. Recorded frames also cover a **finished** list, a list

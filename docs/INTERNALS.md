@@ -109,7 +109,7 @@ fields that matter:
 | `est_ms` / `est_src` (in the task log) | the estimate the pane was showing for the step in flight, and which rung of the ladder produced it (`shape` / `blend` / `pace`), stamped on every poll while it runs. When the step closes, the pair (projection, outcome) is what `fbtodo status` scores as `estimate error`, per source — so "is this getting better?" is answered from records rather than from a tally that could drift |
 | `task_history` | per-step remembered span, model-aware: `{label: {med, n}}`, where `n` is how many samples the median stands on. A state written by an older build holds a bare int and is read the same way. It no longer prices a step directly — the `own wording` rung was retired 2026-09-29 after firing 0 times in 170 replayed steps — it is read only as the remembered pace the bound leans on |
 | task-log pruning | a record of THIS session that is no longer in the current list is dropped — unless it has a `done_ms`. A finished record is evidence (`estimate error`, `forecast error`, and all three memories read it), and a step that was reworded simply becomes another sample under its own key; a record that never finished is dropped because its `started_ms` would keep a clock running for a step that is on no list any more. Dropping the finished ones too (what builds ≤ 4.26.0 did) made the two score lines self-erasing: a rewritten list deleted the very step whose forecast was the only scored row in the log. Records of other sessions are never touched |
-| `fc` (in the task log) | the **forecast ledger**, written once on the first poll that saw the step running: `{at, v, model, shape?, blend?, pace, pick}`. Scored by `forecast_error`, and printed by `fbtodo status` as `forecast error` — one row per rung, all three scored on every step. A vector stamped after the step had already been running (a watcher restarting mid-step — `LEDGER_FRESH_MS`) carries that step's clock inside it, so it is flagged `late` and left out of every rung, counted instead. `fbtodo ledger` prints these rows (`ledger_rows` / `fmt_ledger`): the vector, the span, each rung's factor error, and a `why` for any row that could not be scored, so a row is never left to read as a miss. Note a step ticked, unticked and worked again restarts `started_ms` while KEEPING the vector it earned on its first sighting, so `fc.at` can precede `started_ms` — the ledger says so on the row. It is the leak-free half of the scoreboard: the size rung's key on the *closing* poll is built from calls the step has already made, so `estimate_error` (`estimate error` in `status`) alone can flatter a rung that recognises rather than predicts |
+| `fc` (in the task log) | the **forecast ledger**, written once on the first poll that saw the step running: `{at, v, model, shape?, blend?, pace, recent?, pick}`. Scored by `forecast_error`, and printed by `fbtodo status` as `forecast error` — one row per rung, every rung scored on every step. A vector stamped after the step had already been running (a watcher restarting mid-step — `LEDGER_FRESH_MS`) carries that step's clock inside it, so it is flagged `late` and left out of every rung, counted instead. `fbtodo ledger` prints these rows (`ledger_rows` / `fmt_ledger`): the vector, the span, each rung's factor error, and a `why` for any row that could not be scored, so a row is never left to read as a miss. Note a step ticked, unticked and worked again restarts `started_ms` while KEEPING the vector it earned on its first sighting, so `fc.at` can precede `started_ms` — the ledger says so on the row. It is the leak-free half of the scoreboard: the size rung's key on the *closing* poll is built from calls the step has already made, so `estimate_error` (`estimate error` in `status`) alone can flatter a rung that recognises rather than predicts |
 | `task_calls` | `{classes: {kind: calls}, calls, rate_ms}` — the one memory a *waiting* step can use, since it has no calls to size it by: the calls a step of that kind usually takes (kind read from the wording by `label_class`) and the seconds each call costs. It is blended half-and-half, in log space, with the list's pace (`pending_blend_ms`). What that buys, re-measured 2026-09-29 on the shipped code (leave-one-session-out over 160 spans, scored against the same step's pace): a **coin flip on the typical step** — better on 77, worse on 83, median ratio 1.01x — and a real gain only in the tail (mean 3.31x against the pace's 3.75x, worst 14.9x against 33.9x). The earlier "beats the pace on every column, on 74% of steps" was a harness bug: it ordered each session's steps by span instead of by time, so the "pace so far" it compared against was the session's smallest steps. Treat the blend as a tail-smoother; `forecast error` is what settles it on real traffic |
 | `task_shapes` | the memory that prices a step that has STARTED, keyed by its **size** — the calls it has made, log-binned (`calls0` … `calls4` …: 1, 2-3, 4-7, 8-15, 16-31 calls) — with `{med, n}` entries. Re-measured 2026-09-30 over the 171 ticked steps whose journals carry a per-call trail, the log-binned count is the best of the keys tried (leave-one-session-out R²(log) 0.657): the verb mix 0.378, exact call counts 0.293, and ADDING a dimension makes it worse — calls + distinct verbs 0.480, calls + a network share 0.401 — because an extra key fragments the samples rather than informing them. A fitted power law in the count matches it (0.655) and is better in the tail (mean 2.13x against 2.23x, worst 8.4x against 10.6x, within 2x on 62% against 58%), but only in 91% of session resamples: a different estimator on the same variable, not a better key. Lookups read through `sized_entry`, which applies `SHAPE_MIN_SAMPLES` and a **floor of `SHAPE_MIN_BUCKET` (`calls4`, 16 calls)** — the memory is keyed by finished steps' FULL tallies and read with a running step's PARTIAL one, so below the floor it prices the steps that stopped that small: at the first call a step sits a median of 3 buckets under the one it ends in, the rung misses by a median 14.1x and loses to the list's pace on 83% of steps. At and above the floor it misses by a median 1.96x / 3.38x mean against the pace's 2.45x / 4.39x, beats that pace on 79% of the steps it fires on (68 of the 171), and scores better in 100% of session bootstraps (2000 resamples over 14 sessions) where floors of 2 and 4 lose outright and 8 and 12 merely tie. Below the floor the rung stands aside — the blend or the pace answers — and a step that has made no calls at all has no size |
 | `model` | the model the session names; the pace is quoted with it |
@@ -122,6 +122,53 @@ fields that matter:
 `snap` / `json` / `bar` read this file when a watcher is live and re-derive it otherwise,
 and an explicit `-s cli|desktop` is never answered from it unless the state describes
 that backend.
+
+## The scoreboard, the spread and the duel
+
+The task log holds a projection and an outcome for every step that was ever seen running,
+and four functions read it. They answer four different questions, and keeping them apart is
+the whole design.
+
+* `estimate_error` — the estimate the pane was *showing* as a step closed. Cheap, and
+  readable by a human step by step, but the size rung's key on the closing poll is built
+  from calls the step has already made: it can flatter a rung that recognises rather than
+  predicts. `status` prints it as `estimate error`.
+* `forecast_error` — the same rungs scored on the vector written on the **first** poll that
+  saw the step running, when nothing about its size was known. One entry per rung:
+  `{n, med, mean, worst, lo, hi}`. `lo`/`hi` are the 10th and 90th percentile of that rung's
+  ratio by **nearest rank** — a sample's own value, no interpolation, because with eleven
+  steps an interpolated quantile would be arithmetic on nothing — and the tails are dropped
+  on purpose: what a rung did on its very worst step is `worst`, and letting that one step
+  define the interval would make every rung look equally uncertain. A rung whose samples all
+  agree prints no bracket at all (`fmt_rung`): a range of one value is not a range. The
+  `late` pseudo-rung is a count, not a spread, and carries no `lo`/`hi`.
+* `rung_duel(rows, a, b)` — is `a` actually better than `b`, or is this the sample? Both are
+  scored on the **same** steps (paired, so neither can win by being asked an easier set), and
+  the resampling is over **sessions**: the steps inside one session are not independent, and
+  drawing them separately would let one long session vote twelve times. `share_steps` is the
+  raw share of paired steps won; `share_resamples` is the share of `DUEL_RESAMPLES` draws won,
+  and that is the number that decides. `winner` stays `None` unless the draws are past
+  `DUEL_RESOLVED` (0.95) in either direction **and** there are at least `DUEL_MIN_SESSIONS`
+  (4) sessions to draw from — a bootstrap over one session redraws the sample it started from,
+  so its share comes back at 1.0 and would crown whoever led in that session. The draws are
+  seeded from the two rung names and the sample shape, so a re-run reports the same verdict
+  without the answer being a constant (`--twice` and the goldens depend on it).
+* `SHIPPED_RUNGS` / `SHADOW_RUNGS` — which rungs the pane may **pick**, and which it only
+  keeps score for. `pick_estimate` and everything downstream of it may return a shipped rung
+  and nothing else; a shadow rung is stamped into the same vector, scored by the same two
+  functions and dueled against the rung it would replace, and that is all it may do. `recent`
+  is the first of them: the median of the current list's last `SHADOW_SAMPLES` finished spans,
+  i.e. the pace that has just delivered, which is the one thing the whole-list pace cannot be
+  compared against by itself. An idea earns its place from the log before it moves a number
+  somebody is looking at.
+
+`status` prints `forecast error` (shipped rungs, median with its bracket), `shadow rungs`
+(one line, tagged *scored, never picked*) and one `rung duel` line per pair `DUEL_PAIRS` can
+judge — a pair nobody has scored is left out rather than shown as a draw. `fbtodo ledger`
+prints the same sentence (`duel_note`) above the rows it was computed from, and shows a
+shadow rung on a row only when that row carries one, so a row recorded before the rung
+existed is not shown a `recent —` it never had. Both surfaces share `fmt_rung` and `duel_note`,
+so a rung's spread cannot read differently in two places.
 
 ## The sources
 
