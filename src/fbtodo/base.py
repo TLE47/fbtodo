@@ -893,17 +893,6 @@ _TEXT_DROP_RE = re.compile(
 )
 
 
-# The keys whose values the TOOL writes and compares against — never prose a source
-# contributes. The walk below stops at these and cleans everything else, which is the
-# inversion that matters: an earlier build cleaned only the fields someone remembered, so a
-# thread's title, a NAS `fb_dir`, a tool name in `tool_calls` and every `turn` field reached
-# the terminal as written (measured 2026-09-30). A backend whose name lost a byte would stop
-# matching "nas", so a value the tool itself compares is left exactly as it is.
-TEXT_ENUM_KEYS = frozenset((
-    "backend", "source", "status", "goal_source", "schema",
-))
-
-
 def clean_text(value) -> str:
     """One string, stripped of everything a terminal would ACT on rather than show.
 
@@ -923,27 +912,25 @@ def _clean_key(key):
     return clean_text(key) if isinstance(key, str) else key
 
 
-def _clean_value(value, skip: frozenset):
+def _clean_value(value):
     """Every string under `value`, cleaned in place of the original — a recursive walk.
 
-    Dicts and lists are rebuilt (never mutated), so a caller's state is untouched. A value
-    under one of the tool's own enum keys is the one thing left alone, and the key itself is
-    cleaned like any other string.
+    Dicts and lists are rebuilt (never mutated), so a caller's state is untouched. There is
+    no exemption list and no depth limit: every string is cleaned, including a dict key,
+    because a key is a string the pane may print (a tool name in `tool_calls`) and the walk
+    cannot know which keys those will be. The tool's own enum values (`backend`, `source`,
+    `status`, `goal_source`, `schema`) are cleaned like anything else; they are ASCII the tool
+    writes itself, so cleaning them is a no-op — and if one ever did carry an escape, printing
+    it raw is exactly the bug this exists to stop.
     """
     if isinstance(value, str):
         return clean_text(value)
     if isinstance(value, dict):
-        out = {}
-        for key, sub in value.items():
-            if isinstance(key, str) and key in skip:
-                out[key] = sub
-            else:
-                out[_clean_key(key)] = _clean_value(sub, skip)
-        return out
+        return {_clean_key(key): _clean_value(sub) for key, sub in value.items()}
     if isinstance(value, list):
-        return [_clean_value(item, skip) for item in value]
+        return [_clean_value(item) for item in value]
     if isinstance(value, tuple):
-        return tuple(_clean_value(item, skip) for item in value)
+        return tuple(_clean_value(item) for item in value)
     return value
 
 
@@ -953,13 +940,12 @@ def clean_observation(state: dict) -> dict:
     Called where a source's state is assembled and again by `render()`; both, so the state
     file itself is clean for its other readers and a frame cannot be painted from a state
     that was written before this filter existed. A recursive walk rather than a list of
-    known keys: anything a source put in the state is cleaned, and only the tool's own enum
-    fields (`TEXT_ENUM_KEYS`) are left as they are, because a comparison against those is
-    not a matter of prose.
+    known keys, and with no key exempted: anything a source put in the state is cleaned,
+    values and dict keys alike, at any depth.
     """
     if not isinstance(state, dict):
         return state
-    return _clean_value(state, TEXT_ENUM_KEYS)
+    return _clean_value(state)
 
 
 # --------------------------------------------------------------------- helpers
@@ -1496,7 +1482,7 @@ __all__ = [
     "SHAPE_MIN_SAMPLES", "SHAPE_MIN_BUCKET", "SPREAD_MIN_SAMPLES", "SPREAD_MIN_RATIO",
     "LABEL_FLOOR_S", "MIN_LABEL_MS", "BLEND_WEIGHT", "ESTIMATE_KNOBS", "label_floor_ms",
     "blend_weight", "set_estimate_knobs", "LEDGER_FRESH_MS", "REFIT_MIN_SCORED",
-    "REFIT_MIN_DECIDED", "EX_CODES", "_ESC_SEQ_RE", "_TEXT_DROP_RE", "TEXT_ENUM_KEYS",
+    "REFIT_MIN_DECIDED", "EX_CODES", "_ESC_SEQ_RE", "_TEXT_DROP_RE",
     "clean_text", "clean_observation", "atomic_write_json",
     "read_json", "pid_alive", "proc_cwds", "lsof_cwds", "cwds_for", "pid_cwd", "parse_etime",
     "ages_for", "installed_freebuff", "is_freebuff_cmd", "freebuff_pids", "process_table",

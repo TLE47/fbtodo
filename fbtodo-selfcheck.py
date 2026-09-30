@@ -3165,9 +3165,9 @@ try:
         #      `tool_calls` and every `turn` field were printed as written. A fully populated
         #      state (stacked threads, a patch, an alert, the action feed, a NAS observation, a
         #      turn) is copied once per string leaf, that one string replaced by a payload, and
-        #      rendered plain and rich: nothing but SGR may come out. The enum fields the tool
-        #      itself owns (backend/source/status/goal_source/schema) are left alone by design.
-        enum_keys = {"backend", "source", "status", "goal_source", "schema"}
+        #      rendered plain and rich: nothing but SGR may come out. No key is exempt, not even
+        #      the enum fields the tool owns (backend/source/status/goal_source/schema): they are
+        #      cleaned like everything else, and their values are ASCII, so it is a no-op.
         ALL_BAD = "".join((osc52, osc0, csi, "\u202e", "\u061c", "\u2028", "\u2029", "\u2060",
                            "\u2064", "\U000E0001", "\U000E007F", "\x1b[?25l", "\t"))
         full_state = dict(
@@ -3198,22 +3198,20 @@ try:
             """Every copy of `obj` with exactly one string in it replaced by `payload`.
 
             Dict KEYS count: a tool name in `tool_calls` is a string the pane prints and the
-            tool does not own. A value under an enum key is offered to nobody — the filter is
-            told to leave those alone, so injecting there would test the skip list, not the
-            walk.
+            tool does not own — and so is `status`. No key is skipped, because the filter skips
+            none: every string at every depth is offered to the walk, which is the property
+            this half of the sweep exists to check.
             """
             out = []
             if isinstance(obj, str):
                 return [payload]
             if isinstance(obj, dict):
                 for key, value in obj.items():
-                    if isinstance(key, str) and key not in enum_keys:
+                    if isinstance(key, str):
                         renamed = dict(obj)
                         del renamed[key]
                         renamed[payload] = value
                         out.append(renamed)
-                    if key in enum_keys:
-                        continue
                     if isinstance(value, str):
                         out.append(dict(obj, **{key: payload}))
                     else:
