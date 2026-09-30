@@ -434,7 +434,12 @@ try:
     # owner's session happened to be doing at that second. A session that has just dropped a
     # finished list is legitimately list-less, and that is not the watcher's fault.
     cli_root = os.path.join(TEST_HOME, "cliwatch")
-    chat_dir = os.path.join(cli_root, "billthuan1", "chats", "2026-01-01T00-00-00.000Z")
+    # The journal root is `<root>/<project>/chats`, and this run follows a session whose
+    # `--cwd` is HOME, so the project is the home directory's own name — `billthuan1` on
+    # the owner's machine, `runner` on a CI runner. Hard-coding the owner's name made this
+    # phase pass locally and fail on every runner, so it is derived, not typed.
+    chat_dir = os.path.join(cli_root, os.path.basename(HOME), "chats",
+                            "2026-01-01T00-00-00.000Z")
     os.makedirs(chat_dir, exist_ok=True)
     with open(os.path.join(chat_dir, "log.jsonl"), "w", encoding="utf-8") as fh:
         fh.write(json.dumps({
