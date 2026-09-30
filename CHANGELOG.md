@@ -103,9 +103,26 @@ Entries start at the newest release; each one is a contract change, not a diff.
 - The phone's summary line had its markdown left in (`**Goal:**`, backticks, emphasis): two
   helpers were both called `_plain` and the renderer's ANSI-stripper, defined later in the file,
   won every call. The prose one is `prose_text` now.
-- `read_theme` filled `THEME_PROBLEMS` by rebinding the list, so a reader in another module (it
-  is `status` that prints it) saw "no problems" for a theme whose values had just been refused.
-  The list is filled in place.
+- A list pane dragged to the other side of its session stays there. A side fixes the **axis**
+  the list hangs off and not the edge of it: a strip above the session counts as `v` and a column
+  to its **left** as `h` exactly as the two the splitter would pick do, a repair returns a drifted
+  pane to the edge it was on (`move-pane -b`) rather than to the default one, and — with no pin —
+  a pane found on the other axis is the owner's arrangement rather than drift, filed as the
+  remembered side after the same two passes a hand-resize gets. Before this, `move-pane -b -h`
+  was back under the session inside one 3 s keeper pass, and `remember_layout` was handed the side
+  *in force*, so the remembered side could never change from its first value at all. `fbtodo why`
+  says `seen (kept, not filed yet)` while a kept side is on its way to the file, and a pin keeps
+  every tooth: a pinned window is put back on the pinned axis every pass.
+- The suite's zsh-integration check no longer leaves a pane keeper behind. It runs `zsh -i` inside
+  a PTY, the `.zshrc` autostart hook calls `fbtodo daemon`, and `daemon` asks for a pane keeper —
+  which keeps the panes of the tmux server in its **environment**: the owner's own server, since
+  the check runs in the owner's pane, while the state root was the throwaway one. That keeper was
+  invisible (its log is a file in a home the suite wipes) and immortal (the owner's server always
+  has panes and a freebuff, so it never reached the pass that lets go), and it moved the owner's
+  list pane back to the default side every 3 s for as long as it lived — the report this was found
+  from. The hook is run with `FBTODO_NO_PANE=1` now, which still starts the watcher the check is
+  about, and a phase asserts that no keeper it added is aimed at the server it is running in
+  (`keeper_leaks`, which reads a keeper's own environment to tell the two apart).
 
 ## 4.29.0
 

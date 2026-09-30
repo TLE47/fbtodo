@@ -268,6 +268,27 @@ The keeper has its own lock on purpose: sharing the watcher's meant a watcher fo
 source could hold the lock while a local window's pane was gone, and the pane never came
 back.
 
+### What a side decides, and what it does not
+
+A layout's `side` fixes the **axis** the list hangs off, never the edge of it. `placed_beside`
+accepts a strip above its session as `v` and a column to the left of it as `h` exactly as it
+accepts the two the splitter would have chosen, and `place_pane_beside` sends a drifted pane
+back to the edge it was already on (`pane_before`, `move-pane -b`). Only the axis is policy.
+
+Where that axis comes from is the second half, and it is where a keeper used to argue with its
+owner: `pane_layout` gives the side the pane was **opened** on (pin, remembered, `FBTODO_SPLIT`,
+default), while `kept_layout` gives the side it is **held** on. Without a pin, a pane found on
+the other axis of its session is the owner's move, not drift, and travels on as `side_source`
+`seen` — `fbtodo why` prints it as `seen (kept, not filed yet)` — and `remember_layout` files
+it after the same two passes a hand-resize gets, so the next pane opens on it. A pin keeps
+every tooth it had: it was typed, so it decides the axis and the pane is put back on it.
+
+A keeper reads the state root it was given and keeps the panes of the tmux server in its
+**environment** (`tmux_identity`), which is why a keeper started by a test hook inside the
+owner's own pane is a keeper that edits the owner's layout from a scratch file. `FBTODO_NO_PANE=1`
+for that hook is the guard, and the suite asserts the hook adds no keeper aimed at the server
+it runs in (`keeper_leaks`).
+
 ## The frame's contract
 
 `render(state, color, watching, width, height, now_ms, theme, truecolor)` is the whole of it. Two
