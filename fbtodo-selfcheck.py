@@ -5305,26 +5305,30 @@ try:
 
         assert kept_left(), f"tmux did not put the pane left of its session: {placement()}"
 
-        def filed_side() -> str | None:
+        def filed_local() -> dict:
+            """This fixture window's `local` half of the remembered layout, or {}."""
             try:
                 with open(os.path.join(TEST_HOME, "fbtodo-last.json")) as handle:
                     doc = json.load(handle)
             except (OSError, ValueError):
-                return None
+                return {}
             for key, entry in (doc if isinstance(doc, dict) else {}).items():
                 local = entry.get("local") if isinstance(entry, dict) else None
                 if key.startswith(f"{sess}:") and isinstance(local, dict):
-                    return local.get("side")
-            return None
+                    return local
+            return {}
 
         deadline = time.time() + 15
-        while time.time() < deadline and not (kept_left() and filed_side() == "h"):
+        while time.time() < deadline and not (kept_left() and filed_local().get("side") == "h"):
             time.sleep(0.3)
         assert kept_left(), (
             f"the keeper put a hand-moved list pane back where it was opened: {placement()}"
         )
-        assert filed_side() == "h", (
-            f"the other side was kept but never filed for the next pane: {filed_side()!r}"
+        assert filed_local().get("side") == "h", (
+            f"the other side was kept but never filed for the next pane: {filed_local()!r}"
+        )
+        assert filed_local().get("before") is True, (
+            f"the edge the pane was on is not in the remembered layout: {filed_local()!r}"
         )
         why_left = run("why", "--window", window_target).stdout
         assert f"side=h (remembered)" in why_left and "MISPLACED" not in why_left, why_left
@@ -5333,6 +5337,33 @@ try:
         assert mine_left and mine_left[0]["placed"] is True, mine_left
         assert (mine_left[0]["side"], mine_left[0]["side_source"]) == ("h", "last"), mine_left
         say("a list pane moved to the other side of its session stays there and is filed: ok")
+
+        # ---- and that remembered edge is what makes the NEXT pane open where this one is:
+        #      `split-window -h` puts a new pane on the right and `-v` under, so a list the
+        #      owner keeps in the left column (or above the session) comes back there only
+        #      because the opener is told. Asserted on the argv the opener would run — a live
+        #      reopen is one more split of this fixture's window, and it moves the panes the
+        #      checks after this one are about.
+        calls = []
+        real_tmux = panes_mod.tmux_run
+
+        def record(*argv):
+            # Only the split is answered from here: `pane_layout` asks tmux for the window
+            # key on its way in, and an answer of "" would read as an unset pin AND an
+            # unremembered window, which is how this check first passed the default side.
+            calls.append([str(part) for part in argv])
+            return "%99" if argv and argv[0] == "split-window" else real_tmux(*argv)
+
+        set_knob(panes_mod, "tmux_run", record)
+        try:
+            panes_mod.local_pane_open(TEST_HOME, inst, window_target)
+        finally:
+            set_knob(panes_mod, "tmux_run", real_tmux)
+        split = [call for call in calls if call[0] == "split-window"]
+        assert split and "-b" in split[0] and "-h" in split[0], (
+            f"the opener was not told the edge the pane was left on: {calls}"
+        )
+        say("the opener splits on the edge the pane was left on, not the trailing one: ok")
 
         # ...and when a pass DOES have to move it back, it returns the pane to the edge it was
         # already on: a pane split in BETWEEN it and its session pushes it off the anchor, and
