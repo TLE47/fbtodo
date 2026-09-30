@@ -1806,32 +1806,38 @@ try:
     ), STRIP(module.render(dict(base_state, now="and check the frozen pane"), False, width=46))
     say("big goal: a compliant line renders whole, and only overruns are elided: ok")
 
-    # without the rule in ~/AGENTS.md there is no line at all: the convention IS the
-    # feature, so the file and the tool's budget are checked together
+    # without the rule in AGENTS.md there is no line at all: the convention IS the feature,
+    # so the file and the tool's budget are checked together. The operator's own
+    # `~/AGENTS.md` is the authority when it is there; a runner has no such home, so the
+    # copy this repository ships (docs/AGENTS.md) is checked instead — the phrases and
+    # `GOAL_MAX_CHARS` still have to agree, on every machine.
     agents_md = os.path.join(HOME, "AGENTS.md")
-    agents_text = open(agents_md, encoding="utf-8").read() if os.path.isfile(agents_md) else ""
-    assert "`Goal:`" in agents_text, "~/AGENTS.md lost the `Goal:` convention the pane reads"
-    assert "concise rewrite" in agents_text, "~/AGENTS.md no longer asks for a concise goal"
+    if not os.path.isfile(agents_md):
+        agents_md = os.path.join(HERE, "docs", "AGENTS.md")
+    agents_text = open(agents_md, encoding="utf-8").read()
+    assert "`Goal:`" in agents_text, f"{agents_md} lost the `Goal:` convention the pane reads"
+    assert "concise rewrite" in agents_text, f"{agents_md} no longer asks for a concise goal"
     assert f"{module.GOAL_MAX_CHARS} characters" in agents_text, (
-        f"~/AGENTS.md and GOAL_MAX_CHARS ({module.GOAL_MAX_CHARS}) disagree on the budget"
+        f"{agents_md} and GOAL_MAX_CHARS ({module.GOAL_MAX_CHARS}) disagree on the budget"
     )
-    say("big goal: ~/AGENTS.md asks for a line that fits, at the tool's own budget: ok")
+    say(f"big goal: {os.path.basename(agents_md)} asks for a line that fits, at the tool's "
+        "own budget: ok")
 
     # ...and the other half of the convention: a list is only as true as its last call, so
     # the rule has to ask for the update as each step lands rather than in a batch
     assert "the moment a step lands" in agents_text, (
-        "~/AGENTS.md no longer asks for the list to be updated as steps land"
+        f"{agents_md} no longer asks for the list to be updated as steps land"
     )
-    assert "batch" in agents_text, "~/AGENTS.md dropped the reason it must not be batched"
+    assert "batch" in agents_text, f"{agents_md} dropped the reason it must not be batched"
     assert "On a bare continuation" in agents_text and "nudge" in agents_text, (
-        "~/AGENTS.md no longer asks for a fresh list on `continue` — the pane's nudge line "
+        f"{agents_md} no longer asks for a fresh list on `continue` — the pane's nudge line "
         "would then nag about a rule nobody has"
     )
     assert "steps in the list, not an epilogue" in agents_text, (
-        "~/AGENTS.md no longer asks for the checks to BE steps in the list — a list that "
+        f"{agents_md} no longer asks for the checks to BE steps in the list — a list that "
         "stops at the implementation hides the verification from the pane"
     )
-    say("the list rule: ~/AGENTS.md asks for the update the moment a step lands: ok")
+    say("the list rule: it asks for the update the moment a step lands: ok")
     say("the list rule: and for a re-written list before continuing from a nudge: ok")
     say("the list rule: and for the checks themselves to be steps of it: ok")
 
