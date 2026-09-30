@@ -218,7 +218,7 @@ def nas_place_panes(panes: list[str], anchor: str | None, quiet: bool = True) ->
         if hold_pane_size(pane, here["window"], "nas", rects, here):
             sized.append((pane, here["size_source"]))
             rects = pane_rects()
-        remember_layout(window, "nas", pane, rects, here["side"])
+        remember_layout(window, "nas", pane, rects, here["side"], anchor)
     forget_settled({row["pane"] for row in pane_rows()})
     for pane in moved:
         # Written down quiet or not, like the keeper's: the watcher is spawned `--quiet`
@@ -260,9 +260,13 @@ def nas_pane_open(args, anchor: str | None = None) -> str | None:
         return None
     layout = pane_layout(window_of(target), "nas")
     command = nas_pane_command(args)
+    # The edge the owner last kept it on (`before`): `split-window -h` alone would open a
+    # pane the owner had put on the left back on the right, and one from under the session
+    # back over it.
+    before = ["-b"] if layout.get("before") else []
     out = tmux_run(
-        "split-window", f"-{layout['side']}", "-l", str(layout["size"]), "-d", "-P", "-F",
-        "#{pane_id}", "-t", target, command,
+        "split-window", *before, f"-{layout['side']}", "-l", str(layout["size"]), "-d", "-P",
+        "-F", "#{pane_id}", "-t", target, command,
     )
     return out.strip() if out and out.strip() else None
 
@@ -576,8 +580,13 @@ def place_pane_beside(pane: str, anchor: str, rects: dict, split: str) -> bool:
         return False
     # Back to the edge it was on, on the side it belongs to: `-b` is `move-pane`'s "before
     # the target", which is what puts a pane above a session rather than under it, or to
-    # its left rather than its right (tmux's own default, and so `split-window`'s).
-    before = ["-b"] if pane_before(there, here, split) else []
+    # its left rather than its right (tmux's own default, and so `split-window`'s). Only
+    # when it was already on that side, though: a pane arriving from the other axis has no
+    # edge to keep, and `pane_before` asked about it answers from a position with nothing
+    # to do with the axis being applied — a strip under the session is "left of" it, which
+    # put a freshly pinned `h` pane on the left instead of the right.
+    same_axis = pane_axis(there, here) == split
+    before = ["-b"] if same_axis and pane_before(there, here, split) else []
     return tmux_run(
         "move-pane", "-d", *before, f"-{split}", "-s", pane, "-t", anchor
     ) is not None
@@ -692,9 +701,14 @@ def pane_layout(window: str | None, role: str, pins: dict | None = None,
         except ValueError:
             env_size = 0
         size, size_source = env_size or 12, "env" if env_size else "default"
+    # The EDGE on that side, remembered with it: `split-window -h` puts a new pane on the
+    # right and `-v` under, so the opener has to be told when the owner keeps the list on
+    # the leading edge. Not a knob and not a pin half — there is nothing to type it with,
+    # because the file is written from where the pane actually is.
     return {
         "side": side, "side_source": side_source,
         "size": size, "size_source": size_source,
+        "before": seen.get("before") is True,
         "window": key, "role": role,
     }
 
@@ -781,15 +795,19 @@ def forget_settled(alive: set) -> None:
         _SETTLED.discard(marker)
 
 
-def remember_layout(window: str | None, role: str, pane: str, rects: dict, side: str) -> bool:
+def remember_layout(window: str | None, role: str, pane: str, rects: dict, side: str,
+                    anchor: str | None = None) -> bool:
     """Remember how a list pane is sitting, so the next one opens in the same place.
 
     The side is the one placement just verified against the geometry. The size comes from
     the pane itself, and is ignored under three cells — that is a pane squashed by a small
-    terminal, not a preference. One pass is not enough either: a drag or a resize moves a
-    pane through values nobody chose, so the same numbers have to be seen twice before
-    they are written. The caller keeps running (the keeper polls every few seconds), and
-    the gate is its own memory, per window and role.
+    terminal, not a preference. So is the EDGE (`before`): which side of its session the
+    list hangs off is the owner's, and the opener can only tell the difference by being
+    told — `split-window -h` puts a new pane on the right, so a list the owner keeps on the
+    left comes back on the left only because this was written down. One pass is not enough
+    either: a drag or a resize moves a pane through values nobody chose, so the same
+    numbers have to be seen twice before they are written. The caller keeps running (the
+    keeper polls every few seconds), and the gate is its own memory, per window and role.
     """
     key = window_key(window)
     rect = rects.get(pane)
@@ -798,15 +816,17 @@ def remember_layout(window: str | None, role: str, pane: str, rects: dict, side:
     size = rect["width"] if side == "h" else rect["height"]
     if size < 3:
         return False
+    there = rects.get(anchor) if anchor else None
+    before = bool(there and pane_before(there, rect, side))
     marker = f"{key}\u001f{role}"
-    if _LAST_SEEN.get(marker) != (side, size):
-        _LAST_SEEN[marker] = (side, size)
+    if _LAST_SEEN.get(marker) != (side, size, before):
+        _LAST_SEEN[marker] = (side, size, before)
         return False
     last = load_last()
     entry = dict(last.get(key) or {})
-    if entry.get(role) == {"side": side, "size": size}:
+    if entry.get(role) == {"side": side, "size": size, "before": before}:
         return False
-    entry[role] = {"side": side, "size": size}
+    entry[role] = {"side": side, "size": size, "before": before}
     last[key] = entry
     save_last(last)
     return True
@@ -991,6 +1011,10 @@ def local_pane_open(cwd: str, instance_pid, window: str, rows=None, table=None) 
     # what the pane was left at last time, then the two global knobs (`pane_layout`).
     layout = pane_layout(window, "local")
     split, size = layout["side"], str(layout["size"])
+    # The edge the owner last kept it on (`before`), because the splitter's own answer is
+    # always the trailing one: without this a list kept in the left column comes back on
+    # the right, and one kept above the session comes back under it.
+    before = ["-b"] if layout.get("before") else []
     # Split the pane the session is DRAWN in, not merely its window: given a window, tmux
     # picks that window's *active* pane, which is not necessarily the one running freebuff,
     # and the list then opens beside somebody else's pane — measured live, where a NAS
@@ -998,7 +1022,7 @@ def local_pane_open(cwd: str, instance_pid, window: str, rows=None, table=None) 
     # wrong column. The window stands in only when the instance's own pane is not found.
     target = freebuff_pane_id(instance_pid, rows=rows, table=table) or window
     out = tmux_run(
-        "split-window", f"-{split}", "-l", str(size), "-d", "-P", "-F", "#{pane_id}",
+        "split-window", *before, f"-{split}", "-l", str(size), "-d", "-P", "-F", "#{pane_id}",
         "-c", cwd, "-t", target, local_pane_command(instance_pid),
     )
     return out.strip() if out and out.strip() else None
@@ -1064,7 +1088,7 @@ def ensure_local_panes(quiet: bool = True) -> list[str]:
             # Written down for next time: a pane killed and reopened — or a whole tmux
             # server that went down — comes back at the size it was left, the side it was
             # put on, instead of at the default.
-            remember_layout(window, "local", pane, rects, here["side"])
+            remember_layout(window, "local", pane, rects, here["side"], inst_pane)
     forget_settled({row["pane"] for row in pane_rows()})
     for pane in moved:
         # Quiet or not, written down: a pane that came back is the one thing worth being
