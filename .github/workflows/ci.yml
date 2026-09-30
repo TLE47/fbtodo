@@ -53,14 +53,7 @@ jobs:
           set +e
           python3 fbtodo-selfcheck.py 2>&1 | tee selfcheck.log
           rc=${PIPESTATUS[0]}
-          if [ "$rc" -ne 0 ]; then
-            {
-              echo '### self-check failed — last 80 lines'
-              echo '```'
-              tail -n 80 selfcheck.log
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          bash .github/ci-report.sh self-check selfcheck.log "$rc"
           exit "$rc"
 
       - name: notify suite
@@ -68,14 +61,7 @@ jobs:
           set +e
           bash notify/test-freebuff-notify.sh 2>&1 | tee notify.log
           rc=${PIPESTATUS[0]}
-          if [ "$rc" -ne 0 ]; then
-            {
-              echo '### notify suite failed — last 80 lines'
-              echo '```'
-              tail -n 80 notify.log
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          bash .github/ci-report.sh notify-suite notify.log "$rc"
           exit "$rc"
 
   # Two ordinary conditions the main matrix masks. A Linux host with no `lsof` is every
@@ -122,14 +108,7 @@ jobs:
           set +e
           python3 fbtodo-selfcheck.py 2>&1 | tee selfcheck.log
           rc=${PIPESTATUS[0]}
-          if [ "$rc" -ne 0 ]; then
-            {
-              echo '### self-check failed — last 80 lines'
-              echo '```'
-              tail -n 80 selfcheck.log
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          bash .github/ci-report.sh self-check selfcheck.log "$rc"
           exit "$rc"
 
       - name: notify suite
@@ -137,14 +116,7 @@ jobs:
           set +e
           bash notify/test-freebuff-notify.sh 2>&1 | tee notify.log
           rc=${PIPESTATUS[0]}
-          if [ "$rc" -ne 0 ]; then
-            {
-              echo '### notify suite failed — last 80 lines'
-              echo '```'
-              tail -n 80 notify.log
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          bash .github/ci-report.sh notify-suite notify.log "$rc"
           exit "$rc"
 
   c-locale:
@@ -176,14 +148,7 @@ jobs:
           set +e
           python3 fbtodo-selfcheck.py 2>&1 | tee selfcheck.log
           rc=${PIPESTATUS[0]}
-          if [ "$rc" -ne 0 ]; then
-            {
-              echo '### self-check failed — last 80 lines'
-              echo '```'
-              tail -n 80 selfcheck.log
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          bash .github/ci-report.sh self-check selfcheck.log "$rc"
           exit "$rc"
 
       - name: notify suite
@@ -191,12 +156,5 @@ jobs:
           set +e
           bash notify/test-freebuff-notify.sh 2>&1 | tee notify.log
           rc=${PIPESTATUS[0]}
-          if [ "$rc" -ne 0 ]; then
-            {
-              echo '### notify suite failed — last 80 lines'
-              echo '```'
-              tail -n 80 notify.log
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          bash .github/ci-report.sh notify-suite notify.log "$rc"
           exit "$rc"
