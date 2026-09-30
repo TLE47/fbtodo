@@ -2305,9 +2305,12 @@ try:
         base_state, todos=steps, done=1, total=2, list_version=3,
         goal="diagnose the frozen pane",
     )
-    assert module.render(wide_state, False, width=80, now_ms=1000) != module.render(
-        wide_state, False, width=80, now_ms=2000
-    ), "footer clock does not move — a still pane would look frozen"
+    frame_a = module.render(wide_state, False, width=80, now_ms=1000)
+    frame_b = module.render(wide_state, False, width=80, now_ms=2000)
+    assert frame_a != frame_b, (
+        "footer clock does not move — a still pane would look frozen\n"
+        f"A={frame_a!r}\nB={frame_b!r}"
+    )
 
     # The same pair with a clock only 42 s old: an ordinary running step, which is the case
     # the list's age has to survive.
