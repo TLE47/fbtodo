@@ -64,12 +64,12 @@ If you would rather not keep a checkout on your PATH, install it as an isolated 
 pipx install git+https://github.com/TLE47/fbtodo
 ```
 
-> pipx installs fbtodo into an isolated environment on your PATH. No Python dependencies are required, though displaying the pane still needs tmux (brew install tmux).
-># Update
+> pipx installs fbtodo into an isolated environment on your PATH. No Python dependencies are required, though displaying the pane still needs tmux
+#### Update + virtualenv
 ```sh
 pipx install --force git+https://github.com/TLE47/fbtodo
 ```
-># Pin version
+#### Pin version
 ```sh
 pipx install "git+https://github.com/TLE47/fbtodo@4.29.0"
 ```
