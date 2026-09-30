@@ -136,7 +136,9 @@ class FileSource(Source):
             # A recorded list with no number on it is that list's first. Saying so here keeps
             # `adopt_version` from borrowing a live watcher's counter for a file it never saw.
             st["list_version"] = 1
-        return st
+        # A file is taken at its word about WHAT it says (the docstring above), not about
+        # what a terminal would DO with it: the same walk every other source runs.
+        return clean_observation(st)
 
     def miss(self) -> dict:
         return {"backend": "file", "todos": [],
@@ -191,7 +193,7 @@ class DesktopSource(Source):
         # recorded goldens byte for byte what they were.
         if st.get("threads"):
             out["threads"] = st["threads"]
-        return out
+        return clean_observation(out)
 
     def miss(self) -> dict:
         return {"backend": None, "todos": [], "error": "no conversation DB found"}

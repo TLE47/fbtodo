@@ -317,8 +317,12 @@ def _render_plain(
                 max_lines=goal_lines,
                 placeholder=" …",
             )
-            lines.append(c(bold, segs[0]))
-            lines += [c(dim, seg) for seg in segs[1:]]
+            # A goal that is non-empty but wraps to nothing — a single space, which is what
+            # the filter leaves of a lone tab — must draw no heading at all, not crash on
+            # `segs[0]`.
+            if segs:
+                lines.append(c(bold, segs[0]))
+                lines += [c(dim, seg) for seg in segs[1:]]
         if now_txt:
             segs = textwrap.wrap(
                 now_txt,
@@ -1046,8 +1050,9 @@ def _render_rich(
         # The label stays the muted grey; the goal itself is `active` ink WITHOUT the bold
         # attribute — it is the list's heading, not its subject, and weight spent here was
         # weight the active row could not have.
-        head.append(c(muted, goal_prefix) + c(active_ink, segs[0][len(goal_prefix):]))
-        head += [c(active_ink, pad + seg[len(pad):]) for seg in segs[1:]]
+        if segs:  # a whitespace-only goal wraps to nothing: draw no heading, do not crash
+            head.append(c(muted, goal_prefix) + c(active_ink, segs[0][len(goal_prefix):]))
+            head += [c(active_ink, pad + seg[len(pad):]) for seg in segs[1:]]
     if now_txt:
         segs = textwrap.wrap(
             now_txt, width=inner, initial_indent="NOW · ", subsequent_indent="      ",
@@ -1057,10 +1062,11 @@ def _render_rich(
         # competing above the list: the goal's label is the muted grey, `NOW` is the accent
         # (the one thing on this row that is a pointer), and both carry `active` prose. The
         # yellow that used to be here is now only ever a warning.
-        body = segs[0][len("NOW · "):]
-        indent = segs[0][:len("NOW · ")] if segs[0].startswith("NOW · ") else "NOW · "
-        head += [c(accent, indent.rstrip(" ·")) + c(st["faint"], " · ")
-                 + c(active_ink, body)]
+        if segs:  # as above: an `now` of one space wraps to nothing
+            body = segs[0][len("NOW · "):]
+            indent = segs[0][:len("NOW · ")] if segs[0].startswith("NOW · ") else "NOW · "
+            head += [c(accent, indent.rstrip(" ·")) + c(st["faint"], " · ")
+                     + c(active_ink, body)]
     if nudge and nudge != now_txt:
         segs = textwrap.wrap(
             "rewrite the list, then continue", width=inner,

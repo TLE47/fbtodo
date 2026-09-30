@@ -3040,9 +3040,13 @@ try:
         osc0 = "\x1b]0;pwnd\x07"
         csi = "\x1b[9;1H"
         rlo, zwsp, bom = "\u202e", "\u200b", "\ufeff"
-        dirty_bits = (osc52, osc0, csi, rlo, zwsp, bom)
-        ESC_SEQ = re.compile(r"\x1b(?:\[[0-9;?]*[A-Za-z]|.)")
-        TOOL_SEQ = re.compile(r"^\x1b\[[0-9;?]*[A-Za-z]$")
+        dirty_bits = (osc52, osc0, csi, rlo, zwsp, bom, "\u061c", "\u2028", "\u2029",
+                      "\u2060", "\u2064", "\U000E0001", "\U000E007F")
+        ESC_SEQ = re.compile(r"\x1b(?:\[[0-9;:?]*[A-Za-z]|.)")
+        # The pane's OWN escapes are SGR and nothing else. A residual CSI cursor move, an
+        # OSC, or a bare CSI with no `m` all fail this — which is the signature of a
+        # payload that survived the filter.
+        TOOL_SEQ = re.compile(r"^\x1b\[[0-9;:]*m$")
 
         def uncleaned(obj):
             """Every escape, control or bidi character still anywhere in a value."""
@@ -3116,6 +3120,117 @@ try:
             assert bad not in feed_frame, (repr(bad), feed_frame[:200])
         assert not uncleaned(ESC_SEQ.sub("", feed_frame)), uncleaned(feed_frame)[:8]
         say("text: OSC 52, OSC 0, cursor moves and bidi overrides never reach the terminal: ok")
+
+        # ---- and the STRUCTURAL half: not a list of remembered prose keys, but a walk of
+        #      every string in the state. The allow-list this replaced cleaned the fields
+        #      someone had thought of, so a thread's title, a NAS `fb_dir`, a tool name in
+        #      `tool_calls` and every `turn` field were printed as written. A fully populated
+        #      state (stacked threads, a patch, an alert, the action feed, a NAS observation, a
+        #      turn) is copied once per string leaf, that one string replaced by a payload, and
+        #      rendered plain and rich: nothing but SGR may come out. The enum fields the tool
+        #      itself owns (backend/source/status/goal_source/schema) are left alone by design.
+        enum_keys = {"backend", "source", "status", "goal_source", "schema"}
+        ALL_BAD = "".join((osc52, osc0, csi, "\u202e", "\u061c", "\u2028", "\u2029", "\u2060",
+                           "\u2064", "\U000E0001", "\U000E007F", "\x1b[?25l", "\t"))
+        full_state = dict(
+            with_patch,
+            threads=[
+                {"id": "t1", "title": "the first thread", "current": True, "running": True,
+                 "source_updated_ms": SWEEP_NOW,
+                 "todos": [{"task": "one", "completed": True}]},
+                {"id": "t2", "title": "the second thread", "current": False, "running": False,
+                 "source_updated_ms": SWEEP_NOW,
+                 "todos": [{"task": "two", "completed": False}]},
+            ],
+            tool_calls={"read_files": 12, "code_search": 5, "write_todos": 2},
+            nas={"dir": "/volume1/proj", "live": True, "fb": "1", "fb_dir": "/volume1/proj",
+                 "fb_project": "proj", "alive": True, "size": 10, "mtime_ms": SWEEP_NOW,
+                 "has_transcript": True, "unchanged": False},
+            turn={"start_ms": SWEEP_NOW - 60_000, "iterations": 9, "files": ["a.py", "b.py"],
+                  "verbs": {"read_files": 3}, "truncated": False},
+            observed=[{"verb": "edit", "what": "the renderer",
+                       "ts_ms": SWEEP_NOW - 60_000}],
+            status="live", heartbeat_ms=SWEEP_NOW, probed_ms=SWEEP_NOW,
+            source_updated_ms=SWEEP_NOW, store_mtime_ms=SWEEP_NOW,
+            thread="2026-09-29T11-26-00.000Z", model="deepseek-v4-flash",
+            list_id=1, list_version=3, done=1, total=2,
+        )
+
+        def variants(obj, payload):
+            """Every copy of `obj` with exactly one string in it replaced by `payload`.
+
+            Dict KEYS count: a tool name in `tool_calls` is a string the pane prints and the
+            tool does not own. A value under an enum key is offered to nobody — the filter is
+            told to leave those alone, so injecting there would test the skip list, not the
+            walk.
+            """
+            out = []
+            if isinstance(obj, str):
+                return [payload]
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    if isinstance(key, str) and key not in enum_keys:
+                        renamed = dict(obj)
+                        del renamed[key]
+                        renamed[payload] = value
+                        out.append(renamed)
+                    if key in enum_keys:
+                        continue
+                    if isinstance(value, str):
+                        out.append(dict(obj, **{key: payload}))
+                    else:
+                        for sub in variants(value, payload):
+                            copy = dict(obj)
+                            copy[key] = sub
+                            out.append(copy)
+            elif isinstance(obj, (list, tuple)):
+                for i, value in enumerate(obj):
+                    for sub in ([payload] if isinstance(value, str) else variants(value, payload)):
+                        copy = list(obj)
+                        copy[i] = sub
+                        out.append(tuple(copy) if isinstance(obj, tuple) else copy)
+            return out
+
+        def clean_frame(frame, where):
+            for bad in dirty_bits:
+                assert bad not in frame, (where, repr(bad), frame[:200])
+            assert not uncleaned(ESC_SEQ.sub("", frame)), (where, uncleaned(frame)[:8])
+            for seq in ESC_SEQ.findall(frame):
+                assert TOOL_SEQ.match(seq), (where, repr(seq))
+
+        # every string leaf, one composite payload: the walk touches each in turn. Both the
+        # list and the no-list (action-feed) layout are painted, plain and rich.
+        swept = 0
+        for dirty in variants(full_state, ALL_BAD):
+            for label, st in (("list", dirty), ("feed", dict(dirty, todos=[]))):
+                for color in (False, True):
+                    framed = module.render(
+                        st, color, watching=999, width=46 if color else 80,
+                        height=20 if color else None, now_ms=SWEEP_NOW,
+                    )
+                    clean_frame(framed, (label, color))
+                    swept += 1
+        assert swept > 40, swept
+        # ...and each payload on its own, in a rendered value and in a tool-call KEY
+        for payload in (osc52, osc0, csi, "\u202e", "\u061c", "\u2028", "\u2060",
+                        "\U000E0001", "\U000E007F", "\x1b[?25l", "\t"):
+            for st in (dict(full_state, goal="head " + payload + " tail"),
+                       dict(full_state, todos=[], tool_calls={payload + "read_files": 3})):
+                for color in (False, True):
+                    framed = module.render(
+                        st, color, watching=999, width=46 if color else 80,
+                        height=20 if color else None, now_ms=SWEEP_NOW,
+                    )
+                    clean_frame(framed, ("payload", repr(payload), color))
+        # a state that only has something to shout about: `error` takes an early return, and
+        # the payload must be gone there too
+        for color in (False, True):
+            framed = module.render(
+                dict(full_state, error="broke: " + ALL_BAD), color, watching=999,
+                width=46 if color else 80, height=20 if color else None, now_ms=SWEEP_NOW,
+            )
+            clean_frame(framed, ("error", color))
+        say("text: every string in a state is filtered, not a list of known keys: ok")
     finally:
         for key, value in saved_env.items():
             var = "FBTODO_" + key.upper()

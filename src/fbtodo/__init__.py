@@ -300,7 +300,9 @@ def state_from_push(data: dict) -> dict:
         "probed_ms": now,
         "source_updated_ms": int(st.get("source_updated_ms") or st.get("ts") or now),
     })
-    return st
+    # The pusher's prose is filtered here like any other source's: the state file is read by
+    # `json` and `status` too, so cleaning only at render would leave them exposed.
+    return clean_observation(st)
 
 
 def cmd_push(args) -> int:

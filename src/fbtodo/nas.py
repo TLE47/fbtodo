@@ -352,7 +352,7 @@ def read_nas(args) -> dict:
     if state.get("kind") == "unchanged":
         if (prev.get("dir") or "") == nas["dir"] and prev.get("todos") is not None:
             nas["unchanged"] = True
-            return {
+            return clean_observation({
                 "todos": prev.get("todos") or [],
                 "ts": prev.get("ts"),
                 "calls": prev.get("calls"),
@@ -365,7 +365,7 @@ def read_nas(args) -> dict:
                 "tool_calls": prev.get("tool_calls") or {},
                 "nas": nas,
                 "patch": probe.get("patch"), "alert": probe.get("alert"),
-            }
+            })
         probe = nas_probe(host, root, project, args.chat or None, None, marker)
         state = probe.get("state") or {}
         tools = (state.get("tools") or {}) or tools
