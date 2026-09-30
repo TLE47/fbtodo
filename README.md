@@ -80,7 +80,7 @@ pipx install git+https://github.com/TLE47/fbtodo
 
 
 > pipx installs fbtodo into an isolated environment on your PATH. No Python dependencies are required, though displaying the pane still needs tmux
-#### Update + virtualenv
+#### Update + virtual env
 ```sh
 pipx install --force git+https://github.com/TLE47/fbtodo
 ```
