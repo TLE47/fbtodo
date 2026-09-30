@@ -211,13 +211,14 @@ def nas_place_panes(panes: list[str], anchor: str | None, quiet: bool = True) ->
     rects = pane_rects()
     moved, sized = [], []
     for pane in panes:
-        if place_pane_beside(pane, anchor, rects, layout["side"]):
+        here = kept_layout(pane, anchor, rects, layout)
+        if place_pane_beside(pane, anchor, rects, here["side"]):
             moved.append(pane)
             rects = pane_rects()  # the layout just moved under us
-        if hold_pane_size(pane, layout["window"], "nas", rects, layout):
-            sized.append((pane, layout["size_source"]))
+        if hold_pane_size(pane, here["window"], "nas", rects, here):
+            sized.append((pane, here["size_source"]))
             rects = pane_rects()
-        remember_layout(window, "nas", pane, rects, layout["side"])
+        remember_layout(window, "nas", pane, rects, here["side"])
     forget_settled({row["pane"] for row in pane_rows()})
     for pane in moved:
         # Written down quiet or not, like the keeper's: the watcher is spawned `--quiet`
@@ -487,29 +488,75 @@ def pane_rects() -> dict:
     return rects
 
 
-def placed_beside(inst_pane: str, todo_pane: str, rects: dict, split: str) -> bool:
-    """Is the todo pane on the side of its session's pane that `split` opens it on?
+def pane_axis(anchor: dict | None, pane: dict | None) -> str | None:
+    """Which axis a pane sits on relative to its anchor: `v` stacked, `h` side by side.
 
-    Below by default, right of it for `FBTODO_SPLIT=h`, so the two agree on one rule.
-    Deliberately lenient about the pane being *wider* than the session's — a strip under
-    two panes is a layout somebody chose, and dragging it narrow again would be the tool
-    arguing with its owner — and strict about where it starts, so a pane that sits
-    somewhere else altogether is brought back.
+    Read from the geometry rather than from the pane's own layout, because the question it
+    answers is where the pane IS: two panes whose rows do not overlap share a column band
+    and are stacked, two whose columns do not overlap share a row band and sit side by
+    side, and anything else — the far corner of a grid — is on no axis of its anchor at
+    all. `None` for a pane in another window too, which is nobody's business.
+    """
+    if not anchor or not pane or anchor["window"] != pane["window"]:
+        return None
+    rows_apart = pane["top"] > anchor["top"] + anchor["height"] or (
+        anchor["top"] > pane["top"] + pane["height"]
+    )
+    cols_apart = pane["left"] > anchor["left"] + anchor["width"] or (
+        anchor["left"] > pane["left"] + pane["width"]
+    )
+    if cols_apart and not rows_apart:
+        return "h"
+    if rows_apart and not cols_apart:
+        return "v"
+    return None
+
+
+def placed_beside(inst_pane: str, todo_pane: str, rects: dict, split: str) -> bool:
+    """Is the todo pane on the side of its session's pane that `split` says it sits on?
+
+    Below by default, beside it for `FBTODO_SPLIT=h`, so the two agree on one rule. What a
+    side fixes is the AXIS, not the order on it: a strip above its session and one under it
+    are both `v`, and a column to the left of one is as much `h` as a column to the right —
+    the other edge of the same axis is a place the owner drags a pane to, not a drift to
+    bring back. Deliberately lenient about the pane being *wider* than the session's — a
+    strip under two panes is a layout somebody chose, and dragging it narrow again would be
+    the tool arguing with its owner — and strict about the band it sits in, so a pane that
+    has come off the axis altogether is brought back.
     """
     a, b = rects.get(inst_pane), rects.get(todo_pane)
     if not a or not b or a["window"] != b["window"]:
         return False
     if split == "h":
         return (
-            b["left"] == a["left"] + a["width"] + 1
-            and b["top"] <= a["top"]
+            b["top"] <= a["top"]
             and b["top"] + b["height"] >= a["top"] + a["height"]
+            and (
+                b["left"] == a["left"] + a["width"] + 1
+                or b["left"] + b["width"] + 1 == a["left"]
+            )
         )
     return (
-        b["top"] == a["top"] + a["height"] + 1
-        and b["left"] <= a["left"]
+        b["left"] <= a["left"]
         and b["left"] + b["width"] >= a["left"] + a["width"]
+        and (
+            b["top"] == a["top"] + a["height"] + 1
+            or b["top"] + b["height"] + 1 == a["top"]
+        )
     )
+
+
+def pane_before(anchor: dict, pane: dict, split: str) -> bool:
+    """Is the pane on its anchor's leading edge — above it (`v`) or left of it (`h`)?
+
+    The half of the position a repair has to keep: the axis comes from the side in force,
+    but WHICH edge of it the list hangs off belongs to the owner (`placed_beside`), so a
+    pane that has to be moved back onto a side it was already on goes back to the edge it
+    came from rather than to the one `split-window` would pick for a brand new pane.
+    """
+    if split == "h":
+        return pane["left"] < anchor["left"]
+    return pane["top"] < anchor["top"]
 
 
 def place_pane_beside(pane: str, anchor: str, rects: dict, split: str) -> bool:
@@ -527,7 +574,13 @@ def place_pane_beside(pane: str, anchor: str, rects: dict, split: str) -> bool:
     here, there = rects.get(pane), rects.get(anchor)
     if not here or not there or here["window"] != there["window"]:
         return False
-    return tmux_run("move-pane", "-d", f"-{split}", "-s", pane, "-t", anchor) is not None
+    # Back to the edge it was on, on the side it belongs to: `-b` is `move-pane`'s "before
+    # the target", which is what puts a pane above a session rather than under it, or to
+    # its left rather than its right (tmux's own default, and so `split-window`'s).
+    before = ["-b"] if pane_before(there, here, split) else []
+    return tmux_run(
+        "move-pane", "-d", *before, f"-{split}", "-s", pane, "-t", anchor
+    ) is not None
 
 
 # ------------------------------------------------------- per-window pins (the layout)
@@ -646,6 +699,27 @@ def pane_layout(window: str | None, role: str, pins: dict | None = None,
     }
 
 
+def kept_layout(pane: str, anchor: str | None, rects: dict, layout: dict) -> dict:
+    """`layout` as it applies to THIS pane: the side in force, or the one it is kept on.
+
+    A pin is a standing instruction somebody typed, so it decides the side and the keeper
+    puts the pane back on that axis every pass. Without one, the side in force is only how
+    a pane was OPENED (`pane_layout`: remembered, FBTODO_SPLIT, or the built-in default),
+    and a pane found on the other axis of its session is the owner's own arrangement rather
+    than drift: it is left where it is, and the side travels on as `seen` — which is the
+    side `remember_layout` then files, after the same two passes a hand-resize gets, so a
+    layout that shifts panes about on its own is never mistaken for a decision. A pane on
+    no axis of its anchor keeps the side in force and is repaired as it always was, and so
+    does one in another window (`pane_axis`).
+    """
+    if layout["side_source"].startswith("pin"):
+        return layout
+    seen = pane_axis(rects.get(anchor) if anchor else None, rects.get(pane))
+    if not seen or seen == layout["side"]:
+        return layout
+    return {**layout, "side": seen, "side_source": "seen"}
+
+
 def source_note(source: str, window: str) -> str:
     """A layout source as a person reads it — `pin (main:1 nas)` rather than `pin:nas`."""
     if source.startswith("pin:"):
@@ -653,6 +727,7 @@ def source_note(source: str, window: str) -> str:
     return {
         "pin": f"pin ({window})",
         "last": "remembered",
+        "seen": "seen (kept, not filed yet)",
         "env": "FBTODO_SPLIT/FBTODO_PANE_SIZE",
     }.get(source, "default")
 
@@ -976,16 +1051,20 @@ def ensure_local_panes(quiet: bool = True) -> list[str]:
         # NAS ssh as well has two list panes that can want different sizes.
         layout = pane_layout(window, "local", pins, last)
         for pane in local_pane_ids(inst, rows, table):
-            if place_pane_beside(pane, inst_pane, rects, layout["side"]):
+            # The side this pane is held at: a pin's, or the one it is keeping (`kept_layout`),
+            # which is also the one written down below — so a pane the owner moved to the
+            # other axis of its session stays there and the next one opens there.
+            here = kept_layout(pane, inst_pane, rects, layout)
+            if place_pane_beside(pane, inst_pane, rects, here["side"]):
                 moved.append(pane)
                 rects = pane_rects()  # the layout just moved under us
-            if hold_pane_size(pane, layout["window"], "local", rects, layout):
-                sized.append((pane, layout["size_source"]))
+            if hold_pane_size(pane, here["window"], "local", rects, here):
+                sized.append((pane, here["size_source"]))
                 rects = pane_rects()
             # Written down for next time: a pane killed and reopened — or a whole tmux
             # server that went down — comes back at the size it was left, the side it was
             # put on, instead of at the default.
-            remember_layout(window, "local", pane, rects, layout["side"])
+            remember_layout(window, "local", pane, rects, here["side"])
     forget_settled({row["pane"] for row in pane_rows()})
     for pane in moved:
         # Quiet or not, written down: a pane that came back is the one thing worth being
@@ -1464,8 +1543,9 @@ __all__ = [
     "pick_ssh_pane", "nas_ssh_pane", "nas_pane_ids", "nas_place_panes", "nas_pane_open",
     "nas_pane_command", "nas_pane_kill", "PANE_INSTANCE_RE", "PANE_WATCH_RE",    "pane_off", "append_log", "pane_log", "pane_repaint", "pane_rows", "local_pane_ids",
     "freebuff_pane_id",
-    "session_windows", "instances_with_pane", "pane_rects", "placed_beside",
-    "place_pane_beside", "load_pins", "window_key", "pin_for_window", "load_last", "save_last",
+    "session_windows", "instances_with_pane", "pane_rects", "pane_axis", "placed_beside",
+    "pane_before", "place_pane_beside", "kept_layout",
+    "load_pins", "window_key", "pin_for_window", "load_last", "save_last",
     "pin_value", "pane_layout", "source_note", "_SETTLED", "_LAST_SEEN", "resize_pane_to",
     "hold_pane_size", "forget_settled", "remember_layout", "save_pins", "window_of",
     "KEEPER_GRACE", "tmux_identity", "ensure_pane_keeper", "cmd_pane_watch",

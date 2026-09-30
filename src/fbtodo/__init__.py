@@ -1652,7 +1652,10 @@ def pane_reason(pane, role: str, window: str | None, anchor: str | None, rects: 
     # the keeper and the watcher leave it alone — so a report that called it misplaced would
     # be sending somebody to fix what is not broken (`place_pane_beside`).
     elsewhere = bool(here and there and here["window"] != there["window"])
-    placed = bool(pane and anchor) and placed_beside(anchor, pane, rects, layout["side"])
+    # The side as it stands for this pane, not only as the file remembers it: a pane kept on
+    # the other axis of its session reads `seen` until the keeper has filed it (kept_layout).
+    kept = kept_layout(pane, anchor, rects, layout) if pane else layout
+    placed = bool(pane and anchor) and placed_beside(anchor, pane, rects, kept["side"])
     return {
         "pane": pane,
         "role": role,
@@ -1661,13 +1664,13 @@ def pane_reason(pane, role: str, window: str | None, anchor: str | None, rects: 
         "window": layout["window"] or (window or ""),
         "anchor": anchor,
         "anchor_note": anchor_note,
-        "side": layout["side"],
-        "side_source": layout["side_source"],
+        "side": kept["side"],
+        "side_source": kept["side_source"],
         "size": layout["size"],
         "size_source": layout["size_source"],
         "placed": placed,
         "now": (f"L{here['left']} T{here['top']} {here['width']}x{here['height']}" if here else ""),
-        "expected": (f"below {anchor}" if layout["side"] == "v" else f"beside {anchor}")
+        "expected": (f"below {anchor}" if kept["side"] == "v" else f"beside {anchor}")
         if anchor else "no pane to place it against",
     }
 
@@ -1724,6 +1727,9 @@ def cmd_why(args) -> int:
     Which one won is invisible in a layout that merely looks right — and the first question
     when one is wrong — so this prints, per pane, the side and size in force WITH the source
     that supplied them, the pane it is placed against, and whether it is actually there.
+    A pane the owner has moved to the other axis of its session is not one of the four
+    sources winning but a decision being kept: it reads `seen (kept, not filed yet)` until
+    the keeper has seen it twice and written it down as the remembered side (`kept_layout`).
     `--window TARGET` limits it to one window; `--json` is the same thing for a script.
     """
     pins, last = load_pins(), load_last()
