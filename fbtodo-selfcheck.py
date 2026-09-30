@@ -4243,9 +4243,21 @@ try:
         ("a goal longer than 500 chars",
          push({"goal": "x" * (mod.PUSH_MAX_STRING + 1), "todos": [{"task": "g"}]})),
         ("a task that is not a string", push({"todos": [{"task": 7}]})),
+        # `completed` must be a real boolean: the coercion `bool("false")` is True, which
+        # would count a pusher's string as a finished step instead of refusing it.
+        ("a completed that is a string", push({"todos": [{"task": "c", "completed": "false"}]})),
+        ("a completed that is a number", push({"todos": [{"task": "c", "completed": 1}]})),
+        # A pathological run of openers is under the byte cap but recurses the parser past its
+        # limit; that is the same data error (65), not a crash and not a truncated state.
+        ("deeply nested JSON", push(None, body="[" * 500_000)),
     ]
     for why, r in capped:
         assert r.returncode == 65, (why, r.returncode, r.stderr[-200:])
+    # an explicit null is "not done", not a malformed field — the row is taken, uncounted
+    # (written aside so it does not become the live state the next assertions read)
+    nulldone = json.loads(push({"session": "NULLD", "todos": [{"task": "n", "completed": None}]},
+                               "--to", os.path.join(TEST_HOME, "null-done.json")).stdout)
+    assert (nulldone["done"], nulldone["total"]) == (0, 1), nulldone
     # the boundary itself is allowed: exactly the caps, written aside with --to
     okfile = os.path.join(TEST_HOME, "at-the-cap.json")
     boundary = push({"todos": [{"task": "y" * mod.PUSH_MAX_STRING}]
@@ -4292,6 +4304,7 @@ try:
         ("too many steps", {"todos": [{"task": "s%d" % i}
                                        for i in range(mod.PUSH_MAX_STEPS + 1)]}),
         ("a task that is not a string", {"todos": [{"task": 7}]}),
+        ("a completed that is not a boolean", {"todos": [{"task": "c", "completed": "no"}]}),
         ("a goal longer than 500 chars",
          {"goal": "x" * (mod.PUSH_MAX_STRING + 1), "todos": [{"task": "g"}]}),
     ):
@@ -4300,6 +4313,16 @@ try:
             json.dump(payload, fh)
         r = run("bar", "-s", f"file:{badfile}")
         assert r.returncode == 65, (why, r.returncode, r.stderr[-200:])
+    # ...and the byte cap and the parser's recursion limit are refusals on disk too, so an
+    # oversized or pathological file is the data error rather than a load the cap forbade
+    bigfile = os.path.join(fdir, "too-big.json")
+    with open(bigfile, "wb") as fh:
+        fh.write(b"[" + b" " * mod.PUSH_MAX_BYTES)
+    assert run("bar", "-s", f"file:{bigfile}").returncode == 65, "a file over the byte cap"
+    deepfile = os.path.join(fdir, "deep.json")
+    with open(deepfile, "w", encoding="utf-8") as fh:
+        fh.write("[" * 500_000)
+    assert run("bar", "-s", f"file:{deepfile}").returncode == 65, "a file that recurses the parser"
     # ...and the flag is still a usage error when it names neither a source nor a path
     for bad in ("file:", "nonsense"):
         assert run("bar", "-s", bad).returncode == 64, bad

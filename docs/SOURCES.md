@@ -76,7 +76,11 @@ printed is not punished for the extra keys.
 - `--quiet` prints nothing.
 - Anything that is not a JSON object with a list of `{task, completed}` steps is refused, and
   the state it refused to replace is left alone. Empty stdin, non-JSON, a non-object and a
-  malformed `todos` each exit non-zero (66 / 65).
+  malformed `todos` each exit non-zero (66 / 65). A `completed` must be a real boolean; a
+  string like `"false"` is refused rather than counted as done.
+- The payload is **capped**, not truncated: 1 MiB of stdin, 200 steps and 500 characters per
+  string, and a run of `[` deep enough to recurse the parser past its limit is a refusal too.
+  Over any cap is the data error (65).
 
 Because a pushed state is written through the same path a watched one is, the readers that
 prefer a live state file answer from it: a hand-pushed list needs no watcher to be shown.

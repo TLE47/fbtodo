@@ -228,8 +228,13 @@ and a different list increments it.
 
 `--to PATH` writes that file instead of the live state (what `-s file:PATH` then reads back),
 `--dry-run` writes nothing, `--quiet` prints nothing, and every refusal — empty stdin (`66`),
-not JSON (`65`), not an object (`65`), `todos` not a list of `{task, completed}` objects (`65`)
-— returns before the write, so the state it refused to replace is untouched. `--source
+not JSON (`65`), not an object (`65`), `todos` not a list of `{task, completed}` objects (`65`,
+with `completed` a real boolean rather than anything `bool()` would coerce) — returns before the
+write, so the state it refused to replace is untouched. The ingress caps live in `check_ingress`:
+1 MiB of bytes, 200 steps, 500 characters per string, and a payload that recurses the parser
+past its limit is the same data error. `check_file_ingress` gives the `file:PATH` door the same
+treatment — the same byte cap before the read, the same `check_ingress` after it, and a missing
+file left to the source's own "no state file" answer. `--source
 file:PATH` makes the readers answer from it: because the pushed state carries `backend: push`,
 a cached live state never satisfies a `file:` request, so a hand-pushed list needs no watcher to
 be shown.

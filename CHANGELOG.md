@@ -42,8 +42,12 @@ Entries start at the newest release; each one is a contract change, not a diff.
   set gains U+061C, U+2028/29, U+2060-2064 and the tag characters, and a tab becomes one
   space.
 - The `push` / `-s file:PATH` ingress is capped: **1 MiB** of stdin, **200** steps, **500**
-  characters per string, and a `task` must be a string. Over a cap is the data error (`65`),
-  never a truncation; the `file:PATH` source is refused at the front door the same way.
+  characters per string, a `task` must be a string, and a `completed` must be a **boolean**
+  (`bool("false")` counted a pushed string as a finished step). The `file:PATH` read is held to
+  the same 1 MiB before it is parsed, and a payload that recurses the parser past its limit is
+  the data error (`65`) rather than an uncaught `RecursionError` or a silent "no state file".
+  Over a cap is the data error (`65`), never a truncation; the `file:PATH` source is refused at
+  the front door the same way.
 - The state root is chosen at **import** but acted on by `main()` (`init_state_root`), so a
   module import creates no directory and moves no file; the legacy `~/.freebuff` migration
   happens on the first command.

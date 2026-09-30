@@ -301,10 +301,53 @@ def check_ingress(data) -> None:
             raise ValueError(f"a todo's task is longer than {PUSH_MAX_STRING} characters")
         if not task.strip():
             raise ValueError("a todo with no task text")
+        done = t.get("completed")
+        # Absent (or an explicit null) means "not done"; anything present must be a real
+        # boolean. The coercion `bool(value)` counted the STRING "false" as a finished step,
+        # so a pusher that sent a string got its list inverted, not refused.
+        if done is not None and not isinstance(done, bool):
+            raise ValueError("a todo's completed must be true or false")
     for key in PUSH_FIELDS:
         value = data.get(key)
         if isinstance(value, str) and len(value) > PUSH_MAX_STRING:
             raise ValueError(f"{key} is longer than {PUSH_MAX_STRING} characters")
+
+
+def check_file_ingress(path: str) -> int | None:
+    """The `file:PATH` doorway to `check_ingress`, refused the way `push` refuses a payload.
+
+    The file is an ingress like stdin, so it gets the same byte cap before it is parsed (a
+    1 MiB file cannot make the reader allocate the denial-of-service it was capped against)
+    and a recursive payload gets the same data error the parser's `RecursionError` would
+    otherwise turn into "no state file". A simply absent file is not an error here — that is
+    the source's own "no state file" answer — so it returns None and lets the source speak.
+    Returns an exit code to stop on, or None when the file is fine or missing.
+    """
+    try:
+        with open(path, "rb") as fh:
+            chunk = fh.read(PUSH_MAX_BYTES + 1)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        print(f"fbtodo: {path}: {exc}", file=sys.stderr)
+        return EX_CODES["ioerr"]
+    if len(chunk) > PUSH_MAX_BYTES:
+        print(f"fbtodo: {path}: larger than {PUSH_MAX_BYTES} bytes — refused", file=sys.stderr)
+        return EX_CODES["dataerr"]
+    try:
+        data = json.loads(chunk.decode("utf-8", "replace"))
+    except RecursionError:
+        print(f"fbtodo: {path}: too deeply nested to parse", file=sys.stderr)
+        return EX_CODES["dataerr"]
+    except ValueError as exc:
+        print(f"fbtodo: {path}: not JSON: {exc}", file=sys.stderr)
+        return EX_CODES["dataerr"]
+    try:
+        check_ingress(data)
+    except ValueError as exc:
+        print(f"fbtodo: {path}: {exc}", file=sys.stderr)
+        return EX_CODES["dataerr"]
+    return None
 
 
 def state_from_push(data: dict) -> dict:
@@ -368,6 +411,11 @@ def cmd_push(args) -> int:
         return EX_CODES["noinput"]
     try:
         data = json.loads(raw)
+    except RecursionError:
+        # A pathological run of `[`/`{` recurses the parser past its limit; that is a
+        # malformed payload, so it is the same data error as any other bad JSON.
+        print("fbtodo push: stdin is too deeply nested to parse", file=sys.stderr)
+        return EX_CODES["dataerr"]
     except ValueError as exc:
         print(f"fbtodo push: stdin is not JSON: {exc}", file=sys.stderr)
         return EX_CODES["dataerr"]
@@ -2175,13 +2223,9 @@ def main(argv=None) -> int:
     # simply absent is left to the source's own "no state file" answer.
     spath = source_path(args.source)
     if spath:
-        fstate = read_json(state_file_in(spath), None)
-        if fstate is not None:
-            try:
-                check_ingress(fstate)
-            except ValueError as exc:
-                print(f"fbtodo: {state_file_in(spath)}: {exc}", file=sys.stderr)
-                return EX_CODES["dataerr"]
+        code = check_file_ingress(state_file_in(spath))
+        if code is not None:
+            return code
 
     if args.command == "push":
         return cmd_push(args)
