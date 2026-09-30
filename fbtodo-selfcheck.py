@@ -3647,7 +3647,8 @@ try:
             duel_log_rows[mod.task_key(sess, f"step {n}")] = {
                 "started_ms": fresh - 100_000, "done_ms": fresh, "model": "m/e",
                 "fc": {"at": fresh - 100_000, "v": "9.9.9",
-                       "pace": 100_000 * (n + 1), "blend": 500_000},
+                       "pace": 100_000 * (n + 1), "blend": 500_000,
+                       "recent": 60_000 + 20_000 * n},
             }
     # the file name because `mod`'s own TASKS_PATH is pointed at the suite's unit fixture,
     # and the child decides its path at import — the same reason the status-home checks above
@@ -3666,7 +3667,67 @@ try:
     assert "[1.00–4.00]" in sout, sout[-800:]
     assert "blend 5.00x over 16" in sout, sout[-800:]
     assert "rung duel         : pace beats blend" in sout, sout[-800:]
+    # ...and the rung that is scored but never picked: its own line, so a reader can see that
+    # the pane is carrying an experiment and that nothing about it moves a number on screen
+    # the score is a symmetric factor, so a rung predicting half the span is as wrong as one
+    # predicting double: 60s/80s/100s/120s against a 100s span read 1.67/1.25/1.00/1.20
+    assert "shadow rungs      : recent 1.23x [1.00–1.67] over 16" in sout, sout[-800:]
+    assert "(scored, never picked)" in sout, sout[-800:]
+    assert "rung duel         : recent beats pace" in sout, sout[-800:]
     say("estimates: `status` shows each rung's spread, and who won the duel: ok")
+
+    # ---- and a shadow rung is scored but never picked: it rides in the same forecast vector,
+    #      is judged by the same functions, and no code path may return it as an estimate. An
+    #      idea has to earn its place from the log rather than from an argument, and `recent` —
+    #      the list's own last few spans, the pace that has just delivered — is the one thing
+    #      the shipped, whole-list pace cannot be compared against by itself.
+    assert mod.SHADOW_RUNGS == ("recent",), mod.SHADOW_RUNGS
+    assert "recent" not in mod.SHIPPED_RUNGS, mod.SHIPPED_RUNGS
+    assert set(mod.SCORED_RUNGS) == set(mod.SHIPPED_RUNGS) | set(mod.SHADOW_RUNGS), mod.SCORED_RUNGS
+    # what it is: the median of the TAIL of the list, not of the whole of it. Five spans of
+    # 1m/3m/5m/7m/9m have a middle of 5m and a last-three middle of 7m, and it is the second
+    # number this rung is claiming to be a better guess from.
+    tail_times = {
+        name: {"started_ms": t0 + i * 60_000, "elapsed_ms": span}
+        for i, (name, span) in enumerate(
+            (("a", 60_000), ("b", 180_000), ("c", 300_000), ("d", 420_000), ("e", 540_000)))
+    }
+    tail_todos = [{"task": n, "completed": True} for n in "abcde"]
+    assert mod.recent_pace_ms(tail_times, tail_todos, t0 + 600_000) == 420_000, "the tail, not the middle"
+    # ...and one span is that step's own time, not a pace, so there is no shadow rung to score
+    assert mod.recent_pace_ms(tail_times, [{"task": "a", "completed": True}],
+                              t0 + 600_000) is None
+    # stamped beside the shipped rungs on the first poll that sees a step running, while the
+    # pick stays one of the three the pane may actually choose
+    put_tasklog(mod, {"schema": mod.TASKLOG_SCHEMA, "session": "SH", "tasks": {}})
+
+    def four(*done):
+        return [{"task": n, "completed": d} for n, d in zip("abcd", done)]
+
+    mod.track_tasks({"session": "SH", "todos": four(False, False, False, False)}, now_ms=t0)
+    mod.track_tasks({"session": "SH", "todos": four(True, False, False, False)}, now_ms=t0 + 60_000)
+    sh = mod.track_tasks({"session": "SH", "todos": four(True, True, False, False)}, now_ms=t0 + 240_000)
+    sh_rec = mod.load_tasklog()["tasks"][mod.task_key("SH", "c")]
+    assert sh_rec["fc"]["recent"] == 120_000, sh_rec["fc"]   # a 60s step and a 180s one
+    assert sh_rec["fc"]["pick"] in mod.SHIPPED_RUNGS, sh_rec["fc"]
+    assert sh_rec["est_src"] in mod.SHIPPED_RUNGS, sh_rec
+    assert sh["task_times"]["c"]["started_ms"] == t0 + 240_000, sh["task_times"]
+    # the ledger prints it beside the shipped rungs — but only on a row that carries one, so a
+    # row recorded before the rung existed is not shown a rung it never had
+    shadow_rows = mod.ledger_rows({mod.task_key("SH", "shadow"): {
+        "started_ms": t0, "done_ms": t0 + 100_000, "model": "m/e",
+        "fc": {"at": t0, "v": "9.9.9", "pace": 100_000, "recent": 50_000}}},
+        t0 + 1000, None, "m/e")
+    assert shadow_rows[0]["errors"]["recent"] == 2.0, shadow_rows[0]
+    assert "recent 50s ×2.00" in mod.fmt_ledger(shadow_rows, t0 + 1000, None, 0)
+    plain_rows = mod.ledger_rows({mod.task_key("SH", "no shadow"): {
+        "started_ms": t0, "done_ms": t0 + 100_000, "model": "m/e",
+        "fc": {"at": t0, "v": "9.9.9", "pace": 100_000}}}, t0 + 1000, None, "m/e")
+    assert "recent" not in mod.fmt_ledger(plain_rows, t0 + 1000, None, 0), "a rung the row never had"
+    # ...and it can be dueled against the rung it would replace, which is the only reason to
+    # keep its score at all
+    assert mod.rung_duel(shadow_rows, "pace", "recent")["steps"] == 1, shadow_rows
+    say("estimates: a shadow rung is scored beside the shipped ones and never picked: ok")
 
     # ---- and how far the log is from re-choosing its own constants: the clip is consulted
     #      only on a young list, and moves the number only sometimes, so the count that
