@@ -1,6 +1,6 @@
 # fbtodo
 
-**Watch your agent's progress in real time — see what it's doing, how long it'll take, and when it's done.**
+**Watch your coding agent work — its checklist, live, in a pane beside it.**
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org)
 [![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#installation)
