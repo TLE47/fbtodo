@@ -2,27 +2,19 @@
 
 **Watch your coding agent work — its checklist, live, in a pane beside it.**
 
+[![CI](https://github.com/TLE47/fbtodo/actions/workflows/ci.yml/badge.svg)](https://github.com/TLE47/fbtodo/actions/workflows/ci.yml)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org)
 [![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#installation)
 [![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#installation)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-
-```
-╭──  FREEBUFF TODOS  ──────────────── watcher: pid 4813 · v4-flash ──╮
-│ 🎯 Goal: fit the pane heading whole                                │
-│   ➔  Split the drawing code into roles                9m38s [~10m] │
-│                                                                    │
-│   [█████▊░░░░░░░░░░░░░░]  29% (2/7) | EST REM 11m21s | ETA 12:09   │
-│  ⠏ WORKING  │ LIST: #47 · 11m ago │ LIVE: 11:57:59                 │
-╰───────────────────────────────────────────────────────────────────[...]
-```
 
 fbtodo displays your [Freebuff](https://freebuff.com) agent's task list in a side pane while it works. It shows:
 - **What's done, running, and next** — with live timers
 - **How much time is left** — estimates based on your project history
 - **If it's stuck or waiting** — with optional alerts to your phone
 
-No setup needed. Works with any agent that keeps a todo list.
+No configuration: it reads the list your agent already keeps. Freebuff's list turns up on its own;
+anything else can push one over stdin — see [docs/SOURCES.md](docs/SOURCES.md).
 
 **[Installation](#installation)** · **[Commands](#commands)** · **[FAQ](#faq)** · [Settings](docs/SETTINGS.md) · [Deep docs](docs/INTERNALS.md)
 
@@ -142,11 +134,14 @@ Three presets are included in `examples/` (Catppuccin, Gruvbox, Nord).
 ### Pane size and position
 
 ```sh
-fbtodo pin --size 12 --side h    # 12 lines, left side
+fbtodo pin --size 24 --side h    # 24 columns wide, beside the session
+fbtodo pin --size 12 --side v    # 12 lines tall, below the session
 fbtodo pin --list                # show current settings
 ```
 
-The pane remembers your last size and opens that way next time. Default: 12 lines.
+`--size` is counted along the split: **columns** for `--side h` (the pane sits beside the
+session) and **lines** for `--side v` (below it). The pane remembers your last size and opens
+that way next time. Default: 12 lines below.
 
 ### Disable the pane
 
@@ -182,7 +177,7 @@ See [notify/README.md](notify/README.md) for details on iMessage and ntfy alerts
 | **Pane is empty** | Run `fbtodo status` — it'll tell you why. Usually the agent hasn't written a list yet. |
 | **Pane won't appear** | Make sure you're in tmux and `fbtodo` is in your PATH. |
 | **Pane closed** | It'll reopen automatically. If it doesn't, try `fbtodo stop` then run `fbtodo` again. |
-| **Wrong size/position** | Use `fbtodo pin --size N --side h` (or `v` for vertical). |
+| **Wrong size/position** | Use `fbtodo pin --side h` (beside) or `--side v` (below), with `--size N` in columns or lines respectively. |
 | **List looks old** | Run `fbtodo status` to check how long ago it was written. |
 
 ---
@@ -204,7 +199,7 @@ No. fbtodo reads local files only. The only outbound traffic is optional phone n
 <details>
 <summary><strong>Will it slow my agent down?</strong></summary>
 
-No. It reads files that are being written anyway — zero overhead.
+No. It reads files that are being written anyway — the overhead is negligible.
 </details>
 
 <details>
