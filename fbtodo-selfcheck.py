@@ -4128,6 +4128,27 @@ try:
                       (json.dumps({"todos": "nope"}), 65)):
         r = push(None, body=bad if isinstance(bad, str) else "")
         assert r.returncode == code, (bad, r.returncode, r.stderr[-200:])
+    # Each ingress cap is a refusal with the data error (65), never a truncated state, and
+    # the state the refusal would have replaced is untouched.
+    capped = [
+        ("stdin over 1 MiB", push(None, body=json.dumps(pushed) + " " * (1 << 20))),
+        ("more than 200 steps",
+         push({"todos": [{"task": "s%d" % i} for i in range(mod.PUSH_MAX_STEPS + 1)]})),
+        ("a task longer than 500 chars",
+         push({"todos": [{"task": "x" * (mod.PUSH_MAX_STRING + 1)}]})),
+        ("a goal longer than 500 chars",
+         push({"goal": "x" * (mod.PUSH_MAX_STRING + 1), "todos": [{"task": "g"}]})),
+        ("a task that is not a string", push({"todos": [{"task": 7}]})),
+    ]
+    for why, r in capped:
+        assert r.returncode == 65, (why, r.returncode, r.stderr[-200:])
+    # the boundary itself is allowed: exactly the caps, written aside with --to
+    okfile = os.path.join(TEST_HOME, "at-the-cap.json")
+    boundary = push({"todos": [{"task": "y" * mod.PUSH_MAX_STRING}]
+                              + [{"task": "s%d" % i} for i in range(mod.PUSH_MAX_STEPS - 1)]},
+                    "--to", okfile)
+    assert boundary.returncode == 0, (boundary.returncode, boundary.stderr[-200:])
+    assert json.loads(boundary.stdout)["total"] == mod.PUSH_MAX_STEPS, boundary.stdout[:200]
     # ...and the failure leaves the state it refused to replace alone
     assert run("bar").stdout.strip() == "todos 1/1", run("bar").stdout
     say("push: a state JSON on stdin becomes the live state, and a bad one does not: ok")
@@ -4161,6 +4182,20 @@ try:
     missing = os.path.join(fdir, "not-here.json")
     assert run("bar", "-s", f"file:{missing}").stdout.strip() == "todos -", missing
     assert "no state file" in run("json", "-s", f"file:{missing}").stdout
+    # ...and a `file:PATH` state that breaks the same caps is refused with the same data
+    # error: the file is an ingress too, not a trusted shortcut
+    for why, payload in (
+        ("too many steps", {"todos": [{"task": "s%d" % i}
+                                       for i in range(mod.PUSH_MAX_STEPS + 1)]}),
+        ("a task that is not a string", {"todos": [{"task": 7}]}),
+        ("a goal longer than 500 chars",
+         {"goal": "x" * (mod.PUSH_MAX_STRING + 1), "todos": [{"task": "g"}]}),
+    ):
+        badfile = os.path.join(fdir, "bad-%s.json" % why.split()[0])
+        with open(badfile, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        r = run("bar", "-s", f"file:{badfile}")
+        assert r.returncode == 65, (why, r.returncode, r.stderr[-200:])
     # ...and the flag is still a usage error when it names neither a source nor a path
     for bad in ("file:", "nonsense"):
         assert run("bar", "-s", bad).returncode == 64, bad

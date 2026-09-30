@@ -265,6 +265,47 @@ PUSH_FIELDS = (
     "model", "turn_ended", "iteration", "list_id", "list_version", "ts",
 )
 
+# The ingress caps, shared by every path that turns untrusted JSON into state — `fbtodo
+# push` on stdin and `-s file:PATH` off disk. They are limits, not truncations: a payload
+# over one is refused with the data error (65) and the state it would have replaced stands.
+# 1 MiB of stdin is far past any real list; 200 steps is past anything a session writes;
+# 500 characters is past any goal or step name, and a task is a STRING — coercing a number
+# or an object with `str()` was how a dict of junk reached a step row.
+PUSH_MAX_BYTES = 1 << 20
+PUSH_MAX_STEPS = 200
+PUSH_MAX_STRING = 500
+
+
+def check_ingress(data) -> None:
+    """Refuse a payload that breaks an ingress cap. Raises ValueError; writes nothing.
+
+    Shared by `state_from_push` and the `file:PATH` source, so the two doorways answer to
+    one contract rather than each having its own idea of "too big".
+    """
+    if not isinstance(data, dict):
+        raise ValueError("stdin must be a JSON object, not an array or a scalar")
+    todos = data.get("todos")
+    if todos is None:
+        todos = []
+    if not isinstance(todos, list):
+        raise ValueError("todos must be a list")
+    if len(todos) > PUSH_MAX_STEPS:
+        raise ValueError(f"too many steps: {len(todos)} (limit {PUSH_MAX_STEPS})")
+    for t in todos:
+        if not isinstance(t, dict):
+            raise ValueError("every todo must be an object")
+        task = t.get("task")
+        if not isinstance(task, str):
+            raise ValueError("a todo's task must be a string")
+        if len(task) > PUSH_MAX_STRING:
+            raise ValueError(f"a todo's task is longer than {PUSH_MAX_STRING} characters")
+        if not task.strip():
+            raise ValueError("a todo with no task text")
+    for key in PUSH_FIELDS:
+        value = data.get(key)
+        if isinstance(value, str) and len(value) > PUSH_MAX_STRING:
+            raise ValueError(f"{key} is longer than {PUSH_MAX_STRING} characters")
+
 
 def state_from_push(data: dict) -> dict:
     """A pushed JSON object as a state the rest of the tool can read.
@@ -272,21 +313,14 @@ def state_from_push(data: dict) -> dict:
     Only the fields a list is MADE of are taken — the steps, the goal, the session, and the
     identity a pusher may carry over (`list_id`/`list_version`) — and everything else is
     stamped here: the pusher does not need to know the tool's clock fields, and a pusher that
-    sent the whole object `fbtodo json` printed is not punished for the extra keys.
+    sent the whole object `fbtodo json` printed is not punished for the extra keys. What it
+    WILL refuse is a payload over the ingress caps (`check_ingress`), before anything is
+    built from it.
     """
-    todos = data.get("todos")
-    if todos is None:
-        todos = []
-    if not isinstance(todos, list):
-        raise ValueError("todos must be a list")
-    steps = []
-    for t in todos:
-        if not isinstance(t, dict):
-            raise ValueError("every todo must be an object")
-        task = str(t.get("task") or "").strip()
-        if not task:
-            raise ValueError("a todo with no task text")
-        steps.append({"task": task, "completed": bool(t.get("completed"))})
+    check_ingress(data)
+    todos = data.get("todos") or []
+    steps = [{"task": t["task"].strip(), "completed": bool(t.get("completed"))}
+             for t in todos]
     now = int(time.time() * 1000)
     st = {k: data[k] for k in PUSH_FIELDS if k in data}
     st["todos"] = steps
@@ -316,7 +350,18 @@ def cmd_push(args) -> int:
     yours), `--dry-run` writes nothing at all, `--quiet` prints nothing, and anything that is
     not an object with a list of steps is refused with the state left alone.
     """
-    raw = sys.stdin.read()
+    # Bounded read: one byte past the cap is enough to know it was broken, and reading the
+    # whole thing first is exactly the denial-of-service the cap exists to refuse.
+    stream = getattr(sys.stdin, "buffer", sys.stdin)
+    chunk = stream.read(PUSH_MAX_BYTES + 1)
+    if isinstance(chunk, bytes):
+        oversize, raw = len(chunk) > PUSH_MAX_BYTES, chunk.decode("utf-8", "replace")
+    else:
+        oversize, raw = len(chunk) > PUSH_MAX_BYTES, chunk
+    if oversize:
+        print(f"fbtodo push: stdin is larger than {PUSH_MAX_BYTES} bytes — refused",
+              file=sys.stderr)
+        return EX_CODES["dataerr"]
     if not raw.strip():
         print("fbtodo push: nothing on stdin — expected a state JSON (see docs/SOURCES.md)",
               file=sys.stderr)
@@ -2121,6 +2166,18 @@ def main(argv=None) -> int:
         # looks alive every second.
         args.interval = 5.0
     os.makedirs(SCRATCH, mode=0o700, exist_ok=True)
+    # A `file:PATH` state is an ingress like push, so the same caps apply and a payload over
+    # one is the same data error (65), not a state the pane is asked to draw. A file that is
+    # simply absent is left to the source's own "no state file" answer.
+    spath = source_path(args.source)
+    if spath:
+        fstate = read_json(state_file_in(spath), None)
+        if fstate is not None:
+            try:
+                check_ingress(fstate)
+            except ValueError as exc:
+                print(f"fbtodo: {state_file_in(spath)}: {exc}", file=sys.stderr)
+                return EX_CODES["dataerr"]
 
     if args.command == "push":
         return cmd_push(args)
