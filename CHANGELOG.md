@@ -86,13 +86,20 @@ Entries start at the newest release; each one is a contract change, not a diff.
   The prefix is required: `-s some/dir` stays the usage error it has always been, and any
   unknown `-s` value now exits `64` rather than being rejected by argparse.
 - The README's demo is **recorded, not drawn**: two clips of the real pane reading the
-  `docs/demo/fixture` transcript — [`demo.gif`](docs/demo/demo.gif) (~990×354, ~21 s) for the pane
-  on its own, and [`side-by-side.gif`](docs/demo/side-by-side.gif) (~1396×352, ~18 s) for the pane
+  `docs/demo/fixture` transcript — [`demo.gif`](docs/demo/demo.gif) (~1920×700, ~21 s) for the pane
+  on its own, and [`side-by-side.gif`](docs/demo/side-by-side.gif) (~1920×456, ~18 s) for the pane
   beside the scripted session that writes the list — with both as MP4s and three stills.
   `docs/demo/record.sh` reproduces all of it from the two tapes in one command, and each frame is
   trimmed to the box the pane actually drew ([`frame.py`](docs/demo/frame.py) measures it, because
-  a frame short enough to have no empty row under the box is a frame that collapses the list). The
-  GIFs and stills are derived from the trimmed master, never the other way round.
+  a frame short enough to have no empty row under the box is a frame that collapses the list) and
+  then scaled to exactly 1920 px wide, so the clips are full-HD across at the height the pane
+  needs. The GIFs and stills are derived from the trimmed master, never the other way round.
+- The demo clips **show the tool, not the shell that started it**: both tapes open on a cleared
+  screen, so the `cd`, the `export`s and the long `fbtodo pane` line stay inside the tape's `Hide`
+  block and never reach a published frame. The pairing's tmux server is started with `-f /dev/null`
+  for the same reason — a `pane-border-status` from the recorder's own tmux config would otherwise
+  print `#{pane_current_path}` above each pane, which is a `/Users/…` line in every frame of the
+  clip.
 - Docs: [docs/SOURCES.md](docs/SOURCES.md) (every way a list can arrive),
   [docs/ESTIMATES.md](docs/ESTIMATES.md) (the estimator's methodology, moved out of the README),
   [docs/SETTINGS.md](docs/SETTINGS.md) (the variable and exit-code reference),

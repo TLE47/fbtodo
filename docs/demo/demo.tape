@@ -5,9 +5,12 @@
 #
 # This tape writes the MP4, in full colour and at the frame size the pane actually needs;
 # record.sh derives the GIF and the stills from it, so the GIF never has to be good enough to
-# be the source of anything. The geometry matters and is worth keeping honest: the font is big
-# enough to read at README width, and the height is the pane's own height plus the padding —
-# a taller frame is mostly empty terminal, which is what the first recording wasted.
+# be the source of anything. The geometry matters and is worth keeping honest: it is recorded a
+# little wider than 1920 so that, once trimmed to the pane's box, record.sh can bring it to
+# exactly 1920 px wide (`scale=1920:-2`) — 1080p-class, and just as readable when GitHub shows it
+# at README width. The font is scaled to match the wider viewport so the pane still gets the same
+# number of columns, and the height is the pane's own height plus the padding — a taller frame is
+# mostly empty terminal, which is what the first recording wasted.
 #
 # What is on screen is the real tool: `fbtodo pane` rendering the fixture journal in
 # docs/demo/fixture, while drive.sh replays a scripted session into that same file. Nothing
@@ -19,9 +22,9 @@ Output docs/demo/.demo-raw.mp4
 
 Set Shell bash
 Set FontFamily "Menlo"
-Set FontSize 16
-Set Width 1000
-Set Height 398
+Set FontSize 32
+Set Width 1970
+Set Height 800
 Set Padding 16
 Set Margin 0
 Set Framerate 20
@@ -47,10 +50,13 @@ Sleep 400ms
 Type "docs/demo/drive.sh &"
 Enter
 Sleep 600ms
-Show
-
-Type "fbtodo pane --no-daemon --chat docs/demo/fixture -i 0.5 --tick 0.5 --stale-after 0"
+# Start the pane on a cleared screen. `clear` wipes everything above it — including the line that
+# started it, and the setup before that — so the recording opens on the box, not on a shell full
+# of export statements. The sleep is the pane's first paint; `Show` lands on a drawn box.
+Type "clear && fbtodo pane --no-daemon --chat docs/demo/fixture -i 0.5 --tick 0.5 --stale-after 0"
 Enter
+Sleep 1200ms
+Show
 
 # Long enough to watch the bar fill and the bell's pair arrive: the driver ticks steps 4, 5,
 # 6 and then the last two with the turn ended.

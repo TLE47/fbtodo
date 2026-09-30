@@ -25,18 +25,23 @@ PANE_COLUMNS=${DEMO_PANE_COLUMNS:-85}
 # pace history, the two log paths keep your own notifier log off the screen, and the five /none
 # watches keep a recorded demo from ringing anybody's phone.
 #
-# Both panes are addressed by the id tmux prints for them rather than by `session:window.pane`:
-# a window index is whatever the machine's tmux config says it is (oh-my-tmux's `base-index 1`
-# makes the first window 1, not 0), and a recording should not depend on whose dotfiles ran.
+# `-f /dev/null` starts the server with tmux's own defaults and none of the machine's config: a
+# recording should not depend on whose dotfiles ran. It is not just tidiness. A config that turns
+# `pane-border-status` on (oh-my-tmux's does) paints a border above every pane, and its usual
+# format is `#{pane_current_path}` — so the clip would open on a row reading
+# `/Users/someone/Projects/fbtodo` above each pane, which is exactly the "terminal command" a demo
+# should not show. Both panes are also addressed by the id tmux prints for them rather than by
+# `session:window.pane`: a window index is whatever the config says it is (oh-my-tmux's
+# `base-index 1` makes the first window 1, not 0).
 tmux -L "$SOCK" kill-server 2>/dev/null || true
-left=$(tmux -L "$SOCK" new-session -d -s pair -c "$ROOT" -P -F '#{pane_id}' \
+left=$(tmux -L "$SOCK" -f /dev/null new-session -d -s pair -c "$ROOT" -P -F '#{pane_id}' \
     -e FBTODO_HOME=/tmp/fbtodo-demo \
     -e FBTODO_PATCH_LOG="$FIXTURE/patch.log" \
     -e FBTODO_ALERT_LOG="$FIXTURE/phone.log" \
     -e FBTODO_NOTIFY=/none -e FBTODO_DROP=/none -e FBTODO_ASK=/none \
     -e FBTODO_PAUSE=/none -e FBTODO_PANE_BELL=/none \
     -e DEMO_NARRATE=1 -e DEMO_STEP_SECONDS="${DEMO_STEP_SECONDS:-3.5}" \
-    "sh $HERE/drive.sh; sleep 30")
+    "printf '\\033[2J\\033[H'; sh $HERE/drive.sh; sleep 30")
 
 # No status bar: the boxes are the only chrome the clip needs, and the bar would cost a row of
 # the pane's own height.
@@ -52,6 +57,12 @@ tmux -L "$SOCK" select-pane -t "$left"
 # refuses to start ("open terminal failed: not a terminal"). So the attach is the foreground job.
 ( sleep "$UP"; tmux -L "$SOCK" kill-server 2>/dev/null || true ) &
 
+# Wipe the shell (and the line that started this script) off the screen before attaching, so a slow
+# attach cannot leave a command visible in the first frames of the recording. This is `clear` and
+# not `printf '\033[2J\033[H'` on purpose: vhs's terminal wants the whole thing gone, and it is
+# `clear`'s extra `\033[3J` (erase scrollback) that takes the old prompt with it. With the plain
+# two-sequence version the prompt survives above the tmux window in the recording.
+clear
 tmux -L "$SOCK" attach -t pair
 
 tmux -L "$SOCK" kill-server 2>/dev/null || true

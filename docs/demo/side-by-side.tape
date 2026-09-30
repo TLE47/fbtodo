@@ -9,16 +9,16 @@
 # own, reading the journal the left pane writes.
 #
 # The width is spent on two panes rather than one, so the font is a step smaller than the
-# pane-only demo's; record.sh trims the frame to the boxes afterwards, so neither clip ends in a
-# band of empty terminal.
+# pane-only demo's; record.sh trims the frame to the boxes afterwards and brings it to exactly
+# 1920 px wide, so neither clip ends in a band of empty terminal.
 
 Output docs/demo/.side-by-side-raw.mp4
 
 Set Shell bash
 Set FontFamily "Menlo"
-Set FontSize 15
-Set Width 1400
-Set Height 400
+Set FontSize 21
+Set Width 1940
+Set Height 560
 Set Padding 16
 Set Margin 0
 Set Framerate 20
@@ -29,11 +29,12 @@ Hide
 Type "cd $(git rev-parse --show-toplevel)"
 Enter
 Sleep 200ms
-# The script brings up the window and attaches to it; the sleep is the time that takes, so the
-# recording starts on the two panes rather than on the commands that made them.
+# The script brings up the window, clears the shell off the screen and attaches; the sleep is the
+# time that takes plus the panes' first paint, so the recording opens on the two boxes rather than
+# on the commands that made them.
 Type "docs/demo/side-by-side.sh"
 Enter
-Sleep 1600ms
+Sleep 2600ms
 Show
 
 # Long enough for all four ticks (3.5 s apart) and the last pair; the window is taken down after

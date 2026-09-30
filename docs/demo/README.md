@@ -6,10 +6,10 @@ it is following.
 
 | File | What it is |
 |---|---|
-| [`demo.gif`](demo.gif) | the pane-only clip: ~990×354, ~21 s, ~0.5 MB, rendered inline by GitHub |
+| [`demo.gif`](demo.gif) | the pane-only clip: ~1920×700, ~21 s, ~1.1 MB, rendered inline by GitHub |
 | [`demo.mp4`](demo.mp4) | the same frames, full colour, for a real player |
 | [`demo-start.png`](demo-start.png) · [`demo-mid.png`](demo-mid.png) · [`demo-done.png`](demo-done.png) | three stills from it ([below](#the-stills)) |
-| [`side-by-side.gif`](side-by-side.gif) · [`side-by-side.mp4`](side-by-side.mp4) | the pairing: the scripted session and the pane in one window — ~1396×352, ~18 s ([below](#the-pairing)) |
+| [`side-by-side.gif`](side-by-side.gif) · [`side-by-side.mp4`](side-by-side.mp4) | the pairing: the scripted session and the pane in one window — ~1920×456, ~18 s ([below](#the-pairing)) |
 | [`demo.tape`](demo.tape) · [`side-by-side.tape`](side-by-side.tape) | the two [vhs](https://github.com/charmbracelet/vhs) scripts |
 | [`record.sh`](record.sh) | `brew install vhs` then `docs/demo/record.sh` → everything above |
 | [`drive.sh`](drive.sh) | replays a scripted session into the fixture (~20 s; `DEMO_NARRATE=1` prints each step as it is ticked) |
@@ -25,9 +25,15 @@ docs/demo/record.sh             # -> both clips, both GIFs, the three stills
 ```
 
 Each tape writes a raw MP4; `record.sh` then trims the frame to the pane's own box (see [The
-frame](#the-frame)) and everything published is derived from that trimmed master. The GIF's 256
-colours therefore cannot cost the video anything, and the video's colour depth cannot make a GIF
-band.
+frame](#the-frame)), brings it to exactly 1920 px wide, and everything published is derived from
+that trimmed master. The GIF's 256 colours therefore cannot cost the video anything, and the
+video's colour depth cannot make a GIF band.
+
+The tapes are recorded a little wider than 1920, so that trim is a small downscale and never a
+blur, and the height is whatever the box needs rather than 1080 rows of background: the clip is
+full-HD *width* — what "1080p" means for a terminal recording — and only as tall as the pane. The
+GIFs are decimated to 10 fps, which the pane's twice-a-second repaint makes invisible and the file
+size very visible.
 
 The tape points `FBTODO_HOME` at a scratch directory (`/tmp/fbtodo-demo`) on purpose: the
 driver's synthetic steps would otherwise be remembered as this project's pace history and
@@ -35,9 +41,16 @@ skew the real estimates. It also points `FBTODO_PATCH_LOG` and `FBTODO_ALERT_LOG
 fixture logs — without that, those two rows would read **your** notifier log, and your own
 name or handle would be published in the GIF.
 
+Both clips open on a cleared screen, which is worth keeping: the pane draws inside a terminal that
+would otherwise still be showing the shell that started it. `demo.tape` runs the pane as
+`clear && fbtodo pane …` and shows only after its first paint; `side-by-side.sh` clears before it
+attaches. In both cases the setup — the `cd`, the `export`s, the long `fbtodo pane` line — happens
+inside the tape's `Hide` block and is wiped before `Show`, so no shell command survives into the
+recording.
+
 ## The stills
 
-The three PNGs are frames of the master — ~990×354, full colour — so they show the pane exactly as
+The three PNGs are frames of the master — ~1920×700, full colour — so they show the pane exactly as
 the animation does, only still.
 
 ![the pane one step in](demo-start.png)
@@ -66,6 +79,12 @@ pane shows — the same eight, written to the fixture and read out of it a momen
 down after ~22 s whether or not anything detached — which is why nothing is left running if a
 recording ends mid-attach.
 
+It also starts that server with `-f /dev/null`, so none of the machine's own tmux config reaches the
+clip. That is not tidiness: a config with `pane-border-status on` (oh-my-tmux's is) paints a border
+above every pane whose usual format is `#{pane_current_path}`, so the recording would open on a row
+reading `/Users/someone/Projects/fbtodo` above each pane — a line of machine-specific path that
+looks exactly like a command nobody wants to see.
+
 ## The frame
 
 Both tapes are trimmed before they are published, and the crop is measured rather than guessed:
@@ -83,8 +102,9 @@ hides steps — which is what the first recording of this demo did.
 `frame.py` takes the union of the ink's bounding box over three frames of the clip (a second in,
 mid-list and the last), adds the tapes' padding, and rounds the size down to even numbers. The
 union is what keeps one state of the pane from being cropped by another's measurement, and the same
-box trims the width, since the box is centred in the tape's padding. `record.sh` applies the
-result to the raw recording and derives everything else from the trimmed master.
+box trims the width, since the box is centred in the tape's padding. `record.sh` applies the result
+to the raw recording, scales the trimmed frame to 1920 px wide (`scale=1920:-2`), and derives
+everything else from that master.
 
 ## Watch it without vhs
 

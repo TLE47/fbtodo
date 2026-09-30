@@ -44,24 +44,30 @@ fi
 # The pane draws its box two rows shorter than the terminal — the last rows belong to the shell it
 # sits over — and it collapses a long list rather than overflow a short terminal, so an untrimmed
 # frame ends in a band of empty terminal under the box. Each recording is therefore trimmed to the
-# box it actually drew, which frame.py measures; the padding is the tapes' own `Set Padding`.
+# box it actually drew, which frame.py measures; the padding is the tapes' own `Set Padding`. The
+# trimmed master is then brought to exactly WIDTH px across (the tapes record a little wider, so
+# this is a small downscale and never a blur), which is what "1080p-class" means for a terminal
+# clip: full HD width, and the height the box actually needs rather than 1080 rows of background.
 PADDING=16
+WIDTH=1920
 
 cd "$ROOT"
 
 # ---- the pane-only demo: the real renderer, reading the fixture
 vhs "$HERE/demo.tape"
 FRAME_DEMO=$(python3 "$HERE/frame.py" "$HERE/.demo-raw.mp4" "$PADDING")
-ffmpeg -v error -y -i "$HERE/.demo-raw.mp4" -vf "crop=$FRAME_DEMO" -pix_fmt yuv420p -crf 18 \
-    -movflags +faststart "$HERE/demo.mp4"
+ffmpeg -v error -y -i "$HERE/.demo-raw.mp4" -vf "crop=$FRAME_DEMO,scale=$WIDTH:-2" \
+    -pix_fmt yuv420p -crf 18 -movflags +faststart "$HERE/demo.mp4"
 rm -f "$HERE/.demo-raw.mp4"
 printf 'wrote %s (framed %s)\n' "docs/demo/demo.mp4" "$FRAME_DEMO"
 
 # The GIF is a palette reduction of the master: a two-pass palette built from the frames themselves
 # (`stats_mode=diff`, because only the list is moving), and bayer dithering kept at its finest
-# setting so the dark UI stays flat instead of noisy.
+# setting so the dark UI stays flat instead of noisy. It is decimated to 10 fps first — the pane
+# repaints twice a second, so the video's 20 fps buys the GIF nothing and costs it megabytes at
+# 1920 px wide.
 ffmpeg -v error -y -i "$HERE/demo.mp4" \
-    -vf "split[a][b];[a]palettegen=max_colors=256:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5" \
+    -vf "fps=10,split[a][b];[a]palettegen=max_colors=256:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5" \
     -loop 0 "$HERE/demo.gif"
 printf 'wrote %s\n' "docs/demo/demo.gif"
 
@@ -80,12 +86,12 @@ vhs "$HERE/side-by-side.tape"
 # recording that ended before that script's own timer did.
 tmux -L demo-pair kill-server 2>/dev/null || true
 FRAME_PAIR=$(python3 "$HERE/frame.py" "$HERE/.side-by-side-raw.mp4" "$PADDING")
-ffmpeg -v error -y -i "$HERE/.side-by-side-raw.mp4" -vf "crop=$FRAME_PAIR" -pix_fmt yuv420p \
-    -crf 18 -movflags +faststart "$HERE/side-by-side.mp4"
+ffmpeg -v error -y -i "$HERE/.side-by-side-raw.mp4" -vf "crop=$FRAME_PAIR,scale=$WIDTH:-2" \
+    -pix_fmt yuv420p -crf 18 -movflags +faststart "$HERE/side-by-side.mp4"
 rm -f "$HERE/.side-by-side-raw.mp4"
 printf 'wrote %s (framed %s)\n' "docs/demo/side-by-side.mp4" "$FRAME_PAIR"
 
 ffmpeg -v error -y -i "$HERE/side-by-side.mp4" \
-    -vf "split[a][b];[a]palettegen=max_colors=256:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5" \
+    -vf "fps=10,split[a][b];[a]palettegen=max_colors=256:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5" \
     -loop 0 "$HERE/side-by-side.gif"
 printf 'wrote %s\n' "docs/demo/side-by-side.gif"
