@@ -64,6 +64,19 @@ fbtodo                           # opens the pane automatically
 
 That's it. Requirements: **Python 3.9+** and **tmux**.
 
+### Install with pipx (no clone to manage)
+
+If you would rather not keep a checkout on your PATH, install it as an isolated app:
+
+```sh
+pipx install git+https://github.com/TLE47/fbtodo
+```
+
+[pipx](https://pipx.pypa.io) builds `fbtodo` in its own virtualenv and puts the console
+script on your PATH; update it later with `pipx install --force git+https://github.com/TLE47/fbtodo`,
+or pin a tag with `pipx install "git+https://github.com/TLE47/fbtodo@4.29.0"`. The package has no
+runtime dependencies, but the pane still needs **tmux** (`brew install tmux`).
+
 ### Using the `fb` shortcut (optional)
 
 For a one-word launcher that updates and manages everything:

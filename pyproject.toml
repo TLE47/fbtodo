@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fbtodo"
+description = "Watch your coding agent work — its checklist, live, in a pane beside it."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "TLE47" }]
+keywords = ["todos", "agent", "tmux", "pane", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Topic :: Terminals",
+]
+# The version is the `VERSION` constant in `fbtodo/base.py`, read statically at build time, so
+# there is one source of truth rather than a second number to keep in step.
+dynamic = ["version"]
+
+[project.scripts]
+fbtodo = "fbtodo:main"
+
+[project.urls]
+Homepage = "https://github.com/TLE47/fbtodo"
+Repository = "https://github.com/TLE47/fbtodo"
+Changelog = "https://github.com/TLE47/fbtodo/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.dynamic]
+version = { attr = "fbtodo.base.VERSION" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

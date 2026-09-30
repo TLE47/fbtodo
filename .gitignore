@@ -3,6 +3,11 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Packaging artifacts, if a build is run in the checkout
+build/
+dist/
+*.egg-info/
+
 # fbtodo's scratch dir, if FBTODO_HOME is pointed inside the repo
 .freebuff/
 fbtodo-*.json

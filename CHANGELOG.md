@@ -72,6 +72,10 @@ Entries start at the newest release; each one is a contract change, not a diff.
   global in the self-check answer exactly as before.
 
 ### Added
+- `fbtodo` is **packagable**: a `pyproject.toml` (src layout, a `fbtodo` console script →
+  `fbtodo:main`, `requires-python >=3.9`, and the version read from `base.VERSION` rather than a
+  second number to keep in step) makes `pipx install git+https://github.com/TLE47/fbtodo` a
+  first-class way in, with no clone on `PATH`. The zero-install launcher is unchanged.
 - The self-check's static read of the package now also refuses a **captured state path**: no
   function default or module-level expression outside `base.py` may read `SCRATCH`, `STATE_PATH`,
   `TASKS_PATH`, `LOCK_PATH`, `LOG_PATH`, `NAS_LOCK_PATH`, `PANE_KEEPER_PATH`, `PANE_LOG_PATH`,
