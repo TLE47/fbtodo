@@ -98,6 +98,51 @@ class CliSource(Source):
         return {"backend": None, "todos": [], "error": "no CLI chat for this directory"}
 
 
+class FileSource(Source):
+    """A state JSON on disk: the generic source, for anything that can write one file.
+
+    Nothing here watches a journal or a process. A file either holds a state or it does not,
+    so `find` is a read and `describe` is the mapping — which is the whole point: any agent,
+    any script, any hand-typed JSON can drive the pane through `fbtodo push`, and the same
+    state comes back through `-s file:PATH`. The state inside is taken at its word, including
+    the list number it recorded; this is a RE-player, not a re-numberer.
+    """
+
+    name = "file"
+    backend = "file"
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def find(self, args, cwd: str):
+        st = read_json(self.path, None)
+        return st if isinstance(st, dict) else None
+
+    def describe(self, args, cwd: str, ob: dict) -> dict:
+        st = dict(ob)
+        todos = st.get("todos") or []
+        st.update({
+            "backend": "file",
+            "target": self.path,
+            "todos": todos,
+            "source": "state-file",
+            # There is no process behind a file to outlive the pane, so nothing here may read
+            # as "the session went away": the file's own mtime is the only clock there is.
+            "instance_alive": True,
+            "store_mtime_ms": store_mtime_ms(self.path, "file"),
+            "source_updated_ms": st.get("ts") or st.get("source_updated_ms"),
+        })
+        if todos and not st.get("list_version"):
+            # A recorded list with no number on it is that list's first. Saying so here keeps
+            # `adopt_version` from borrowing a live watcher's counter for a file it never saw.
+            st["list_version"] = 1
+        return st
+
+    def miss(self) -> dict:
+        return {"backend": "file", "todos": [],
+                "error": f"no state file at {self.path}"}
+
+
 class DesktopSource(Source):
     """The desktop app's conversation DB: one sqlite store, one thread."""
 
@@ -208,11 +253,47 @@ SOURCE_ORDER = {
     "cli": ("cli",),
     "desktop": ("desktop",),
     "nas": ("nas",),
+    "file": ("file",),
 }
+
+# `-s file:PATH` names a path rather than a mode, so it is a prefix rather than a word. The
+# prefix is required: `-s some/dir` must keep failing as the usage error it has always been
+# instead of quietly reading a file the caller did not name.
+FILE_SOURCE_PREFIX = "file:"
+
+
+def source_path(value: str | None) -> str | None:
+    """The path in a `file:PATH` source, or None when the value is not one."""
+    text = str(value or "")
+    if not text.startswith(FILE_SOURCE_PREFIX):
+        return None
+    return text[len(FILE_SOURCE_PREFIX):] or None
+
+
+def source_kind(value: str | None) -> str:
+    """What `-s` MEANS, without its path: `file` for `file:PATH`, else the word itself.
+
+    A state's `backend` is a word, so anything comparing the two has to compare like with
+    like: `state_matches_request` asking whether a cached state answers `file:/tmp/s.json`
+    would never match the `file` a watcher wrote.
+    """
+    return "file" if source_path(value) else str(value or "auto")
+
+
+def state_file_in(path: str) -> str:
+    """The file a `file:` source names, expanding a directory to the state inside it.
+
+    So `-s file:$FBTODO_HOME` reads that home's own state — the one a run with that home
+    writes — and `-s file:/path/state.json` reads exactly that file.
+    """
+    return os.path.join(path, STATE_FILE_NAME) if os.path.isdir(path) else path
 
 
 def sources_for(args) -> tuple:
     """The sources `args.source` asks for, in the order they are asked."""
+    path = source_path(getattr(args, "source", None))
+    if path is not None:
+        return (FileSource(state_file_in(path)),)
     return tuple(SOURCES[name] for name in SOURCE_ORDER.get(args.source, ("cli", "desktop")))
 
 
@@ -272,6 +353,7 @@ def store_mtime_ms(target: str | None, backend: str | None) -> int | None:
 
 
 __all__ = [
-    "Source", "CliSource", "DesktopSource", "NasSource", "SOURCE_CLASSES", "SOURCES",
-    "SOURCE_ORDER", "sources_for", "snapshot", "_snapshot", "store_mtime_ms",
+    "Source", "CliSource", "DesktopSource", "NasSource", "FileSource", "SOURCE_CLASSES",
+    "SOURCES", "SOURCE_ORDER", "FILE_SOURCE_PREFIX", "source_path", "source_kind",
+    "state_file_in", "sources_for", "snapshot", "_snapshot", "store_mtime_ms",
 ]

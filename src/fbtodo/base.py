@@ -143,7 +143,8 @@ def _state_root():
 SCRATCH, STATE_NOTE = _state_root()
 
 
-STATE_PATH = os.path.join(SCRATCH, "fbtodo-state.json")
+STATE_FILE_NAME = "fbtodo-state.json"
+STATE_PATH = os.path.join(SCRATCH, STATE_FILE_NAME)
 
 
 # The task log is two files. The stream is the evidence store — one JSON object per line,
@@ -781,7 +782,10 @@ REFIT_MIN_DECIDED = 78
 EX_CODES = {
     "ok": 0,
     "usage": 2,
+    "ex_usage": 64,
+    "dataerr": 65,
     "nofile": 66,
+    "noinput": 66,
     "cantcreat": 73,
     "ioerr": 74,
     "tempfail": 75,
@@ -1394,6 +1398,7 @@ def state_is_fresh(state: dict | None, max_age: float = HEARTBEAT_GRACE) -> bool
 __all__ = [
     "VERSION", "HOME", "LEGACY_SCRATCH", "STATE_DIR", "LEGACY_NAMES", "LEGACY_CLAIMS",
     "_claim_live", "_legacy_claim_live", "_state_root", "SCRATCH", "STATE_NOTE", "STATE_PATH",
+    "STATE_FILE_NAME",
     "TASKS_PATH", "events_path", "self_argv", "LOCK_PATH", "LOG_PATH", "NAS_LOCK_PATH",
     "PANE_KEEPER_PATH", "PANE_LOG_PATH", "PINS_PATH", "LAST_PATH", "NAS_STATE_PATH",
     "NAS_LOG_PATH", "NAS_NOTIFY", "DROP_NOTIFY", "ASK_NOTIFY", "PAUSE_NOTIFY", "PANE_NOTIFY",

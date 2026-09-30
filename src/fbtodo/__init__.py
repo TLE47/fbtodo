@@ -234,6 +234,115 @@ def finish_state(state: dict, prev: dict | None, claim_first: bool = False) -> d
     return state
 
 
+def finish_probe(state: dict) -> dict:
+    """`finish_state` for a one-shot probe, which may be reading a FILE.
+
+    A probe that read a file has that file's own list identity in hand, so the file is
+    compared with itself: renumbering it would let a recorded state say `#7` and the pane
+    print `#0`. A probe that read a journal or a database has no history and passes None,
+    borrowing the counter from the watcher (`adopt_version`).
+    """
+    if state.get("backend") == "file":
+        # The file states its own list number, so the comparison is the file with itself and
+        # nothing moves: the number it recorded is the number the pane prints, and a file that
+        # recorded none starts at the first (`1`), not at a borrowed watcher's counter.
+        recorded = state.get("list_version")
+        state["list_version"] = int(recorded) if recorded is not None else (
+            1 if state.get("todos") else 0)
+        state["list_id"] = list_fingerprint(state)
+        return finish_state(state, dict(state))
+    return adopt_version(finish_state(state, None))
+
+
+# ==================================================================== push
+# In plain words: the generic source. A journal, a database and an ssh session are the three
+# ways THIS machine finds a list; anything else — another agent, a script, a CI job, a hand
+# written file — can say what the list is in one JSON object. `fbtodo push` takes one on
+# stdin and makes it the live state, and `-s file:PATH` reads the same shape back. Neither
+# knows what a Freebuff is.
+PUSH_FIELDS = (
+    "session", "title", "summary", "goal", "goal_source", "now", "nudge", "todos",
+    "model", "turn_ended", "iteration", "list_id", "list_version", "ts",
+)
+
+
+def state_from_push(data: dict) -> dict:
+    """A pushed JSON object as a state the rest of the tool can read.
+
+    Only the fields a list is MADE of are taken — the steps, the goal, the session, and the
+    identity a pusher may carry over (`list_id`/`list_version`) — and everything else is
+    stamped here: the pusher does not need to know the tool's clock fields, and a pusher that
+    sent the whole object `fbtodo json` printed is not punished for the extra keys.
+    """
+    todos = data.get("todos")
+    if todos is None:
+        todos = []
+    if not isinstance(todos, list):
+        raise ValueError("todos must be a list")
+    steps = []
+    for t in todos:
+        if not isinstance(t, dict):
+            raise ValueError("every todo must be an object")
+        task = str(t.get("task") or "").strip()
+        if not task:
+            raise ValueError("a todo with no task text")
+        steps.append({"task": task, "completed": bool(t.get("completed"))})
+    now = int(time.time() * 1000)
+    st = {k: data[k] for k in PUSH_FIELDS if k in data}
+    st["todos"] = steps
+    st.update({
+        "ts": int(st.get("ts") or now),
+        "backend": "push",
+        "source": "push",
+        "status": "watching",
+        "tool_version": VERSION,
+        "heartbeat_ms": now,
+        "probed_ms": now,
+        "source_updated_ms": int(st.get("source_updated_ms") or st.get("ts") or now),
+    })
+    return st
+
+
+def cmd_push(args) -> int:
+    """Make a state JSON on stdin the live state, so anything can drive the pane.
+
+    The pushed object is normalized to the fields a list is made of and put through the same
+    `finish_state` a watched list goes through, so its counts, its session and its list number
+    are the tool's rather than the pusher's — a pusher that says `list_version: 9` gets 9 only
+    if it is the same list the state already held, and one that says nothing gets 1. `--to
+    PATH` writes that file instead of the live state (which is how the demo does not touch
+    yours), `--dry-run` writes nothing at all, `--quiet` prints nothing, and anything that is
+    not an object with a list of steps is refused with the state left alone.
+    """
+    raw = sys.stdin.read()
+    if not raw.strip():
+        print("fbtodo push: nothing on stdin — expected a state JSON (see docs/SOURCES.md)",
+              file=sys.stderr)
+        return EX_CODES["noinput"]
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        print(f"fbtodo push: stdin is not JSON: {exc}", file=sys.stderr)
+        return EX_CODES["dataerr"]
+    if not isinstance(data, dict):
+        print("fbtodo push: stdin must be a JSON object, not an array or a scalar",
+              file=sys.stderr)
+        return EX_CODES["dataerr"]
+    try:
+        state = state_from_push(data)
+    except ValueError as exc:
+        print(f"fbtodo push: {exc}", file=sys.stderr)
+        return EX_CODES["dataerr"]
+    target = getattr(args, "push_to", None) or STATE_PATH
+    state = finish_state(state, read_json(target, None), claim_first=True)
+    if not args.dry_run:
+        atomic_write_json(target, state)
+    if not args.quiet:
+        json.dump(state, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+    return 0
+
+
 def state_matches_request(state: dict | None, args) -> bool:
     """Is the cached watcher state an answer to THIS question?
 
@@ -248,7 +357,7 @@ def state_matches_request(state: dict | None, args) -> bool:
         return False
     if state.get("tool_version") != VERSION:
         return False
-    source = getattr(args, "source", "auto")
+    source = source_kind(getattr(args, "source", "auto"))
     return source == "auto" or (state.get("backend") or "") == source
 
 
@@ -1340,9 +1449,7 @@ def cmd_pane(args) -> int:
                     state = st
                     watching = st.get("daemon_pid") or daemon_pid()
                 else:
-                    state = adopt_version(
-                        finish_state(snapshot(args, cwd=cwd, instance_pid=inst), None)
-                    )
+                    state = finish_probe(snapshot(args, cwd=cwd, instance_pid=inst))
                     # No watcher is serving THIS request (that is why we snapshotted), so name
                     # one only if the cached state actually describes it: a `-s nas` pane was
                     # crediting the local CLI watcher for a remote session it never watched.
@@ -1443,7 +1550,7 @@ def c_stale_notice(color: bool, idle_s: float, limit_s: float) -> str:
 
 
 def cmd_snap(args) -> int:
-    state = adopt_version(finish_state(snapshot(args), None))
+    state = finish_probe(snapshot(args))
     if not state.get("error"):
         state = track_tasks(state)
     print(render(state, use_color(), width=width_of_default(), goal_lines=args.goal_lines))
@@ -1455,7 +1562,7 @@ def cmd_json(args) -> int:
     state = (
         st
         if state_is_fresh(st) and state_matches_request(st, args)
-        else adopt_version(finish_state(snapshot(args), None))
+        else finish_probe(snapshot(args))
     )
     if not state.get("error") and not state.get("task_times"):
         state = track_tasks(state)
@@ -1469,7 +1576,7 @@ def cmd_bar(args) -> int:
     state = (
         st
         if state_is_fresh(st) and state_matches_request(st, args)
-        else adopt_version(finish_state(snapshot(args), None))
+        else finish_probe(snapshot(args))
     )
     print(bar_text(state))
     return 0
@@ -1805,7 +1912,8 @@ def build_parser():
     )
     ap.add_argument("command", nargs="?", default="pane",
                     choices=["pane", "snap", "json", "bar", "daemon", "stop", "status",
-                             "prune", "nas", "pane-watch", "pin", "why", "ledger", "doctor"])
+                             "prune", "nas", "pane-watch", "pin", "why", "ledger", "doctor",
+                             "push"])
     ap.add_argument(
         "--label-floor", type=float, default=None, metavar="SEC",
         help="estimates: a finished span under SEC is not evidence — it sets no pace and "
@@ -1836,7 +1944,16 @@ def build_parser():
     ap.add_argument("-i", "--interval", type=float, default=1.0,
                     help="pane: seconds between polls (the clock repaints far more "
                          "often than this; 5s for -s nas)")
-    ap.add_argument("-s", "--source", default="auto", choices=["auto", "cli", "nas", "desktop"])
+    ap.add_argument(
+        "-s", "--source", default="auto", metavar="SOURCE",
+        help="where the list comes from: auto, cli, nas, desktop, or file:PATH (a state "
+             "JSON on disk, the same shape `fbtodo push` writes)",
+    )
+    ap.add_argument(
+        "--to", dest="push_to", metavar="PATH",
+        help="push: write this state file instead of the live state (the list a `-s file:PATH` "
+             "then reads back)",
+    )
     ap.add_argument(
         "--nas-host", default=NAS_HOST, metavar="USER@HOST",
         help="nas: ssh target holding the freebuff store (FBTODO_NAS; required for -s nas)",
@@ -1968,6 +2085,13 @@ def main(argv=None) -> int:
     # `set_estimate_knobs`): the env vars are read at import, and a flag beats them, as the
     # precedence promises.
     set_estimate_knobs(args.label_floor, args.blend_weight)
+    # `-s` is a word or a `file:PATH`, so the word set is checked here rather than by
+    # argparse's choices: a typo is the caller's usage error (64), and a `file:` prefix
+    # must reach `sources_for` instead of being rejected before it.
+    if args.source not in ("auto", "cli", "nas", "desktop") and not source_path(args.source):
+        print(f"fbtodo: unknown source {args.source!r} — expected auto, cli, nas, desktop, "
+              "or file:PATH", file=sys.stderr)
+        return EX_CODES["ex_usage"]
     if args.source == "nas" and args.interval <= 1.0:
         # One ssh per poll, and the pane no longer needs a poll to move its own numbers:
         # the clock and the "N ago" repaint locally (see the pane loop), so the store is
@@ -1976,6 +2100,8 @@ def main(argv=None) -> int:
         args.interval = 5.0
     os.makedirs(SCRATCH, mode=0o700, exist_ok=True)
 
+    if args.command == "push":
+        return cmd_push(args)
     if args.command == "pane":
         return cmd_pane(args)
     if args.command == "snap":
