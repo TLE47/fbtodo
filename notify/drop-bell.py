@@ -37,6 +37,8 @@ sets how often a `--watch` asks the pid; FREEBUFF_BELL / FREEBUFF_PHONE mute the
 of a report (read by bell.sh and phone.sh).
 """
 
+from __future__ import annotations
+
 import fcntl
 import json
 import os

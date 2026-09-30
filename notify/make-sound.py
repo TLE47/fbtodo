@@ -24,6 +24,8 @@ folders. Samples are 16-bit PCM in .sf2 and Vorbis in .sf3; ffmpeg decodes the
 latter when it is available.
 """
 
+from __future__ import annotations
+
 import argparse
 import array
 import glob

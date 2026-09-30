@@ -44,6 +44,8 @@ FREEBUFF_PHONE_SH points at a different sender (both tests).
 Exit: 0 decided · 78 the pane watcher is failing and there is nothing configured to send to.
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os

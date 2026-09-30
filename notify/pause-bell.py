@@ -37,6 +37,8 @@ the push (phone.sh) and FREEBUFF_PHONE_SH points at a different sender (tests).
 Exit: 0 decided · 78 the session has stopped and there is nothing configured to send to.
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os

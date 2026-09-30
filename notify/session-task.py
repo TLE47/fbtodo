@@ -15,6 +15,8 @@ usage: session-task.py <root-pid> [max-chars]
 Environment: FREEBUFF_PROJECTS_DIR overrides the sessions root (used by tests).
 """
 
+from __future__ import annotations
+
 import glob
 import json
 import os

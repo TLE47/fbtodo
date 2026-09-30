@@ -39,6 +39,8 @@ FREEBUFF_BELL=off mutes the chime (bell.sh); FREEBUFF_PHONE=off mutes the push
 NAS side; FREEBUFF_PHONE_SH points at a different sender (tests).
 """
 
+from __future__ import annotations
+
 import json
 import os
 import shutil

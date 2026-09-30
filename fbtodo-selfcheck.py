@@ -10,6 +10,8 @@ The suite drives real tmux servers it starts itself and takes ~90-160 s. It clea
 up only that one directory — created by this script, verified by path — never a
 parent.
 """
+from __future__ import annotations
+
 import ast
 import builtins
 import importlib

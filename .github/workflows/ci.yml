@@ -49,10 +49,34 @@ jobs:
           python3 fbtodo doctor || true
 
       - name: self-check
-        run: python3 fbtodo-selfcheck.py
+        run: |
+          set +e
+          python3 fbtodo-selfcheck.py 2>&1 | tee selfcheck.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            {
+              echo '### self-check failed — last 80 lines'
+              echo '```'
+              tail -n 80 selfcheck.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$rc"
 
       - name: notify suite
-        run: bash notify/test-freebuff-notify.sh
+        run: |
+          set +e
+          bash notify/test-freebuff-notify.sh 2>&1 | tee notify.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            {
+              echo '### notify suite failed — last 80 lines'
+              echo '```'
+              tail -n 80 notify.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$rc"
 
   # Two ordinary conditions the main matrix masks. A Linux host with no `lsof` is every
   # container and busybox box: `/proc` answers cwd on its own there, and `doctor` must
@@ -94,10 +118,34 @@ jobs:
           python3 -c 'import json,sys; d=json.load(open("/tmp/doctor.json")); sys.exit(0 if d["fail"]==0 else 1)'
 
       - name: self-check
-        run: python3 fbtodo-selfcheck.py
+        run: |
+          set +e
+          python3 fbtodo-selfcheck.py 2>&1 | tee selfcheck.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            {
+              echo '### self-check failed — last 80 lines'
+              echo '```'
+              tail -n 80 selfcheck.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$rc"
 
       - name: notify suite
-        run: bash notify/test-freebuff-notify.sh
+        run: |
+          set +e
+          bash notify/test-freebuff-notify.sh 2>&1 | tee notify.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            {
+              echo '### notify suite failed — last 80 lines'
+              echo '```'
+              tail -n 80 notify.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$rc"
 
   c-locale:
     name: ubuntu · py3.x · LANG=C
@@ -124,7 +172,31 @@ jobs:
           python3 -c 'import sys; print("stdout encoding:", sys.stdout.encoding)'
 
       - name: self-check
-        run: python3 fbtodo-selfcheck.py
+        run: |
+          set +e
+          python3 fbtodo-selfcheck.py 2>&1 | tee selfcheck.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            {
+              echo '### self-check failed — last 80 lines'
+              echo '```'
+              tail -n 80 selfcheck.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$rc"
 
       - name: notify suite
-        run: bash notify/test-freebuff-notify.sh
+        run: |
+          set +e
+          bash notify/test-freebuff-notify.sh 2>&1 | tee notify.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            {
+              echo '### notify suite failed — last 80 lines'
+              echo '```'
+              tail -n 80 notify.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$rc"

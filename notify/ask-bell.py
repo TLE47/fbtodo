@@ -46,6 +46,8 @@ FREEBUFF_PHONE_SH points at a different sender (tests).
 Exit: 0 decided · 78 the question is up and there is nothing configured to send it to.
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
