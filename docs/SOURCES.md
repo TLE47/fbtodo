@@ -25,6 +25,23 @@ dropped immediately instead of lingering.
 `-s cli|desktop` is never answered from cached watcher state unless that state describes the
 same backend.
 
+### The desktop app's live threads
+
+The app can hold several threads on one project at once, each writing its own `write_todos`, so
+reading only the followed one would show a single list while the others worked unseen. `-s
+desktop` therefore reads the store's *other* live threads too and stacks them in the one pane:
+the followed thread first, then every open thread whose newest list is inside `--thread-live`
+minutes (default 90; `0` disables the window). `--threads N` (default 4) caps how many are shown,
+the followed one included, and `--threads 0` restores the single-list answer. A thread the owner
+has filed away — `status = closed`, or sitting in the sidebar archive — is never drawn, because a
+pane that kept showing it would be arguing with the sidebar.
+
+When only one thread qualifies, the `threads` key is left off the state entirely rather than set
+empty: a renderer tells "show one list" from "stack these" by its presence, so a single-list frame
+is byte-for-byte what it always was, and no other source changes shape. The other threads are a
+bonus on top of a list that has already been read, so a store this build cannot answer the second
+question about returns the first list rather than none.
+
 The instance to follow is found in this order:
 
 1. `--instance-of PID` — the agent process launched by that shell.

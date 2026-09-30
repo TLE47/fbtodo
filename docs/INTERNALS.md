@@ -106,6 +106,7 @@ fields that matter:
 | `goal`, `goal_source` | the agent's `Goal:` line and where it was found |
 | `now`, `nudge` | a newer request since the list was written; `nudge` when it is a continuation |
 | `todos` | the list, newest `write_todos` only — state is never merged |
+| `threads` | present **only** when the desktop store holds more than one live thread: `[{id, title, todos, current, running, source_updated_ms}]`, the followed thread first and marked `current`. `list_groups` reads it — or, with the key absent, makes one untitled group from `todos` — and a renderer with more than one group prints each thread's heading on its first step. The key is left off a single-thread answer rather than set empty, which is what keeps every other source, a single-list frame and the recorded goldens byte-identical |
 | `observed` | the newest calls the session actually made, `{verb, what, ts_ms}` newest first, capped at `ACTION_KEEP`. The second source: `write_todos` is the only *plan* in the transcript, so a model that skips it leaves `todos` empty — and the calls it did make are a fact, which is what the pane draws instead (`edited fbtodo · 2m ago`). Never a plan, so never a progress bar, an estimate or a tick |
 | `done`, `total`, `list_id`, `list_version` | progress, and the identity of *this* list |
 | `cleared`, `cleared_turn` | no list is drawn, and which drop caused it. `cleared` is a dropped list: a new session, or a **finished** list the next turn replaced. `cleared_turn` names the second and is what `no_list_reason` prints for it. A drop never touches `list_version` — the number identifies a list, and the new turn's list is what increments it |
@@ -311,6 +312,13 @@ guarantee behind them, and they are no-ops for a frame that already fits (`tests
 it: not one recorded row moved when they were added). Below 30 columns there is no room for a
 box, so the plain strip is drawn even on a colour terminal — the same rule that decides what
 `snap` prints.
+
+A frame can carry more than one list: `list_groups(state)` returns one group per thread (or a
+single untitled group when the state has only its own `todos`), and both renderers build one
+`plan` of `(group, index, todo, heading)` rows from it, printing a heading only when there is more
+than one group. The heading is added **after** the `TASK_MAX_LINES` cap — it costs no step's line
+— and the fit is anchored on the followed thread's current step, so stacking a second list cannot
+push the list the pane was pointed at out of view.
 
 ## Conventions worth keeping
 

@@ -43,6 +43,15 @@ Entries start at the newest release; each one is a contract change, not a diff.
   global in the self-check answer exactly as before.
 
 ### Added
+- The **desktop** source shows every live thread of a store at once. When more than one thread of
+  a project's `desktop-v2.db` carries a recent `write_todos`, the pane stacks them in one list,
+  each under its own heading with its own `done/total`. `--threads N` (default 4; `0` restores
+  the single-thread answer every earlier build gave) is how many are shown including the one
+  being followed, and `--thread-live MINUTES` (default 90; `0` for no window) is how quiet a
+  thread's own list may be and still count. Closed and sidebar-archived threads are never drawn,
+  the followed thread is always first and is read from the state's own list, and the `threads`
+  key is absent when only one qualifies — so a single-list frame is byte-identical to what it
+  was and no other source changes shape.
 - **`fbtodo push`** makes a state JSON on stdin the live state: the object is normalized to the
   fields a list is made of, put through the same `finish_state` a watched list goes through, and
   written where the readers look — so a script, a CI job, another agent or a hand-typed JSON
