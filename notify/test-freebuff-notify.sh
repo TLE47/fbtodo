@@ -922,6 +922,25 @@ check "the request file is cleaned up" \
 check_match "with bounded timeouts" "$(cat "$PCTL")" '^--max-time$'
 check_match "and curl's own retry of the transient classes" "$(cat "$PCTL")" '^--retry$'
 
+# A message that starts with `@` is DATA, not a path: curl's `-d @file` READS THE FILE and
+# posts its contents, so `@/etc/hostname` would have leaked the host's name to the topic.
+# `--data-raw` says "this is the body", and the body must arrive as the literal text. A CR
+# or LF in a header value is header injection, so the three header fields lose both first.
+raw_before=$(grep -c '^--data-raw$' "$PCTL")
+ph --title $'t\nX-Injected: yes' --message "@/etc/hostname" \
+  --tags $'a\nb' --priority $'default\nX-Evil: 1' >/dev/null 2>&1
+check "a message that starts with @ still sends" "$?" "0"
+check "the body is taken raw, not read from a file" \
+  "$(grep -c '^--data-raw$' "$PCTL")" "$((raw_before + 1))"
+check "the @ message is the literal request body" \
+  "$(grep -cxF '@/etc/hostname' "$PCTL")" "1"
+check "a newline in the title cannot inject a header" \
+  "$(grep -cx 'X-Injected: yes' "$PCTL")" "0"
+check "a newline in the tags cannot inject a header" \
+  "$(grep -cx 'b' "$PCTL")" "0"
+check "a newline in the priority cannot inject a header" \
+  "$(grep -cx 'X-Evil: 1' "$PCTL")" "0"
+
 n=$(pcalls)
 PH_CURL_CODE=500 ph --title t --message m >/dev/null 2>&1
 check "a 500 is reported as a failure" "$?" "69"

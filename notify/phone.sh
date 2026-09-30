@@ -76,6 +76,14 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# A header value is ONE line by construction. A CR or LF smuggled into --title/--tags/
+# --priority would let a caller inject a header of its own (or, if curl refuses it, drop the
+# notification entirely), so both are stripped here. The MESSAGE is the request body and
+# keeps its newlines.
+title=$(printf %s "$title" | tr -d '\r\n')
+priority=$(printf %s "$priority" | tr -d '\r\n')
+tags=$(printf %s "$tags" | tr -d '\r\n')
+
 # The mute switch, same shape as bell.sh's: environment, then a state file.
 enabled=on
 value=${FREEBUFF_PHONE:-}
@@ -331,7 +339,7 @@ set -- curl -sS -o "$dir/phone.reply" -w '%{http_code}' \
   --retry 3 --retry-delay 1 --retry-max-time 45 \
   --config "$tmp" \
   -H "Title: ${title:-freebuff}" -H "Priority: $priority" -H "Tags: $tags" \
-  -d "$message"
+  --data-raw "$message"
 
 if [ "$dry_run" = 1 ]; then
   printf 'would send: %s (url and any token from %s)\n' \
