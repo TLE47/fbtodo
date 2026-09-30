@@ -938,6 +938,71 @@ try:
         assert not unread, f"{_mod}.py reads names nothing provides: {unread}"
     say("the package: every module's globals are provided for by its own layers: ok")
 
+    # ---- ...and no module may CAPTURE one of the state paths at import time. `base` picks the
+    #      root at import (`SCRATCH` and the paths derived from it), and `init_state_root` may
+    #      move it by the time the first command runs, so a function default or a module-level
+    #      expression that reads one of these names freezes the path this process started with —
+    #      the pane and the daemon would then disagree about where the state lives. Only `base`,
+    #      which owns them, may hold them.
+    state_path_names = {
+        "SCRATCH", "STATE_PATH", "TASKS_PATH", "LOCK_PATH", "LOG_PATH", "NAS_LOCK_PATH",
+        "PANE_KEEPER_PATH", "PANE_LOG_PATH", "PINS_PATH", "LAST_PATH", "NAS_STATE_PATH",
+        "NAS_LOG_PATH",
+    }
+
+    def _import_time_names(node) -> list:
+        """The `Load` names a top-level statement reads when the module is imported.
+
+        Descends through everything a `def`/`class` evaluates immediately — its defaults,
+        decorators and bases (and, for a class, its body) — but not into a function body,
+        which runs later, when the name is read afresh from `base`.
+        """
+        found = []
+
+        def walk(n):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                for d in [*n.args.defaults, *[x for x in n.args.kw_defaults if x]]:
+                    walk(d)
+                for dec in n.decorator_list:
+                    walk(dec)
+                return
+            if isinstance(n, ast.ClassDef):
+                for dec in n.decorator_list:
+                    walk(dec)
+                for base in n.bases:
+                    walk(base)
+                for kw in n.keywords:
+                    walk(kw.value)
+                for stmt in n.body:      # a class body runs at import too
+                    walk(stmt)
+                return
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                found.append(n.id)
+            for child in ast.iter_child_nodes(n):
+                walk(child)
+
+        walk(node)
+        return found
+
+    for _mod, _tree in trees.items():
+        if _mod == "base":
+            continue
+        captured = set()
+        # a default is evaluated when its `def` runs — at import for a module-level def — so ANY
+        # default that reads a path name freezes it, however deeply the def is nested
+        for _node in ast.walk(_tree):
+            if isinstance(_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                for _d in [*_node.args.defaults, *[x for x in _node.args.kw_defaults if x]]:
+                    captured |= {n.id for n in ast.walk(_d) if isinstance(n, ast.Name)}
+        for _stmt in _tree.body:
+            captured |= set(_import_time_names(_stmt))
+        captured &= state_path_names
+        assert not captured, (
+            f"{_mod}.py captures a state path at import: {sorted(captured)} — read it through "
+            "base at call time, not into a default or a module global"
+        )
+    say("the package: no module freezes a state path into a default or a global: ok")
+
     # ---- how the program names itself back to itself. Every pane, the keeper and the daemon
     #      are re-invocations, so this must name something that RUNS. That is the launcher
     #      beside the package; a copy carrying the package without one has to fall back to the

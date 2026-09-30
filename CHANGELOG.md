@@ -72,6 +72,12 @@ Entries start at the newest release; each one is a contract change, not a diff.
   global in the self-check answer exactly as before.
 
 ### Added
+- The self-check's static read of the package now also refuses a **captured state path**: no
+  function default or module-level expression outside `base.py` may read `SCRATCH`, `STATE_PATH`,
+  `TASKS_PATH`, `LOCK_PATH`, `LOG_PATH`, `NAS_LOCK_PATH`, `PANE_KEEPER_PATH`, `PANE_LOG_PATH`,
+  `PINS_PATH`, `LAST_PATH`, `NAS_STATE_PATH` or `NAS_LOG_PATH`. `base` picks the root at import
+  and `init_state_root` may move it before the first command, so a frozen copy is how the pane
+  and the daemon come to disagree about where the state lives; every read must be at call time.
 - The **desktop** source shows every live thread of a store at once. When more than one thread of
   a project's `desktop-v2.db` carries a recent `write_todos`, the pane stacks them in one list,
   each under its own heading with its own `done/total`. `--threads N` (default 4; `0` restores

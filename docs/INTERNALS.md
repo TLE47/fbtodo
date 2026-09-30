@@ -57,6 +57,14 @@ A module's own imports are the promise it keeps: `from .scan import *` at the to
 package statically and fails if any module loads a name nothing under `fbtodo/` provides —
 which is what a forgotten layer looks like before the line that needs it ever runs.
 
+The same static read keeps the **state paths** from being captured at import: `base` chooses
+the root at import and `init_state_root` may move it before the first command, so a function
+default or a module-level expression outside `base` that reads `SCRATCH`, `STATE_PATH`,
+`TASKS_PATH`, `LOCK_PATH`, `LOG_PATH`, `NAS_LOCK_PATH`, `PANE_KEEPER_PATH`, `PANE_LOG_PATH`,
+`PINS_PATH`, `LAST_PATH`, `NAS_STATE_PATH` or `NAS_LOG_PATH` would freeze the path this process
+started with — the pane and the daemon disagreeing about where the state lives. Every read must
+happen at call time, through `base`'s namespace.
+
 `self_argv(here="")` is how the program re-invokes itself — the panes, the pane keeper, the
 NAS watcher, and the daemon re-execing itself in the foreground: `sys.executable` plus the
 **launcher**, never the asking file's own path, because a package's `__init__.py` run as a

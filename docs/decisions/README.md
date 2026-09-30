@@ -84,7 +84,10 @@ renderer's ANSI-stripper shadowed the prose one), the estimate knobs rebound by 
 `THEME_PROBLEMS` rebound by `read_theme`, a dropped `import shutil as _shutil` (the blocker keyed
 on the module name, the code read the alias), and `nas.py` missing the import that brought
 `_iso_ms`. A static AST check in the self-check now walks every module and asserts no global is
-loaded that nothing provided — which is how a future split fails fast instead of at runtime.
+loaded that nothing provided — which is how a future split fails fast instead of at runtime. A
+second AST check refuses the other import-time trap: a function default or module-level
+expression outside `base.py` that reads one of the state paths, which would freeze the root
+`init_state_root` is allowed to move.
 
 ## Limits
 
