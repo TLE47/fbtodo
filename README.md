@@ -36,11 +36,18 @@ Two commands and one habit. Only the pane needs tmux.
 brew install tmux                                       # macOS: `apt install tmux` on Debian/Ubuntu
 git clone https://github.com/TLE47/fbtodo ~/Projects/fbtodo
 mkdir -p ~/.local/bin && ln -sf ~/Projects/fbtodo/fbtodo ~/.local/bin/fbtodo
+. ~/Projects/fbtodo/examples/fb.sh                      # add to ~/.zshrc: `fb` = agent + pane
 
 tmux new -s work                                        # 1. a tmux session
-freebuff                                               # 2. your agent, in it
-# 3. a FBTODO pane opens next to it, on its own
+fb                                                      # 2. your agent, and its pane, in one word
+# 3. the FBTODO pane opens next to it, on its own
 ```
+
+**Use `fb`.** Sourcing [`examples/fb.sh`](examples/fb.sh) once in your shell startup file turns
+`fb` into the whole setup: it refreshes the agent, opens the pane beside the session it is about
+to start, then runs `freebuff` in the space you were already in. One word instead of three steps
+(`FREEBUFF_NO_REFRESH=1` skips the update round trip). Plain `freebuff` works too — the pane
+opens all the same.
 
 No config file, no hook, nothing to add to a prompt: fbtodo reads the todo list the agent
 **already keeps for itself**. You need **Python 3.9+** and **tmux**. The one thing worth doing
@@ -92,9 +99,10 @@ No `.cursorrules` snippet, no hook: if the agent is working through a list, the 
 so explicitly. **One self-contained Python file**, no dependencies (`export PATH="$HOME/.local/bin:$PATH"`
 if `fbtodo: command not found`).
 
-`fb` is an optional nickname: two letters that keep your agent updated, make room for the list,
-start the agent, and tidy up ([`examples/fb.sh`](examples/fb.sh)); by hand, `Ctrl-b "` then
-`fbtodo --instance-of $$`.
+**`fb` is the convenient way in** — two letters that keep your agent updated, make room for the
+list, start the agent, and tidy the pane away when the session ends
+([`examples/fb.sh`](examples/fb.sh), sourced once from your shell startup file). By hand, the
+same dance is `Ctrl-b "` then `fbtodo --instance-of $$`.
 
 ---
 
@@ -153,7 +161,8 @@ fbtodo pin --list                        # what is set, and where each half came
 ```
 
 Without a pin the pane is **remembered, not argued with**: the keeper records the size you drag
-it to and opens the next one that way (`FBTODO_SPLIT`, `FBTODO_PANE_SIZE`, default 12 lines). Any
+it to and opens the next one that way (`FBTODO_SPLIT` — `left`/`right`/`top`/`bottom`, or `h`/`v` —
+and `FBTODO_PANE_SIZE`, default 12 lines). Any
 other layout you arrange is a decision, not drift; to turn panes off: `FBTODO_NO_PANE=1`.
 
 ---
