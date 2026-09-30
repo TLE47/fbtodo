@@ -14,7 +14,7 @@
 │                                                                    │
 │   [█████▊░░░░░░░░░░░░░░]  29% (2/7) | EST REM 11m21s | ETA 12:09   │
 │  ⠏ WORKING  │ LIST: #47 · 11m ago │ LIVE: 11:57:59                 │
-╰────────────────────────────────────────────────────────────────────╯
+╰───────────────────────────────────────────────────────────────────[...]
 ```
 
 fbtodo mirrors the todo list a [Freebuff](https://freebuff.com) session is working through — the
@@ -210,36 +210,57 @@ The state-file contract, the frame's guarantees and the pane's lifecycle are in
 
 | Symptom | First thing to try |
 |---|---|
-| Pane is empty | `fbtodo bar` prints `todos -` when there is no list at all, and `fbtodo status` says why. If that is the answer, [ask the agent for one](#how-it-works) — otherwise the pane is bound to the wrong session, and `fbtodo why` is next. |
-| Pane exits or vanishes | exit `66` is no running instance or no store for the cwd (try `--instance-of PID` or `-p`); a pane that goes after a while is `--stale-after` (default 60 min of store silence, `0` = never). |
+| Pane is empty | `fbtodo bar` prints `todos -` when there is no list at all, and `fbtodo status` says why. If that is the answer, [ask the agent for one](#how-it-works) — otherwise the pane is bound to the wrong session or the list is done. |
+| Pane exits or vanishes | exit `66` is no running instance or no store for the cwd (try `--instance-of PID` or `-p`); a pane that goes after a while is `--stale-after` (default 60 min of store silence). |
 | Pane not where you want it | `fbtodo why` — read the `source` on the line, it is usually the answer. Then `fbtodo pin`. A pane killed mid-session comes back within ~3 s. |
-| List shows old progress | Check the list's own age (`LIST: #7 · 12m ago`, or `list written` in `status`). `[STALE?]` means the list is finished and the session worked on — the agent owes a new list. If the age is growing, the agent stopped calling `write_todos`; ask for the rewrite. |
-| A step with no duration | The watcher never saw it running — a step's clock starts at the tick, not at the list's mtime. And a pane running old code holds what it started with: `fbtodo stop`, then re-open it. |
+| List shows old progress | Check the list's own age (`LIST: #7 · 12m ago`, or `list written` in `status`). `[STALE?]` means the list is finished and the session worked on — the agent owes a new list. |
+| A step with no duration | The watcher never saw it running — a step's clock starts at the tick, not at the list's mtime. And a pane running old code holds what it started with: `fbtodo stop`, then restart. |
 
 ---
 
 ## FAQ
 
-**Do I need Freebuff?** 
-    For the built-in stores, yes — but a state JSON is enough: `fbtodo push`
-    and `-s file:PATH` take any agent or job that can write one file ([docs/SOURCES.md](docs/SOURCES.md)).
+<details open>
+<summary><strong>Do I need Freebuff?</strong></summary>
 
-**Does this send my code or my data anywhere?** 
-    No — it reads local transcript files; the only outbound traffic is the notification kit, and only if you install it. 
+For the built-in stores, yes — but a state JSON is enough: `fbtodo push` and `-s file:PATH` take any agent or job that can write one file ([docs/SOURCES.md](docs/SOURCES.md)).
+</details>
 
-**Will it slow the agent down?** 
-    No: it reads files that are being written anyway.
+<details>
+<summary><strong>Does this send my code or my data anywhere?</strong></summary>
 
-**Why does the pane show nothing?** 
-    Either the session has not written a todo list yet (`fbtodo status`), 
-    or the pane is bound to the wrong session (`fbtodo why`).
+No — it reads local transcript files; the only outbound traffic is the notification kit, and only if you install it.
+</details>
 
-**Several sessions at once?** Yes — one pane per session, each bound to its own. 
+<details>
+<summary><strong>Will it slow the agent down?</strong></summary>
 
-**Windows?** WSL only; tmux is the missing piece.'
+No: it reads files that are being written anyway.
+</details>
 
-**Just want a status-bar number?** `fbtodo bar`
-prints `todos 3/5`; set `FBTODO_NO_PANE=1`.
+<details>
+<summary><strong>Why does the pane show nothing?</strong></summary>
+
+Either the session has not written a todo list yet (`fbtodo status`), or the pane is bound to the wrong session (`fbtodo why`).
+</details>
+
+<details>
+<summary><strong>Several sessions at once?</strong></summary>
+
+Yes — one pane per session, each bound to its own.
+</details>
+
+<details>
+<summary><strong>Windows?</strong></summary>
+
+WSL only; tmux is the missing piece.
+</details>
+
+<details>
+<summary><strong>Just want a status-bar number?</strong></summary>
+
+`fbtodo bar` prints `todos 3/5`; set `FBTODO_NO_PANE=1`.
+</details>
 
 ---
 
