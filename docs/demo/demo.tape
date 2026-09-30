@@ -1,11 +1,13 @@
-# docs/demo/demo.tape — the master recording behind the README's demo.
+# docs/demo/demo.tape — the recording behind the README's demo.
 #
-#     brew install vhs
-#     docs/demo/record.sh          # writes demo.gif, demo.mp4 and the stills
+#     brew install vhs webp
+#     docs/demo/record.sh          # writes demo.webp and the three stills
 #
-# This tape writes the MP4, in full colour and at the frame size the pane actually needs;
-# record.sh derives the GIF and the stills from it, so the GIF never has to be good enough to
-# be the source of anything. The geometry matters and is worth keeping honest: it is recorded a
+# This tape writes the raw capture — vhs' own MP4, the only format it has — and record.sh throws it
+# away: it trims the frame to the pane's own box, brings it to 1920 px across and lands the frames
+# as PNGs, which are the master. The published demo is an animated lossless WebP cut from those
+# frames, so nothing lossy sits between the pane and the reader. The geometry matters and is worth
+# keeping honest: it is recorded a
 # little wider than 1920 so that, once trimmed to the pane's box, record.sh can bring it to
 # exactly 1920 px wide (`scale=1920:-2`) — 1080p-class, and just as readable when GitHub shows it
 # at README width. The font is scaled to match the wider viewport so the pane still gets the same

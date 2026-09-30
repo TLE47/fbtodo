@@ -30,7 +30,7 @@ No setup needed. Works with any agent that keeps a todo list.
 
 ## See it work
 
-![fbtodo's pane working through a scripted session](docs/demo/demo.gif)
+![fbtodo's pane working through a scripted session](docs/demo/demo.webp)
 
 That clip is the real pane — `fbtodo pane`, drawing a scripted session as it ticks through eight
 steps and finishes with the list done *and* the turn ended, which is the pair the bell waits for.
@@ -38,10 +38,11 @@ steps and finishes with the list done *and* the turn ended, which is the pair th
 The pane goes beside the session it is following, so here is the pairing too — the scripted session
 on the left, the pane reading it on the right:
 
-![the scripted session and the pane, side by side](docs/demo/side-by-side.gif)
+![the scripted session and the pane, side by side](docs/demo/side-by-side.webp)
 
-Both clips, three stills, the same frames as MP4s and the one command that reproduces all of it are
-in [`docs/demo`](docs/demo).
+Both clips, three stills and the one command that reproduces all of them — `docs/demo/record.sh`,
+which exports the animation as a lossless WebP rather than a video, so it renders inline at pixel
+for pixel — are in [`docs/demo`](docs/demo).
 
 ---
 

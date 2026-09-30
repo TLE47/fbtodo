@@ -13,7 +13,7 @@ The box is what is drawn above the terminal's own background, so the ink's bound
 frames of the clip *is* the box: the union of a second in, mid-list and the last frame, so no state
 of the pane can lose a row to a crop measured from another. The width comes out symmetric for the
 same reason — the box is centred in the tape's padding — and only the size is rounded down to even
-numbers, which is what ffmpeg's crop wants and what h264 requires.
+numbers, which is what ffmpeg's crop wants and what every encoder that follows is happiest with.
 """
 
 import subprocess

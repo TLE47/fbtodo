@@ -6,12 +6,11 @@ it is following.
 
 | File | What it is |
 |---|---|
-| [`demo.gif`](demo.gif) | the pane-only clip: ~1920×700, ~21 s, ~1.1 MB, rendered inline by GitHub |
-| [`demo.mp4`](demo.mp4) | the same frames, full colour, for a real player |
+| [`demo.webp`](demo.webp) | the pane-only clip: ~1920×700, ~21 s, ~1.1 MB, animated lossless WebP — renders inline, pixel for pixel, in GitHub and VS Code previews and in every current browser |
 | [`demo-start.png`](demo-start.png) · [`demo-mid.png`](demo-mid.png) · [`demo-done.png`](demo-done.png) | three stills from it ([below](#the-stills)) |
-| [`side-by-side.gif`](side-by-side.gif) · [`side-by-side.mp4`](side-by-side.mp4) | the pairing: the scripted session and the pane in one window — ~1920×456, ~18 s ([below](#the-pairing)) |
+| [`side-by-side.webp`](side-by-side.webp) | the pairing: the scripted session and the pane in one window — ~1920×456, ~18 s ([below](#the-pairing)) |
 | [`demo.tape`](demo.tape) · [`side-by-side.tape`](side-by-side.tape) | the two [vhs](https://github.com/charmbracelet/vhs) scripts |
-| [`record.sh`](record.sh) | `brew install vhs` then `docs/demo/record.sh` → everything above |
+| [`record.sh`](record.sh) | `brew install vhs webp` then `docs/demo/record.sh` → everything above |
 | [`drive.sh`](drive.sh) | replays a scripted session into the fixture (~20 s; `DEMO_NARRATE=1` prints each step as it is ticked) |
 | [`side-by-side.sh`](side-by-side.sh) | builds the pairing's tmux window and attaches to it (~22 s) |
 | [`frame.py`](frame.py) | measures a raw recording and prints the crop that trims it to the box ([The frame](#the-frame)) |
@@ -20,26 +19,37 @@ it is following.
 ## Record it
 
 ```sh
-brew install vhs                # pulls ttyd and ffmpeg; the pairing clip also needs tmux
-docs/demo/record.sh             # -> both clips, both GIFs, the three stills
+brew install vhs webp           # vhs pulls ttyd and ffmpeg; webp supplies img2webp
+docs/demo/record.sh             # -> both clips, the three stills
 ```
 
-Each tape writes a raw MP4; `record.sh` then trims the frame to the pane's own box (see [The
-frame](#the-frame)), brings it to exactly 1920 px wide, and everything published is derived from
-that trimmed master. The GIF's 256 colours therefore cannot cost the video anything, and the
-video's colour depth cannot make a GIF band.
+Each tape writes a raw MP4 — vhs' own capture format, and the only one it has — and `record.sh`
+throws it away: one ffmpeg pass trims the frame to the pane's own box (see [The
+frame](#the-frame)), brings it to exactly 1920 px wide, decimates it to 10 fps and lands the frames
+as PNGs, and those frames are the master. The WebP and the stills both come from them, so neither
+is a re-encode of the other.
+
+**Animated lossless WebP, not an MP4 and not a GIF.** A video would be smaller, but a Markdown or
+HTML page renders a video through a codec, with a poster frame and a play button, while it renders
+an image at full pixel-for-pixel accuracy. A GIF renders the same way, and is supported even more
+widely, but 256 colours is 256 colours: the pane's gradient bar and its antialiased text both get
+dithered, which is a poor way to show off a tool whose whole job is being readable. Lossless WebP
+is exact — what is decoded is the frame `frame.py` measured — it animates in GitHub's and VS
+Code's Markdown previews and in every current browser, and it comes out smaller than the GIF it
+replaced. If you need a GIF anyway, ffmpeg reads WebP: `ffmpeg -i demo.webp -loop 0 demo.gif`
+(decode it from the start, as that does; ffmpeg cannot seek into an animated WebP).
 
 The tapes are recorded a little wider than 1920, so that trim is a small downscale and never a
 blur, and the height is whatever the box needs rather than 1080 rows of background: the clip is
-full-HD *width* — what "1080p" means for a terminal recording — and only as tall as the pane. The
-GIFs are decimated to 10 fps, which the pane's twice-a-second repaint makes invisible and the file
-size very visible.
+full-HD *width* — what "1080p" means for a terminal recording — and only as tall as the pane. 10
+fps is all the motion there is, since the pane repaints twice a second; `img2webp` then merges the
+frames that came out identical, which is most of them.
 
 The tape points `FBTODO_HOME` at a scratch directory (`/tmp/fbtodo-demo`) on purpose: the
 driver's synthetic steps would otherwise be remembered as this project's pace history and
 skew the real estimates. It also points `FBTODO_PATCH_LOG` and `FBTODO_ALERT_LOG` at the
 fixture logs — without that, those two rows would read **your** notifier log, and your own
-name or handle would be published in the GIF.
+name or handle would be published in the clip.
 
 Both clips open on a cleared screen, which is worth keeping: the pane draws inside a terminal that
 would otherwise still be showing the shell that started it. `demo.tape` runs the pane as
@@ -50,12 +60,12 @@ recording.
 
 ## The stills
 
-The three PNGs are frames of the master — ~1920×700, full colour — so they show the pane exactly as
-the animation does, only still.
+The three PNGs are frames of the same master the WebP is cut from — ~1920×700, lossless — so they
+show the pane exactly as the animation does, only still.
 
 ![the pane one step in](demo-start.png)
 
-*One step in: the first row ticked, the second running, the bar at 12% of its eight steps.*
+*A second in: three of the eight ticked, the fourth running, the bar at 38%.*
 
 ![the pane with six of the eight steps done](demo-mid.png)
 
@@ -68,7 +78,7 @@ turn ending, which is what the bell waits for.*
 
 ## The pairing
 
-![the scripted session and the pane, side by side](side-by-side.gif)
+![the scripted session and the pane, side by side](side-by-side.webp)
 
 The clip the pane exists for: a session on the left, its pane on the right, one tmux window. The
 left-hand pane is `drive.sh` with `DEMO_NARRATE=1`, so every step it prints as ticked is a step the
@@ -103,8 +113,8 @@ hides steps — which is what the first recording of this demo did.
 mid-list and the last), adds the tapes' padding, and rounds the size down to even numbers. The
 union is what keeps one state of the pane from being cropped by another's measurement, and the same
 box trims the width, since the box is centred in the tape's padding. `record.sh` applies the result
-to the raw recording, scales the trimmed frame to 1920 px wide (`scale=1920:-2`), and derives
-everything else from that master.
+to the raw recording — `crop=…,scale=1920:-2,fps=10` — and lands the frames as PNGs; that is the
+master, and both the WebP and the stills are built from it.
 
 ## Watch it without vhs
 

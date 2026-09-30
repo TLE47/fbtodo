@@ -86,14 +86,21 @@ Entries start at the newest release; each one is a contract change, not a diff.
   The prefix is required: `-s some/dir` stays the usage error it has always been, and any
   unknown `-s` value now exits `64` rather than being rejected by argparse.
 - The README's demo is **recorded, not drawn**: two clips of the real pane reading the
-  `docs/demo/fixture` transcript — [`demo.gif`](docs/demo/demo.gif) (~1920×700, ~21 s) for the pane
-  on its own, and [`side-by-side.gif`](docs/demo/side-by-side.gif) (~1920×456, ~18 s) for the pane
-  beside the scripted session that writes the list — with both as MP4s and three stills.
+  `docs/demo/fixture` transcript — [`demo.webp`](docs/demo/demo.webp) (~1920×700, ~21 s) for the
+  pane on its own, and [`side-by-side.webp`](docs/demo/side-by-side.webp) (~1920×456, ~18 s) for
+  the pane beside the scripted session that writes the list — plus three stills.
   `docs/demo/record.sh` reproduces all of it from the two tapes in one command, and each frame is
   trimmed to the box the pane actually drew ([`frame.py`](docs/demo/frame.py) measures it, because
   a frame short enough to have no empty row under the box is a frame that collapses the list) and
   then scaled to exactly 1920 px wide, so the clips are full-HD across at the height the pane
-  needs. The GIFs and stills are derived from the trimmed master, never the other way round.
+  needs. The stills are frames of that master, never the other way round.
+- The demo is published as **animated lossless WebP, not an MP4 and not a GIF**. A video renders in
+  a Markdown page through a codec, with a poster frame and a player, while an image renders at full
+  pixel-for-pixel accuracy; a GIF renders the same way but 256 colours dithers the pane's gradient
+  bar and its antialiased text. WebP is animated in GitHub's and VS Code's Markdown previews and in
+  every current browser, is exact, and is smaller than the GIF it replaced — which is why `vhs`'s
+  raw MP4 is now decoded to PNG frames and thrown away instead of being published. `ffmpeg -i
+  demo.webp -loop 0 demo.gif` still produces a GIF for anything that needs one.
 - The demo clips **show the tool, not the shell that started it**: both tapes open on a cleared
   screen, so the `cd`, the `export`s and the long `fbtodo pane` line stay inside the tape's `Hide`
   block and never reach a published frame. The pairing's tmux server is started with `-f /dev/null`
