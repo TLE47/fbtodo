@@ -5316,6 +5316,13 @@ try:
         tmux2 = ["tmux", "-L", sock2]
         # the NAS block restored FBTODO_NAS on its way out; this pane needs it again
         env["FBTODO_NAS"] = fake_ssh
+        # A watcher left behind by the NAS phase is ADOPTED by these panes — its state
+        # answers `-s nas`, because `state_matches_request` compares the source and not the
+        # store — and it carries THAT phase's marker, so `instance_alive` stays true no
+        # matter what happens to this fixture's session and the plain pane never closes.
+        # The panes below have to be reading a state this fixture produced; the
+        # local-session fixture stops the same way, for the same reason.
+        run("stop")
         # The stand-in session ends when THIS suite says so, not on a clock of its own. A
         # `sleep 2` marker put the two panes in a race with the pane's own start-up: on a
         # loaded runner the plain pane's first poll landed after the sleep had already
@@ -5351,11 +5358,15 @@ try:
         # that is still importing `fbtodo` when the marker's process dies has seen nothing
         # to close on and sits there. The pane says which of the two it is showing, so wait
         # for that rather than for a fixed sleep long enough for a quiet machine.
-        def sighted(sess) -> bool:
+        def pane_text(sess) -> str:
             shot = subprocess.run(
                 tmux2 + ["capture-pane", "-p", "-t", sess], capture_output=True, text=True
             )
-            return shot.returncode == 0 and "waiting for a NAS freebuff session" not in STRIP(shot.stdout)
+            return STRIP(shot.stdout) if shot.returncode == 0 else "<no pane>"
+
+        def sighted(sess) -> bool:
+            text = pane_text(sess)
+            return text != "<no pane>" and "waiting for a NAS freebuff session" not in text
 
         deadline = time.time() + 25
         while time.time() < deadline and not (sighted("wait") and sighted("nowait")):
@@ -5365,11 +5376,17 @@ try:
             f" nowait={sighted('nowait')}"
         )
         short.kill()
-        deadline = time.time() + 15
+        # A poll is an ssh round trip plus a probe, and the close happens at the END of the
+        # poll that notices: on a loaded runner one poll can outlast a short deadline, so
+        # this waits several of them (`-i 2.5`) rather than two.
+        deadline = time.time() + 30
         while time.time() < deadline and alive("nowait"):
             time.sleep(0.3)
         assert alive("wait"), "--wait pane closed when its session ended"
-        assert not alive("nowait"), "a plain nas pane lingered after its session ended"
+        assert not alive("nowait"), (
+            "a plain nas pane lingered after its session ended:"
+            f" text={pane_text('nowait')!r} state={read_json(state_path, {})!r}"
+        )
         shot = subprocess.run(tmux2 + ["capture-pane", "-p", "-t", "wait"], capture_output=True, text=True)
         assert "waiting for a NAS freebuff session" in STRIP(shot.stdout), shot.stdout
         subprocess.run(tmux2 + ["kill-server"], capture_output=True)

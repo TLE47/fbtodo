@@ -70,6 +70,10 @@ Entries start at the newest release; each one is a contract change, not a diff.
   says tmux made the pane; a plain pane still importing `fbtodo` when the marker's process
   dies has seen nothing to close on, so it stayed open while the same fixture passed on a
   quiet machine.
+- The NAS pane-lifetime fixture ends the **previous** phase's watcher before it starts its
+  own panes. A watcher left behind answers `-s nas` (the request matches the source, not the
+  store) and carries that phase's marker, so the fixture's plain pane stayed alive forever
+  and never closed with its session.
 - The notification kit's suite is no longer tied to the maintainer's machine: it sourced the
   `freebuff` shell functions out of `$HOME/.zshrc` (a runner has none, so every wrapper check
   failed), and it required MuseScore's SoundFont for its chime checks. It now sources the
