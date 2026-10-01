@@ -6,30 +6,30 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org)
 [![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#installation)
 [![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#installation)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](https://github.com/TLE47/fbtodo/blob/main/LICENSE)
 
-fbtodo displays your [Freebuff](https://freebuff.com) agent's task list in a side pane while it works. It shows:
+fbtodo displays your [Freebuff](https://freebuff.com) agent's todo list in a side pane while it works. It shows:
 - **What's done, running, and next** — with live timers
 - **How much time is left** — estimates based on your project history
 - **If it's stuck or waiting** — with optional alerts to your phone
 
 No configuration: it reads the list your agent already keeps. Freebuff's list turns up on its own;
-anything else can push one over stdin — see [docs/SOURCES.md](docs/SOURCES.md).
+anything else can push one over stdin — see [docs/SOURCES.md](https://github.com/TLE47/fbtodo/blob/main/docs/SOURCES.md).
 
-**[Installation](#installation)** · **[Commands](#commands)** · **[FAQ](#faq)** · [Install guide](docs/INSTALL.md) · [Settings](docs/SETTINGS.md) · [Deep docs](docs/INTERNALS.md)
+**[Installation](#installation)** · **[Commands](#commands)** · **[FAQ](#faq)** · [Install guide](https://github.com/TLE47/fbtodo/blob/main/docs/INSTALL.md) · [Settings](https://github.com/TLE47/fbtodo/blob/main/docs/SETTINGS.md) · [Deep docs](https://github.com/TLE47/fbtodo/blob/main/docs/INTERNALS.md)
 
 ---
 
 ## See it work
 
-![fbtodo's pane working through a scripted session](docs/demo/demo.webp)
+![fbtodo's pane working through a scripted session](https://raw.githubusercontent.com/TLE47/fbtodo/main/docs/demo/demo.webp)
 
 The clip above shows - `fbtodo pane` in real time. It monitors a scripted session through eight steps, updating continuously until all tasks are marked complete *and* the session ends—the exact trigger required for the notification bell.
 
 ### Side-by-Side View 
 To see how the pane mirrors the active session, here is the side-by-side pairing: the scripted session on the left, and the fbtodo pane tracking it on the right:
 
-![the scripted session and the pane, side by side](docs/demo/side-by-side.webp)
+![the scripted session and the pane, side by side](https://raw.githubusercontent.com/TLE47/fbtodo/main/docs/demo/side-by-side.webp)
 
 >**Note**: The recording script exports animations as lossless WebP files rather than standard video formats. This ensures crisp, pixel-perfect inline rendering directly within GitHub Markdown.
 
@@ -70,7 +70,7 @@ fbtodo                            # opens the pane automatically
 
 Requirements: **Python 3.9+** and **tmux**. If the pane does not appear, run
 `fbtodo doctor` — it names what is missing. Every route, with pinned versions and
-how to uninstall, is in [docs/INSTALL.md](docs/INSTALL.md).
+how to uninstall, is in [docs/INSTALL.md](https://github.com/TLE47/fbtodo/blob/main/docs/INSTALL.md).
 
 ### Using the `fb` shortcut (optional)
 
@@ -182,7 +182,7 @@ chmod +x ~/.config/freebuff-notify/*.sh
 ~/.config/freebuff-notify/phone.sh --init
 ```
 
-See [scripts/notify/README.md](scripts/notify/README.md) for details on iMessage and ntfy alerts.
+See [scripts/notify/README.md](https://github.com/TLE47/fbtodo/blob/main/scripts/notify/README.md) for details on iMessage and ntfy alerts.
 
 ---
 
@@ -203,7 +203,7 @@ See [scripts/notify/README.md](scripts/notify/README.md) for details on iMessage
 <details open>
 <summary><strong>Do I need Freebuff?</strong></summary>
 
-For the built-in stores, yes. But you can use any agent that writes a JSON state file — see [docs/SOURCES.md](docs/SOURCES.md).
+For the built-in stores, yes. But you can use any agent that writes a JSON state file — see [docs/SOURCES.md](https://github.com/TLE47/fbtodo/blob/main/docs/SOURCES.md).
 </details>
 
 <details>
@@ -252,4 +252,4 @@ bash scripts/notify/test-freebuff-notify.sh   # notification tests
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/TLE47/fbtodo/blob/main/LICENSE).
