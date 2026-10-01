@@ -5316,7 +5316,12 @@ try:
         tmux2 = ["tmux", "-L", sock2]
         # the NAS block restored FBTODO_NAS on its way out; this pane needs it again
         env["FBTODO_NAS"] = fake_ssh
-        short = subprocess.Popen(["sleep", "2"])
+        # The stand-in session ends when THIS suite says so, not on a clock of its own. A
+        # `sleep 2` marker put the two panes in a race with the pane's own start-up: on a
+        # loaded runner the plain pane's first poll landed after the sleep had already
+        # exited, so it never saw a live session and never had a reason to close — while on
+        # a fast machine the same fixture passed. It is killed explicitly below instead.
+        short = subprocess.Popen(["sleep", "60"])
         marker2 = os.path.join(TEST_HOME, "fb-session-2")
         with open(marker2, "w") as fh:
             fh.write(f"{short.pid} 2026-01-01T00:00:00Z {store}/otherproj\n")
@@ -5331,12 +5336,21 @@ try:
                 tmux2 + ["new-session", "-d", "-s", name, "-x", "70", "-y", "12", f"{base}{extra}"],
                 capture_output=True,
             )
-        time.sleep(6)  # the marker's pid is dead by now
-
         def alive(sess) -> bool:
             p = subprocess.run(tmux2 + ["list-panes", "-t", sess], capture_output=True)
             return p.returncode == 0
 
+        # Long enough for both panes to have polled at least once (`-i 2.5`) with the
+        # session alive — that first sighting is what a plain pane closes AFTER.
+        deadline = time.time() + 20
+        while time.time() < deadline and not (alive("wait") and alive("nowait")):
+            time.sleep(0.3)
+        assert alive("wait") and alive("nowait"), "a NAS pane never came up"
+        time.sleep(6)
+        short.kill()
+        deadline = time.time() + 15
+        while time.time() < deadline and alive("nowait"):
+            time.sleep(0.3)
         assert alive("wait"), "--wait pane closed when its session ended"
         assert not alive("nowait"), "a plain nas pane lingered after its session ended"
         shot = subprocess.run(tmux2 + ["capture-pane", "-p", "-t", "wait"], capture_output=True, text=True)
