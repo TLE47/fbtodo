@@ -58,10 +58,13 @@ Entries start at the newest release; each one is a contract change, not a diff.
   "the last title is Done" a race (it failed on a runner, passed here). Its `title_matches`
   helper is defined where it is first waited on rather than an hundred lines later, so that
   wait no longer runs out its cap waiting for a function that did not exist yet.
-- `phone.sh --init` bounds its Apple ID lookup. `defaults` talks to cfprefsd and can block
-  for minutes where there is no preferences session at all (a CI runner), which hung the
-  whole config write — the topic had already been minted — for one line of convenience.
-  Five seconds per domain, then the commented placeholder.
+- `phone.sh --init` bounds its Apple ID lookup, and does not wait on it. `defaults` talks to
+  cfprefsd and can block for minutes where there is no preferences session at all (a CI
+  runner), which hung the whole config write — the topic already minted — for one line of
+  convenience; the read is now capped at five seconds per domain, its fds are the temp file
+  and `/dev/null` so a survivor holds nothing open, and neither `kill` nor `wait` is given a
+  chance to hang in its place. The topic is minted with `od -N16` rather than a `tr … | head`
+  pair, so nothing in this path depends on a pipeline ending on a signal.
 - The NAS pane-lifetime fixture waits for each pane to have **seen** the live session — the
   pane says which of the two it is showing — instead of a fixed six seconds. `alive` only
   says tmux made the pane; a plain pane still importing `fbtodo` when the marker's process

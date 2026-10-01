@@ -110,8 +110,11 @@ read_pref() { # domain -> its plist on stdout, or nothing when it takes too long
     sleep 1
     _pref_waited=$((_pref_waited + 1))
   done
-  kill "$_pref_pid" 2>/dev/null
-  wait "$_pref_pid" 2>/dev/null
+  # No `wait` on purpose: the case this cap exists for is a `defaults` that never answers,
+  # and waiting on it after a `kill` is the same hang with extra steps. Both of its fds are
+  # the temp file and /dev/null, so a survivor cannot hold this script — or a caller's
+  # command substitution — open either.
+  kill -9 "$_pref_pid" 2>/dev/null
   cat "$_pref_file" 2>/dev/null
   rm -f "$_pref_file" "$_pref_flag"
 }
@@ -134,7 +137,10 @@ if [ "${init:-0}" = 1 ]; then
     exit 78
   fi  # 128 bits: the topic IS the authentication for a public ntfy server, so it is drawn
   # from the kernel's entropy and never typed, never an argument, never in the log
-  hex=$(LC_ALL=C tr -dc 'a-f0-9' </dev/urandom 2>/dev/null | head -c 32)
+  # `od -N16` reads exactly the 16 bytes and exits, so there is no pipeline to stall on
+  # (a `tr … | head` pair finished by a signal is one more thing that can hang a script
+  # whose whole job is to write a file and return).
+  hex=$(od -An -N16 -tx1 </dev/urandom 2>/dev/null | tr -d ' \n')
   [ ${#hex} -eq 32 ] || {
     printf 'phone.sh: could not read 128 bits from /dev/urandom — no topic written\n' >&2
     exit 69
