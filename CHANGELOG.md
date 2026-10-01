@@ -53,6 +53,10 @@ Entries start at the newest release; each one is a contract change, not a diff.
   happens on the first command.
 
 ### Fixed
+- The NAS-status check writes the local state file's session itself instead of reading whatever
+  the last local watcher recorded. That watcher finds the operator's own journal and fills in
+  their live session on a workstation, and finds no journal at all on a runner — so the same
+  assertion passed on one and had nothing to compare against on the other.
 - `phone.sh` sends the ntfy body with `--data-raw`, so a message that starts with `@` is text
   rather than a file curl would read and POST; `--title`/`--tags`/`--priority` lose any CR/LF,
   which would otherwise inject a header.

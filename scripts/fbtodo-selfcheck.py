@@ -4961,6 +4961,21 @@ try:
         # `-s nas status` has to describe the NAS. It read the local watcher's state file
         # and printed the Mac's own list beside "nas session: — no session found" — about a
         # box that was running a freebuff at the time.
+        # The state file the local half of this check reads is written HERE rather than left
+        # to whatever the last local watcher recorded. On the owner's machine that watcher
+        # finds the operator's own journal and fills in their live session; on a runner there
+        # is no journal, so the file held no session at all and the check had nothing to
+        # compare against — it failed with `local_sess = None` on every runner while passing
+        # on the machine it was written on. The session set here is this suite's own local
+        # fixture, and it is deliberately distinct from the NAS one asserted just above.
+        local_state = {}
+        if os.path.exists(state_path):
+            try:
+                local_state = json.load(open(state_path))
+            except ValueError:
+                local_state = {}
+        local_state["session"] = os.path.basename(chat_dir)
+        module.atomic_write_json(state_path, local_state)
         status_nas = STRIP(run("-s", "nas", *nas_args, "status").stdout)
         assert "nas session       : 2026-01-01T00-00-02.000Z/" in status_nas, status_nas
         assert "todos             : 2/2 done" in status_nas, status_nas
