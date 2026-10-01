@@ -59,6 +59,9 @@ Entries start at the newest release; each one is a contract change, not a diff.
   function, so its session ran the bare stand-in and never opened a pane. Identifying that
   pane is case-insensitive too, because Linux names the interpreter `python3` where macOS
   names it `Python`.
+- The NAS phase's remote shell puts the checkout on its own PATH, so `fbtodo` is found even
+  where the launcher is not installed (a runner has it only in the working copy), and it runs
+  with `-d` so Ubuntu's `/etc/zsh` — which prompts from `compinit` there — cannot block it.
 - The NAS-status check writes the local state file's session itself instead of reading whatever
   the last local watcher recorded. That watcher finds the operator's own journal and fills in
   their live session on a workstation, and finds no journal at all on a runner — so the same

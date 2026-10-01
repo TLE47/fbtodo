@@ -6099,7 +6099,11 @@ try:
         with open(os.path.join(nas_bin, "pgrep"), "w") as fh:
             fh.write("#!/bin/sh\nexit 1\n")
         os.chmod(os.path.join(nas_bin, "pgrep"), 0o755)
-        path3 = os.pathsep.join([nas_bin, shim, saved_path])
+        # The checkout first, so the `remote` function below finds `fbtodo` even on a
+        # machine where the launcher is not installed on PATH — a runner has it only in
+        # the working copy, and without it `fbtodo nas --quiet` failed silently into the
+        # redirect and no watcher was ever started.
+        path3 = os.pathsep.join([ROOT, nas_bin, shim, saved_path])
         marker3 = os.path.join(TEST_HOME, "fb-session-3")
         # The phone notifier this build asks about, as a stub: what is under test here is
         # that the watcher asks it while a session runs and stops when it goes.
@@ -6188,7 +6192,9 @@ try:
                 # The fixture's stand-in for whatever function a user wraps a remote login in:
             # it asks fbtodo for the pane watcher, then execs an ssh. The argv has to LOOK
             # like an ssh on the process table, because that is what placement anchors on.
-            rf"zsh -i -c 'export PATH={path3}:\$PATH; "
+            # `-d` keeps the distribution's `/etc/zsh` out of it: Ubuntu's runs `compinit`,
+            # which prompts on a runner and blocks the shell before `remote` is defined.
+            rf"zsh -d -i -c 'export PATH={path3}:\$PATH; "
             rf"remote() {{ fbtodo nas --quiet >/dev/null 2>&1 &!; "
             rf"exec ssh -t remote@nas.local \"cd / && exec \$SHELL -l\"; }}; remote'",
             ],
