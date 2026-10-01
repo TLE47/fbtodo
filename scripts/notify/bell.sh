@@ -66,7 +66,10 @@ if [ "$drop" = 1 ]; then
   [ -n "$name" ] || name=Basso
 fi
 
-fallback=/System/Library/Sounds/Glass.aiff
+# Where the fallback system sounds live; FREEBUFF_SOUNDS_DIR points at another directory
+# (the test suite uses one, so its chime checks run without macOS).
+sounds=${FREEBUFF_SOUNDS_DIR:-/System/Library/Sounds}
+fallback=$sounds/Glass.aiff
 case $name in
   piano | f4) file=$dir/piano.wav ; [ -r "$file" ] || file=$fallback ;;
   steel | guitar | pluck | b-string | b) file=$dir/steel.wav ; [ -r "$file" ] || file=$fallback ;;
@@ -76,7 +79,7 @@ case $name in
     if [ -r "$dir/$name.wav" ]; then
       file=$dir/$name.wav # any generated voice, so a new one cannot fall through
     else
-      file=/System/Library/Sounds/$name.aiff
+      file=$sounds/$name.aiff
     fi
     ;;
 esac

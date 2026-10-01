@@ -16,7 +16,9 @@
 # different note (Basso, or $HOME/.config/freebuff-notify/drop-sound) and pushes to the
 # phone with the session's last stderr. `drop-bell.py --help` says what counts as a drop;
 # FREEBUFF_DROP_INTERRUPT=off silences a session you interrupted yourself.
-_FREEBUFF_SOUNDS=/System/Library/Sounds
+# Where the fallback system sounds live. FREEBUFF_SOUNDS_DIR points the picker somewhere
+# else, which is how the test suite exercises the chime on a machine that is not a Mac.
+_FREEBUFF_SOUNDS=${FREEBUFF_SOUNDS_DIR:-/System/Library/Sounds}
 
 _freebuff-bell-enabled() {
   local state="$HOME/.config/freebuff-notify/state" value=${FREEBUFF_BELL:-}

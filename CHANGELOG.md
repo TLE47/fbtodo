@@ -110,6 +110,10 @@ Entries start at the newest release; each one is a contract change, not a diff.
   are none) without generating anything, so a caller can tell "no bank here" from "the
   generator failed" — which is what the suite uses to skip its chime checks on a machine with
   no MuseScore.
+- `FREEBUFF_SOUNDS_DIR` points the chime picker (and `bell.sh`'s fallback) at a directory of
+  system sounds instead of macOS's `/System/Library/Sounds`, so a machine that is not a Mac
+  can ring a sound it actually has — which is how the kit's suite runs its chime checks off a
+  Mac.
 - `.github/ci-report.sh` annotates a suite's `FAIL` lines when it has any, instead of only the
   last six lines of the log: a suite that fails dozens of checks ends its tail in `PASS`es, so
   the tail alone named nothing (the job summary still carries the full 80-line tail).

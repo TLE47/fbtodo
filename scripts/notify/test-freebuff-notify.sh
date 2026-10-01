@@ -25,6 +25,14 @@ cleanup() {
 trap cleanup EXIT
 fails=0
 
+# macOS's system sounds are a real dependency of the chime — they are the files the picker
+# falls back to, and a runner has none. Point the resolver at a fixture directory holding the
+# names the checks use, so the chime path is exercised (and asserted) off a Mac too.
+SOUNDS="$SANDBOX/sounds"
+export FREEBUFF_SOUNDS_DIR="$SOUNDS"
+mkdir -p "$SOUNDS"
+for s in Glass Hero Basso Submarine Ping; do : >"$SOUNDS/$s.aiff"; done
+
 # Per-check timing, opt-in with FBTODO_NOTIFY_TIME=1: `PASS  …` then `  [+0.4s 12s]`.
 # The suite costs 72 s and no single sleep explains it — a hundred-odd checks, each with a
 # stub and a wait, do. That is the same instrument fbtodo-selfcheck.py carries, and it is
@@ -321,7 +329,7 @@ run_plain >/dev/null 2>&1
 wait_plays 1
 check "chimes once when enabled" "$(plays)" "1"
 check "plays the saved sound, quietly" "$(tail -1 "$CHIMES" 2>/dev/null)" \
-  "afplay -v 0.5 /System/Library/Sounds/Glass.aiff"
+  "afplay -v 0.5 $SOUNDS/Glass.aiff"
 
 echo off >"$PLAIN/.config/freebuff-notify/state"
 run_plain >/dev/null 2>&1
@@ -384,13 +392,13 @@ out=$(sound_cmd sound hero)          # matches case-insensitively
 check "sets and previews the pick" "$out" "freebuff sound: Hero"
 check "pick is saved" "$(cat "$SOUND_HOME/.config/freebuff-notify/sound")" "Hero"
 check "preview played it" "$(tail -1 "$CHIMES")" \
-  "afplay -v 0.5 /System/Library/Sounds/Hero.aiff"
+  "afplay -v 0.5 $SOUNDS/Hero.aiff"
 
 # resolved from a fresh shell with no caller locals in scope: zsh's dynamic
 # scoping once hid a saved pick that only worked inside freebuff-bell
 check "a saved system sound is honoured on its own" \
   "$(HOME="$SOUND_HOME" zsh -c 'source "$1/funcs.zsh"; _freebuff-bell-file "$(_freebuff-bell-sound)"' zsh "$STUB")" \
-  "/System/Library/Sounds/Hero.aiff"
+  "$SOUNDS/Hero.aiff"
 
 before=$(plays)
 sound_cmd sound Nope >/dev/null 2>&1
@@ -400,9 +408,9 @@ check "unknown sound plays nothing" "$(plays)" "$before"
 
 out=$(FREEBUFF_BELL_VOLUME=0.25 sound_cmd test)
 check "test previews the current sound" "$(tail -1 "$CHIMES")" \
-  "afplay -v 0.25 /System/Library/Sounds/Hero.aiff"
+  "afplay -v 0.25 $SOUNDS/Hero.aiff"
 check_match "test reports the pick and the file it resolved to" "$out" \
-  '^played: Hero \(/System/Library/Sounds/Hero.aiff\)$'
+  "^played: Hero \\($SOUNDS/Hero.aiff\\)$"
 
 echo
 echo "== alert sound =="
@@ -1170,7 +1178,7 @@ dw_run "$DMID" --local --exit 143 --cwd "$DW/proj" --stderr-log "$DW/stderr.log"
 dw_wait dw_plays "$((p + 1))"
 dw_wait dw_sends "$((n + 1))"
 check "a drop rings, on its own note" "$(tail -1 "$DW/plays.log")" \
-  "afplay -v 0.5 /System/Library/Sounds/Basso.aiff"
+  "afplay -v 0.5 $SOUNDS/Basso.aiff"
 check_match "is pushed at high priority" "$(tail -1 "$DW/sends.log")" 'priority high' 
 check_match "named for the session's directory" "$(tail -1 "$DW/sends.log")" \
   'freebuff dropped · proj --message died on its own'
@@ -1314,14 +1322,14 @@ ds_key() { # key, then bell.sh flags
   HOME="$DH" "$DH/.config/freebuff-notify/bell.sh" --print "$@" |
     awk -v k="$key" '{for(i=1;i<=NF;i++){split($i,kv,"=");v[kv[1]]=kv[2]}} END{print v[k]}'
 }
-check "a drop is heard as Basso by default" "$(ds_key file --drop)" "/System/Library/Sounds/Basso.aiff"
+check "a drop is heard as Basso by default" "$(ds_key file --drop)" "$SOUNDS/Basso.aiff"
 check "and bell.sh was told it is a drop" "$(ds_key drop --drop)" "1"
-check "the finish note is untouched by that" "$(ds_key file)" "/System/Library/Sounds/Glass.aiff"
+check "the finish note is untouched by that" "$(ds_key file)" "$SOUNDS/Glass.aiff"
 printf '%s\n' Hero >"$DH/.config/freebuff-notify/drop-sound"
-check "drop-sound picks another voice for it" "$(ds_key file --drop)" "/System/Library/Sounds/Hero.aiff"
-check "and does not change the finish note" "$(ds_key file)" "/System/Library/Sounds/Glass.aiff"
+check "drop-sound picks another voice for it" "$(ds_key file --drop)" "$SOUNDS/Hero.aiff"
+check "and does not change the finish note" "$(ds_key file)" "$SOUNDS/Glass.aiff"
 check "FREEBUFF_BELL_SOUND_DROP wins over the file" \
-  "$(FREEBUFF_BELL_SOUND_DROP=Submarine ds_key file --drop)" "/System/Library/Sounds/Submarine.aiff"
+  "$(FREEBUFF_BELL_SOUND_DROP=Submarine ds_key file --drop)" "$SOUNDS/Submarine.aiff"
 check "the drop honours the same off switch" "$(FREEBUFF_BELL=off ds_key enabled --drop)" "off"
 
 echo
@@ -1334,7 +1342,7 @@ n=$(plain_sends)
 (FREEBUFF_BELL=on run_plain) >/dev/null 2>&1
 wait_plays $((b + 1))
 check "a clean quit chimes once, with the picked sound" "$(tail -1 "$CHIMES")" \
-  "afplay -v 0.5 /System/Library/Sounds/Glass.aiff"
+  "afplay -v 0.5 $SOUNDS/Glass.aiff"
 check "...and pushes nothing" "$(plain_sends)" "$n"
 
 b=$(plays)
@@ -1343,7 +1351,7 @@ n=$(plain_sends)
 wait_plays $((b + 1))
 dw_wait plain_sends "$((n + 1))"
 check "a killed session chimes the drop note" "$(tail -1 "$CHIMES")" \
-  "afplay -v 0.5 /System/Library/Sounds/Basso.aiff"
+  "afplay -v 0.5 $SOUNDS/Basso.aiff"
 check "...instead of the finish note, not as well as" "$(plays)" "$((b + 1))"
 check "and the wrapper pushed it" "$(plain_sends)" "$((n + 1))"
 check_match "with what it died of" "$(tail -1 "$PLAIN/sends.log")" 'died on its own \(SIGTERM\)'
