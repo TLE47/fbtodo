@@ -4650,6 +4650,12 @@ try:
         # log lived in a home this suite wipes (found 2026-09-29, from the pane that would
         # not stay where the owner dragged it). The watcher this check is about still starts.
         os.environ["FBTODO_NO_PANE"] = "1"
+        # `fbtodo` has to resolve in the interactive shell even where the operator's rc is not
+        # this checkout: the launcher's own directory goes on PATH. The autostart this check
+        # is ABOUT must also be allowed to fire — CI sets FBTODO_NO_AUTOSTART for the other
+        # phases (it keeps stray watchers out of them), so it is cleared for this child alone.
+        os.environ["PATH"] = os.path.dirname(FB) + os.pathsep + os.environ.get("PATH", "")
+        os.environ.pop("FBTODO_NO_AUTOSTART", None)
         os.execv("/bin/zsh", ["/bin/zsh", "-i", "-c", "command -v fbtodo && fbtodo bar"])
     out = b""
     os.set_blocking(ptyfd, False)
