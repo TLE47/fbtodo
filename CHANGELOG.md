@@ -5,6 +5,11 @@ Entries start at the newest release; each one is a contract change, not a diff.
 
 ## Unreleased
 
+## 4.30.2
+
+### Fixed
+- README.md's image and doc links render on the PyPI project page: they pointed at repo-relative paths (`docs/demo/*.webp`, `docs/*.md`, `LICENSE`) that 404 on pypi.org/p/fbtodo. They are now absolute GitHub URLs (`raw.githubusercontent.com` for images, `blob/main/` for docs), which also work on GitHub's own rendering.
+
 ## 4.30.1
 
 ## 4.30.0

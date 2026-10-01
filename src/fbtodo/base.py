@@ -34,7 +34,7 @@ import textwrap
 import time
 import unicodedata
 
-VERSION = "4.30.1"
+VERSION = "4.30.2"
 
 
 HOME = os.path.expanduser("~")
