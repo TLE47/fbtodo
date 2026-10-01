@@ -5,6 +5,8 @@ Entries start at the newest release; each one is a contract change, not a diff.
 
 ## Unreleased
 
+## 4.30.1
+
 ## 4.30.0
 
 ### Changed
