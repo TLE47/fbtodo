@@ -4669,7 +4669,10 @@ try:
             )
         os.environ["ZDOTDIR"] = zdot
         os.environ.pop("FBTODO_NO_AUTOSTART", None)
-        os.execv("/bin/zsh", ["/bin/zsh", "-i", "-c", "command -v fbtodo && fbtodo bar"])
+        # `-d` (no global rcs) keeps the distribution's `/etc/zsh` out of the way: on Ubuntu it
+        # runs `compinit`, which prompts about "insecure directories" on a runner and blocks
+        # the shell before `command -v fbtodo` ever runs. Our `ZDOTDIR/.zshrc` still loads.
+        os.execv("/bin/zsh", ["/bin/zsh", "-d", "-i", "-c", "command -v fbtodo && fbtodo bar"])
     out = b""
     os.set_blocking(ptyfd, False)
     deadline = time.time() + 20
