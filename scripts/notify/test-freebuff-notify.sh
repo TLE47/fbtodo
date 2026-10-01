@@ -247,13 +247,17 @@ STUB="$SANDBOX/stub"
 mkdir -p "$STUB/bin" "$STUB/.config/freebuff-notify"
 # FB_EXIT is what the drop tests make the session die with; the default is a clean quit.
 printf '#!/bin/sh\necho "stub-freebuff $*"\nsleep ${FB_SLEEP:-2}\nexit ${FB_EXIT:-0}\n' >"$STUB/bin/freebuff"
+# A silent stub afplay: this phase runs the real wrapper, which rings the chime at exit, and
+# the suite has to stay quiet. Without it a machine that has afplay actually plays it, and one
+# that does not prints bell.sh's fallback note on stderr — the same run, two different logs.
+printf '#!/bin/sh\nexit 0\n' >"$STUB/bin/afplay"
 # A stub fbtodo, so the end-of-session decision reads the sandbox's store and never the
 # real machine's (a live session here is mid-turn, which would look like a drop).
 printf '#!/bin/sh\ncat "%s" 2>/dev/null\n' "$STUB/state.json" >"$STUB/bin/fbtodo"
 printf '%s\n' '{"backend":"cli","cwd":"/tmp","session":"s1","list_id":"L1","done":1,"total":1,"turn_ended":true}' >"$STUB/state.json"
 cp "$HERE/session-timer.sh" "$STUB/.config/freebuff-notify/session-timer.sh"
 install_bell "$STUB"
-chmod +x "$STUB/bin/freebuff" "$STUB/bin/fbtodo" "$STUB/.config/freebuff-notify/session-timer.sh"
+chmod +x "$STUB/bin/freebuff" "$STUB/bin/fbtodo" "$STUB/bin/afplay" "$STUB/.config/freebuff-notify/session-timer.sh"
 # The wrapper under test is the SHIPPED one (`funcs.zsh`, next to this suite), not the copy
 # in the operator's `~/.zshrc`: a runner has no personal shell setup, and the wrapper the
 # bells are wired into is the kit's, so it has to be in the repository to be tested at all.
