@@ -2260,6 +2260,11 @@ try:
     base_state = dict(
         json.loads(run("json").stdout),
         model="some-provider/space-bunny-alpha-preview",
+        # `error` is machine state, not shape: a runner with no session of its own gets
+        # `no conversation DB found` here, and `render` draws that INSTEAD of the list —
+        # so every check below was asserting against a two-line error frame. Cleared, the
+        # shape still comes from the live `json` and the list is really rendered.
+        error=None,
         task_history={},        # no remembered pace: the default keeps `~2m` in the strip
         # `now`, `nudge` and the patch/alert pair ride along in the live `json`, and each one
         # can add a ROW to the frame. Measured 2026-09-29: a request arriving mid-run put a
