@@ -96,9 +96,29 @@ esac
 
 # The Apple ID this Mac is signed in as — the default iMessage target, so a note to self
 # needs no typing. Read from the account plist; there is no API for "my own handle".
+# `defaults` is bounded on purpose. It talks to cfprefsd, and where there is no
+# preferences session at all — a CI runner — it can block for minutes rather than answer
+# "no such domain". An Apple ID only saves typing one line of the config this writes, so it
+# is never worth `--init` hanging for: five seconds, then the placeholder is written.
+read_pref() { # domain -> its plist on stdout, or nothing when it takes too long
+  _pref_file=$(mktemp "${TMPDIR:-/tmp}/freebuff-pref.XXXXXX") || return 1
+  _pref_flag="$_pref_file.done"
+  ( defaults read "$1" >"$_pref_file" 2>/dev/null; : >"$_pref_flag" ) &
+  _pref_pid=$!
+  _pref_waited=0
+  while [ ! -e "$_pref_flag" ] && [ "$_pref_waited" -lt 5 ]; do
+    sleep 1
+    _pref_waited=$((_pref_waited + 1))
+  done
+  kill "$_pref_pid" 2>/dev/null
+  wait "$_pref_pid" 2>/dev/null
+  cat "$_pref_file" 2>/dev/null
+  rm -f "$_pref_file" "$_pref_flag"
+}
+
 discover_appleid() {
   for src in MobileMeAccounts com.apple.imservice.ids; do
-    found=$(defaults read "$src" 2>/dev/null |
+    found=$(read_pref "$src" |
       sed -n 's/.*AccountID[ =>"]*"\([^"@]*@[^"]*\)".*/\1/p' | head -1)
     [ -n "$found" ] && { printf '%s' "$found"; return 0; }
   done

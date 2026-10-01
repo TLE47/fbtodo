@@ -53,6 +53,10 @@ Entries start at the newest release; each one is a contract change, not a diff.
   happens on the first command.
 
 ### Fixed
+- `phone.sh --init` bounds its Apple ID lookup. `defaults` talks to cfprefsd and can block
+  for minutes where there is no preferences session at all (a CI runner), which hung the
+  whole config write — the topic had already been minted — for one line of convenience.
+  Five seconds per domain, then the commented placeholder.
 - The NAS pane-lifetime fixture waits for each pane to have **seen** the live session — the
   pane says which of the two it is showing — instead of a fixed six seconds. `alive` only
   says tmux made the pane; a plain pane still importing `fbtodo` when the marker's process
