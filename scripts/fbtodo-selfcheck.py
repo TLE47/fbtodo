@@ -5777,8 +5777,8 @@ try:
             )
             rects_raw = subprocess.run(
                 tmux + ["list-panes", "-a", "-F",
-                        "#{pane_id}\t#{window_id}\t#{pane_left}\t#{pane_top}"
-                        "\t#{pane_width}\t#{pane_height}"],
+                        "#{pane_id}|#{window_id}|#{pane_left}|#{pane_top}"
+                        "|#{pane_width}|#{pane_height}"],
                 capture_output=True, text=True,
             )
             return (

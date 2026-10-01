@@ -111,7 +111,8 @@ def tmux(*args: str) -> str:
 
 def panes(wanted: list[str]) -> list[dict]:
     """Every pane, or just the named ones — with the three fields the gate needs."""
-    fmt = "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}\t#{window_name}"
+    # `|`, not a tab: a tab in a tmux format is not portable (see panes.py's pane_rows).
+    fmt = "#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{window_name}"
     rows = []
     if wanted:
         for pane in wanted:
@@ -122,7 +123,7 @@ def panes(wanted: list[str]) -> list[dict]:
         rows = (tmux("list-panes", "-a", "-F", fmt) or "").splitlines()
     found = []
     for line in rows:
-        parts = line.split("\t")
+        parts = line.split("|", 3)
         if len(parts) < 4 or not parts[0].startswith("%"):
             continue
         found.append(

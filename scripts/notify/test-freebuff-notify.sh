@@ -1384,9 +1384,10 @@ cat >"$AB/panes/%7.txt" <<'FRAME'
 FRAME
 cp "$AB/panes/%7.txt" "$AB/panes/%9.txt"   # the same modal, under a pane that is not a TUI
 printf ' Working...  1m 12s   ■ Esc\n╭────────────────────╮\n│ Enter a coding task\n' >"$AB/panes/%8.txt"
-printf '%s\n' '%7	node	/home/me/proj	win' >"$AB/panes.list"
+printf '%s\n' '%7|node|/home/me/proj|win' >"$AB/panes.list"
 # A stub tmux: the panes list and the frames are files, and both are the exact shape the
-# real one prints, tabs and all.
+# real one prints. The separator is `|`, not a tab: a tab inside a `-F` format does not
+# survive every tmux (see panes.py's pane_rows).
 cat >"$AB/bin/tmux" <<TMUX
 #!/bin/sh
 case "\$1" in
@@ -1460,18 +1461,18 @@ ab_run >/dev/null
 check "the next question is a new one and pushes again" "$(ab_sends)" "2"
 
 # a pane that is not a TUI: the same words, drawn by something that is not freebuff
-printf '%s\n' '%9	bash	/tmp	win' >>"$AB/panes.list"
+printf '%s\n' '%9|bash|/tmp|win' >>"$AB/panes.list"
 out=$(ab_run --print)
 check_match "the same box under a shell pane is not a question" "$out" '^silent:'
 
 # ...and a TUI pane with no modal on it is not one either
-printf '%s\n' '%8	node	/home/me/proj	win' '%9	bash	/tmp	win' >"$AB/panes.list"
+printf '%s\n' '%8|node|/home/me/proj|win' '%9|bash|/tmp|win' >"$AB/panes.list"
 check_match "an ordinary freebuff screen is not a question" "$(ab_run --print)" '^silent:'
 
 # no sender and no topic: the caller's back-off signal, not a crash. A pending
 # question is needed to ask it at all — with nothing on screen there is nothing to
 # report, and a watcher must not be told to back off over a quiet screen.
-printf '%s\n' '%7	node	/home/me/proj	win' >"$AB/panes.list"
+printf '%s\n' '%7|node|/home/me/proj|win' >"$AB/panes.list"
 out=$(PATH="$AB/bin:$PATH" HOME="$AB/home" FREEBUFF_TMUX="$AB/bin/tmux" \
   FREEBUFF_PHONE_SH="$AB/notify/nope.sh" FREEBUFF_ASK_BELL_STATE="$AB/fresh.json" \
   python3 "$AB/notify/ask-bell.py" 2>&1); rc=$?
@@ -1482,7 +1483,7 @@ check "...and the question is not claimed, so it can still push later" \
 # a modal whose header has scrolled off was NOT read as a question: the frame's first
 # rows, without the title line, are what a wrapped output looks like
 tail -n +5 "$AB/panes/%7.txt" >"$AB/panes/%8.txt"
-printf '%s\n' '%8	node	/home/me/proj	win' >"$AB/panes.list"
+printf '%s\n' '%8|node|/home/me/proj|win' >"$AB/panes.list"
 check_match "a frame with no header on it is silent" "$(ab_run --print)" '^silent:'
 
 echo

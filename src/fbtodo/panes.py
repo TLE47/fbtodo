@@ -365,10 +365,14 @@ def pane_repaint(previous: list | None, frame: list, rows: int) -> str:
 
 def pane_rows() -> list[dict]:
     """Every pane, with what deciding about it needs: its id, its window, its shell."""
-    fmt = "#{pane_id}\t#{window_id}\t#{pane_pid}\t#{pane_start_command}"
+    # The field separator is a printable `|`, not a tab: a tab inside a `-F` format does not
+    # survive every tmux, and where it did not the whole row failed to parse — which read as
+    # "no panes at all" on that machine (seen on a Linux runner under a C locale, where the
+    # tab came back as `_`). Nothing else about the format depends on the separator.
+    fmt = "#{pane_id}|#{window_id}|#{pane_pid}|#{pane_start_command}"
     rows = []
     for line in (tmux_run("list-panes", "-a", "-F", fmt) or "").splitlines():
-        parts = line.split("\t", 3)
+        parts = line.split("|", 3)
         if len(parts) < 4 or not parts[0].startswith("%"):
             continue
         rows.append(
@@ -470,12 +474,12 @@ def instances_with_pane(rows, table) -> set:
 def pane_rects() -> dict:
     """Geometry per pane: what deciding "is this beside that" needs (one tmux call)."""
     fmt = (
-        "#{pane_id}\t#{window_id}\t#{pane_left}\t#{pane_top}"
-        "\t#{pane_width}\t#{pane_height}"
+        "#{pane_id}|#{window_id}|#{pane_left}|#{pane_top}"
+        "|#{pane_width}|#{pane_height}"
     )
     rects = {}
     for line in (tmux_run("list-panes", "-a", "-F", fmt) or "").splitlines():
-        parts = line.split("\t")
+        parts = line.split("|")
         if len(parts) < 6 or not parts[0].startswith("%"):
             continue
         try:

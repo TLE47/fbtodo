@@ -53,6 +53,10 @@ Entries start at the newest release; each one is a contract change, not a diff.
   happens on the first command.
 
 ### Fixed
+- tmux is asked for a pane's fields with a `|` separator rather than a tab: a tab inside a
+  `-F` format does not survive every tmux — on one Linux runner under a C locale it came
+  back as `_` — and then every row failed to parse, which read as "no panes at all" and left
+  the placement check and the ask watch looking at an empty pane list.
 - The `local-session` phase opens its pane with the wrapper the repository ships
   (`examples/fb.sh`), sourced from a throwaway `ZDOTDIR` and invoked as `fb`, instead of the
   `freebuff()` function a developer's own `~/.zshrc` happens to define. A runner has no such
