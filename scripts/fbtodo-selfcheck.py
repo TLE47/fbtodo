@@ -5769,7 +5769,26 @@ try:
                 and panes_mod.placed_beside(inst_now_pane, pane_now, rects_now, "v")
                 else "NOT under"
             )
-            return f"{pane_now} {where} {inst_now_pane}: {rects_now}"
+            # Only ever built for a failure message: which tmux the module was pointed at,
+            # what a raw call to that server says, and what the module's own readers see.
+            raw = subprocess.run(
+                tmux + ["list-panes", "-a", "-F", "#{pane_id} #{pane_pid} #{pane_start_command}"],
+                capture_output=True, text=True,
+            )
+            rects_raw = subprocess.run(
+                tmux + ["list-panes", "-a", "-F",
+                        "#{pane_id}\t#{window_id}\t#{pane_left}\t#{pane_top}"
+                        "\t#{pane_width}\t#{pane_height}"],
+                capture_output=True, text=True,
+            )
+            return (
+                f"{pane_now} {where} {inst_now_pane}: {rects_now}"
+                f" | inst={inst_now} pane={pane}"
+                f" | TMUX_BIN={panes_mod.TMUX_BIN!r} tmux={tmux!r}"
+                f" | raw rc={raw.returncode} out={raw.stdout.strip()!r} err={raw.stderr.strip()!r}"
+                f" | rects rc={rects_raw.returncode} out={rects_raw.stdout.strip()!r}"
+                f" | rows={panes_mod.pane_rows()}"
+            )
 
         pane, inst = todo_pane_and_instance()
         assert pane and inst, f"no list pane with an instance: {panes_detail()}"
