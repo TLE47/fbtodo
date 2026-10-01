@@ -5795,12 +5795,16 @@ try:
                         "|#{pane_width}|#{pane_height}"],
                 capture_output=True, text=True,
             )
+            version = subprocess.run(
+                tmux + ["-V"], capture_output=True, text=True
+            ).stdout.strip()
             return (
                 f"{pane_now} {where} {inst_now_pane}: {rects_now}"
                 f" | inst={inst_now} pane={pane}"
                 f" | TMUX_BIN={panes_mod.TMUX_BIN!r} tmux={tmux!r}"
                 f" | raw rc={raw.returncode} out={raw.stdout.strip()!r} err={raw.stderr.strip()!r}"
                 f" | rects rc={rects_raw.returncode} out={rects_raw.stdout.strip()!r}"
+                f" | {version}"
                 f" | rows={panes_mod.pane_rows()}"
             )
 
@@ -6002,6 +6006,18 @@ try:
         subprocess.run(
             tmux + ["move-pane", "-d", "-v", "-s", pane, "-t", inst_pane], capture_output=True
         )
+        # ...with the two stand-ins the checks above split in taken back out. Each is a
+        # `sleep 60` the keeper may move about on its own, and a window crowded with them is
+        # a size tmux can refuse to give a pinned pane: the boundary it would resize against
+        # is already at the other pane's minimum, so the pin lands at a width nobody asked
+        # for (seen on a runner: the session squeezed to one column, the list stuck at six).
+        # What a pin promises is the arrangement, and that is what this block is about.
+        for row in subprocess.run(
+            tmux + ["list-panes", "-t", sess, "-F", "#{pane_id} #{pane_start_command}"],
+            capture_output=True, text=True,
+        ).stdout.splitlines():
+            if "sleep 60" in row:
+                subprocess.run(tmux + ["kill-pane", "-t", row.split()[0]], capture_output=True)
 
         def pinned_ok(side: str, size: int) -> bool:
             inst_pane_now = panes_mod.freebuff_pane_id(inst)
@@ -6022,6 +6038,10 @@ try:
         assert pinned_ok("h", 10), (
             f"a pinned side/size was not applied to the list pane: {pane_geometry()}"
             f" pin={set_pin.stdout.strip()!r}"
+            f" | list={pane} inst_pane={inst_pane} window={window_target!r}"
+            f" | {placement()}"
+            f" | cmds={pane_cmds()}"
+            f" | {daemon_diag()}"
         )
         say("a window pin puts the list pane where it says, at the size it says: ok")
 

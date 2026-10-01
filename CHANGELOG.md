@@ -59,6 +59,11 @@ Entries start at the newest release; each one is a contract change, not a diff.
   shipped `funcs.zsh`, and skips the chime section with a stated reason when no bank is
   available. Its wrapper phase also stubs `afplay` like every other phase, so the chime the
   real wrapper rings at exit is silent and leaves the same log on every machine.
+- The pin check's fixture clears the two `sleep 60` stand-ins the checks above split in. A
+  window crowded with them is a size tmux can refuse to give a pinned pane — the boundary it
+  resizes against is already at the other pane's minimum — so on a runner the list landed at
+  six columns with the session squeezed to one. The failure message carries the panes, the
+  keeper's log and the tmux version now.
 - The NAS phase's session runs under a throwaway `ZDOTDIR` holding one `.zshrc`: an
   interactive zsh that finds no startup file at all runs `zsh-newuser-install` and blocks on
   its prompt, so on a runner (whose `HOME` has no `~/.zshrc`) the session never reached the
