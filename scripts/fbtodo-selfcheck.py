@@ -5316,13 +5316,15 @@ try:
         tmux2 = ["tmux", "-L", sock2]
         # the NAS block restored FBTODO_NAS on its way out; this pane needs it again
         env["FBTODO_NAS"] = fake_ssh
-        # A watcher left behind by the NAS phase is ADOPTED by these panes — its state
-        # answers `-s nas`, because `state_matches_request` compares the source and not the
-        # store — and it carries THAT phase's marker, so `instance_alive` stays true no
-        # matter what happens to this fixture's session and the plain pane never closes.
-        # The panes below have to be reading a state this fixture produced; the
-        # local-session fixture stops the same way, for the same reason.
+        # A watcher left behind by an earlier phase is ADOPTED by these panes: its state
+        # answers `-s nas` because `state_matches_request` compares the source and not the
+        # session it watched, so the panes would read a live-looking list that this fixture
+        # has no handle on and never updates. Stop it — the panes below have to be reading
+        # a state this fixture produced. Its state FILE outlives it and answers `-s nas` on
+        # its own while it is still fresh, so drop that too.
         run("stop")
+        if os.path.exists(state_path):
+            os.unlink(state_path)
         # The stand-in session ends when THIS suite says so, not on a clock of its own. A
         # `sleep 2` marker put the two panes in a race with the pane's own start-up: on a
         # loaded runner the plain pane's first poll landed after the sleep had already
@@ -5330,8 +5332,22 @@ try:
         # a fast machine the same fixture passed. It is killed explicitly below instead.
         short = subprocess.Popen(["sleep", "60"])
         marker2 = os.path.join(TEST_HOME, "fb-session-2")
+        # The marker's dir selects the store the pane reads, and this fixture is about pane
+        # LIFETIME — so it points at a project of its OWN, with no list in it. Sharing the
+        # NAS phase's `otherproj` made the state carry that phase's list, and a NAS state
+        # that is no longer alive still draws the last list it has: the pane could not be
+        # told apart from one that had never seen a session, and the `--wait` pane below
+        # rendered a list instead of the "waiting" line it is checked for.
+        wait_dir = os.path.join(store, "panelifetime")
+        # A session with a journal and no `chat-messages.json`: the store must hold a session
+        # (or the probe answers "no session on the NAS") but no list, so the list-less pane
+        # reaches the one line this fixture is about.
+        wait_chat = os.path.join(wait_dir, "chats", "2026-01-01T00-00-00.000Z")
+        os.makedirs(wait_chat, exist_ok=True)
+        with open(os.path.join(wait_chat, "log.jsonl"), "w") as fh:
+            fh.write("{}\n")
         with open(marker2, "w") as fh:
-            fh.write(f"{short.pid} 2026-01-01T00:00:00Z {store}/otherproj\n")
+            fh.write(f"{short.pid} 2026-01-01T00:00:00Z {wait_dir}\n")
         base = (
             f"FBTODO_HOME={TEST_HOME} FBTODO_NAS={env['FBTODO_NAS']} "
             f"PATH={shim}:{saved_path} "
@@ -5354,28 +5370,47 @@ try:
             time.sleep(0.3)
         assert alive("wait") and alive("nowait"), "a NAS pane never came up"
         # ...and a sighting has to be SEEN, not merely started: `alive` only says tmux made
-        # the pane. A plain pane closes because the instance it had seen went away, so one
-        # that is still importing `fbtodo` when the marker's process dies has seen nothing
-        # to close on and sits there. The pane says which of the two it is showing, so wait
-        # for that rather than for a fixed sleep long enough for a quiet machine.
+        # the pane, and a plain pane closes only after a poll in which it saw a live
+        # instance. Both panes read the same state file, so wait for that file to name THIS
+        # marker's directory as live and then let both panes poll it again — a pane's first
+        # poll is immediate, but it can land before the watcher's first write (the cached
+        # file was just dropped) and a pane that polls only a not-yet-live state never has
+        # anything to close on. The pane's own text is NOT the test here: a NAS state that
+        # is not alive still draws the last list, so "not waiting" is true either way.
         def pane_text(sess) -> str:
             shot = subprocess.run(
                 tmux2 + ["capture-pane", "-p", "-t", sess], capture_output=True, text=True
             )
             return STRIP(shot.stdout) if shot.returncode == 0 else "<no pane>"
 
-        def sighted(sess) -> bool:
-            text = pane_text(sess)
-            return text != "<no pane>" and "waiting for a NAS freebuff session" not in text
+        def state_read() -> dict:
+            try:
+                return json.load(open(state_path))
+            except (OSError, ValueError):
+                return {}
 
-        deadline = time.time() + 25
-        while time.time() < deadline and not (sighted("wait") and sighted("nowait")):
+        this_dir = os.path.join(store, "panelifetime")
+
+        def live_here() -> bool:
+            st = state_read()
+            return bool(st.get("instance_alive")) and (st.get("nas") or {}).get("fb_dir") == this_dir
+
+        deadline = time.time() + 40
+        while time.time() < deadline and not live_here():
             time.sleep(0.3)
-        assert sighted("wait") and sighted("nowait"), (
-            f"a NAS pane never saw the live session: wait={sighted('wait')}"
-            f" nowait={sighted('nowait')}"
+        assert live_here(), (
+            "the NAS panes never saw this fixture's session as live:"
+            f" {state_read()!r}"
         )
+        time.sleep(6)  # more than two poll intervals (`-i 2.5`), so both panes have polled
+        assert alive("wait") and alive("nowait"), "a NAS pane closed while its session was live"
         short.kill()
+        # Reap it. A killed child stays a ZOMBIE until its parent waits, and `kill -0` on a
+        # zombie still answers: the NAS probe reads this marker's pid, so the session looked
+        # alive to every pane for as long as this fixture ran — on a machine whose timing
+        # left the child unreaped, the plain pane never closed. A wrapper that has really
+        # ended leaves no such process, and `wait` is what makes the pid gone here.
+        short.wait(timeout=10)
         # A poll is an ssh round trip plus a probe, and the close happens at the END of the
         # poll that notices: on a loaded runner one poll can outlast a short deadline, so
         # this waits several of them (`-i 2.5`) rather than two.
@@ -5383,9 +5418,17 @@ try:
         while time.time() < deadline and alive("nowait"):
             time.sleep(0.3)
         assert alive("wait"), "--wait pane closed when its session ended"
+        mine = {}
+        if os.path.exists(state_path):
+            try:
+                mine = json.load(open(state_path))
+            except ValueError:
+                mine = {}
+        marker_seen = open(marker2).read().strip() if os.path.exists(marker2) else "<gone>"
         assert not alive("nowait"), (
             "a plain nas pane lingered after its session ended:"
-            f" text={pane_text('nowait')!r} state={read_json(state_path, {})!r}"
+            f" text={pane_text('nowait')!r} marker={marker_seen!r}"
+            f" watcher={module.live_watcher_pid(lock_path)} state={mine!r}"
         )
         shot = subprocess.run(tmux2 + ["capture-pane", "-p", "-t", "wait"], capture_output=True, text=True)
         assert "waiting for a NAS freebuff session" in STRIP(shot.stdout), shot.stdout

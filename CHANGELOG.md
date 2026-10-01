@@ -70,10 +70,17 @@ Entries start at the newest release; each one is a contract change, not a diff.
   says tmux made the pane; a plain pane still importing `fbtodo` when the marker's process
   dies has seen nothing to close on, so it stayed open while the same fixture passed on a
   quiet machine.
-- The NAS pane-lifetime fixture ends the **previous** phase's watcher before it starts its
-  own panes. A watcher left behind answers `-s nas` (the request matches the source, not the
-  store) and carries that phase's marker, so the fixture's plain pane stayed alive forever
-  and never closed with its session.
+- A `-s nas` pane's watcher follows the session that pane named. `spawn_daemon` never
+  forwarded `--fb-marker`, so the pane asked a daemon about `$HOME/.fb-session` and then read
+  its answer about a different session: a pane for a live marker was shown another store's
+  list, and one whose own marker had ended could stay up while the default marker's pid was
+  still alive.
+- The NAS pane-lifetime fixture no longer races the phases before it. It stops the watcher an
+  earlier phase left behind (a leftover state answers `-s nas` whatever session it watched),
+  drops that watcher's state file, **reaps** the stand-in session so `kill -0` cannot keep
+  answering for a zombie, and waits for the state to report its own marker live rather than
+  reading the pane's text — a NAS state that is not alive still draws the last list, so the
+  text cannot tell a live session from a finished one.
 - The notification kit's suite is no longer tied to the maintainer's machine: it sourced the
   `freebuff` shell functions out of `$HOME/.zshrc` (a runner has none, so every wrapper check
   failed), and it required MuseScore's SoundFont for its chime checks. It now sources the

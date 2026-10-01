@@ -531,6 +531,13 @@ def spawn_daemon(args, cwd: str, instance_pid: int, quiet: bool = True) -> int |
         "--nas-project",
         args.nas_project,
     ]
+    # Which session the daemon watches. Absent this, a `-s nas` pane that named its own
+    # marker spawned a daemon watching `$HOME/.fb-session` instead, and then read that
+    # daemon's answer about a DIFFERENT session: a pane for a live marker saw "no session"
+    # (and closed early), and one whose marker had ended stayed up because the file the
+    # daemon watched belonged to something else that was still alive.
+    if getattr(args, "fb_marker", None):
+        argv += ["--fb-marker", args.fb_marker]
     # The estimate knobs, forwarded only when the caller actually set them: the watcher is
     # the process that builds the memories, so a flag it never saw would be silently halved.
     if args.label_floor is not None:
