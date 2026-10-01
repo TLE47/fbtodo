@@ -5346,7 +5346,24 @@ try:
         while time.time() < deadline and not (alive("wait") and alive("nowait")):
             time.sleep(0.3)
         assert alive("wait") and alive("nowait"), "a NAS pane never came up"
-        time.sleep(6)
+        # ...and a sighting has to be SEEN, not merely started: `alive` only says tmux made
+        # the pane. A plain pane closes because the instance it had seen went away, so one
+        # that is still importing `fbtodo` when the marker's process dies has seen nothing
+        # to close on and sits there. The pane says which of the two it is showing, so wait
+        # for that rather than for a fixed sleep long enough for a quiet machine.
+        def sighted(sess) -> bool:
+            shot = subprocess.run(
+                tmux2 + ["capture-pane", "-p", "-t", sess], capture_output=True, text=True
+            )
+            return shot.returncode == 0 and "waiting for a NAS freebuff session" not in STRIP(shot.stdout)
+
+        deadline = time.time() + 25
+        while time.time() < deadline and not (sighted("wait") and sighted("nowait")):
+            time.sleep(0.3)
+        assert sighted("wait") and sighted("nowait"), (
+            f"a NAS pane never saw the live session: wait={sighted('wait')}"
+            f" nowait={sighted('nowait')}"
+        )
         short.kill()
         deadline = time.time() + 15
         while time.time() < deadline and alive("nowait"):

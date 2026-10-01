@@ -53,6 +53,11 @@ Entries start at the newest release; each one is a contract change, not a diff.
   happens on the first command.
 
 ### Fixed
+- The NAS pane-lifetime fixture waits for each pane to have **seen** the live session — the
+  pane says which of the two it is showing — instead of a fixed six seconds. `alive` only
+  says tmux made the pane; a plain pane still importing `fbtodo` when the marker's process
+  dies has seen nothing to close on, so it stayed open while the same fixture passed on a
+  quiet machine.
 - The notification kit's suite is no longer tied to the maintainer's machine: it sourced the
   `freebuff` shell functions out of `$HOME/.zshrc` (a runner has none, so every wrapper check
   failed), and it required MuseScore's SoundFont for its chime checks. It now sources the
