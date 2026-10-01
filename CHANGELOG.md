@@ -53,6 +53,10 @@ Entries start at the newest release; each one is a contract change, not a diff.
   happens on the first command.
 
 ### Fixed
+- The NAS phase's session runs under a throwaway `ZDOTDIR` holding one `.zshrc`: an
+  interactive zsh that finds no startup file at all runs `zsh-newuser-install` and blocks on
+  its prompt, so on a runner (whose `HOME` has no `~/.zshrc`) the session never reached the
+  command that starts the watcher.
 - tmux is asked for a pane's fields with a `|` separator rather than a tab: a tab inside a
   `-F` format does not survive every tmux — on one Linux runner under a C locale it came
   back as `_` — and then every row failed to parse, which read as "no panes at all" and left

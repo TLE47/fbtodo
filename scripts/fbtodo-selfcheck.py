@@ -6209,11 +6209,22 @@ try:
                 "}\n"
                 "remote\n"
             )
+        # ...and a throwaway `ZDOTDIR`, because an interactive zsh that finds NO startup
+        # files at all runs `zsh-newuser-install` and BLOCKS on its prompt: every runner
+        # pane sat at "--- Type one of the keys in parentheses ---" and the watcher this
+        # session was supposed to start never appeared. A runner's HOME has no `~/.zshrc`;
+        # the autostart and local-session phases sidestep it the same way. The file's only
+        # job is to exist — what the session RUNS is `remote_session.zsh`, below.
+        zdot_nas = os.path.join(TEST_HOME, "zdot-nas")
+        os.makedirs(zdot_nas, exist_ok=True)
+        with open(os.path.join(zdot_nas, ".zshrc"), "w", encoding="utf-8") as fh:
+            fh.write("# present so zsh does not offer its first-run install prompt\n")
         created3 = subprocess.run(
             tmux3
             + [
                 "new-session", "-d", "-s", sess3, "-x", "100", "-y", "30",
                 "-e", f"FBTODO_HOME={TEST_HOME}",
+                "-e", f"ZDOTDIR={zdot_nas}",
                 # FBTODO_NAS* point the watcher and its pane at the fixture store, so this
                 # asserts what the pane RENDERS, not what the real NAS happens to hold.
                 "-e", f"FBTODO_NAS={fake_ssh}",
