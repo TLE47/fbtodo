@@ -6233,14 +6233,34 @@ try:
             return [ln.split()[0] for ln in nas_listing().splitlines() if "-s nas" in ln]
 
         # the wrapper on its own must NOT open one: the pane belongs to the session over there
-        deadline = time.time() + 8
+        nas_lock = os.path.join(TEST_HOME, "fbtodo-nas-pane.pid")
+        deadline = time.time() + 20
         while time.time() < deadline:
             assert not nas_panes(), f"the remote shell opened a pane with no NAS session: {nas_listing()}"
+            if os.path.exists(nas_lock):
+                break
             time.sleep(0.3)
-        assert json.loads(run("nas", "--status", "--json").stdout)["watcher_pid"], (
-            f"the remote shell did not start the NAS watcher: rc={created3.returncode} "
-            f"err={created3.stderr.strip()!r}"
-        )
+        if not json.loads(run("nas", "--status", "--json").stdout)["watcher_pid"]:
+            # Only built for the failure: the watcher's own log and state, its claim, and the
+            # process table it would be in. A `--quiet` start writes nothing anywhere but its
+            # log, so this is the only place it can say what happened.
+            tail = ""
+            for name in ("fbtodo-nas-pane.log", "fbtodo-nas-pane.json"):
+                try:
+                    with open(os.path.join(TEST_HOME, name)) as fh:
+                        tail += f" {name}={fh.read()[-800:]!r}"
+                except OSError as exc:
+                    tail += f" {name}={exc.__class__.__name__}"
+            table = subprocess.run(
+                ["ps", "-eo", "pid=,args="], capture_output=True, text=True,
+            ).stdout or ""
+            watchers = [ln.strip() for ln in table.splitlines()
+                        if "fbtodo" in ln and " nas" in ln]
+            raise AssertionError(
+                f"the remote shell did not start the NAS watcher: rc={created3.returncode}"
+                f" err={created3.stderr.strip()!r} lock_file={os.path.exists(nas_lock)}"
+                f" panes={nas_listing()!r} watchers={watchers}{tail}"
+            )
         say("a remote shell carries you over and starts the watcher, without opening a pane: ok")
 
         # the liveness probe asked about the NAS and counted ITSELF as a match, so a NAS
