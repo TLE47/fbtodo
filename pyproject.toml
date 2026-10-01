@@ -17,8 +17,14 @@ classifiers = [
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Terminals",
+    "Topic :: System :: Monitoring",
 ]
 # The version is the `VERSION` constant in `fbtodo/base.py`, read statically at build time, so
 # there is one source of truth rather than a second number to keep in step.
@@ -30,6 +36,7 @@ fbtodo = "fbtodo:main"
 [project.urls]
 Homepage = "https://github.com/TLE47/fbtodo"
 Repository = "https://github.com/TLE47/fbtodo"
+Issues = "https://github.com/TLE47/fbtodo/issues"
 Changelog = "https://github.com/TLE47/fbtodo/blob/main/CHANGELOG.md"
 
 [tool.setuptools]

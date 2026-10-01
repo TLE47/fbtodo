@@ -1,0 +1,129 @@
+name: publish
+
+# A tag is the release: the tag name IS the version (`4.29.0`), matching the
+# `VERSION` constant in `src/fbtodo/base.py` (see CHANGELOG.md). This workflow
+# refuses a tag that disagrees, so PyPI and the source cannot diverge.
+#
+# One-time setup, done once by the maintainer, not in code:
+#   * on PyPI, add a *trusted publisher* for this repo and workflow (`publish.yml`)
+#     at https://pypi.org/manage/account/publishing/ — no API token is stored here;
+#   * to keep the Homebrew tap in step, add a `HOMEBREW_TAP_TOKEN` secret with
+#     write access to TLE47/homebrew-tap. Without it, that job simply skips.
+on:
+  push:
+    tags: ["*"]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Build and check only; publish nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and check the tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: the tag must be the version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="$(python3 -c 'import re,pathlib; print(re.search(r"^VERSION = \"([^\"]+)\"", pathlib.Path("src/fbtodo/base.py").read_text(), re.M).group(1))')"
+          echo "tag: $tag   version: $version"
+          if [ "$tag" != "$version" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "::error::tag $tag does not match VERSION $version — bump one or the other"
+            exit 1
+          fi
+
+      - name: build sdist and wheel
+        run: |
+          python3 -m pip install --upgrade build
+          python3 -m build
+
+      - name: install the wheel and run it
+        run: |
+          python3 -m venv /tmp/check
+          /tmp/check/bin/pip install --quiet dist/*.whl
+          /tmp/check/bin/fbtodo --version
+          /tmp/check/bin/fbtodo doctor --json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["fail"] == 0, d'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  pypi:
+    name: publish to PyPI
+    needs: build
+    # A tag is the only thing that publishes — a manual run is a build-only dry
+    # run unless it was dispatched *on* a tag and asked to publish.
+    if: startsWith(github.ref, 'refs/tags/') && (github.event_name == 'push' || inputs.dry-run == false)
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fbtodo
+    permissions:
+      id-token: write   # OIDC, for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  homebrew:
+    name: update the Homebrew tap
+    needs: pypi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: skip when no tap token is configured
+        id: gate
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -n "$TAP_TOKEN" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            echo "HOMEBREW_TAP_TOKEN is not set — leaving the tap alone" >&2
+          fi
+
+      - name: write the formula from the release on PyPI
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          # Give PyPI a moment, then read the published sdist's url and sha256
+          # rather than guessing them from a locally-built file's bytes.
+          sleep 15
+          python3 packaging/homebrew/update-formula.py --version "$GITHUB_REF_NAME"
+
+      - name: push it to TLE47/homebrew-tap
+        if: steps.gate.outputs.go == 'true'
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -eu
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_TOKEN}@github.com/TLE47/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp packaging/homebrew/Formula/fbtodo.rb tap/Formula/fbtodo.rb
+          cd tap
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/fbtodo.rb
+          git commit -m "fbtodo ${GITHUB_REF_NAME}"
+          git push

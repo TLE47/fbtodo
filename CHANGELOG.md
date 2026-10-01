@@ -123,7 +123,7 @@ Entries start at the newest release; each one is a contract change, not a diff.
 ### Moved
 - The suite and the notifier kit left the repository root: `scripts/fbtodo-selfcheck.py` and
   `scripts/notify/`. The top level is now only the launcher, `src/`, `tests/`, `docs/`,
-  `examples/`, the packaging and the docs that describe them, and the suite resolves the
+  `examples/`, the packaging, the installer and the docs that describe them, and the suite resolves the
   checkout it drives from its own directory's parent rather than from a file beside it.
 - The program is a package (`src/fbtodo/`) behind a thin launcher (`fbtodo`). Nothing
   changes for anyone who runs, links or copies it: the launcher is the same path, takes
@@ -137,6 +137,27 @@ Entries start at the newest release; each one is a contract change, not a diff.
   global in the self-check answer exactly as before.
 
 ### Added
+- **fbtodo is installable without a checkout.** Three new ways in, all of them the same
+  command on the `PATH`: `install.sh` (served at
+  `https://raw.githubusercontent.com/TLE47/fbtodo/main/install.sh`, for `curl … | sh`)
+  takes the first of Homebrew, `uv`, `pipx`, a venv or a clone that the machine already
+  has, never runs as root, and pins with `--version` (and the matching `FBTODO_VERSION`
+  and friends); a Homebrew formula (`packaging/homebrew/Formula/fbtodo.rb`) makes
+  `brew install TLE47/tap/fbtodo`, built from the PyPI sdist with no `resource` blocks
+  because fbtodo has no dependencies; and a tag now **publishes the package** —
+  `.github/workflows/publish.yml` checks the tag against `VERSION`, builds the sdist and
+  wheel, runs the installed wheel's own `fbtodo doctor`, and uploads to PyPI through a
+  trusted publisher, so `uvx fbtodo` and `pipx install fbtodo` have something to fetch.
+  `scripts/release.py` does the mechanical half of a release (bump `VERSION`, roll the
+  changelog, build, commit, tag) and
+  `packaging/homebrew/update-formula.py` writes a release's `url` and `sha256` into the
+  formula from the versioned PyPI index — the two values cannot be filled earlier,
+  because a sdist built here is not the sdist it will serve. `scripts/preflight.py`
+  reports whether a release can succeed *before* its tag exists — the tree, the branch,
+  the tag's availability, whether that version is already spent on PyPI, whether the tap
+  repository has a branch to push to, and which of those it cannot see without GitHub
+  credentials — because a mistyped tag costs a version number rather than a retry, and
+  the tap job's failure mode is to skip quietly.
 - [`scripts/notify/funcs.zsh`](scripts/notify/funcs.zsh) is the notification kit's shell half —
   the chime picker and the `freebuff` wrapper that runs the title timer and the drop watch —
   shipped rather than left in the maintainer's `~/.zshrc`. The kit's suite sources this copy,

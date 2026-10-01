@@ -16,7 +16,7 @@ fbtodo displays your [Freebuff](https://freebuff.com) agent's task list in a sid
 No configuration: it reads the list your agent already keeps. Freebuff's list turns up on its own;
 anything else can push one over stdin — see [docs/SOURCES.md](docs/SOURCES.md).
 
-**[Installation](#installation)** · **[Commands](#commands)** · **[FAQ](#faq)** · [Settings](docs/SETTINGS.md) · [Deep docs](docs/INTERNALS.md)
+**[Installation](#installation)** · **[Commands](#commands)** · **[FAQ](#faq)** · [Install guide](docs/INSTALL.md) · [Settings](docs/SETTINGS.md) · [Deep docs](docs/INTERNALS.md)
 
 ---
 
@@ -37,24 +37,40 @@ To see how the pane mirrors the active session, here is the side-by-side pairing
 
 ## Installation
 
-### Quick start
+**One line** — takes the first method your machine already has (Homebrew, `uv`,
+`pipx`, a plain venv, or a clone), and never runs as root:
 
 ```sh
-# 1. Install tmux (shows the pane)
-brew install tmux                # or: apt install tmux
-
-# 2. Clone fbtodo
-git clone https://github.com/TLE47/fbtodo ~/Projects/fbtodo
-
-# 3. Add to your PATH
-mkdir -p ~/.local/bin && ln -sf ~/Projects/fbtodo/fbtodo ~/.local/bin/fbtodo
-
-# 4. Start working
-tmux new -s work
-fbtodo                           # opens the pane automatically
+curl -fsSL https://raw.githubusercontent.com/TLE47/fbtodo/main/install.sh | sh
 ```
 
-That's it. Requirements: **Python 3.9+** and **tmux**.
+**Homebrew**
+
+```sh
+brew install TLE47/tap/fbtodo     # brew taps it for you
+```
+
+**uv / pipx** — an isolated venv, nothing to manage on your `PATH`:
+
+```sh
+uvx fbtodo                        # run it once, install nothing
+uv tool install fbtodo            # ...or keep it
+pipx install fbtodo
+```
+
+**From the checkout** — no install at all:
+
+```sh
+brew install tmux                 # or: apt install tmux
+git clone https://github.com/TLE47/fbtodo ~/Projects/fbtodo
+mkdir -p ~/.local/bin && ln -sf ~/Projects/fbtodo/fbtodo ~/.local/bin/fbtodo
+tmux new -s work
+fbtodo                            # opens the pane automatically
+```
+
+Requirements: **Python 3.9+** and **tmux**. If the pane does not appear, run
+`fbtodo doctor` — it names what is missing. Every route, with pinned versions and
+how to uninstall, is in [docs/INSTALL.md](docs/INSTALL.md).
 
 ### Using the `fb` shortcut (optional)
 
@@ -70,24 +86,18 @@ One lazy command:
 echo '. ~/Projects/fbtodo/examples/fb.sh' >> ~/.bashrc && source ~/.bashrc && fb
 ```
 
-### Install with pipx (no clone to manage)
+### Updating and pinning
 
-If you would rather not keep a checkout on your PATH, install it as an isolated app:
+Each installer updates itself — `brew upgrade fbtodo`, `uv tool upgrade fbtodo`,
+`pipx upgrade fbtodo`. To pin a release, name it; the tag is the version:
 
 ```sh
-pipx install git+https://github.com/TLE47/fbtodo
+uv tool install fbtodo==4.30.0
+pipx install fbtodo==4.30.0
+pipx install "git+https://github.com/TLE47/fbtodo@4.30.0"   # from the tag
 ```
 
-
-> pipx installs fbtodo into an isolated environment on your PATH. No Python dependencies are required, though displaying the pane still needs tmux
-#### Update + virtual env
-```sh
-pipx install --force git+https://github.com/TLE47/fbtodo
-```
-#### Pin version
-```sh
-pipx install "git+https://github.com/TLE47/fbtodo@4.29.0"
-```
+> No Python dependencies are required, though displaying the pane still needs tmux.
 
 ---
 
