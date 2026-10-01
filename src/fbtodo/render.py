@@ -222,6 +222,33 @@ def _clamp_rows(rows: list, height: int | None, head: int, tail: int) -> list:
     return rows[:head] + rows[head:len(rows) - tail][:room] + rows[len(rows) - tail:]
 
 
+def _wrap_segs(
+    text: str,
+    width: int,
+    *,
+    initial_indent: str = "",
+    subsequent_indent: str = "",
+    max_lines: int | None = None,
+) -> list[str]:
+    """`textwrap.wrap` that cannot raise on a too-narrow width.
+
+    Python refuses to wrap when the indent plus the `…` placeholder do not fit the width,
+    and the exact cutoff moves between versions — a pane can be asked for any width, so the
+    budget is raised to the smallest legal one here. `render` clips every line to `width`
+    afterwards, so a wider line cannot paint past the pane's edge.
+    """
+    indent = subsequent_indent if (max_lines or 1) > 1 else initial_indent
+    floor = len(indent) + len(" …".lstrip()) + 1
+    return textwrap.wrap(
+        text,
+        width=max(width, floor),
+        initial_indent=initial_indent,
+        subsequent_indent=subsequent_indent,
+        max_lines=max_lines,
+        placeholder=" …",
+    )
+
+
 def _render_plain(
     state: dict,
     color: bool,
@@ -297,25 +324,21 @@ def _render_plain(
             # agent's to write, and a missing one is a rule that was skipped. Wrapped like the
             # heading itself, at the width it was given: a floor here (16 columns, once) drew
             # rows wider than a 12-column pane, which is the frame wrapping as it is printed.
-            segs = textwrap.wrap(
-                "— none stated",
-                width=max(1, width),
+            segs = _wrap_segs(
+                "— none stated", max(1, width),
                 initial_indent="big goal · ",
                 subsequent_indent="           ",
                 max_lines=goal_lines,
-                placeholder=" …",
             )
             lines += [c(dim, seg) for seg in segs]
         if goal:
             # `initial_indent` is counted INSIDE `width`, so the full pane width goes
             # here: subtracting the label as well wrapped headings 11 columns early.
-            segs = textwrap.wrap(
-                goal,
-                width=max(1, width),
+            segs = _wrap_segs(
+                goal, max(1, width),
                 initial_indent="big goal · ",
                 subsequent_indent="           ",
                 max_lines=goal_lines,
-                placeholder=" …",
             )
             # A goal that is non-empty but wraps to nothing — a single space, which is what
             # the filter leaves of a lone tab — must draw no heading at all, not crash on
@@ -324,13 +347,11 @@ def _render_plain(
                 lines.append(c(bold, segs[0]))
                 lines += [c(dim, seg) for seg in segs[1:]]
         if now_txt:
-            segs = textwrap.wrap(
-                now_txt,
-                width=max(1, width),
+            segs = _wrap_segs(
+                now_txt, max(1, width),
                 initial_indent="now · ",
                 subsequent_indent="      ",
                 max_lines=2,
-                placeholder=" …",
             )
             lines += [c(yellow, seg) for seg in segs]
         nudge = str(state.get("nudge") or "")
@@ -339,13 +360,11 @@ def _render_plain(
             # says re-write it before carrying on. Shown only while the list has NOT been
             # rewritten since (a newer write_todos clears `nudge`), so it is the pane
             # reporting a skipped rule rather than a permanent nag.
-            segs = textwrap.wrap(
-                "rewrite the list, then continue",
-                width=max(16, width),
+            segs = _wrap_segs(
+                "rewrite the list, then continue", max(16, width),
                 initial_indent=f"nudge · {nudge} — ",
                 subsequent_indent="        ",
                 max_lines=2,
-                placeholder=" …",
             )
             lines += [c(yellow, seg) for seg in segs]
 
@@ -1035,13 +1054,11 @@ def _render_rich(
     max_goal_lines = min(goal_lines, 2) if width < 60 else goal_lines
     goal_prefix = "🎯 Goal: "
     if max_goal_lines > 0 and goal:
-        segs = textwrap.wrap(
-            goal,
-            width=max(12, inner - 1),
+        segs = _wrap_segs(
+            goal, max(12, inner - 1),
             initial_indent=goal_prefix,
             subsequent_indent=" " * _cell_width(goal_prefix),
             max_lines=max_goal_lines,
-            placeholder=" …",
         )
         # The icon and its label carry the identity in the muted grey; the goal itself is
         # the frame's heading, so it is drawn in the readable ink rather than being dimmed
@@ -1054,9 +1071,9 @@ def _render_rich(
             head.append(c(muted, goal_prefix) + c(active_ink, segs[0][len(goal_prefix):]))
             head += [c(active_ink, pad + seg[len(pad):]) for seg in segs[1:]]
     if now_txt:
-        segs = textwrap.wrap(
-            now_txt, width=inner, initial_indent="NOW · ", subsequent_indent="      ",
-            max_lines=1, placeholder=" …",
+        segs = _wrap_segs(
+            now_txt, inner, initial_indent="NOW · ", subsequent_indent="      ",
+            max_lines=1,
         )
         # The macro goal and the micro step are separated by INK, not by two bright colours
         # competing above the list: the goal's label is the muted grey, `NOW` is the accent
@@ -1068,10 +1085,10 @@ def _render_rich(
             head += [c(accent, indent.rstrip(" ·")) + c(st["faint"], " · ")
                      + c(active_ink, body)]
     if nudge and nudge != now_txt:
-        segs = textwrap.wrap(
-            "rewrite the list, then continue", width=inner,
+        segs = _wrap_segs(
+            "rewrite the list, then continue", inner,
             initial_indent=f"NUDGE · {nudge} — ", subsequent_indent="        ",
-            max_lines=1, placeholder=" …",
+            max_lines=1,
         )
         head += [c(yellow, seg) for seg in segs]
     no_times = no_times_note(state)
