@@ -60,6 +60,10 @@ Entries start at the newest release; each one is a contract change, not a diff.
   the filter leaves of a lone tab) — the heading is drawn or skipped, never indexed.
 
 ### Moved
+- The suite and the notifier kit left the repository root: `scripts/fbtodo-selfcheck.py` and
+  `scripts/notify/`. The top level is now only the launcher, `src/`, `tests/`, `docs/`,
+  `examples/`, the packaging and the docs that describe them, and the suite resolves the
+  checkout it drives from its own directory's parent rather than from a file beside it.
 - The program is a package (`src/fbtodo/`) behind a thin launcher (`fbtodo`). Nothing
   changes for anyone who runs, links or copies it: the launcher is the same path, takes
   the same arguments, and a copy of the package without it still runs

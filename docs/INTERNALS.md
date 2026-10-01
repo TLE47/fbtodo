@@ -25,10 +25,11 @@ fbtodo                 the launcher: `src/` on the import path beside its own re
                        symlink, the pane command lines, the keeper, the daemon's own
                        foreground re-exec
 src/fbtodo/            the program, a layer per module (below)
-fbtodo-selfcheck.py    the suite: it imports the package (`load_fbtodo`) rather than
+scripts/fbtodo-selfcheck.py
+                       the suite: it imports the package (`load_fbtodo`) rather than
                        loading a file by path, so its patch sites patch module globals
                        the same way they always did
-notify/                the watches, each invoked as a subprocess
+scripts/notify/        the watches, each invoked as a subprocess
 ```
 
 The program is one package in ten modules, and it is **one namespace** still: each module
@@ -428,7 +429,7 @@ push the list the pane was pointed at out of view.
 ### Testing
 
 ```sh
-python3 fbtodo-selfcheck.py --list          # the phases, with line numbers
-python3 fbtodo-selfcheck.py --only local-session  # the cheap body + that phase, ~20 s
-bash notify/test-freebuff-notify.sh         # the notification kit
+python3 scripts/fbtodo-selfcheck.py --list          # the phases, with line numbers
+python3 scripts/fbtodo-selfcheck.py --only local-session  # the cheap body + that phase, ~20 s
+bash scripts/notify/test-freebuff-notify.sh         # the notification kit
 ```

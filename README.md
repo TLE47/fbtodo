@@ -167,12 +167,12 @@ Get notifications when your agent finishes, gets stuck, or asks for input:
 ```sh
 # Install the notification kit
 mkdir -p ~/.config/freebuff-notify
-cp notify/*.py notify/*.sh ~/.config/freebuff-notify/
+cp scripts/notify/*.py scripts/notify/*.sh ~/.config/freebuff-notify/
 chmod +x ~/.config/freebuff-notify/*.sh
 ~/.config/freebuff-notify/phone.sh --init
 ```
 
-See [notify/README.md](notify/README.md) for details on iMessage and ntfy alerts.
+See [scripts/notify/README.md](scripts/notify/README.md) for details on iMessage and ntfy alerts.
 
 ---
 
@@ -233,9 +233,9 @@ Set `FBTODO_NO_PANE=1` and use `fbtodo bar`. It prints `todos 3/5` and updates e
 Run the test suite:
 
 ```sh
-python3 fbtodo-selfcheck.py              # full suite (~90-160 seconds)
-python3 fbtodo-selfcheck.py --only local-session   # one test
-bash notify/test-freebuff-notify.sh      # notification tests
+python3 scripts/fbtodo-selfcheck.py      # full suite (~90-160 seconds)
+python3 scripts/fbtodo-selfcheck.py --only local-session   # one test
+bash scripts/notify/test-freebuff-notify.sh   # notification tests
 ```
 
 ---

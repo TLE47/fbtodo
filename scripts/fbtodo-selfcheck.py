@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Self-check for `fbtodo`, the copy sitting next to this file.
+"""Self-check for `fbtodo`, the checkout this file lives under.
 
 Runs everything against a throwaway FBTODO_HOME (`.freebuff/fbtodo-test/`) and a
 fake "freebuff instance" (a sleep process) whose death must stop the watcher:
 
-    python3 fbtodo-selfcheck.py
+    python3 scripts/fbtodo-selfcheck.py
 
 The suite drives real tmux servers it starts itself and takes ~90-160 s. It cleans
 up only that one directory — created by this script, verified by path — never a
@@ -27,14 +27,18 @@ import sys
 import time
 
 HOME = os.path.expanduser("~")
+# This suite lives in `scripts/`; the checkout it drives is the directory above it, so the
+# launcher, `src/`, `tests/`, `docs/` and `examples/` are all found from ROOT rather than
+# from the suite's own directory.
 HERE = os.path.dirname(os.path.abspath(__file__))
-FB = os.path.join(HERE, "fbtodo")
+ROOT = os.path.dirname(HERE)
+FB = os.path.join(ROOT, "fbtodo")
 TEST_HOME = os.path.join(HOME, ".freebuff", "fbtodo-test")
 REAL_HOME = os.path.join(HOME, ".freebuff")
-PANES = os.path.join(HERE, "fbtodo")
+PANES = os.path.join(ROOT, "fbtodo")
 # The program is the package under `src/`; `FB` above is the launcher beside it, which is
 # what every subprocess phase runs and what `self_argv` names back to us.
-SRC = os.path.join(HERE, "src")
+SRC = os.path.join(ROOT, "src")
 sys.path.insert(0, SRC)
 CWD = HOME
 STRIP = lambda s: re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", s)  # noqa: E731
@@ -292,9 +296,9 @@ def kill_tree(proc) -> None:
 # name cut out (as `pass`, line numbers preserved), keeping the cheap body — fixture
 # setup, marker checks, unit tests — that the phases depend on. `--list` shows them.
 #
-#   python3 fbtodo-selfcheck.py --list
-#   python3 fbtodo-selfcheck.py --only local-session
-#   python3 fbtodo-selfcheck.py --only 1 --only "nas pane"
+#   python3 scripts/fbtodo-selfcheck.py --list
+#   python3 scripts/fbtodo-selfcheck.py --only local-session
+#   python3 scripts/fbtodo-selfcheck.py --only 1 --only "nas pane"
 SUBSET_GUARD = "FBTODO_SELFCHECK_SUBSET"  # set for the re-run, so it does not recurse
 PHASE_MARK = "#@phase "
 
@@ -594,7 +598,7 @@ try:
     #      state is fed through the same functions the commands call, with the clock frozen
     #      and the state directory empty, so a change to what the pane prints is a DIFF to
     #      read rather than a surprise in the terminal.
-    gold = os.path.join(HERE, "tests", "golden.py")
+    gold = os.path.join(ROOT, "tests", "golden.py")
     run_gold = lambda where=None: subprocess.run(  # noqa: E731
         [sys.executable, gold] + (["--golden", where] if where else []),
         capture_output=True, text=True, env=env, cwd=CWD, timeout=180,
@@ -604,7 +608,7 @@ try:
     # ...and it CAN fail: a checker nobody has seen fail is a checker nobody can trust.
     mutated = os.path.join(TEST_HOME, "golden-mutated")
     shutil.rmtree(mutated, ignore_errors=True)
-    shutil.copytree(os.path.join(HERE, "tests", "golden"), mutated)
+    shutil.copytree(os.path.join(ROOT, "tests", "golden"), mutated)
     with open(os.path.join(mutated, "bar.txt"), "a") as fh:
         fh.write("todos 9/9\n")
     bad = run_gold(mutated)
@@ -1813,7 +1817,7 @@ try:
     # `GOAL_MAX_CHARS` still have to agree, on every machine.
     agents_md = os.path.join(HOME, "AGENTS.md")
     if not os.path.isfile(agents_md):
-        agents_md = os.path.join(HERE, "docs", "AGENTS.md")
+        agents_md = os.path.join(ROOT, "docs", "AGENTS.md")
     agents_text = open(agents_md, encoding="utf-8").read()
     assert "`Goal:`" in agents_text, f"{agents_md} lost the `Goal:` convention the pane reads"
     assert "concise rewrite" in agents_text, f"{agents_md} no longer asks for a concise goal"
@@ -4665,7 +4669,7 @@ try:
         with open(os.path.join(zdot, ".zshrc"), "w", encoding="utf-8") as fh:
             fh.write(
                 f'path=({os.path.dirname(FB)} $path)\n'
-                f'. {os.path.join(HERE, "examples", "zshrc-autostart.zsh")}\n'
+                f'. {os.path.join(ROOT, "examples", "zshrc-autostart.zsh")}\n'
             )
         os.environ["ZDOTDIR"] = zdot
         os.environ.pop("FBTODO_NO_AUTOSTART", None)
@@ -5239,12 +5243,12 @@ try:
         # "and what has it been doing instead?", and rows are the answer that fits.
         st8 = dict(st7, tool_calls={"run_terminal_command": 2, "skill": 1}, observed=[
             {"verb": "edited", "what": "fbtodo", "ts_ms": SWEEP_NOW - 120_000},
-            {"verb": "ran", "what": "python3 fbtodo-selfcheck.py", "ts_ms": SWEEP_NOW - 60_000},
+            {"verb": "ran", "what": "python3 scripts/fbtodo-selfcheck.py", "ts_ms": SWEEP_NOW - 60_000},
         ])
         feed = ansi.sub("", module.render(
             st8, True, watching=999, width=68, height=14, now_ms=SWEEP_NOW))
         assert "edited fbtodo  ·  2m ago" in feed, feed
-        assert "ran python3 fbtodo-selfcheck.py  ·  1m ago" in feed, feed
+        assert "ran python3 scripts/fbtodo-selfcheck.py  ·  1m ago" in feed, feed
         assert "called so far" not in feed, feed
         # ...and a state carrying no calls keeps the line it had: the feed is an addition,
         # never a blank where the old answer used to be.

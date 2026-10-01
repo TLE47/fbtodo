@@ -1,9 +1,10 @@
 name: ci
 
 # Both suites, on both platforms the pane claims to support, on the oldest Python it
-# promises (3.9) and the newest. The suites are the contract: `fbtodo-selfcheck.py` drives
-# private tmux servers and a throwaway FBTODO_HOME, and `notify/test-freebuff-notify.sh`
-# drives the bells with stubbed senders, so nothing here touches a real session or phone.
+# promises (3.9) and the newest. The suites are the contract: `scripts/fbtodo-selfcheck.py`
+# drives private tmux servers and a throwaway FBTODO_HOME, and
+# `scripts/notify/test-freebuff-notify.sh` drives the bells with stubbed senders, so nothing
+# here touches a real session or phone.
 on:
   push:
     branches: [main]
@@ -53,7 +54,7 @@ jobs:
       - name: self-check
         run: |
           set +e
-          python3 fbtodo-selfcheck.py 2>&1 | tee selfcheck.log
+          python3 scripts/fbtodo-selfcheck.py 2>&1 | tee selfcheck.log
           rc=${PIPESTATUS[0]}
           bash .github/ci-report.sh self-check selfcheck.log "$rc"
           exit "$rc"
@@ -61,7 +62,7 @@ jobs:
       - name: notify suite
         run: |
           set +e
-          bash notify/test-freebuff-notify.sh 2>&1 | tee notify.log
+          bash scripts/notify/test-freebuff-notify.sh 2>&1 | tee notify.log
           rc=${PIPESTATUS[0]}
           bash .github/ci-report.sh notify-suite notify.log "$rc"
           exit "$rc"
@@ -108,7 +109,7 @@ jobs:
       - name: self-check
         run: |
           set +e
-          python3 fbtodo-selfcheck.py 2>&1 | tee selfcheck.log
+          python3 scripts/fbtodo-selfcheck.py 2>&1 | tee selfcheck.log
           rc=${PIPESTATUS[0]}
           bash .github/ci-report.sh self-check selfcheck.log "$rc"
           exit "$rc"
@@ -116,7 +117,7 @@ jobs:
       - name: notify suite
         run: |
           set +e
-          bash notify/test-freebuff-notify.sh 2>&1 | tee notify.log
+          bash scripts/notify/test-freebuff-notify.sh 2>&1 | tee notify.log
           rc=${PIPESTATUS[0]}
           bash .github/ci-report.sh notify-suite notify.log "$rc"
           exit "$rc"
@@ -148,7 +149,7 @@ jobs:
       - name: self-check
         run: |
           set +e
-          python3 fbtodo-selfcheck.py 2>&1 | tee selfcheck.log
+          python3 scripts/fbtodo-selfcheck.py 2>&1 | tee selfcheck.log
           rc=${PIPESTATUS[0]}
           bash .github/ci-report.sh self-check selfcheck.log "$rc"
           exit "$rc"
@@ -156,7 +157,7 @@ jobs:
       - name: notify suite
         run: |
           set +e
-          bash notify/test-freebuff-notify.sh 2>&1 | tee notify.log
+          bash scripts/notify/test-freebuff-notify.sh 2>&1 | tee notify.log
           rc=${PIPESTATUS[0]}
           bash .github/ci-report.sh notify-suite notify.log "$rc"
           exit "$rc"

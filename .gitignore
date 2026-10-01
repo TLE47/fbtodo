@@ -14,11 +14,11 @@ fbtodo-*.json
 fbtodo-*.pid
 fbtodo-*.log
 
-# The notifier kit's state and config
-notify/phone.conf
-notify/*.state
-notify/*.state.lock
-notify/*.log
+# The notifier kit's state and config, if the kit is run from the checkout
+scripts/notify/phone.conf
+scripts/notify/*.state
+scripts/notify/*.state.lock
+scripts/notify/*.log
 
 # Editor / OS noise
 .DS_Store

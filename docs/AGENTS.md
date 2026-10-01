@@ -32,3 +32,10 @@ behind it.
 - **Testing and verification are steps in the list, not an epilogue.** Write the checks the
   work will need — the suite, the typecheck, the live run, the negative path — as their own
   todos when the list is written, and tick each one as it lands.
+
+## Commits
+
+- Keep the subject line **under 50 characters**, and put the reasoning in the body. GitHub
+  prints the subject beside every file in the commit's tree, so a longer one is truncated
+  mid-word exactly where the history is read most often.
+- One idea per commit. A subject that needs "and" is two commits that were not separated.

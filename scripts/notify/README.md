@@ -27,7 +27,7 @@ The bells find each other by their own directory, and `fbtodo` looks for them in
 
 ```sh
 mkdir -p ~/.config/freebuff-notify
-cp notify/*.py notify/*.sh ~/.config/freebuff-notify/
+cp scripts/notify/*.py scripts/notify/*.sh ~/.config/freebuff-notify/
 chmod +x ~/.config/freebuff-notify/*.py ~/.config/freebuff-notify/*.sh
 ~/.config/freebuff-notify/phone.sh --init      # writes phone.conf with a fresh topic
 ```
