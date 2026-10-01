@@ -5,6 +5,8 @@ Entries start at the newest release; each one is a contract change, not a diff.
 
 ## Unreleased
 
+## 4.30.0
+
 ### Changed
 - `render` takes the palette and the colour depth as arguments (resolved from the environment only
   when they are left out), so a frame is a function of the state, the clock and the size it was
