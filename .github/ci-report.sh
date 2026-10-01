@@ -27,15 +27,20 @@ tail_text="$(tail -n 80 "$log" 2>/dev/null || true)"
   echo '```'
 } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
-# A suite that fails dozens of checks ends its tail in PASSes, so the tail alone hides WHAT
-# broke. When the log has FAIL lines, annotate those (first ones) instead: they name the
-# checks, and the tail of them is where a cascade from one cause starts.
+# Both ends are worth having and neither replaces the other:
+#   * the FIRST FAIL lines name what broke — a suite that fails dozens of checks ends its
+#     tail in PASSes, so the tail alone says nothing; a cascade's cause is at its start, and
+#     the first FAIL is where the whole log's own failures begin;
+#   * the TAIL is where a capped run stopped, which is the only clue a hang leaves behind.
 annotate="$tail_text"
-grep -q '^FAIL' "$log" 2>/dev/null && annotate="$(grep '^FAIL' "$log" | head -n 6)"
+if grep -q '^FAIL' "$log" 2>/dev/null; then
+  annotate="$(grep '^FAIL' "$log" | head -n 4)
+$(tail -n 6 "$log")"
+fi
 
 # One annotation per line, newest last. Workflow commands are one line each, so newlines are
 # not a problem; `%` and CR do need escaping.
-printf '%s\n' "$annotate" | tail -n 6 | while IFS= read -r line; do
+printf '%s\n' "$annotate" | tail -n 10 | while IFS= read -r line; do
   esc="$(printf '%s' "$line" | sed -e 's/%/%25/g' -e 's/\r/%0D/g')"
   echo "::error title=${name}::${esc}"
 done

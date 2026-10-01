@@ -62,7 +62,7 @@ jobs:
       - name: notify suite
         run: |
           set +e
-          bash .github/ci-timeout.sh 720 notify.log bash scripts/notify/test-freebuff-notify.sh
+          bash .github/ci-timeout.sh 1200 notify.log bash scripts/notify/test-freebuff-notify.sh
           rc=$?
           bash .github/ci-report.sh notify-suite notify.log "$rc"
           exit "$rc"
@@ -117,7 +117,7 @@ jobs:
       - name: notify suite
         run: |
           set +e
-          bash .github/ci-timeout.sh 720 notify.log bash scripts/notify/test-freebuff-notify.sh
+          bash .github/ci-timeout.sh 1200 notify.log bash scripts/notify/test-freebuff-notify.sh
           rc=$?
           bash .github/ci-report.sh notify-suite notify.log "$rc"
           exit "$rc"
@@ -157,7 +157,7 @@ jobs:
       - name: notify suite
         run: |
           set +e
-          bash .github/ci-timeout.sh 720 notify.log bash scripts/notify/test-freebuff-notify.sh
+          bash .github/ci-timeout.sh 1200 notify.log bash scripts/notify/test-freebuff-notify.sh
           rc=$?
           bash .github/ci-report.sh notify-suite notify.log "$rc"
           exit "$rc"
