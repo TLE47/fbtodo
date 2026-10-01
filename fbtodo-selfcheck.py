@@ -4638,6 +4638,11 @@ try:
     #      alive before it are remembered, so what the hook adds can be told from what the
     #      machine already had (an old build's stray is a real thing to report, but not a
     #      failure of this run — see the check below the hook).
+    # The autostart adopts a running Freebuff, so the check needs one: a runner has no
+    # session at all, and without a stand-in the hook correctly starts nothing. The stand-in
+    # is reaped with the check.
+    autostart_fake = spawn_quiet(fake)
+    time.sleep(0.4)
     keepers_before = keeper_aim()
     ptypid, ptyfd = pty.fork()
     if ptypid == 0:
@@ -4650,11 +4655,19 @@ try:
         # log lived in a home this suite wipes (found 2026-09-29, from the pane that would
         # not stay where the owner dragged it). The watcher this check is about still starts.
         os.environ["FBTODO_NO_PANE"] = "1"
-        # `fbtodo` has to resolve in the interactive shell even where the operator's rc is not
-        # this checkout: the launcher's own directory goes on PATH. The autostart this check
-        # is ABOUT must also be allowed to fire — CI sets FBTODO_NO_AUTOSTART for the other
-        # phases (it keeps stray watchers out of them), so it is cleared for this child alone.
-        os.environ["PATH"] = os.path.dirname(FB) + os.pathsep + os.environ.get("PATH", "")
+        # The autostart hook lives in the operator's `~/.zshrc`, which a runner does not have,
+        # so this child reads a throwaway `ZDOTDIR` instead: it puts this checkout on PATH and
+        # SOURCES the hook the repository ships (`examples/zshrc-autostart.zsh`) — the rule
+        # under test is the shipped one, not the machine's. FBTODO_NO_AUTOSTART is cleared
+        # for this child alone, since CI sets it to keep the other phases quiet.
+        zdot = os.path.join(TEST_HOME, "zdot")
+        os.makedirs(zdot, exist_ok=True)
+        with open(os.path.join(zdot, ".zshrc"), "w", encoding="utf-8") as fh:
+            fh.write(
+                f'path=({os.path.dirname(FB)} $path)\n'
+                f'. {os.path.join(HERE, "examples", "zshrc-autostart.zsh")}\n'
+            )
+        os.environ["ZDOTDIR"] = zdot
         os.environ.pop("FBTODO_NO_AUTOSTART", None)
         os.execv("/bin/zsh", ["/bin/zsh", "-i", "-c", "command -v fbtodo && fbtodo bar"])
     out = b""
@@ -4700,6 +4713,7 @@ try:
         f"the test state root: {stray}"
     )
     say("the zshrc hook keeps no pane keeper of its own (FBTODO_NO_PANE): ok")
+    kill_tree(autostart_fake)
 
     # ---- retention: old records, the count cap, temp files, the log cap
     saved_home = os.environ.get("FBTODO_HOME")

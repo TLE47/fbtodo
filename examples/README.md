@@ -6,6 +6,7 @@ configuration at all — and none of them touches the tool's code.
 | File | What it is |
 |---|---|
 | [`fb.sh`](fb.sh) | the `fb` launcher: agent and its pane in one word |
+| [`zshrc-autostart.zsh`](zshrc-autostart.zsh) | start the watcher from an interactive shell |
 | [`AGENTS.md`](AGENTS.md) | the rule that makes an agent keep a todo list at all |
 | [`tmux.conf`](tmux.conf) | `fbtodo bar` in your tmux status line — progress at a glance, no pane |
 | [`theme-catppuccin-mocha.json`](theme-catppuccin-mocha.json) | a theme preset (24-bit colour) |
@@ -69,4 +70,12 @@ than the transcript — cheap enough for a status line that refreshes every few 
 [`tmux.conf`](tmux.conf) for the two lines to append.
 
 If you only want the status line, set `FBTODO_NO_PANE=1` so no pane is ever opened.
+
+## Autostart
+
+`fbtodo` starts its own watcher when you open a pane, so nothing else is needed. If you would
+rather a watcher exist from the first terminal of the day — so `fbtodo bar` has a live state
+before any pane opens — source [`zshrc-autostart.zsh`](zshrc-autostart.zsh) from your
+`~/.zshrc`; it runs `fbtodo daemon` once, only in an interactive shell, and skips itself under
+`FBTODO_NO_AUTOSTART=1`. With no Freebuff running it correctly starts nothing.
 

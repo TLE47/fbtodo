@@ -72,6 +72,10 @@ Entries start at the newest release; each one is a contract change, not a diff.
   global in the self-check answer exactly as before.
 
 ### Added
+- [`examples/zshrc-autostart.zsh`](examples/zshrc-autostart.zsh) is the interactive-shell
+  autostart hook, shipped rather than left in the maintainer's `~/.zshrc`: sourced from your
+  `~/.zshrc`, it runs `fbtodo daemon` once so a watcher exists before any pane opens, honours
+  `FBTODO_NO_AUTOSTART=1`, and starts nothing when no Freebuff is running.
 - `fbtodo` is **packagable**: a `pyproject.toml` (src layout, a `fbtodo` console script →
   `fbtodo:main`, `requires-python >=3.9`, and the version read from `base.VERSION` rather than a
   second number to keep in step) makes `pipx install git+https://github.com/TLE47/fbtodo` a
