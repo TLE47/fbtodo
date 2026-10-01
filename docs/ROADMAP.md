@@ -9,6 +9,7 @@ scoped so one person could land it.
 | **`brew install fbtodo` + `uvx fbtodo` + a one-line installer** | Removing "clone and symlink" is the single biggest adoption lever. |
 | **`fb` as a first-class command** — ship the launcher, or a `fbtodo init` that writes it into your shell startup file | One word to launch an agent *and* its pane; today it is a snippet to paste. |
 | **`fbtodo board` — all live sessions in one pane** | People run two or three agents at once. One pane showing every session, its list and its clock beats switching windows. |
+| **Watch the desktop app live, not per turn** | The app commits a message only when a turn closes, so its list is up to a turn behind — measured, with the mechanism and the fix directions in [OPEN-PROBLEMS.md](OPEN-PROBLEMS.md). |
 | **`fbtodo serve` — a read-only web mirror** | Watch from your phone or another machine, no ssh. Pairs with the notify kit you already have. |
 | **Theme presets and `fbtodo theme`** (`catppuccin`, `gruvbox`, `nord`, `dracula`, `--preview`) | [`examples/`](../examples) ships three hand-written presets today; a picker would make it a gallery. |
 | **More transports: Slack, Discord, Telegram, Pushover, native macOS notifications** | iMessage + ntfy covers two platforms; a room of teammates is one webhook away. |

@@ -120,6 +120,10 @@ Entries start at the newest release; each one is a contract change, not a diff.
   system sounds instead of macOS's `/System/Library/Sounds`, so a machine that is not a Mac
   can ring a sound it actually has — which is how the kit's suite runs its chime checks off a
   Mac.
+- `.github/ci-timeout.sh` runs a suite under a wall-clock cap and tees it to a log, and the CI
+  steps use it (720 s) instead of piping straight to `tee`: a suite that blocks must not spend
+  the job's whole 30-minute budget, and the last lines in its log are what names the hang.
+  `timeout(1)` is not on a macOS runner's PATH, which is why this is a script and not a flag.
 - `.github/ci-report.sh` annotates a suite's `FAIL` lines when it has any, instead of only the
   last six lines of the log: a suite that fails dozens of checks ends its tail in `PASS`es, so
   the tail alone named nothing (the job summary still carries the full 80-line tail).

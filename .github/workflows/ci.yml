@@ -54,16 +54,16 @@ jobs:
       - name: self-check
         run: |
           set +e
-          python3 scripts/fbtodo-selfcheck.py 2>&1 | tee selfcheck.log
-          rc=${PIPESTATUS[0]}
+          bash .github/ci-timeout.sh 720 selfcheck.log python3 scripts/fbtodo-selfcheck.py
+          rc=$?
           bash .github/ci-report.sh self-check selfcheck.log "$rc"
           exit "$rc"
 
       - name: notify suite
         run: |
           set +e
-          bash scripts/notify/test-freebuff-notify.sh 2>&1 | tee notify.log
-          rc=${PIPESTATUS[0]}
+          bash .github/ci-timeout.sh 720 notify.log bash scripts/notify/test-freebuff-notify.sh
+          rc=$?
           bash .github/ci-report.sh notify-suite notify.log "$rc"
           exit "$rc"
 
@@ -109,16 +109,16 @@ jobs:
       - name: self-check
         run: |
           set +e
-          python3 scripts/fbtodo-selfcheck.py 2>&1 | tee selfcheck.log
-          rc=${PIPESTATUS[0]}
+          bash .github/ci-timeout.sh 720 selfcheck.log python3 scripts/fbtodo-selfcheck.py
+          rc=$?
           bash .github/ci-report.sh self-check selfcheck.log "$rc"
           exit "$rc"
 
       - name: notify suite
         run: |
           set +e
-          bash scripts/notify/test-freebuff-notify.sh 2>&1 | tee notify.log
-          rc=${PIPESTATUS[0]}
+          bash .github/ci-timeout.sh 720 notify.log bash scripts/notify/test-freebuff-notify.sh
+          rc=$?
           bash .github/ci-report.sh notify-suite notify.log "$rc"
           exit "$rc"
 
@@ -149,15 +149,15 @@ jobs:
       - name: self-check
         run: |
           set +e
-          python3 scripts/fbtodo-selfcheck.py 2>&1 | tee selfcheck.log
-          rc=${PIPESTATUS[0]}
+          bash .github/ci-timeout.sh 720 selfcheck.log python3 scripts/fbtodo-selfcheck.py
+          rc=$?
           bash .github/ci-report.sh self-check selfcheck.log "$rc"
           exit "$rc"
 
       - name: notify suite
         run: |
           set +e
-          bash scripts/notify/test-freebuff-notify.sh 2>&1 | tee notify.log
-          rc=${PIPESTATUS[0]}
+          bash .github/ci-timeout.sh 720 notify.log bash scripts/notify/test-freebuff-notify.sh
+          rc=$?
           bash .github/ci-report.sh notify-suite notify.log "$rc"
           exit "$rc"
