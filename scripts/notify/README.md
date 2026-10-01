@@ -17,6 +17,7 @@ decision *and* the "already sent" record, so there is nothing to keep in sync.
 | `make-sound.py` | generates a chime from a SoundFont (optional; `bell.sh` falls back to a system sound) |
 | `session-timer.sh` | keeps the terminal tab title on the session: a live timer plus what it is working on |
 | `session-task.py` | the caption the timer shows — a short description of what the session is working on |
+| `funcs.zsh` | the kit's shell integration: the chime picker and the `freebuff` wrapper that runs the tab-title timer and the drop watch |
 | `phone.conf.example` | the transport config, with placeholders |
 | `test-freebuff-notify.sh` | this kit's own test suite |
 
@@ -30,7 +31,13 @@ mkdir -p ~/.config/freebuff-notify
 cp scripts/notify/*.py scripts/notify/*.sh ~/.config/freebuff-notify/
 chmod +x ~/.config/freebuff-notify/*.py ~/.config/freebuff-notify/*.sh
 ~/.config/freebuff-notify/phone.sh --init      # writes phone.conf with a fresh topic
+. ~/Projects/fbtodo/scripts/notify/funcs.zsh   # the shell side: the wrapper and the bell commands
 ```
+
+`funcs.zsh` is the shell half — the `freebuff` wrapper that runs the title timer and the
+drop watch, plus `freebuff-bell`. Source it from `~/.zshrc`; the test suite drives this copy,
+so the wrapper the bells hang off is the one in the repository rather than whatever a
+particular machine happens to define.
 
 Nothing else is required. If you keep them somewhere else, point `fbtodo` at them with
 `FBTODO_NOTIFY`, `FBTODO_DROP`, `FBTODO_ASK`, `FBTODO_PAUSE`, `FBTODO_PANE_BELL`.

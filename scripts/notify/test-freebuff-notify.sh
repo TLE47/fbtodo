@@ -5,7 +5,6 @@
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ZRC="$HOME/.zshrc"
 # ---- the suite's clock. Nothing is asserted against wall time here, so the two clocks the
 # suite has to wait for are turned down and every fixed `sleep` that waited one out is
 # correspondingly short (see session-timer.sh's FREEBUFF_TIMER_SECONDS):
@@ -247,7 +246,10 @@ printf '%s\n' '{"backend":"cli","cwd":"/tmp","session":"s1","list_id":"L1","done
 cp "$HERE/session-timer.sh" "$STUB/.config/freebuff-notify/session-timer.sh"
 install_bell "$STUB"
 chmod +x "$STUB/bin/freebuff" "$STUB/bin/fbtodo" "$STUB/.config/freebuff-notify/session-timer.sh"
-sed -n '/^# freebuff:/,$p' "$ZRC" >"$STUB/funcs.zsh"
+# The wrapper under test is the SHIPPED one (`funcs.zsh`, next to this suite), not the copy
+# in the operator's `~/.zshrc`: a runner has no personal shell setup, and the wrapper the
+# bells are wired into is the kit's, so it has to be in the repository to be tested at all.
+cp "$HERE/funcs.zsh" "$STUB/funcs.zsh"
 
 WRAP_TTY="$SANDBOX/wrap.log"
 run_wrapper() { # HOME, tty
@@ -404,6 +406,10 @@ check_match "test reports the pick and the file it resolved to" "$out" \
 
 echo
 echo "== alert sound =="
+# A SoundFont is not shipped — the chimes are built from MuseScore's bank on the operator's
+# own machine, and a runner has none. Without one nothing here can run, so say so once and
+# skip these checks instead of failing for a missing tool the suite cannot install.
+if python3 "$HERE/make-sound.py" --check >/dev/null 2>&1; then
 gen=$(python3 "$HERE/make-sound.py" "$SANDBOX/gen.wav" 2>&1)
 check_match "generator defaults to the piano F4" "$gen" 'fundamental confirmed at F4 \(piano F4\)'
 check_match "generator uses a real recorded piano note" "$gen" 'source: .*"Piano MF E3\(L\)"'
@@ -515,6 +521,13 @@ check "and plays it at the saved volume" "$(tail -1 "$CHIMES")" \
 check "piano pick is saved" "$(cat "$VOICE_HOME/.config/freebuff-notify/sound")" "piano"
 check "the f4 alias resolves to the piano note" "$(voice_cmd sound f4)" "freebuff sound: piano"
 check "one chime per preview" "$(plays)" "$((before + 2))"
+else
+  # Only what the NEXT section reads, so a fontless machine still runs the rest of the suite.
+  VOICE_HOME="$SANDBOX/voice-home"
+  mkdir -p "$VOICE_HOME/.config/freebuff-notify"
+  install_bell "$VOICE_HOME"
+  echo "SKIP  the sound generator and its chimes: no SoundFont on this machine (see make-sound.py)"
+fi
 
 echo
 echo "== bell.sh resolves what the picker resolves =="

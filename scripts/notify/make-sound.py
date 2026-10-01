@@ -85,6 +85,8 @@ SOUNDFONTS = [
     os.path.expanduser("~/Documents/MuseScore4/SoundFonts/*.sf2"),
     os.path.expanduser("~/Library/Application Support/MuseScore/MuseScore4/SoundFonts/*.sf2"),
 ]
+ 
+
 SEMITONES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 
 
@@ -270,8 +272,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--voice", choices=sorted(VOICES), default="piano")
     parser.add_argument("--seconds", type=float, help="override the voice's length in seconds")
+    parser.add_argument("--check", action="store_true",
+                        help="print the SoundFonts found, or say there are none, and exit 0/1")
     parser.add_argument("output", nargs="?", help="default: <voice>.wav beside this script")
     args = parser.parse_args()
+    if args.check:
+        fonts = [path for pattern in SOUNDFONTS for path in sorted(glob.glob(pattern))]
+        if fonts:
+            print("\n".join(fonts))
+            return 0
+        print("no SoundFont found; install MuseScore or pass a bank in SOUNDFONTS", file=sys.stderr)
+        return 1
     voice = VOICES[args.voice]
     seconds = args.seconds or voice.get("seconds", KEEP_SECONDS)
     # a short note can't spend most of its life fading, or the attack goes too

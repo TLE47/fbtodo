@@ -53,6 +53,11 @@ Entries start at the newest release; each one is a contract change, not a diff.
   happens on the first command.
 
 ### Fixed
+- The notification kit's suite is no longer tied to the maintainer's machine: it sourced the
+  `freebuff` shell functions out of `$HOME/.zshrc` (a runner has none, so every wrapper check
+  failed), and it required MuseScore's SoundFont for its chime checks. It now sources the
+  shipped `funcs.zsh`, and skips the chime section with a stated reason when no bank is
+  available.
 - The NAS phase's session runs under a throwaway `ZDOTDIR` holding one `.zshrc`: an
   interactive zsh that finds no startup file at all runs `zsh-newuser-install` and blocks on
   its prompt, so on a runner (whose `HOME` has no `~/.zshrc`) the session never reached the
@@ -97,6 +102,17 @@ Entries start at the newest release; each one is a contract change, not a diff.
   global in the self-check answer exactly as before.
 
 ### Added
+- [`scripts/notify/funcs.zsh`](scripts/notify/funcs.zsh) is the notification kit's shell half —
+  the chime picker and the `freebuff` wrapper that runs the title timer and the drop watch —
+  shipped rather than left in the maintainer's `~/.zshrc`. The kit's suite sources this copy,
+  so the wrapper it drives is the repository's, not whatever one machine happens to define.
+- `make-sound.py --check` reports the SoundFonts it can see (and says so on stderr when there
+  are none) without generating anything, so a caller can tell "no bank here" from "the
+  generator failed" — which is what the suite uses to skip its chime checks on a machine with
+  no MuseScore.
+- `.github/ci-report.sh` annotates a suite's `FAIL` lines when it has any, instead of only the
+  last six lines of the log: a suite that fails dozens of checks ends its tail in `PASS`es, so
+  the tail alone named nothing (the job summary still carries the full 80-line tail).
 - [`examples/zshrc-autostart.zsh`](examples/zshrc-autostart.zsh) is the interactive-shell
   autostart hook, shipped rather than left in the maintainer's `~/.zshrc`: sourced from your
   `~/.zshrc`, it runs `fbtodo daemon` once so a watcher exists before any pane opens, honours
