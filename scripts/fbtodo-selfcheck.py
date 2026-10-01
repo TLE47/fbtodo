@@ -6179,6 +6179,22 @@ try:
         env["FBTODO_PAUSE"] = os.path.join(notify_dir, "pause-bell.py")
         env["FBTODO_NAS"] = fake_ssh
         env["FBTODO_FB_MARKER"] = marker3
+        # The session's own command is written to a file and sourced by path. The fixture's
+        # stand-in for whatever function a user wraps a remote login in asks fbtodo for the
+        # pane watcher and then execs an ssh whose argv LOOKS like one, because that is what
+        # placement anchors on. It is a file rather than one quoted string because the
+        # nested quotes did not survive tmux's own `/bin/sh -c` on a runner: the shell came
+        # up with nothing to run and sat at a prompt, so the watcher never started.
+        remote_sh = os.path.join(TEST_HOME, "remote-session.zsh")
+        with open(remote_sh, "w", encoding="utf-8") as fh:
+            fh.write(
+                f"export PATH={path3}:$PATH\n"
+                "remote() {\n"
+                "  fbtodo nas --quiet >/dev/null 2>&1 &!\n"
+                '  exec ssh -t remote@nas.local "cd / && exec $SHELL -l"\n'
+                "}\n"
+                "remote\n"
+            )
         created3 = subprocess.run(
             tmux3
             + [
@@ -6206,16 +6222,12 @@ try:
                 "-e", "FBTODO_ASK_SECONDS=1",
                 "-e", f"FBTODO_PAUSE={os.path.join(notify_dir, 'pause-bell.py')}",
                 "-e", "FBTODO_PAUSE_SECONDS=1",
-                # PATH inside zsh, not via -e: tmux's own env handling and .zshrc's
-                # prepends both fight it, and the real ssh would then be used
-                # The fixture's stand-in for whatever function a user wraps a remote login in:
-            # it asks fbtodo for the pane watcher, then execs an ssh. The argv has to LOOK
-            # like an ssh on the process table, because that is what placement anchors on.
-            # `-d` keeps the distribution's `/etc/zsh` out of it: Ubuntu's runs `compinit`,
-            # which prompts on a runner and blocks the shell before `remote` is defined.
-            rf"zsh -d -i -c 'export PATH={path3}:\$PATH; "
-            rf"remote() {{ fbtodo nas --quiet >/dev/null 2>&1 &!; "
-            rf"exec ssh -t remote@nas.local \"cd / && exec \$SHELL -l\"; }}; remote'",
+                # PATH is set by the script, not by `-e`: tmux's own env handling and
+                # .zshrc's prepends both fight it, and the real ssh would then be used.
+                # `-d` keeps the distribution's `/etc/zsh` out of it: Ubuntu's runs
+                # `compinit`, which prompts on a runner and blocks the shell before the
+                # script is read. ONE layer of quoting — the path is the only argument.
+                f"zsh -d -i -c 'source {remote_sh}'",
             ],
             capture_output=True,
         )
@@ -6256,10 +6268,15 @@ try:
             ).stdout or ""
             watchers = [ln.strip() for ln in table.splitlines()
                         if "fbtodo" in ln and " nas" in ln]
+            first_pane = (nas_listing().split() or ["%0"])[0]
+            seen = subprocess.run(
+                tmux3 + ["capture-pane", "-p", "-t", first_pane],
+                capture_output=True, text=True,
+            ).stdout.strip()
             raise AssertionError(
                 f"the remote shell did not start the NAS watcher: rc={created3.returncode}"
                 f" err={created3.stderr.strip()!r} lock_file={os.path.exists(nas_lock)}"
-                f" panes={nas_listing()!r} watchers={watchers}{tail}"
+                f" panes={nas_listing()!r} pane_text={seen!r} watchers={watchers}{tail}"
             )
         say("a remote shell carries you over and starts the watcher, without opening a pane: ok")
 
