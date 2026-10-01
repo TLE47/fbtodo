@@ -88,6 +88,9 @@ done
 
 titles() { tr '\007' '\n' <"$1" 2>/dev/null | grep -oE '(⏱|✓ Done) freebuff [0-9hms]+( · .*)?'; }
 bells() { tr -cd '\007' <"$1" 2>/dev/null | wc -c | tr -d ' '; }
+# Defined here rather than in the section that first used it: a `wait_for title_matches` ran
+# before the definition existed, so it waited out its cap and the title was read anyway.
+title_matches() { titles "$1" | tail -1 | grep -q "$2"; }
 
 # ---- the only two waits in this suite -------------------------------------------------
 # Every positive check is "wait until X, then assert X". A fixed `sleep` is either too short
@@ -234,12 +237,15 @@ TIMERS="$TIMERS $TASK_TIMER"
 wait_for 3 title_matches "$TASK_TTY" 'a brand new prompt'
 check_match "running title carries the prompt" "$(titles "$TASK_TTY" | tail -1)" \
   '^⏱ freebuff [0-9]s · a brand new prompt$'
-FREEBUFF_PROJECTS_DIR="$FAKE" sh "$HERE/session-timer.sh" finish "$(date +%s)" "$TASK_TTY"
-check_match "done title carries the prompt" "$(titles "$TASK_TTY" | tail -1)" \
-  '^✓ Done freebuff [0-9]s · a brand new prompt$'
+# The wrapper kills the running timer BEFORE it stamps the finish — that is the order the
+# tab sees, and why the done title stays put — so this does the same. A live `run` loop
+# overwrites the stamp on its next tick, which made "the last title is Done" a race.
 kill $TASK_TIMER 2>/dev/null
 wait $TASK_TIMER 2>/dev/null
 TIMERS=""
+FREEBUFF_PROJECTS_DIR="$FAKE" sh "$HERE/session-timer.sh" finish "$(date +%s)" "$TASK_TTY"
+check_match "done title carries the prompt" "$(titles "$TASK_TTY" | tail -1)" \
+  '^✓ Done freebuff [0-9]s · a brand new prompt$'
 
 echo
 echo "== wrapper: tab-title timer =="
@@ -321,7 +327,6 @@ run_plain() { PATH="$PLAIN/bin:$PATH" HOME="$PLAIN" FREEBUFF_TTY="$BELL_TTY" \
   FBTODO_NO_PANE=1 zsh -c 'source "$1/funcs.zsh"; freebuff' zsh "$STUB"; }
 plays() { if [ -r "$CHIMES" ]; then grep -c afplay "$CHIMES"; else echo 0; fi; }
 bells_at_least() { [ "$(bells "$BELL_TTY")" -ge "$1" ]; }
-title_matches() { titles "$1" | tail -1 | grep -q "$2"; }
 # the chime is backgrounded, so wait for the stub to log rather than guess
 wait_plays() { # want, up to 4s
   wait_counter_is 4 plays "$1"

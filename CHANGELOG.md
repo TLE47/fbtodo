@@ -53,6 +53,11 @@ Entries start at the newest release; each one is a contract change, not a diff.
   happens on the first command.
 
 ### Fixed
+- The notification suite stamps its done title **after** stopping the running timer, the order
+  the wrapper itself uses: a live `run` loop overwrote the stamp on its next tick, which made
+  "the last title is Done" a race (it failed on a runner, passed here). Its `title_matches`
+  helper is defined where it is first waited on rather than an hundred lines later, so that
+  wait no longer runs out its cap waiting for a function that did not exist yet.
 - `phone.sh --init` bounds its Apple ID lookup. `defaults` talks to cfprefsd and can block
   for minutes where there is no preferences session at all (a CI runner), which hung the
   whole config write — the topic had already been minted — for one line of convenience.
@@ -133,9 +138,10 @@ Entries start at the newest release; each one is a contract change, not a diff.
   steps use it (720 s) instead of piping straight to `tee`: a suite that blocks must not spend
   the job's whole 30-minute budget, and the last lines in its log are what names the hang.
   `timeout(1)` is not on a macOS runner's PATH, which is why this is a script and not a flag.
-- `.github/ci-report.sh` annotates a suite's `FAIL` lines when it has any, instead of only the
-  last six lines of the log: a suite that fails dozens of checks ends its tail in `PASS`es, so
-  the tail alone named nothing (the job summary still carries the full 80-line tail).
+- `.github/ci-report.sh` annotates both ends of a failed suite's log: its first `FAIL` lines,
+  because a suite that fails dozens of checks ends its tail in `PASS`es and a cascade's cause
+  is at its start, and the last lines, because that is the only clue a capped (hung) run
+  leaves behind. The job summary still carries the full 80-line tail.
 - [`examples/zshrc-autostart.zsh`](examples/zshrc-autostart.zsh) is the interactive-shell
   autostart hook, shipped rather than left in the maintainer's `~/.zshrc`: sourced from your
   `~/.zshrc`, it runs `fbtodo daemon` once so a watcher exists before any pane opens, honours
