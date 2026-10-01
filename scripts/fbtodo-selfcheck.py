@@ -5405,12 +5405,13 @@ try:
         time.sleep(6)  # more than two poll intervals (`-i 2.5`), so both panes have polled
         assert alive("wait") and alive("nowait"), "a NAS pane closed while its session was live"
         short.kill()
-        # Reap it. A killed child stays a ZOMBIE until its parent waits, and `kill -0` on a
-        # zombie still answers: the NAS probe reads this marker's pid, so the session looked
-        # alive to every pane for as long as this fixture ran — on a machine whose timing
-        # left the child unreaped, the plain pane never closed. A wrapper that has really
-        # ended leaves no such process, and `wait` is what makes the pid gone here.
+        # Reap it, then take its marker away. A killed child stays a ZOMBIE until its parent
+        # waits, and `kill -0` on a zombie still answers — worse, a freed pid can be handed
+        # to another process on a busy runner, so the same probe would call the session alive
+        # again at random. A wrapper whose session has ended removes its marker; that is what
+        # makes every later poll say "not live" here without depending on a pid's afterlife.
         short.wait(timeout=10)
+        os.unlink(marker2)
         # A poll is an ssh round trip plus a probe, and the close happens at the END of the
         # poll that notices: on a loaded runner one poll can outlast a short deadline, so
         # this waits several of them (`-i 2.5`) rather than two.
@@ -5434,7 +5435,8 @@ try:
         assert "waiting for a NAS freebuff session" in STRIP(shot.stdout), shot.stdout
         subprocess.run(tmux2 + ["kill-server"], capture_output=True)
         short.kill()
-        os.unlink(marker2)
+        if os.path.exists(marker2):
+            os.unlink(marker2)
         env.pop("FBTODO_NAS", None)
         say("nas pane: --wait outlives one fb run, a plain pane closes with it: ok")
         env["PATH"] = saved_path

@@ -65,11 +65,10 @@ Entries start at the newest release; each one is a contract change, not a diff.
   and `/dev/null` so a survivor holds nothing open, and neither `kill` nor `wait` is given a
   chance to hang in its place. The topic is minted with `od -N16` rather than a `tr … | head`
   pair, so nothing in this path depends on a pipeline ending on a signal.
-- The NAS pane-lifetime fixture waits for each pane to have **seen** the live session — the
-  pane says which of the two it is showing — instead of a fixed six seconds. `alive` only
-  says tmux made the pane; a plain pane still importing `fbtodo` when the marker's process
-  dies has seen nothing to close on, so it stayed open while the same fixture passed on a
-  quiet machine.
+- The NAS pane-lifetime fixture waits for its **own** session to be reported live in the
+  state the panes read, instead of a fixed six seconds or a glance at the pane's text:
+  `alive` only says tmux made the pane, and a NAS state that is not alive still draws the
+  last list it has, so its text says nothing about whether a pane has seen a session at all.
 - A `-s nas` pane's watcher follows the session that pane named. `spawn_daemon` never
   forwarded `--fb-marker`, so the pane asked a daemon about `$HOME/.fb-session` and then read
   its answer about a different session: a pane for a live marker was shown another store's
@@ -77,10 +76,12 @@ Entries start at the newest release; each one is a contract change, not a diff.
   still alive.
 - The NAS pane-lifetime fixture no longer races the phases before it. It stops the watcher an
   earlier phase left behind (a leftover state answers `-s nas` whatever session it watched),
-  drops that watcher's state file, **reaps** the stand-in session so `kill -0` cannot keep
-  answering for a zombie, and waits for the state to report its own marker live rather than
-  reading the pane's text — a NAS state that is not alive still draws the last list, so the
-  text cannot tell a live session from a finished one.
+  drops that watcher's state file, and waits for the state to report its own marker live
+  rather than reading the pane's text — a NAS state that is not alive still draws the last
+  list, so the text cannot tell a live session from a finished one. When the stand-in session
+  ends it is **reaped** and its marker **removed**: `kill -0` answers for a zombie, and a
+  freed pid can be handed to another process on a busy runner, so a probe that trusts the
+  pid alone says the session is alive again at random.
 - The notification kit's suite is no longer tied to the maintainer's machine: it sourced the
   `freebuff` shell functions out of `$HOME/.zshrc` (a runner has none, so every wrapper check
   failed), and it required MuseScore's SoundFont for its chime checks. It now sources the
