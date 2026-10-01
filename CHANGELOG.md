@@ -53,6 +53,12 @@ Entries start at the newest release; each one is a contract change, not a diff.
   happens on the first command.
 
 ### Fixed
+- The `local-session` phase opens its pane with the wrapper the repository ships
+  (`examples/fb.sh`), sourced from a throwaway `ZDOTDIR` and invoked as `fb`, instead of the
+  `freebuff()` function a developer's own `~/.zshrc` happens to define. A runner has no such
+  function, so its session ran the bare stand-in and never opened a pane. Identifying that
+  pane is case-insensitive too, because Linux names the interpreter `python3` where macOS
+  names it `Python`.
 - The NAS-status check writes the local state file's session itself instead of reading whatever
   the last local watcher recorded. That watcher finds the operator's own journal and fills in
   their live session on a workstation, and finds no journal at all on a runner — so the same

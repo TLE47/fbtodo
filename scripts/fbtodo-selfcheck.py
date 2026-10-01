@@ -5500,11 +5500,28 @@ try:
         # stall-watch stub, so the check below would ask a process that cannot answer.
         # Stop it first — the session opened here has to start its own watcher.
         run("stop")
+        # The wrapper that opens the pane is the SHELL's, not this checkout's: on the
+        # machine this suite was written on, `~/.zshrc` defines a `freebuff()` that splits
+        # the pane and then runs the CLI. A runner has no such file — the session there ran
+        # the bare stub and never opened a pane — so the shell is given a throwaway
+        # `ZDOTDIR` and runs the wrapper the REPOSITORY ships, `examples/fb.sh`, with its
+        # npm refresh off (that refresh is a network round trip on every launch, and this
+        # is a test). `-d` below keeps the distribution's `/etc/zsh` out of it.
+        zdot_sess = os.path.join(TEST_HOME, "zdot-session")
+        os.makedirs(zdot_sess, exist_ok=True)
+        with open(os.path.join(zdot_sess, ".zshrc"), "w", encoding="utf-8") as fh:
+            fh.write(
+                f'path=({ROOT} $path)\n'
+                'export FREEBUFF_NO_REFRESH=1\n'
+                f'. {os.path.join(ROOT, "examples", "fb.sh")}\n'
+            )
         created = subprocess.run(
             tmux
             + [
-                "new-session", "-d", "-s", sess, "-x", "100", "-y", "30",                "-e", f"FBTODO_HOME={TEST_HOME}",
+                "new-session", "-d", "-s", sess, "-x", "100", "-y", "30",
+                "-e", f"FBTODO_HOME={TEST_HOME}",
                 "-e", f"PATH={path}",
+                "-e", f"ZDOTDIR={zdot_sess}",
                 # ...and no autostart daemon left behind either (see the NAS block)
                 "-e", "FBTODO_NO_AUTOSTART=1",
                 # notice a killed pane quickly: the shipped default is deliberately calm
@@ -5516,11 +5533,11 @@ try:
                 "-e", "FBTODO_PANE_BELL_SECONDS=1",
                 # ONE command string, so tmux runs it through a shell: given
                 # separate argv elements tmux execs them directly, the quotes land
-                # in zsh's command text, and the pane dies without a word.
-                # PATH is prepended inside zsh, after the .zshrc that prepends
-                # nvm's node bin (where the real freebuff lives) — otherwise the
-                # real CLI runs and the stand-in 'session' never ends.
-                f"zsh -i -c 'export PATH={stub_bin}:$PATH; freebuff'",
+                # in zsh's command text, and the pane dies without a word. PATH is
+                # prepended here, after the `.zshrc` above has put the launcher's own
+                # directory on it, so `command freebuff` still resolves to the stub
+                # session while `command -v fbtodo` finds the launcher.
+                f"zsh -d -i -c 'export PATH={stub_bin}:$PATH; fb'",
             ],
             capture_output=True,
         )
@@ -5531,6 +5548,18 @@ try:
                 capture_output=True, text=True,
             )
             return p.stdout.split() if p.returncode == 0 else []
+
+        def is_todo_pane(cmd: str) -> bool:
+            """Whether a pane's current command is the todo pane.
+
+            `#{pane_current_command}` is the OS's own name for the process, and it is not
+            the same string on both platforms: macOS reports `Python` for the interpreter a
+            script is run by, Linux reports `python3`, and a system that answers with the
+            script's own name would say `fbtodo`. All three name the same pane, so the test
+            is "an interpreter, or the launcher itself", matched case-insensitively, rather
+            than one OS's spelling of it.
+            """
+            return cmd.lower().startswith(("python", "fbtodo"))
 
         def panes_detail() -> str:
             s = subprocess.run(tmux + ["list-sessions"], capture_output=True, text=True)
@@ -5546,13 +5575,13 @@ try:
 
         deadline = time.time() + 20
         while time.time() < deadline and not (
-            len(pane_cmds()) >= 2 and any(c.startswith("Python") for c in pane_cmds())
+            len(pane_cmds()) >= 2 and any(is_todo_pane(c) for c in pane_cmds())
         ):
             time.sleep(0.3)
-        assert any(c.startswith("Python") for c in pane_cmds()), (
-            f"freebuff() did not open a todo pane: {pane_cmds()} | {panes_detail()}"
+        assert any(is_todo_pane(c) for c in pane_cmds()), (
+            f"the wrapper did not open a todo pane: {pane_cmds()} | {panes_detail()}"
         )
-        say("freebuff() opens a fbtodo pane alongside the session: ok")
+        say("the shell's wrapper opens a fbtodo pane alongside the session: ok")
 
         # The stall watch is asked on its own clock while a LOCAL session runs: it is the
         # one notifier that needs `shouldEndTurn`, which only this build writes.
@@ -5639,7 +5668,7 @@ try:
             out = []
             for line in (p.stdout or "").splitlines():
                 parts = line.split()
-                if len(parts) == 2 and parts[1].startswith("Python"):
+                if len(parts) == 2 and is_todo_pane(parts[1]):
                     out.append(parts[0])
             return out
 
@@ -6033,10 +6062,10 @@ try:
             pass
         deadline = time.time() + 20
         while time.time() < deadline and pane_cmds() and any(
-            c.startswith("Python") for c in pane_cmds()
+            is_todo_pane(c) for c in pane_cmds()
         ):
             time.sleep(0.3)
-        assert not any(c.startswith("Python") for c in pane_cmds()), (
+        assert not any(is_todo_pane(c) for c in pane_cmds()), (
             f"todo pane outlived the session: {pane_cmds()}"
         )
         say("the pane closes when the session ends: ok")
