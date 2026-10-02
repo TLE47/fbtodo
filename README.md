@@ -81,17 +81,20 @@ fbtodo init          # writes the launcher + adds the source line to your shell 
 fb                   # now use 'fb' instead of 'fbtodo'
 ```
 
-`fbtodo init` detects your shell (`bash`, `zsh`), writes the `fb` function into
-`~/.config/fbtodo/fb.sh`, and adds the `source` line to your startup file — all
-idempotently, so it's safe to re-run after upgrading.  You can still source the
-example file by hand if you prefer:
+`fbtodo init` detects your shell (`$SHELL`, then the launching process), writes the
+`fb` function into `~/.config/fbtodo/`, and adds the `source` line to your startup
+file — all idempotently, so it's safe to re-run after upgrading. It knows the
+**Bourne family** (`bash`, `zsh`, `ksh`, `mksh`, `dash`, `sh` → a POSIX body and
+`fb.sh`) and **fish** (a native body and `fb.fish`), and picks the right startup
+file for each. You can still source the example file by hand if you prefer:
 
 ```sh
 . ~/Projects/fbtodo/examples/fb.sh    # manual install — adds 'fb' to this shell only
 fb                                    # now use 'fb' instead of 'fbtodo'
 ```
 
-`--shell SHELL` overrides auto-detection, and `--dry-run` previews without writing.
+`--shell SHELL` overrides auto-detection, `--startup-file PATH` names one for a
+shell not in the table, and `--dry-run` previews without writing.
 
 ### Updating and pinning
 

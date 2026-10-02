@@ -6,9 +6,19 @@ Entries start at the newest release; each one is a contract change, not a diff.
 ## Unreleased
 
 ### Added
-- `fbtodo init` — installs the `fb` launcher: detects the shell (`bash`, `zsh`), writes the
-  `fb()` function to `~/.config/fbtodo/fb.sh`, and adds the `source` line to the startup file
-  (idempotent, `--shell` / `--dry-run`). One word after a one-time command.
+- `fbtodo init` — installs the `fb` launcher: detects the shell (`$SHELL`, then the launching
+  process), writes the function into `~/.config/fbtodo/`, and adds the `source` line to the
+  startup file (idempotent; `--shell`, `--startup-file`, `--dry-run`). One word after a
+  one-time command. It carries two bodies because shells share no one function syntax: a
+  POSIX body for `bash`, `zsh`, `ksh`, `mksh`, `dash` and `sh` (each with its own startup
+  file), and a native body for fish.
+
+### Fixed
+- The `fb` launcher's POSIX body now runs unmodified under **zsh**, **ksh93** and **dash**,
+  not just bash: it no longer passes split flags through an unquoted `$_fb_split` (zsh does
+  not word-split an unquoted expansion, so `-h -b` arrived as one argument and only the
+  default split worked), and no longer declares `local` (which ksh93 lacks, silently
+  emptying `_fb_refresh`'s variables there). Each split arm now calls `tmux` directly.
 
 ## 4.30.2
 

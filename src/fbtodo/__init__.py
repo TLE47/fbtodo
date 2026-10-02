@@ -2181,7 +2181,10 @@ def build_parser():
     ap.add_argument("--clear", action="store_true", help="pin: drop this window's pin")
     ap.add_argument("--dry-run", action="store_true", help="nas: say what it would do, change nothing; init: show without writing")
     ap.add_argument("--shell", metavar="SHELL", default=None,
-                    help="init: shell to configure (bash, zsh; default: detected from $SHELL)")
+                    help="init: shell to configure (bash, zsh, ksh, mksh, dash, sh, fish; "
+                         "default: detected from $SHELL, then the parent process)")
+    ap.add_argument("--startup-file", metavar="PATH", default=None,
+                    help="init: startup file to edit, for a shell not in the table")
     ap.add_argument("--idle-exit", type=float, default=30.0, metavar="MIN",
                     help="nas: quit after MIN of no session and no client (0 = run forever)")
     ap.add_argument("--instance-pid", type=int, help="daemon: watch this pid (internal)")

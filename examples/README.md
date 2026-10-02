@@ -50,16 +50,25 @@ and new ones are very welcome.
 
 `fb` is a nickname you teach your terminal once, so that one word does the whole dance. The
 recommended way to install it is `fbtodo init` — it detects your shell, writes the function
-into `~/.config/fbtodo/fb.sh`, and adds the `source` line to your startup file, all
-idempotently:
+into `~/.config/fbtodo/`, and adds the `source` line to your startup file, all idempotently:
 
 ```sh
 fbtodo init        # installs `fb` — safe to re-run after upgrades
 fb                 # launches the agent with its pane
 ```
 
-`--shell SHELL` overrides auto-detection, and `--dry-run` previews without writing. You can
-also source [`fb.sh`](fb.sh) by hand if you prefer. In plain words: it updates your agent
+Shells do not share one function syntax, so `init` carries two bodies and picks by shell:
+
+| Shells | Body | Startup file |
+|---|---|---|
+| `bash`, `zsh`, `ksh`, `mksh`, `dash`, `sh` | POSIX (`fb.sh`) | `~/.bashrc`, `~/.zshrc`, `~/.kshrc`, `~/.mkshrc`, `~/.profile` |
+| `fish` | native (`fb.fish`) | `~/.config/fish/config.fish` |
+
+The POSIX body is written to run in all of them: it avoids `local` (ksh93 has none) and
+never relies on unquoted word-splitting (zsh does none). `--shell SHELL` overrides
+auto-detection, `--startup-file PATH` covers a shell not in the table, and `--dry-run`
+previews without writing. You can also source [`fb.sh`](fb.sh) by hand if you prefer. In
+plain words: it updates your agent
 if a new release is out, makes room for the todo list, starts the agent in the space you
 were already in, and closes the list when that session ends. Nothing else in thisepository depends on it, and skipping it is fine.
 

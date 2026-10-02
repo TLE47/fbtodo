@@ -5,10 +5,15 @@
 #
 #     fbtodo init                     # writes ~/.config/fbtodo/fb.sh + sources it
 #
-# You can still do it by hand — source this file from ~/.zshrc or ~/.bashrc,
-# then run `fb` instead of `freebuff`:
+# You can still do it by hand — source this file from your shell startup, then run
+# `fb` instead of `freebuff`:
 #
-#     . ~/Projects/fbtodo/examples/fb.sh
+#     . ~/Projects/fbtodo/examples/fb.sh       # bash, zsh, ksh, mksh, dash, sh
+#     source ~/Projects/fbtodo/examples/fb.sh  # fish: see FB_SCRIPT's fish twin below
+#
+# `fbtodo init` knows the Bourne family (bash, zsh, ksh, mksh, dash, sh) and fish;
+# this file is the Bourne body, written to run in all of them — no `local` (ksh93
+# has none), and no reliance on unquoted word-splitting (zsh does none).
 #
 # It does three things, in the order that matters:
 #
@@ -50,15 +55,19 @@ fb() {
         # -d splits without stealing the cursor, so the agent still starts in this pane.
         # A pane killed by hand comes back on its own: the keeper `fbtodo pane-watch`
         # re-opens it while the session lives.
-        case "${FBTODO_SPLIT:-v}" in
-            left)    _fb_split="-h -b" ;;
-            right|h) _fb_split="-h" ;;
-            top)     _fb_split="-v -b" ;;
-            *)       _fb_split="-v" ;;   # bottom, v, and anything unknown
-        esac
+        #
+        # Each arm calls tmux itself rather than passing a `$_fb_split` string: zsh
+        # does not split an unquoted variable into words, so "-h -b" would arrive as
+        # ONE argument there and as two in bash. Same flags, no splitting to rely on.
+        _fb_size="${FBTODO_PANE_SIZE:-12}"
         # The place rides into the pane, so the keeper reopens in the same corner.
-        tmux split-window $_fb_split -l "${FBTODO_PANE_SIZE:-12}" -d \
-            "FBTODO_SPLIT=${FBTODO_SPLIT:-v} fbtodo --instance-of $$ --stale-after 0"
+        _fb_cmd="FBTODO_SPLIT=${FBTODO_SPLIT:-v} fbtodo --instance-of $$ --stale-after 0"
+        case "${FBTODO_SPLIT:-v}" in
+            left)    tmux split-window -h -b -l "$_fb_size" -d "$_fb_cmd" ;;
+            right|h) tmux split-window -h    -l "$_fb_size" -d "$_fb_cmd" ;;
+            top)     tmux split-window -v -b -l "$_fb_size" -d "$_fb_cmd" ;;
+            *)       tmux split-window -v    -l "$_fb_size" -d "$_fb_cmd" ;;   # bottom, v, unknown
+        esac
     fi
 
     # `command` so the function does not recurse into itself.
@@ -70,18 +79,18 @@ _fb_refresh() {
     [ -n "${FREEBUFF_NO_REFRESH:-}" ] && return 0
     command -v npm >/dev/null 2>&1 || return 0
 
-    local pkg before after
-    pkg="$(command npm root -g 2>/dev/null)/freebuff/package.json"
-    before=$(_fb_version "$pkg")
+    # No `local`: ksh93 has no such builtin. Prefixed names are harmless if they leak.
+    _fb_pkg="$(command npm root -g 2>/dev/null)/freebuff/package.json"
+    _fb_before="$(_fb_version "$_fb_pkg")"
 
     # --no-fund / --no-audit: neither adds anything to a global CLI install, and both would
     # spend a network round trip this is already paying for.
     if command npm i -g freebuff --no-fund --no-audit >/dev/null 2>&1; then
-        after=$(_fb_version "$pkg")
-        if [ -z "$before" ] && [ -n "$after" ]; then
-            printf 'fb: installed freebuff %s\n' "$after" >&2
-        elif [ -n "$after" ] && [ "$before" != "$after" ]; then
-            printf 'fb: freebuff updated %s -> %s\n' "$before" "$after" >&2
+        _fb_after="$(_fb_version "$_fb_pkg")"
+        if [ -z "$_fb_before" ] && [ -n "$_fb_after" ]; then
+            printf 'fb: installed freebuff %s\n' "$_fb_after" >&2
+        elif [ -n "$_fb_after" ] && [ "$_fb_before" != "$_fb_after" ]; then
+            printf 'fb: freebuff updated %s -> %s\n' "$_fb_before" "$_fb_after" >&2
         fi
     else
         printf '%s\n' "fb: npm i -g freebuff failed; launching the installed version" >&2
