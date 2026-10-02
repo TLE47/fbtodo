@@ -48,12 +48,22 @@ and new ones are very welcome.
 
 ## `fb`: the launcher
 
-`fb` is a nickname you teach your terminal once, so that one word does the whole dance. In
-plain words: it updates your agent if a new release is out, makes room for the todo list,
-starts the agent in the space you were already in, and closes the list when that session ends.
-Nothing else in this repository depends on it, and skipping it is fine.
+`fb` is a nickname you teach your terminal once, so that one word does the whole dance. The
+recommended way to install it is `fbtodo init` — it detects your shell, writes the function
+into `~/.config/fbtodo/fb.sh`, and adds the `source` line to your startup file, all
+idempotently:
 
-Source [`fb.sh`](fb.sh) from your shell startup file and `fb` replaces `freebuff`. It does
+```sh
+fbtodo init        # installs `fb` — safe to re-run after upgrades
+fb                 # launches the agent with its pane
+```
+
+`--shell SHELL` overrides auto-detection, and `--dry-run` previews without writing. You can
+also source [`fb.sh`](fb.sh) by hand if you prefer. In plain words: it updates your agent
+if a new release is out, makes room for the todo list, starts the agent in the space you
+were already in, and closes the list when that session ends. Nothing else in thisepository depends on it, and skipping it is fine.
+
+`fbtodo init` sources `fb.sh` from your shell startup file and `fb` replaces `freebuff`. It does
 three things in the order that matters: refreshes the released CLI (`npm i -g freebuff`,
 quiet unless the version moved — `FREEBUFF_NO_REFRESH=1` skips it, which scripts and tests
 want), opens the todo pane bound to the session it is about to start, then runs the agent in

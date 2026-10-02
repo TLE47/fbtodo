@@ -77,14 +77,21 @@ how to uninstall, is in [docs/INSTALL.md](https://github.com/TLE47/fbtodo/blob/m
 For a one-word launcher that updates and manages everything:
 
 ```sh
-. ~/Projects/fbtodo/examples/fb.sh    # add this line to ~/.zshrc or ~/.bashrc
+fbtodo init          # writes the launcher + adds the source line to your shell rc
+fb                   # now use 'fb' instead of 'fbtodo'
+```
+
+`fbtodo init` detects your shell (`bash`, `zsh`), writes the `fb` function into
+`~/.config/fbtodo/fb.sh`, and adds the `source` line to your startup file — all
+idempotently, so it's safe to re-run after upgrading.  You can still source the
+example file by hand if you prefer:
+
+```sh
+. ~/Projects/fbtodo/examples/fb.sh    # manual install — adds 'fb' to this shell only
 fb                                    # now use 'fb' instead of 'fbtodo'
 ```
 
-One lazy command:
-```sh
-echo '. ~/Projects/fbtodo/examples/fb.sh' >> ~/.bashrc && source ~/.bashrc && fb
-```
+`--shell SHELL` overrides auto-detection, and `--dry-run` previews without writing.
 
 ### Updating and pinning
 

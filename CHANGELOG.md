@@ -5,6 +5,11 @@ Entries start at the newest release; each one is a contract change, not a diff.
 
 ## Unreleased
 
+### Added
+- `fbtodo init` — installs the `fb` launcher: detects the shell (`bash`, `zsh`), writes the
+  `fb()` function to `~/.config/fbtodo/fb.sh`, and adds the `source` line to the startup file
+  (idempotent, `--shell` / `--dry-run`). One word after a one-time command.
+
 ## 4.30.2
 
 ### Fixed

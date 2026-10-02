@@ -1,6 +1,12 @@
 # fb — one word to launch the agent with its todo pane, on the current release.
 #
-# Source this file from ~/.zshrc or ~/.bashrc, then run `fb` instead of `freebuff`:
+# The recommended way to install this is `fbtodo init` — it writes this file into
+# your config dir and adds the source line to your shell startup for you:
+#
+#     fbtodo init                     # writes ~/.config/fbtodo/fb.sh + sources it
+#
+# You can still do it by hand — source this file from ~/.zshrc or ~/.bashrc,
+# then run `fb` instead of `freebuff`:
 #
 #     . ~/Projects/fbtodo/examples/fb.sh
 #

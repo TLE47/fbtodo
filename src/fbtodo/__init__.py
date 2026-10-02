@@ -4,6 +4,7 @@
     fbtodo snap         one snapshot, plain text
     fbtodo json         one snapshot, clean JSON
     fbtodo bar          "todos 3/5" — for a tmux status bar
+    fbtodo init          write the `fb` launcher into your shell startup file
     fbtodo daemon       start the background watcher (-f for foreground)
     fbtodo stop         stop the watcher
     fbtodo pane-watch   keep the todo panes open, for as long as freebuff runs
@@ -151,6 +152,7 @@ from .scan import *  # noqa: F401,F403 — the package is one namespace
 from .desktop import *  # noqa: F401,F403 — the package is one namespace
 from .nas import *  # noqa: F401,F403 — the package is one namespace
 from .tasks import *  # noqa: F401,F403 — the package is one namespace
+from .fb_init import *  # noqa: F401,F403 — the package is one namespace
 
 
 def list_fingerprint(state: dict) -> str:
@@ -2028,7 +2030,7 @@ def build_parser():
     ap.add_argument("command", nargs="?", default="pane",
                     choices=["pane", "snap", "json", "bar", "daemon", "stop", "status",
                              "prune", "nas", "pane-watch", "pin", "why", "ledger", "doctor",
-                             "push"])
+                             "push", "init"])
     ap.add_argument(
         "--label-floor", type=float, default=None, metavar="SEC",
         help="estimates: a finished span under SEC is not evidence — it sets no pace and "
@@ -2177,7 +2179,9 @@ def build_parser():
                     help="pin, why: the tmux window to act on (default: the pane you are in)")
     ap.add_argument("--list", action="store_true", help="pin: every pin, and whether its window exists")
     ap.add_argument("--clear", action="store_true", help="pin: drop this window's pin")
-    ap.add_argument("--dry-run", action="store_true", help="nas: say what it would do, change nothing")
+    ap.add_argument("--dry-run", action="store_true", help="nas: say what it would do, change nothing; init: show without writing")
+    ap.add_argument("--shell", metavar="SHELL", default=None,
+                    help="init: shell to configure (bash, zsh; default: detected from $SHELL)")
     ap.add_argument("--idle-exit", type=float, default=30.0, metavar="MIN",
                     help="nas: quit after MIN of no session and no client (0 = run forever)")
     ap.add_argument("--instance-pid", type=int, help="daemon: watch this pid (internal)")
@@ -2236,6 +2240,8 @@ def main(argv=None) -> int:
 
     if args.command == "push":
         return cmd_push(args)
+    if args.command == "init":
+        return cmd_init(args)
     if args.command == "pane":
         return cmd_pane(args)
     if args.command == "snap":
