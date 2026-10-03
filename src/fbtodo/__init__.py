@@ -7,6 +7,16 @@
     fbtodo init          write the `fb` launcher into your shell startup file
     fbtodo daemon       start the background watcher (-f for foreground)
     fbtodo stop         stop the watcher
+    fbtodo keep         turn the pane-repair knob off/on: `keep off` for this pane — kept
+                        as it is, still diagnosed and told — `keep on` back, `keep
+                        default` to inherit again (`--pane %ID`, `--window TARGET`,
+                        `--server`; no verb prints what is in force)
+    fbtodo locks        audit every claim file — who holds it, whether the lock and the
+                        name are one file, whether a record is stale, and what clearing
+                        it would take (--json; the audit itself never writes; --fix clears
+                        dead records and ends untied role processes, asking before any
+                        kill; --restart re-claims the watcher and keeper through the
+                        normal ask afterwards; --dry-run plans without changing anything)
     fbtodo pane-watch   keep the todo panes open, for as long as freebuff runs
                         (started for you; --once for one pass)
     fbtodo pin          pin the list pane's side or size for one window
@@ -16,6 +26,7 @@
                         the source that supplied them, the pane it sits beside
                         (--window TARGET, --json)
     fbtodo status       instance, watcher, state-file and scratch footprint
+                        (--watch reports only keeper changes; --json for a script)
     fbtodo ledger       every step's forecast vector beside the outcome it was scored
                         against — the rows behind the scoreboard
                         (--days N, --limit N, --model M, --json)
@@ -553,7 +564,9 @@ def spawn_daemon(args, cwd: str, instance_pid: int, quiet: bool = True) -> int |
         )
     finally:
         log.close()
-    # wait for the lock so callers can rely on the daemon existing
+    # wait for the lock so callers can rely on the daemon existing. The probe is the
+    # right question for a START: a free record naming a dead pid must not read as "it
+    # started" (`lock_peek` would leave the leftover that made it read that way).
     for _ in range(60):
         time.sleep(0.05)
         if daemon_pid():
@@ -611,7 +624,17 @@ def cmd_daemon(args) -> int:
 
 
 def daemon_loop(args) -> int:
-    if daemon_pid() and not args.force:
+    # A watcher that re-execs itself (see the build check in the loop below) hands its claim
+    # over the exec — same pid, same open file description — so the claim is taken BACK
+    # before anything asks whether one is free: `daemon_pid()` with the handed-over claim
+    # still in hand names this very process, and the guard would stand down the watcher it
+    # just restarted. Nothing to take is no problem: this is then an ordinary start and the
+    # guard below decides.
+    carried = lock_adopt()
+    # The start guard probes on purpose: a leftover must be cleared before this process
+    # claims the name, and only a HELD claim is a watcher to stand down for (or refuse
+    # without `--force`). A look would use `lock_peek`.
+    if not carried and daemon_pid() and not args.force:
         if not args.quiet:
             print(f"watcher already running (pid {daemon_pid()})", file=sys.stderr)
         return 0
@@ -636,6 +659,20 @@ def daemon_loop(args) -> int:
         if not args.quiet:
             print(f"watcher already running (pid {daemon_pid() or '—'})", file=sys.stderr)
         return 0
+    # The root this claim lives in, by IDENTITY and not by existence: a claim file that moved
+    # (removed, replaced) leaves the directory's inode alone, while a directory that was
+    # REMOVED and re-created — even by this watcher's own state write, whose `atomic_write`
+    # makes the directory again — is a different inode. That is what keeps "the name moved"
+    # (re-claim) apart from "the whole root is gone" (stop, never resurrect a home somebody
+    # removed), and it survives the race where a state write lands alongside the removal.
+    def root_ident():
+        try:
+            st = os.stat(os.path.dirname(LOCK_PATH))
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino)
+
+    claimed_root = root_ident()
     # The ask watch's own clock: one scan of the panes every `--ask-seconds`, whatever the
     # render interval is, because a question can arrive between two of them.
     ask_due = 0.0
@@ -649,6 +686,17 @@ def daemon_loop(args) -> int:
     # most likely to be watching. The ask watch is the opposite case (a question can be on
     # screen at any moment) and starts at once.
     bell_due = time.monotonic() + max(1.0, args.pane_bell_seconds)
+    # When the watcher next asks whether it is still the build on disk. It asks the same
+    # question the pane asks (`source_newer_than`) for the same reason: nothing re-imports a
+    # running process, so a watcher left over from an earlier version would keep writing its
+    # older answers until the next `fbtodo` start replaced it — and the watcher is where every
+    # reader's numbers come from. The difference from the pane is the claim: the pane holds
+    # none, while the claim is the watcher's whole standing and must not so much as blink, or
+    # a second watcher could take it in the gap. `lock_handoff` carries it through the exec
+    # and `lock_adopt` above takes it back. `held_note` remembers the broken save already
+    # logged, so a half-written file is noted once rather than once per tick.
+    next_build_check = 0.0
+    held_note = None
     stop_reason = "stopped"
     stop_code = 0
 
@@ -668,13 +716,77 @@ def daemon_loop(args) -> int:
                 stop_code = 0
                 break
             if not lock_ours(LOCK_PATH):
-                # the claim is this watcher's hold on the state directory; if it is gone
-                # (removed, or the directory itself), or if the file is no longer the one
-                # this process locked (something replaced it), the watcher is no longer
-                # the owner — stop instead of re-creating the directory.
-                stop_reason = "lock-removed"
-                stop_code = 0
-                break
+                # The name half of the claim moved — the file was removed, or replaced by a
+                # fresh one — while the kernel lock on the unlinked inode kept this process
+                # looking like the owner. Left alone the watcher writes state no reader ties
+                # to a watcher: `lock_peek` says the role is not running, the process half of
+                # `locks` names it an orphan, and `locks --fix` ends it. So it takes the NAME
+                # back the way the keeper does — a free or absent name is claimed again
+                # (`write_lock` drops the registry entry that no longer points at the name),
+                # and a name a live process HOLDS belongs to that process: another watcher
+                # serves this root now, so this one stands down rather than fight it, which
+                # is its start's own rule. The one case to stop for is a root that is GONE,
+                # judged by the directory's IDENTITY rather than its existence (see
+                # `root_ident` below): re-claiming into a removed root would resurrect a home
+                # somebody removed.
+                if root_ident() != claimed_root:
+                    stop_reason = "root-removed"
+                    stop_code = 0
+                    break
+                gone = not os.path.exists(LOCK_PATH)
+                if not write_lock(cwd, instance_pid):
+                    stop_reason = "claim taken by another watcher"
+                    stop_code = 0
+                    break
+                append_log(
+                    LOG_PATH,
+                    f"watcher re-claimed its name (pid {os.getpid()}, the file was "
+                    + ("removed)" if gone else "replaced)"),
+                )
+            now = time.time()
+            if now >= next_build_check:
+                next_build_check = now + BUILD_CHECK_S
+                changed = source_newer_than(STARTED_AT, now)
+                if changed:
+                    # A parse is not enough to hand the process over to: a tree that compiles
+                    # file by file can still fail to BECOME a process (a name imported from a
+                    # module that no longer defines it, a raise at module scope), and the exec
+                    # below would replace this running watcher with one that dies at import.
+                    # So the new build is asked to load first (`reload_probe_error`), and only
+                    # a build that answers yes is executed into; otherwise this watcher holds,
+                    # keeping the last build that provably loaded.
+                    broken = source_syntax_error()
+                    unfit = broken or reload_probe_error()
+                    if unfit:
+                        if unfit != held_note:  # once per distinct problem, not once a tick
+                            held_note = unfit
+                            append_log(
+                                LOG_PATH,
+                                f"watcher holding, source does not parse: {unfit}" if broken
+                                else f"watcher holding, the new build does not load: {unfit}",
+                            )
+                    else:
+                        append_log(LOG_PATH, f"watcher reloading: {changed} changed "
+                                             "after this process started")
+                        fd = lock_handoff()
+                        argv = self_argv()
+                        try:
+                            os.execv(argv[0], [*argv, *sys.argv[1:]])
+                        except OSError as exc:
+                            # Still the watcher: put the claim's fd back the way this process
+                            # keeps it, and record that the reload did not happen — once per
+                            # distinct failure, because the source is still newer on the next
+                            # tick and a line a second is a flood, not a note.
+                            if fd is not None:
+                                os.environ.pop(LOCK_FD_ENV, None)
+                                try:
+                                    os.set_inheritable(fd, False)
+                                except OSError:
+                                    pass
+                            note = f"reload failed: {exc.__class__.__name__}"
+                            if note != held_note:
+                                held_note = note
+                                append_log(LOG_PATH, f"watcher {note}")
             st = snapshot(args, cwd=cwd, instance_pid=instance_pid)
             if remote:
                 # There is no local pid to lose, so the session ending is read from the probe:
@@ -742,6 +854,53 @@ def daemon_loop(args) -> int:
     if not args.quiet and stop_reason:
         print(f"fbtodo watcher stopped ({stop_reason})", file=sys.stderr)
     return stop_code
+
+
+def _short_python(path: str) -> str:
+    """`/opt/homebrew/…/Python`: enough of an interpreter path to tell two of them apart.
+
+    A framework python's path ends in forty characters of the same suffix on every install
+    (`…/Resources/Python.app/Contents/MacOS/Python`), so printed whole the two halves of
+    `pane python` differ somewhere off the right edge of the terminal. The head is where the
+    difference is — `/opt/homebrew`, `/Library/Developer`, `/usr/bin` — so the head and the
+    name are what is kept.
+    """
+    parts = path.split(os.sep)
+    if len(parts) <= 5:
+        return path
+    return os.sep.join([*parts[:3], "…", parts[-1]])
+
+
+def one_python_check(roles: list) -> tuple:
+    """The doctor's `one python` line: the pane, its watcher and the keeper on one interpreter.
+
+    In plain words: the pin exists so these three agree, and a disagreement is invisible from
+    the outside — which is how one went unnoticed until it was found by hand (2026-10-01: a
+    pane on `/usr/bin/python3` 3.9.6 beside a watcher on Homebrew's 3.14). `doctor` is where
+    the question gets asked on purpose, and the roles are read from the processes themselves
+    (`pane_python`, `python_of`), never assumed, and compared by REAL PATH — a symlinked
+    spelling is the same interpreter, the same rule `pane_drifted` uses.
+
+    A disagreement is a WARN and not a FAIL: the keeper reopens a drifted pane on its pin and
+    the next session comes up pinned, so nothing here stops a pane — but a machine that
+    answers with three paths is a machine to look at, and those paths ARE the answer, which
+    is why they are printed whole rather than shortened. Fewer than two roles running is
+    nothing to compare, which is `ok` said out loud rather than silently.
+    """
+    known = [(role, path) for role, path in roles if path]
+    if not known:
+        return ("ok", "no pane, watcher or keeper running — nothing to compare")
+    if len(known) == 1:
+        return ("ok", f"{known[0][0]} on {_short_python(known[0][1])} — nothing to compare "
+                       "yet (a pane and its keeper start with a session)")
+    if len({os.path.realpath(path) for _role, path in known}) == 1:
+        names = [role for role, _path in known]
+        who = names[0] if len(names) == 1 else ", ".join(names[:-1]) + f" and {names[-1]}"
+        return ("ok", f"{who} all on {_short_python(known[0][1])}")
+    # A mismatch is where the reader needs the whole path: the two heads are the difference
+    # being diagnosed, and `_short_python`'s ellipsis would hide exactly that.
+    return ("warn", " · ".join(f"{role} {path}" for role, path in known)
+            + " — the keeper reopens a pane on its watcher's pin")
 
 
 def cmd_doctor(args) -> int:
@@ -827,10 +986,20 @@ def cmd_doctor(args) -> int:
                        f"stop both and the next run moves it to {STATE_DIR}"))
     elif STATE_NOTE == "failed":
         checks.append(("warn", "state", f"still {SCRATCH} — could not move to {STATE_DIR}"))
-    holder = lock_holder(LOCK_PATH)
-    checks.append(("ok" if holder else "warn", "watcher",
-                   f"pid {holder} holds {os.path.basename(LOCK_PATH)}" if holder
-                   else "not running (a pane starts one)"))
+    # The watcher's claim is READ, not probed: `lock_holder` is deliberately destructive (a
+    # free claim means the record is a leftover it removes), and `doctor` must not empty a
+    # state root it was only asked to look at — that record is what `_claim_live` decides the
+    # move from, and what `one python` reads the watcher's pid from. `lock_peek` asks the same
+    # two questions — can the lock be taken, and what pid does the record name — with no
+    # unlink and no write anywhere: a doctor run leaves every claim record byte-identical.
+    held, holder = lock_peek(LOCK_PATH)
+    if held:
+        checks.append(("ok", "watcher",
+                       f"pid {holder} holds {os.path.basename(LOCK_PATH)}" if holder
+                       else f"a claim is held on {os.path.basename(LOCK_PATH)} "
+                            "(no pid in the record)"))
+    else:
+        checks.append(("warn", "watcher", "not running (a pane starts one)"))
 
     kit = os.path.dirname(NAS_NOTIFY)
     if not os.path.isdir(kit):
@@ -845,6 +1014,31 @@ def cmd_doctor(args) -> int:
     checks.append(("ok", "instance", f"freebuff pid {inst} in {inst_cwd}") if inst
                   else ("warn", "instance",
                         "no freebuff for this directory — a watcher here would exit 66"))
+
+    # One interpreter for the pane, its watcher and the keeper: the pin exists to make them
+    # agree, and a repair that would leave the keeper itself behind on another one is exactly
+    # what a keeper left from an older build used to do. See `one_python_check` for why a
+    # disagreement is a warn rather than a fail, and why the paths are printed whole.
+    #
+    # The keeper's pid comes from the record it writes, not from `lock_holder`: that probe is
+    # deliberately destructive — a claim it finds free means the record is a leftover it
+    # REMOVES — and `doctor` must not empty a state root it was only asked to look at. The
+    # record is exactly what the move decision is read from (`_claim_live` asks the same
+    # file), so a diagnostic that deleted it would erase the fact it reported a line earlier.
+    # The read is the pane bell's (`keeper_alive`): the record, and whether its pid is alive.
+    table = process_table()
+    rows = pane_rows()
+    panes = local_pane_ids(inst, rows, table) if inst else []
+    keeper_rec = read_json(PANE_KEEPER_PATH, {}) or {}
+    keeper_pid = keeper_rec.get("pid")
+    keeper_pid = int(keeper_pid) if keeper_pid and pid_alive(keeper_pid) else None
+    python_level, python_detail = one_python_check([
+        *[(f"pane {p}" if len(panes) > 1 else "pane", pane_python(p, rows, table))
+          for p in panes],
+        ("watcher", python_of((table.get(holder) or (0, ""))[1]) if holder else None),
+        ("keeper", python_of((table.get(keeper_pid) or (0, ""))[1]) if keeper_pid else None),
+    ])
+    checks.append((python_level, "one python", python_detail))
 
     fails = [c for c in checks if c[0] == "FAIL"]
     warns = [c for c in checks if c[0] == "warn"]
@@ -867,6 +1061,10 @@ def cmd_doctor(args) -> int:
 
 
 def cmd_stop(args) -> int:
+    # Stop is an ACTOR: `daemon_pid` is the probe, so a free record naming a dead pid is a
+    # leftover — removed here rather than believed. Reading it as a watcher would signal
+    # nothing and leave the record for the next start to trip over; the look-only family
+    # uses `lock_peek` instead (see `daemon_pid`).
     pid = daemon_pid()
     if not pid:
         clear_lock()
@@ -886,10 +1084,679 @@ def cmd_stop(args) -> int:
     return 0
 
 
+def keeper_server_view() -> dict:
+    """The keeper's server and whether the asks that could replace it agree.
+
+    One answer for the row and for `--json`: a script watching for keeper churn reads the
+    same facts the row prints, from the same reader. `status` only READS — the record is
+    believed by the pid it names, never by taking the claim, whose free answer removes the
+    record (the doctor learned that the hard way). `server` is the record reduced to the
+    socket it denotes (a record written by an older build spells the socket differently,
+    which is a spelling, not another server), `recorded` is the spelling itself, `asks`
+    are the names the two asks would write — reduced the same way, `None` when that context
+    cannot name a server — and `would_replace` names the asks that name a different server:
+    each one, when it next runs, kills this keeper and starts its own. `note` is the row's
+    sentence.
+    """
+    rec = read_json(PANE_KEEPER_PATH, {}) or {}
+    pid = rec.get("pid")
+    pid = int(pid) if pid and pid_alive(pid) else None
+    if not pid:
+        return {
+            "running": False, "pid": None, "server": None, "recorded": None,
+            "asks": {"pane": None, "watcher": None}, "agree": False,
+            "would_replace": [], "note": "— none running",
+        }
+    recorded = rec.get("tmux")
+    server = tmux_socket_of(recorded) or recorded or "unnameable"
+    here = tmux_identity() if os.environ.get("TMUX") else None
+    outside = tmux_identity_outside()
+    asks = {
+        "pane": tmux_socket_of(here) or here if here else None,
+        "watcher": tmux_socket_of(outside) or outside if outside else None,
+    }
+    stranger = [
+        (label, ask) for label, ask in (("pane", here), ("watcher", outside))
+        if ask and not same_tmux_server(recorded, ask)
+    ]
+    if stranger:
+        note = "; ".join(
+            f"the {label}'s ask names {tmux_socket_of(ask) or ask}" for label, ask in stranger
+        ) + " — the next ask replaces this keeper"
+    elif here and outside:
+        note = "the pane's and the watcher's asks name it"
+    elif here:
+        note = "the pane's ask names it"
+    elif outside:
+        note = "the watcher's ask names it"
+    else:
+        note = "no ask from this context names a server"
+    if recorded and server != recorded:
+        note += f"; recorded as {recorded}"
+    return {
+        "running": True, "pid": pid, "server": server, "recorded": recorded,
+        "asks": asks, "agree": not stranger and bool(here or outside),
+        "would_replace": [label for label, _ask in stranger], "note": note,
+    }
+
+
+def keeper_watch_event(prev: dict | None, cur: dict) -> dict | None:
+    """The keeper change worth a line between two reads, or None when nothing moved.
+
+    In plain words: a keeper's failure mode is history — a pid that was replaced, asks
+    that would replace it — which a snapshot cannot show, and a poll that reported every
+    read would bury that history under identical lines. So two reads are compared and only
+    the moves become events: the state a watch STARTS in (`now`, once), a pid change
+    (`pid`, which reads `gone` when the keeper stops answering), the asks that would
+    replace it going from agreement to a stranger (`churn`), and the same set going back to
+    agreement (`agree`). Everything else — same pid, same verdict — is None and says
+    nothing, because the silence is what makes the stream readable over an hour.
+    """
+    if prev is None:
+        return {**cur, "event": "now", "previous_pid": None}
+    if prev["pid"] != cur["pid"]:
+        return {**cur, "event": "gone" if cur["pid"] is None else "pid",
+                "previous_pid": prev["pid"]}
+    if cur["would_replace"] != prev["would_replace"]:
+        if cur["would_replace"]:
+            return {**cur, "event": "churn", "previous_pid": prev["pid"]}
+        if prev["would_replace"]:
+            return {**cur, "event": "agree", "previous_pid": prev["pid"]}
+    return None
+
+
+def keeper_watch_line(event: dict) -> str:
+    """One watch event as the line a person reads — the same facts `--json` carries."""
+    what, pid, was = event["event"], event["pid"], event["previous_pid"]
+    head = f"{what:<7} keeper : "
+    if pid is None:
+        return head + "— none running" + (f"  (was {was})" if was else "")
+    if what == "pid":
+        detail = f"was {was or '—'}, replaced" if was else "appeared"
+    else:
+        detail = event["note"]
+    return f"{head}{pid}  ({detail})"
+
+
+def watch_keeper(args) -> int:
+    """Watch the keeper: one line for the state it starts in, then one per CHANGE only.
+
+    In plain words: `status` is a snapshot, and a keeper's failure mode is history — a pid
+    that was replaced, asks that would replace it — which a snapshot cannot show. This
+    polls the same reader the row uses (`keeper_server_view`), prints the state once, and
+    after that only moves: a pid change, churn due, churn cleared. Between them it says
+    nothing, so the output stays readable however long it runs and a script can watch for
+    keeper churn without filtering identical lines (`--json`: one event object per line,
+    the same facts the snapshot's `keeper` object carries). `-i` sets the poll; Ctrl-C
+    ends it, quietly.
+    """
+    every = max(0.2, float(getattr(args, "interval", None) or 1.0))
+    seen = None
+    try:
+        while True:
+            now = keeper_server_view()
+            event = keeper_watch_event(seen, now)
+            if event is not None:
+                seen = now
+                if args.json:
+                    json.dump({"at_ms": int(time.time() * 1000), **event}, sys.stdout,
+                              ensure_ascii=False)
+                    sys.stdout.write("\n")
+                else:
+                    print(keeper_watch_line(event))
+                sys.stdout.flush()
+            time.sleep(every)
+    except KeyboardInterrupt:
+        return EX_CODES["ok"]
+    except BrokenPipeError:
+        # `status --watch | head -1` is a normal way to read it: a closed reader is an end,
+        # not an error, and the interpreter must not complain while flushing at exit.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        return EX_CODES["ok"]
+
+
+def cmd_keep(args) -> int:
+    """Turn the pane-repair knob off and on — `@fbtodo_repair`, without the incantation.
+
+    In plain words: the knob exists so a deliberate interpreter mix survives the keeper's
+    automatic repair (see `pane_repair_off`), and until now it was only reachable as a tmux
+    command. Three verbs are the whole interface: `off` keeps a drifted pane as it is —
+    still diagnosed, still told on its own chip (`KEPT …`) — `on` resumes the repair, said
+    explicitly so that one pane can win over a server-wide `off`, and `default` removes the
+    choice at the scope instead of writing a value over it, so what the scope inherits from
+    applies again. With no verb, it prints what is in force. One scope per call: the pane
+    you are in, or one named with `--pane %3`; one window with `--window TARGET`, resolved
+    through tmux so `main:2` and a window name both work and the report names the id that
+    landed; `--server` is the whole server, which is how a machine that mixes interpreters
+    on purpose marks every pane at once.
+    """
+    server = bool(getattr(args, "keep_server", False))
+    pane = getattr(args, "keep_pane", None)
+    asked = (getattr(args, "window", None) or "").strip()
+    given = [name for name, on in
+             (("--server", server), ("--pane", bool(pane)), ("--window", bool(asked))) if on]
+    if len(given) > 1:
+        print(f"fbtodo keep: {given[0]} is one scope and {given[1]} another; pick one",
+              file=sys.stderr)
+        return EX_CODES["ex_usage"]
+    window = None
+    if asked:
+        # Resolved once, before the read and used by the write: `window_of` accepts the
+        # same targets `pin`/`why` do, answers with the id, and a window that is gone is
+        # tmux's silence (69) rather than a guessed `-w` target.
+        window = window_of(asked)
+        if window is None:
+            print(f"fbtodo keep: no such window: {asked}", file=sys.stderr)
+            return EX_CODES["unavailable"]
+        scope = f"window {window}"
+    elif server:
+        scope = "server-wide"
+    else:
+        pane = pane or os.environ.get("TMUX_PANE")
+        if not pane:
+            print("fbtodo keep: not in a tmux pane — name one with --pane %ID, a window "
+                  "with --window TARGET, or use --server for every pane", file=sys.stderr)
+            return EX_CODES["ex_usage"]
+        scope = f"pane {pane}"
+
+    def report(state: str) -> int:
+        effect = {
+            "off": "a drifted pane is kept as it is, and told",
+            "on": "a drifted pane is reopened on its pin",
+            "default": ("the server's choice applies again" if window
+                        else "the window's or the server's choice applies again"),
+        }[state]
+        print(f"  repair : {state}  ({scope} — {effect})")
+        return EX_CODES["ok"]
+
+    verb = args.keep_verb
+    if verb is None:
+        if window:
+            value = window_repair_value(window)
+            if value is None:
+                print(f"fbtodo keep: tmux cannot read window {window}", file=sys.stderr)
+                return EX_CODES["unavailable"]
+        elif server:
+            value = tmux_run("show-options", "-g", "-v", "@fbtodo_repair")
+            if value is None and tmux_run("list-sessions") is None:
+                print("fbtodo keep: no tmux server to ask", file=sys.stderr)
+                return EX_CODES["unavailable"]
+        else:
+            value = pane_repair_value(pane)
+            if value is None:
+                print(f"fbtodo keep: tmux cannot read pane {pane}", file=sys.stderr)
+                return EX_CODES["unavailable"]
+        return report("off" if repair_is_off(value) else "on")
+    setting = None if verb == "default" else verb
+    if window:
+        wrote = set_window_repair(window, setting)
+    else:
+        wrote = set_pane_repair(None if server else pane, setting)
+    if not wrote:
+        print(f"fbtodo keep: tmux refused to set @fbtodo_repair on {scope}", file=sys.stderr)
+        return EX_CODES["unavailable"]
+    return report(verb)
+
+
+def claim_files() -> list:
+    """Every claim file this state root knows: the role, and the path it is claimed at.
+
+    The three roles' own files, plus the legacy root's own two when they are still there —
+    a claim that was never moved can still hold the old store (`_claim_live`), so the audit
+    names it instead of pretending this root is all there is.
+    """
+    files = [("watcher", LOCK_PATH), ("keeper", PANE_KEEPER_PATH), ("nas pane", NAS_LOCK_PATH)]
+    seen = {os.path.realpath(p) for _, p in files}
+    for label, name in (("watcher", LEGACY_CLAIMS[0]), ("keeper", LEGACY_CLAIMS[1])):
+        path = os.path.join(LEGACY_SCRATCH, name)
+        if os.path.exists(path) and os.path.realpath(path) not in seen:
+            files.append((f"legacy {label}", path))
+            seen.add(os.path.realpath(path))
+    return files
+
+
+def locks_findings(rows: list, running: list) -> dict:
+    """Every finding the audit can name, keyed by the THING that is wrong — a watch's unit.
+
+    In plain words: `locks` prints two kinds of wrong, and a watch needs them as a SET so it
+    can tell a new finding from a standing one. An ORPHAN is a live role process no claim
+    names (`orphan:<role>:<pid>`), read from the process half of the audit. A BROKEN TIE is
+    a claim file that is free while its record names a LIVE process (`tie:<role>:<pid>`):
+    the file and the record are no longer the same claim. A held claim, a dead leftover and
+    an absent file are not findings — the audit's own row explains each, and a watch that
+    cried at a claim being born would be noise. The value carries what a message needs
+    (role, pid, path, whether the process could be placed at all).
+    """
+    out: dict = {}
+    for label, entry in rows:
+        for proc in claim_orphans(entry, [p for p in running if p["role"] == label]):
+            if int(proc["pid"]) == os.getpid():
+                continue  # a watch is not a finding about itself
+            out[f"orphan:{label}:{proc['pid']}"] = {
+                "kind": "orphan", "role": label, "pid": int(proc["pid"]),
+                "path": entry["path"], "root_named": bool(proc.get("root_named", True)),
+                "env_clipped": bool(proc.get("env_clipped", False)),
+            }
+        if (entry.get("leftover") and entry.get("name_inode") == "mismatch"
+                and entry.get("pid_alive") and entry.get("pid")):
+            out[f"tie:{label}:{entry['pid']}"] = {
+                "kind": "tie", "role": label, "pid": int(entry["pid"]),
+                "path": entry["path"], "version": entry.get("version"),
+            }
+    return out
+
+
+def locks_watch_line(event: str, finding: dict) -> str:
+    """One watch event as the line a person reads — the same facts `--json` carries."""
+    role = f"{finding['role']:<9}"
+    head = f"{event:<6} {finding['kind']:<7} {role} pid {finding['pid']:<7}"
+    where = os.path.basename(finding.get("path") or "")
+    if finding["kind"] == "orphan":
+        detail = "no claim names it" + (
+            "" if finding.get("root_named", True) else " (this root assumed)")
+    else:
+        detail = "free while its record names this live pid — the name and the inode parted"
+    if event == "clear":
+        detail = "a claim names it again" if finding["kind"] == "orphan" else \
+            "the file and the record agree again"
+    return f"{head}{detail}  ({where})" if where else f"{head}{detail}"
+
+
+def watch_locks(args) -> int:
+    """Watch the audit: a line per finding as it appears, and one when it goes.
+
+    In plain words: `locks` is a snapshot, and the two things it can find are both things
+    that HAPPEN — a role process whose claim name was replaced under it (it holds a lock on
+    an inode nothing points at, so every reader calls the role dead and a second one may be
+    started over the fresh name), and a claim file whose name and inode have parted. Both
+    are invisible in every store, so nothing else will ever mention them: a watch is the
+    only way an operator hears about it without typing `locks` at the right moment. The
+    stream prints each finding once, as it appears, plus one line when it is resolved, and
+    says nothing in between however long it runs. When a NEW finding appears it asks the
+    locks watch (`LOCKS_NOTIFY`, absent on a machine without the kit) to push it to the
+    phone; the bell owns whether it has already pushed, so a restart cannot double-send.
+    `-i` sets the poll; Ctrl-C ends it, quietly.
+    """
+    every = max(0.5, float(getattr(args, "interval", None) or 5.0))
+    seen: dict = {}
+    try:
+        while True:
+            rows = [(label, claim_audit(path)) for label, path in claim_files()]
+            findings = locks_findings(rows, claim_processes())
+            appeared = [key for key in findings if key not in seen]
+            for key in appeared:
+                seen[key] = findings[key]
+                event = {"at_ms": int(time.time() * 1000), "event": "open",
+                         "key": key, **findings[key]}
+                if args.json:
+                    json.dump(event, sys.stdout, ensure_ascii=False)
+                    sys.stdout.write("\n")
+                else:
+                    print(locks_watch_line("open", findings[key]))
+            cleared = [k for k in seen if k not in findings]
+            for key in cleared:
+                gone = seen.pop(key)
+                event = {"at_ms": int(time.time() * 1000), "event": "clear",
+                         "key": key, **gone}
+                if args.json:
+                    json.dump(event, sys.stdout, ensure_ascii=False)
+                    sys.stdout.write("\n")
+                else:
+                    print(locks_watch_line("clear", gone))
+            # Both kinds flush: a watch is read through a pipe (`| head`), and a line the
+            # reader cannot see until the buffer fills is not a watch. Flushing only the
+            # open lines left a resolution invisible for as long as the pipe stayed open.
+            if appeared or cleared:
+                sys.stdout.flush()
+            if appeared:
+                locks_notify_once(args, quiet=args.quiet)
+            time.sleep(every)
+    except KeyboardInterrupt:
+        return EX_CODES["ok"]
+    except BrokenPipeError:
+        # `locks --watch | head -3` is a normal way to read it: a closed reader is an end,
+        # not an error, and the interpreter must not complain while flushing at exit.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        return EX_CODES["ok"]
+
+
+def cmd_locks(args) -> int:
+    """Audit every claim file: holder, name↔inode tie, stale records, and clearing.
+
+    In plain words: each role that owns a scratch dir — the watcher, the pane keeper, the
+    NAS pane watcher — owns it through one claim file, and this asks those files the
+    questions their own readers and writers use, WITHOUT writing anything anywhere (the
+    probe `lock_holder` would remove a leftover; an audit exists to say so instead). Who
+    holds it (the record's pid, and whether it is alive); whether the lock and the NAME are
+    one file (a held claim blocks this process's own open of the name, so the tie holds; a
+    record naming a LIVE pid while the file is free is the tie broken — a leftover, a claim
+    being born, or a claim orphaned by a replaced file); whether the record is stale; and
+    what clearing it would take (a held claim: end the holder, and unlinking does not; a
+    free leftover: the next ask; an empty free file: nothing — it may be about to be
+    locked).
+
+    ...and the rows are CROSS-CHECKED against the processes that are actually running
+    (`claim_processes`): a claim file can only name a holder that still ties to its name,
+    so a process whose name was replaced — the leftover cleanup above took it, and it went
+    on running invisibly — leaves a file that reads `absent` or `free`. The process table
+    is asked the other end: every watcher/keeper/NAS watcher running with THIS state root,
+    and which of them no claim names. Those rows print under the claim that cannot see
+    them, and `orphans` carries the same facts in `--json`. `--json` is the same rows for
+    a script, and no run changes a claim file — `--fix` is the separate path that acts on
+    these findings (see `locks_fix`), so the audit stays a look.
+    """
+    if getattr(args, "fix", False):
+        return locks_fix(args)
+    if getattr(args, "watch", False):
+        return watch_locks(args)
+    rows = [(label, claim_audit(path)) for label, path in claim_files()]
+    running = claim_processes()
+    orphans = {label: claim_orphans(entry, [p for p in running if p["role"] == label])
+               for label, entry in rows}
+
+    def level_of(entry: dict) -> str:
+        if entry["name_inode"] == "mismatch":
+            return "warn"
+        if entry["state"] == "held":
+            return "note" if entry["pid"] and not entry["pid_alive"] else "ok"
+        if entry["state"] == "absent":
+            return "ok"
+        return "note"
+
+    if args.json:
+        json.dump(
+            {"version": VERSION, "scratch": SCRATCH,
+             "claims": [{"role": label, **entry,
+                         "orphans": orphans.get(label, [])} for label, entry in rows]},
+            sys.stdout, ensure_ascii=False,
+        )
+        sys.stdout.write("\n")
+        return EX_CODES["ok"]
+    hint = {
+        "watcher": " — `fbtodo stop` asks this one to end",
+        "keeper": " — it also exits with the last freebuff",
+        "nas pane": " — `fbtodo nas` starts it",
+    }
+    print(f"fbtodo locks  {SCRATCH}")
+    for label, entry in rows:
+        role = label[len("legacy "):] if label.startswith("legacy ") else label
+        tie = "" if entry["name_inode"] is None else f"  [name↔inode: {entry['name_inode']}]"
+        print(f"  {level_of(entry):<5} {label:<14} {os.path.basename(entry['path']):<23}"
+              f" {entry['note']}{tie}")
+        if entry["state"] != "absent":
+            print(f"        clear: {entry['clearing']}{hint.get(role, '')}")
+        for proc in orphans.get(label, []):
+            # The sentence the name-based read cannot produce: a process is RUNNING under
+            # this root, and the file above does not name it. It holds a claim nobody can
+            # find — a lock on an unlinked inode — and clearing means ending it, not
+            # unlinking (there is nothing on disk left to unlink). A process whose
+            # environment could not be READ — or came back clipped at the kernel's ~1 KB
+            # copy — is reported with the assumption said out loud, because that root is
+            # only assumed and `locks --fix` does not end what it cannot place.
+            py = f"  [{_short_python(proc['python'])}]" if proc.get("python") else ""
+            if proc.get("root_named", True):
+                print(f"        running: pid {proc['pid']} ({label}) with this state root, "
+                      f"holding a claim no name points at{py}")
+                print(f"        clear: end pid {proc['pid']} (SIGTERM) — its lock lives on an "
+                      "unlinked file; nothing on disk to unlink")
+            else:
+                why = ("its environment came back clipped at the kernel's ~1 KB copy, so a "
+                       "root variable may have been cut off" if proc.get("env_clipped") else
+                       "no environment could be read from it")
+                print(f"        running: pid {proc['pid']} ({label}), holding a claim no name "
+                      f"points at{py}")
+                print(f"        assume: {why} — this state root is assumed only, so "
+                      "`locks --fix` will not end it")
+    return EX_CODES["ok"]
+
+
+def locks_fix_plan(rows: list, running: list) -> tuple:
+    """What a fix would do — the audit read one more time, with no side effects.
+
+    In plain words: two findings are fixable, and only these two. A claim whose record is
+    FREE and names a pid is a `leftover` (the next ask would remove it anyway) and goes in
+    `clears`. A running role process no claim can name is UNTIED — it holds a lock on an
+    unlinked inode, so nothing on disk can free it — and goes in `kills`; but only when it
+    was PLACED, i.e. its own environment was read and named this state root (`root_named`).
+    `claim_processes` deliberately counts an environment it could not read — or one that came
+    back clipped at the kernel's ~1 KB copy, which may have cut the root variable off — as
+    ours: "a false positive is a sentence, not a kill", and a sentence is all the audit may
+    do with that. Those go in `skipped` instead, because ending a process this run cannot
+    place is the one thing a repair must not do on a guess. A held claim with its name, an empty free file (a claim being born),
+    an absent file, and this very process are not findings.
+    """
+    orphans = {label: claim_orphans(entry, [p for p in running if p["role"] == label])
+               for label, entry in rows}
+    clears = [(label, entry) for label, entry in rows
+              if entry["state"] == "free" and entry.get("leftover")]
+    kills: list = []
+    skipped: list = []
+    for label, _entry in rows:
+        for proc in orphans.get(label, []):
+            if int(proc["pid"]) == os.getpid():
+                continue
+            (kills if proc.get("root_named", True) else skipped).append((label, proc))
+    return clears, kills, skipped
+
+
+def _confirm(prompt: str, args) -> bool | None:
+    """Ask before acting: True yes, False no, None when it cannot be asked at all.
+
+    The prompt goes to STDERR so `--json` stdout stays one parseable object, and a `y`/`yes`
+    (any case) approves — anything else, including EOF on a disconnected stdin, does not.
+    `--yes` answers for the operator, and `--no-input` — or a stdin that is not a terminal —
+    never prompts: a question nobody can answer must fail fast (the caller turns None into
+    66) rather than hang.
+    """
+    if getattr(args, "yes", False):
+        return True
+    if getattr(args, "no_input", False) or not sys.stdin.isatty():
+        return None
+    sys.stderr.write(f"{prompt} [y/N] ")
+    sys.stderr.flush()
+    try:
+        answer = sys.stdin.readline()
+    except (OSError, KeyboardInterrupt):
+        return None
+    return bool(answer) and answer.strip().lower() in ("y", "yes")
+
+
+def restart_claims(args) -> dict:
+    """Ask the machine to watch again after a fix: the keeper, then the watcher.
+
+    In plain words: a repair that ended an untied role process leaves the claim FREE, and
+    nothing re-claims it until the next session start or the next shell hook happens to run
+    — which can be hours on a quiet machine, with the panes unguarded while it waits. So
+    `--restart` runs the same ask a session start uses (`ensure_daemon`, which asks for the
+    keeper before it consults the watcher's lock), and reports what each role looks like
+    afterwards. It is a no-op where a watcher or keeper is already running — the ask returns
+    the holder rather than starting a second — and it never ends anything to make room: any
+    ending was `locks --fix`'s own job, already done above. A start that cannot even be
+    attempted (no running Freebuff instance to follow) is not an error here: the keeper may
+    still have been asked for, and the watcher is simply left as it is.
+    """
+    def held(path: str):
+        ok, pid = lock_peek(path)
+        return pid or None if ok else None
+
+    before = {"watcher": held(LOCK_PATH), "keeper": held(PANE_KEEPER_PATH)}
+    try:
+        ensure_daemon(args, quiet=True)
+    except Exception as exc:  # a start that could not be attempted at all
+        return {role: {"pid": before[role], "before": before[role],
+                       "error": exc.__class__.__name__} for role in before}
+    return {role: {"pid": held(LOCK_PATH if role == "watcher" else PANE_KEEPER_PATH),
+                   "before": before[role]} for role in before}
+
+
+def locks_fix(args) -> int:
+    """Resolve what the audit found: clear dead records, end untied role processes.
+
+    In plain words: `locks` is a LOOK and says what clearing each claim would take; this is
+    the same read with the hand that acts. The free leftovers it reports are removed
+    through the same probe the next ask uses (`lock_holder`), which re-opens the file, takes
+    it and re-checks the name under the lock — so a claim that appeared between the audit
+    and here is never deleted. Untied role processes are ended with SIGTERM (a bounded wait,
+    and a survivor is reported rather than escalated): their lock lives on an inode no name
+    points at, so ending them is the only repair, and it is the receiver that then re-claims
+    when it next runs. A repair that would end ANYTHING asks first — on the terminal, or with
+    `--yes` — and refuses with 66 when it cannot ask (`--no-input`, no terminal), changing
+    nothing at all: a kill is never taken on a guess, and never half-applied.    `--dry-run` prints the same plan and touches nothing. On its own it starts nothing —
+    the claims it frees are what the next ask (the shell's `fbtodo daemon`, a pane, `fbtodo
+    nas`) re-claims; `--restart` is the opt-in that runs that ask now (see `restart_claims`),
+    so one command can leave the machine watched again instead of waiting for the next
+    session to start.
+    """
+    rows = [(label, claim_audit(path)) for label, path in claim_files()]
+    clears, kills, skipped = locks_fix_plan(rows, claim_processes())
+    applied, reason = False, None
+    cleared: list = []
+    ended: list = []
+    failed: list = []
+    restarted: dict = {}
+    if args.dry_run:
+        reason = "dry run"
+    elif kills:
+        asked = _confirm(
+            "end " + str(len(kills)) + " untied process(es) — "
+            + ", ".join(f"{label} pid {proc['pid']}" for label, proc in kills)
+            + "?",
+            args,
+        )
+        if asked is None:
+            reason = "confirmation required"
+        elif not asked:
+            reason = "declined"
+        else:
+            applied = True
+    else:
+        applied = True
+    if applied:
+        for label, entry in clears:
+            lock_holder(entry["path"])  # the ask's own cleanup: re-checks the name, then unlinks
+            cleared.append({"role": label, "path": entry["path"],
+                            "removed": not os.path.exists(entry["path"])})
+        for label, proc in kills:
+            pid = int(proc["pid"])
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                ended.append({"role": label, "pid": pid, "outcome": "already gone"})
+                continue
+            # `pid_running`, not `pid_alive`: the keeper this ends is usually somebody
+            # else's child, and an unreaped one answers `kill(pid, 0)` from beyond the
+            # grave — reporting that corpse as a survivor would be a failure that is not
+            # there (measured: the self-check's own keeper, a child of the suite).
+            for _ in range(40):
+                if not pid_running(pid):
+                    break
+                time.sleep(0.05)
+            outcome = "still alive after SIGTERM" if pid_running(pid) else "ended"
+            ended.append({"role": label, "pid": pid, "outcome": outcome})
+            if outcome != "ended":
+                failed.append(ended[-1])
+        if getattr(args, "restart", False):
+            # After the hand that acts: ask for the watcher and the keeper back. Only when
+            # something was actually applied — a declined or unconfirmed fix changed nothing,
+            # and a start on top of that would be a change nobody approved.
+            restarted = restart_claims(args)
+    code = EX_CODES["ok"]
+    if reason == "confirmation required":
+        code = EX_CODES["noinput"]
+    elif reason == "declined" or failed:
+        code = 1
+    if args.json:
+        doc = {
+            "version": VERSION, "scratch": SCRATCH,
+            "dry_run": bool(args.dry_run), "applied": applied, "reason": reason,
+            "planned": {
+                "clears": [{"role": label, "path": entry["path"]}
+                           for label, entry in clears],
+                "kills": [{"role": label, "pid": proc["pid"]} for label, proc in kills],
+                "skip": [{"role": label, "pid": proc["pid"]} for label, proc in skipped],
+            },
+            "cleared": cleared, "ended": ended,
+            "restarted": restarted,
+            "claims": [{"role": label, **entry} for label, entry in rows],
+        }
+        json.dump(doc, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+    else:
+        print("fbtodo locks --dry-run  " + SCRATCH if args.dry_run
+              else "fbtodo locks --fix  " + SCRATCH)
+        for label, entry in clears:
+            name = os.path.basename(entry["path"])
+            if not applied:
+                print(f"  would clear  {label:<14} {name:<23} a free record — dead weight")
+                continue
+            got = next((c for c in cleared if c["role"] == label), {})
+            tail = "dead record gone; the next ask re-claims" if got.get("removed") \
+                else "a claim appeared — left alone"
+            print(f"  {'cleared' if got.get('removed') else 'left   '}  {label:<14} "
+                  f"{name:<23} {tail}")
+        for label, proc in kills:
+            if not applied:
+                print(f"  would end    {label:<14} pid {proc['pid']} (SIGTERM) — its claim "
+                      "lives on an unlinked file")
+                continue
+            got = next((e for e in ended if e["pid"] == proc["pid"] and e["role"] == label),
+                       {})
+            print(f"  {'ended' if got.get('outcome') == 'ended' else 'failed':<14} "
+                  f"{label:<14} pid {proc['pid']}  ({got.get('outcome')})")
+        for label, proc in skipped:
+            why = ("its environment came back clipped at the kernel's ~1 KB copy"
+                   if proc.get("env_clipped") else "its environment could not be read")
+            print(f"  skip         {label:<14} pid {proc['pid']} — {why}, so this root is "
+                  "only assumed (a sentence, not a kill)")
+        if getattr(args, "restart", False):
+            if restarted:
+                for role in ("watcher", "keeper"):
+                    info = restarted.get(role, {})
+                    pid = info.get("pid")
+                    if info.get("error"):
+                        print(f"  restart      {role:<14} not attempted ({info['error']})")
+                    elif pid and info.get("before") == pid:
+                        print(f"  watching     {role:<14} pid {pid}  (already running)")
+                    elif pid:
+                        print(f"  restarted    {role:<14} pid {pid}  — re-claimed")
+                    else:
+                        print(f"  restart      {role:<14} not running after the ask")
+            elif args.dry_run:
+                print("  would restart watcher and keeper through the normal ask")
+            else:
+                print("  restart      skipped — nothing was changed")
+        if not (clears or kills or skipped or getattr(args, "restart", False)):
+            print("  nothing to fix")
+    if reason == "confirmation required":
+        print(f"fbtodo locks --fix: refusing to end {len(kills)} untied process(es) without "
+              "confirmation — rerun with --yes, or --dry-run to see the plan",
+              file=sys.stderr)
+        return code
+    if reason == "declined":
+        print("fbtodo locks --fix: nothing changed", file=sys.stderr)
+    return code
+
+
 def cmd_status(args) -> int:
+    if getattr(args, "watch", False):
+        return watch_keeper(args)
     cwd = os.path.realpath(os.getcwd())
     inst, inst_cwd = find_instance(cwd, args.watch_pid, args.instance_of)
-    pid = daemon_pid()
+    # The watcher's claim is READ, not probed: `daemon_pid()` is deliberately destructive
+    # (its free-claim answer removes a leftover record), and `status` only looks. The row
+    # and `--json` number are unchanged — a held claim names the record's pid, a free one
+    # says "not running" — but a leftover `fbtodo-daemon.pid` now survives the run: it is
+    # what `_claim_live` decides the state root from, and a look that erased it would
+    # erase the fact it reports on (found in `doctor` first, 2026-10-02). Same read as
+    # that row (`lock_peek`): open, try the lock, no unlink and no write anywhere.
+    held, pid = lock_peek(LOCK_PATH)
+    pid = pid if held else None
     st = read_json(STATE_PATH, None)
     # The state file is whatever the LOCAL watcher follows. `-s nas` asks about the NAS, so
     # ask it (one probe): reporting the local session's list against "nas session: — no
@@ -903,6 +1770,7 @@ def cmd_status(args) -> int:
                 "instance_pid": inst,
                 "instance_cwd": inst_cwd,
                 "watcher_pid": pid,
+                "keeper": keeper_server_view(),
                 "state_file": STATE_PATH,
                 "state_fresh": state_is_fresh(st),
                 "theme_problems": [list(p) for p in THEME_PROBLEMS],
@@ -938,11 +1806,12 @@ def cmd_status(args) -> int:
     # hand-maintained, so a watcher left over from an earlier copy keeps working while the
     # pane beside it is a different build — the one way this pane has ever misled its
     # owner. Both numbers on one line make that self-diagnosing: they agree when the pane
-    # and its watcher are the same build, and the state's own stamp is exactly what a
-    # version-stale watcher is killed for on the next start (see `live_watcher_pid`).
+    # and its watcher are the same build, and a stale stamp is the state a watcher wrote
+    # before it reloaded itself (`daemon_loop`) — or, for one whose build is gone, before
+    # the next start replaces it (`live_watcher_pid`).
     watching = (st or {}).get("tool_version")
     stale_note = (
-        f"  (watcher {watching} — stale, replaced on the next start)"
+        f"  (watcher {watching} — stale; it reloads itself, or the next start replaces it)"
         if watching and watching != VERSION else ""
     )
     print(f"  tool version      : {VERSION}{stale_note}")
@@ -1037,7 +1906,13 @@ def cmd_status(args) -> int:
         # What the finished-task bell rings on, said out loud: a ticked-off list with the
         # agent still working is exactly the case that must stay silent.
         if view.get("turn_ended"):
-            print("  agent             : turn ended — waiting for you")
+            # The boundary guard: a turn that changed files without re-publishing the list
+            # has not finished, whatever the ticks say.
+            gap = unlisted_note(view)
+            if gap:
+                print(f"  agent             : steps still open — {gap}")
+            else:
+                print("  agent             : turn ended — waiting for you")
         else:
             print("  agent             : working (the list is not the finish line)")
     # The ask watch, said out loud like the other notifiers: a question on screen stops
@@ -1094,6 +1969,43 @@ def cmd_status(args) -> int:
     if inst:
         mine = local_pane_ids(inst)
         print(f"  todo pane         : {', '.join(mine) if mine else '— none right now'}")
+        # In plain words: which Python is that pane actually on? The pane and the watcher are
+        # the two that have to agree, and a pane rendering under one Python while its watcher
+        # writes under another is a difference nobody can see from the outside — which is how
+        # it went unnoticed until one was found by hand (2026-10-01: a pane respawned by tmux
+        # on `/usr/bin/python3` 3.9.6 beside a watcher on Homebrew's 3.14, because tmux
+        # rebuilds a pane's PATH and the pane command used to be resolved through it). Both
+        # are read from the processes themselves (`pane_python`, `python_of`), never assumed,
+        # and the pin's own job is to make this line boring: `same as the watcher`. When they
+        # do differ the keeper reopens the pane on its pin (see `repair_drifted_panes`), so
+        # the line reports the disagreement rather than asking the reader to fix it.
+        table = process_table()
+        pane_py = pane_python(mine[0], table=table) if mine else None
+        watch_py = python_of((table.get(pid) or (0, ""))[1]) if pid else None
+        if pane_py and watch_py:
+            note = (
+                "same as the watcher"
+                if os.path.realpath(pane_py) == os.path.realpath(watch_py)
+                else f"watcher {_short_python(watch_py)} — they differ; the keeper puts the pane back on its pin"
+            )
+            print(f"  pane python       : {_short_python(pane_py)}  ({note})")
+        elif pane_py:
+            print(f"  pane python       : {_short_python(pane_py)}")
+    # The keeper's server, in the same shape as the pane python line above: the name its
+    # record actually holds, canonicalised (a record written by an older build spells the
+    # socket as the raw `TMUX` value — a spelling, not a different server), and whether
+    # the asks that can replace it agree with it. The pane's ask is the name an ask from
+    # this context writes, and it is only there when this IS a pane (`TMUX` is set); the
+    # watcher's is the ask that spawns a watcher, made outside tmux (the shell autostart,
+    # the desktop integration; `tmux_identity_outside`). A disagreement is the churn
+    # itself: the next ask from that side kills this keeper and starts its own. Read,
+    # never taken: `status` must not remove a leftover record (the doctor learned that
+    # the hard way).
+    keeper = keeper_server_view()
+    if not keeper["running"]:
+        print("  keeper server     : — none running")
+    else:
+        print(f"  keeper server     : {keeper['server']}  ({keeper['note']})")
     log = load_tasklog()
     last = log.get("pruned_ms")
     when = f"{short_duration((time.time() * 1000 - last))} ago" if last else "never"
@@ -1490,6 +2402,62 @@ def cmd_ledger(args) -> int:
     return 0
 
 
+# The note a pane leaves for its own replacement across a reload (`cmd_pane`). The old image
+# cannot know the new build's `VERSION` — that is in code it never imported — so it leaves its
+# own behind in the environment, which along with the open fds is what an exec carries, and the
+# image on the other side says what it is running. `RELOAD_NOTE_S` is how long the title chip
+# carries it: long enough to catch from the corner of an eye, short enough that the chip is the
+# pane's own name again before anyone could read it as state. The file that changed rides the
+# same hand-over for the log rather than the chip.
+PANE_RELOAD_ENV = "FBTODO_PANE_RELOADED"
+RELOAD_NOTE_S = 5.0
+
+
+def reload_note(raw: str | None) -> str | None:
+    """What a pane that just re-exec'd says on its title chip: `RELOADED 4.30.2 → 4.30.3`.
+
+    In plain words: which build is this now? The hand-over is JSON (`{"from": …, "file": …}`)
+    and one that does not parse is no note rather than a traceback — a pane's job is the list,
+    and a garbled variable is not worth taking it down. The build the pane came FROM is named
+    only when it differs from the one it is on: an edit between releases still reloads, and
+    there the chip just says which build it is now.
+    """
+    if not raw:
+        return None
+    try:
+        was = json.loads(raw)
+        old = str(was.get("from") or "")
+    except (ValueError, AttributeError):
+        return None
+    if old and old != VERSION:
+        return f"RELOADED {old} → {VERSION}"
+    return f"RELOADED {VERSION}"
+
+
+def reopen_note(note: dict | None) -> str | None:
+    """What a pane says on its title chip about what the keeper saw: `REOPENED (was on …)`,
+    or `KEPT (was on …)` when the repair is turned off for it (`@fbtodo_repair`).
+
+    In plain words: the keeper's finding was loud in its log and silent in the pane — the
+    wrong way round, because the person watching is looking at the PANE when its process is
+    replaced under them. The note cannot ride the environment the way a reload's does
+    (`respawn-pane` starts a fresh command with none of ours), so the keeper leaves it in a
+    file and the pane claims it by its own id, `TMUX_PANE`: at startup for a respawn, and on
+    its own poll for a `kept` note — nothing restarted that pane, so nothing else would ever
+    deliver it. It names the interpreter the pane — or a child of it — was on, shortened the
+    way `status` shortens one, since that is the whole reason the repair exists; a note
+    somehow missing its name still says which act it was.
+    """
+    if not note:
+        return None
+    kept = (note.get("kind") or "reopen") == "kept"
+    was = str(note.get("was") or "")
+    if not was:
+        return "KEPT (repair off)" if kept else "REOPENED ON THE PIN"
+    who = "a child was on" if note.get("child") else "was on"
+    return f"{'KEPT' if kept else 'REOPENED'} ({who} {_short_python(was)})"
+
+
 def cmd_pane(args) -> int:
     cwd = os.path.realpath(os.getcwd())
     if not args.no_daemon:
@@ -1515,6 +2483,29 @@ def cmd_pane(args) -> int:
     # clock and its "N ago" could not move until the next ssh had come back.
     WAKE = 0.25
     next_poll = 0.0
+    # When this pane next asks whether it is still the build on disk — `BUILD_CHECK_S`, the
+    # clock the watcher's own reload runs on too (`daemon_loop`).
+    next_build_check = 0.0
+    held_note = None
+    # A pane that re-exec'd itself left the note for its replacement (see the build check
+    # below). It is shown on the title chip until `reloaded_until`, then the chip is the
+    # pane's own name again — and the variable is popped whatever it says, so nothing this
+    # pane starts inherits a note about a reload that is long over. The clock is armed by the
+    # first frame the note can be painted into, not here: a reload can begin with a slow poll
+    # (a NAS pane's is an ssh round trip), and a note that expired while waiting for the state
+    # is a note nobody sees.
+    reloaded = reload_note(os.environ.pop(PANE_RELOAD_ENV, None))
+    # ...and the other note a pane can start with: the keeper reopened this one because its
+    # Python was not its watcher's, and it left the reason in a file (a respawn carries no
+    # environment of ours — see `pane_note_take`). The pane's own id is how the note finds it.
+    keeper_note = reopen_note(pane_note_take(os.environ.get("TMUX_PANE")))
+    reloaded_until = None
+    keeper_note_until = None
+    # ...and the note with no restart behind it: a pane the keeper KEPT as it is — the repair
+    # is off for it (`@fbtodo_repair`) — can only be told on the chip of the process already
+    # running, so this pane asks the note file itself (the poll in the loop below), and only
+    # for `kept`: a `reopen` note belongs to the process that will replace this one.
+    next_note_check = 0.0
     state = watching = inst = None
 
     def restore(*_a):
@@ -1547,6 +2538,51 @@ def cmd_pane(args) -> int:
             hide = True
         while True:
             now = time.time()
+            # In plain words: am I still the code that is there? A pane keeps the build it
+            # imported, and an upgrade — a release, a `git pull`, an edit under the pane's own
+            # feet — used to leave the list drawn by the OLD build until someone respawned the
+            # pane by hand; a pane found running a day-old build is why `status` prints a
+            # `tool version` beside the watcher's at all. Nothing re-imports a running Python
+            # process, so the pane starts itself over instead. The exec keeps the pane, its
+            # pid and its tty — only the code changes — and it is deferred while the sources
+            # do not parse, so a half-saved file cannot take the pane away from the person
+            # who is editing it. The same guard covers a tree that PARSES but will not become
+            # a process (`reload_probe_error`): a pane that execs into a build which dies at
+            # import is a pane the keeper then reopens, into the same broken tree, over and
+            # over — so an unfit build is one the pane holds on, not one it becomes.
+            if not args.once and now >= next_build_check:
+                next_build_check = now + BUILD_CHECK_S
+                changed = source_newer_than(STARTED_AT, now)
+                if changed:
+                    broken = source_syntax_error()
+                    unfit = broken or reload_probe_error()
+                    if unfit:
+                        if unfit != held_note:  # once per distinct problem, not once a second
+                            held_note = unfit
+                            pane_log(
+                                f"pane holding, source does not parse: {unfit}" if broken
+                                else f"pane holding, the new build does not load: {unfit}",
+                            )
+                    else:
+                        # The cursor back on first: the exec replaces this process, so a build
+                        # that fails to import should leave a readable pane behind it rather
+                        # than an invisible one.
+                        sys.stdout.write("\x1b[?25h")
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                        pane_log(f"pane reloading: {changed} changed after this process started")
+                        # ...and what the next image cannot know: this one's VERSION. The
+                        # environment is what an exec carries besides the open fds, so the
+                        # hand-over rides there and the new chip can name the build it came
+                        # from — and the file, which the log line above already has.
+                        os.environ[PANE_RELOAD_ENV] = json.dumps({"from": VERSION,
+                                                                  "file": changed})
+                        argv = self_argv()
+                        try:
+                            os.execv(argv[0], [*argv, *sys.argv[1:]])
+                        except OSError as exc:
+                            os.environ.pop(PANE_RELOAD_ENV, None)
+                            pane_log(f"pane reload failed: {exc.__class__.__name__}")
             if state is None or now >= next_poll:
                 remote = args.source == "nas"
                 if remote:
@@ -1558,6 +2594,9 @@ def cmd_pane(args) -> int:
                     # Only this source's watcher state: a `-s nas` pane must not render the
                     # local CLI watcher's list just because that one happens to be fresh.
                     state = st
+                    # The pane ACTS (it tracks tasks and may start a watcher), so the probe
+                    # is allowed here: a leftover record must not be printed as the watcher
+                    # serving this state. Look-only commands use `lock_peek`.
                     watching = st.get("daemon_pid") or daemon_pid()
                 else:
                     state = finish_probe(snapshot(args, cwd=cwd, instance_pid=inst))
@@ -1575,6 +2614,14 @@ def cmd_pane(args) -> int:
                     state = track_tasks(state)
                 next_poll = time.time() + max(0.2, args.interval)
             now = time.time()
+            if now >= next_note_check:
+                next_note_check = now + 1.0
+                polled = reopen_note(pane_note_take(os.environ.get("TMUX_PANE"),
+                                                    kind="kept", sweep=False))
+                if polled:
+                    # a sighting with no respawn behind it: the keeper kept this pane as it
+                    # is, and only the process already on screen can say so
+                    keeper_note, keeper_note_until = polled, None
             # “stale” means the *store* stopped moving, not that the list stopped:
             # the journal is appended every iteration while the agent works, so a
             # long single step keeps the pane alive while a finished or abandoned
@@ -1592,6 +2639,16 @@ def cmd_pane(args) -> int:
             if act != last_act:
                 last_act, last_activity = act, now
             idle_s = now - last_activity
+            # the notes, while they last: the frame's own title chip says which build this
+            # pane is now, or what the keeper saw of it and did about it — reopened it, or
+            # kept it because repair is off — then goes back to the pane's name (see
+            # `reload_note`, `reopen_note`)
+            if reloaded and reloaded_until is None:
+                reloaded_until = now + RELOAD_NOTE_S
+            if keeper_note and keeper_note_until is None:
+                keeper_note_until = now + RELOAD_NOTE_S
+            note = (reloaded if reloaded_until and now < reloaded_until
+                    else keeper_note if keeper_note_until and now < keeper_note_until else None)
             text = render(
                 state,
                 color,
@@ -1601,6 +2658,7 @@ def cmd_pane(args) -> int:
                 stale_after_s=stale_after_s,
                 goal_lines=args.goal_lines,
                 height=_shutil.get_terminal_size(fallback=(80, 24)).lines,
+                reloaded=note,
             )
             if args.once:
                 print(text)
@@ -1619,6 +2677,9 @@ def cmd_pane(args) -> int:
                 state.get("cleared"),
                 state.get("error"),
                 watching,
+                # ...and the note, so the chip goes back to the pane's own name on the tick
+                # it expires rather than whenever the frame next moves
+                note,
             )
             if sig != last_sig or now - last_draw >= (
                 1.0 if has_running_clock(state, int(now * 1000)) else tick
@@ -2030,7 +3091,15 @@ def build_parser():
     ap.add_argument("command", nargs="?", default="pane",
                     choices=["pane", "snap", "json", "bar", "daemon", "stop", "status",
                              "prune", "nas", "pane-watch", "pin", "why", "ledger", "doctor",
-                             "push", "init"])
+                             "push", "init", "keep", "locks"])
+    ap.add_argument("keep_verb", nargs="?", default=None, metavar="on|off|default",
+                    choices=["on", "off", "default"],
+                    help="keep: on resumes the pane-repair, off keeps a drifted pane as it is, "
+                         "default removes the choice again (omitted: print what is in force)")
+    ap.add_argument("--pane", dest="keep_pane", metavar="ID",
+                    help="keep: the pane whose knob to read or set (default: the pane you are in)")
+    ap.add_argument("--server", dest="keep_server", action="store_true",
+                    help="keep: apply to the whole tmux server instead of one pane")
     ap.add_argument(
         "--label-floor", type=float, default=None, metavar="SEC",
         help="estimates: a finished span under SEC is not evidence — it sets no pace and "
@@ -2059,8 +3128,9 @@ def build_parser():
     ap.add_argument("--stale-after", type=float, default=60.0, metavar="MIN",
                     help="pane: close after MIN minutes of no store activity (0 = never)")
     ap.add_argument("-i", "--interval", type=float, default=1.0,
-                    help="pane: seconds between polls (the clock repaints far more "
-                         "often than this; 5s for -s nas)")
+                    help="pane, status --watch, locks --watch: seconds between polls (the "
+                         "clock repaints far more often than this; 5s for -s nas; "
+                         "locks --watch polls every 5s by default)")
     ap.add_argument(
         "-s", "--source", default="auto", metavar="SOURCE",
         help="where the list comes from: auto, cli, nas, desktop, or file:PATH (a state "
@@ -2118,7 +3188,23 @@ def build_parser():
     ap.add_argument("-f", "--foreground", action="store_true", help="daemon: don't detach")
     ap.add_argument("--force", action="store_true", help="daemon: start even if one runs")
     ap.add_argument("--quiet", action="store_true")
-    ap.add_argument("--json", action="store_true", help="status: JSON output")
+    ap.add_argument("--json", action="store_true", help="status: JSON output; with --watch, one event object per line")
+    ap.add_argument("--watch", action="store_true",
+                    help="status: report only keeper changes — a pid that moved, asks that "
+                         "would replace it, churn clearing — instead of a snapshot "
+                         "(Ctrl-C ends; -i sets the poll)")
+    ap.add_argument("--fix", action="store_true",
+                    help="locks: resolve the audit's findings — clear free leftover records "
+                         "and end untied role processes (SIGTERM), asking before any kill; "
+                         "--dry-run plans without changing anything")
+    ap.add_argument("--yes", action="store_true",
+                    help="locks --fix: approve ending the untied processes without asking")
+    ap.add_argument("--restart", action="store_true",
+                    help="locks --fix: after the repair, re-claim the watcher and the pane "
+                         "keeper through the same ask a session start uses, so one command "
+                         "leaves the machine watched again")
+    ap.add_argument("--no-input", action="store_true",
+                    help="never prompt — a confirmation that cannot be asked is refused (66)")
     ap.add_argument("--no-daemon", action="store_true", help="pane: read stores directly")
     # --- the NAS pane watcher (`nas`): a local daemon because `fb` over there cannot
     # reach this Mac's tmux, so something here has to notice the session starting.
@@ -2176,10 +3262,13 @@ def build_parser():
                          "one a NAS ssh pulls in (`nas`), or the window's shared answer "
                          "for any of them (`both`, the default)")
     ap.add_argument("--window", metavar="TARGET",
-                    help="pin, why: the tmux window to act on (default: the pane you are in)")
+                    help="pin, why, keep: the tmux window to act on (default: the pane "
+                         "you are in)")
     ap.add_argument("--list", action="store_true", help="pin: every pin, and whether its window exists")
     ap.add_argument("--clear", action="store_true", help="pin: drop this window's pin")
-    ap.add_argument("--dry-run", action="store_true", help="nas: say what it would do, change nothing; init: show without writing")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="nas: say what it would do, change nothing; init: show without "
+                         "writing; locks --fix: plan without changing anything")
     ap.add_argument("--shell", metavar="SHELL", default=None,
                     help="init: shell to configure (bash, zsh, ksh, mksh, dash, sh, fish; "
                          "default: detected from $SHELL, then the parent process)")
@@ -2195,7 +3284,40 @@ def build_parser():
     return ap
 
 
+def probe_answer() -> int:
+    """The self-reload probe's answer: does this build actually WORK, or merely import?
+
+    In plain words: importing only proves the module-level code ran. A function body is not
+    name-resolved until it runs, so a reference to a global that was renamed or deleted sits
+    harmless until the one command that reaches that line is called — and a self-reload
+    would have replaced a running image with that time bomb in the meantime. The probe
+    therefore exercises what it safely can and interrogates the rest: it BUILDS THE COMMAND
+    PARSER (the entry point every invocation goes through, so its own body and every default
+    it computes are executed), then asks `undefined_global_names` the deep question — does
+    every name the package's functions load as a global still exist? A missing one is printed
+    for the caller's log and the exit is nonzero, so the caller HOLDS.
+
+    Nothing is claimed, moved or written here: this runs before `init_state_root`, the first
+    thing that touches disk, and the parser is built without ever reading the real argv. A
+    probe is therefore inert even though it now runs code.
+    """
+    build_parser()
+    missing = undefined_global_names()
+    if missing:
+        print(f"fbtodo: this build uses a name it never defines — {missing}", file=sys.stderr)
+        return EX_CODES["ex_software"]
+    return 0
+
+
 def main(argv=None) -> int:
+    if os.environ.get(RELOAD_PROBE_ENV):
+        # The self-reload's own pre-flight (`reload_probe_error`): a child run of this very
+        # command line asks whether the build on disk can BE a process at all. It returns
+        # before `init_state_root`, the first thing that touches disk, so a probe creates
+        # nothing, moves nothing and claims nothing. `probe_answer` is the whole check: the
+        # parser is exercised and every global the functions load is resolved, not just the
+        # module-level code the import ran.
+        return probe_answer()
     # The state root is chosen at import but ACTED ON only here: importing the package must
     # not create a directory or move the legacy store (see `init_state_root`). Before the
     # parser is built, so a flag whose default is a path defaults to the real one.
@@ -2207,6 +3329,24 @@ def main(argv=None) -> int:
         return EX_CODES["usage"]
     if extra:
         print(f"unexpected arguments: {' '.join(extra)}", file=sys.stderr)
+        return EX_CODES["usage"]
+    if args.keep_verb is not None and args.command != "keep":
+        print(f"unexpected argument: {args.keep_verb!r} — on/off/default belong to `keep`",
+              file=sys.stderr)
+        return EX_CODES["usage"]
+    if args.watch and args.command not in ("status", "locks"):
+        print("unexpected argument: --watch — it belongs to `status` and `locks`",
+              file=sys.stderr)
+        return EX_CODES["usage"]
+    if args.watch and args.fix:
+        print("unexpected argument: --watch with --fix — one watches, the other repairs",
+              file=sys.stderr)
+        return EX_CODES["usage"]
+    if args.fix and args.command != "locks":
+        print("unexpected argument: --fix — it belongs to `locks`", file=sys.stderr)
+        return EX_CODES["usage"]
+    if args.restart and not args.fix:
+        print("unexpected argument: --restart — it belongs to `locks --fix`", file=sys.stderr)
         return EX_CODES["usage"]
     if args.help:
         print(__doc__)
@@ -2225,6 +3365,11 @@ def main(argv=None) -> int:
         print(f"fbtodo: unknown source {args.source!r} — expected auto, cli, nas, desktop, "
               "or file:PATH", file=sys.stderr)
         return EX_CODES["ex_usage"]
+    if args.command == "locks" and args.watch and args.interval <= 1.0:
+        # One poll is a full audit — every claim file plus the process table — and a finding
+        # is worth hearing within seconds, not within one: the same floor, and the same
+        # reasoning, as the NAS poll below.
+        args.interval = 5.0
     if args.source == "nas" and args.interval <= 1.0:
         # One ssh per poll, and the pane no longer needs a poll to move its own numbers:
         # the clock and the "N ago" repaint locally (see the pane loop), so the store is
@@ -2257,6 +3402,10 @@ def main(argv=None) -> int:
         return cmd_daemon(args)
     if args.command == "stop":
         return cmd_stop(args)
+    if args.command == "keep":
+        return cmd_keep(args)
+    if args.command == "locks":
+        return cmd_locks(args)
     if args.command == "status":
         return cmd_status(args)
     if args.command == "doctor":

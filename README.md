@@ -128,7 +128,7 @@ fbtodo snap         # print one snapshot
 fbtodo status       # show pane info and why it might be empty
 ```
 
-**Other commands:** `ledger` (forecast vs. actual), `why` (pane location), `pin` (resize pane), `stop` (close watcher), `prune` (clean up old data).
+**Other commands:** `ledger` (forecast vs. actual), `why` (pane location), `pin` (resize pane), `keep` (pane-repair switch), `locks` (claim-file audit; `--fix` clears leftovers and ends untied processes, `--fix --restart` re-claims the watcher and keeper through the normal ask afterwards, `--watch` streams a line per finding and rings the kit's locks bell), `stop` (close watcher), `prune` (clean up old data).
 
 Run `fbtodo -h` for all flags.
 

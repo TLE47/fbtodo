@@ -74,6 +74,28 @@ takes the asking file so the answer does not depend on which module holds the fu
 that carries the package without the launcher falls back to `__init__.py` beside the asker, and
 the `__main__` guard at the top of `__init__.py` re-enters as the package, so that path works.
 
+`pinned_path()` is the other half of that: the PATH a pane — and every child of this program —
+is handed **explicitly**, because tmux rebuilds a pane's environment from its own server's and
+the interpreter of anything resolved by name follows from it (see
+[The pane's environment](#the-panes-environment-is-pinned-not-inherited)). It is the opener's
+PATH, `FBTODO_PATH` overrides it, and `python_of(command)` is the reader that says which
+interpreter a running process ended up on — the two together are what `fbtodo status` prints
+as `pane python`.
+
+`STARTED_AT` is when this process read the package off disk, and it is what makes "am I still
+the build that is there?" answerable at all: nothing re-imports a running Python process, so a
+long-running pane holds the code it started with however the checkout moves under it — the one
+way this tool has ever misled its owner. `source_newer_than(started, ...)` compares that stamp
+against the package's own sources (`_package_sources`), `source_syntax_error` says whether the
+newer build would even parse, `reload_probe_error` says whether it would actually LOAD (a parse
+is not enough — the reload EXECS, so a tree that compiles but dies at import would become a
+corpse where a running image was), and every long-running loop — the pane's, the watcher's and
+the keeper's — asks both before starting itself over (see
+[The pane lifecycle](#the-pane-lifecycle)).
+`SOURCE_SETTLE_S` is the two seconds a fresh write is left alone first, so a save still landing
+is never read as a finished one, and `BUILD_CHECK_S` is how often they ask at all: one listing
+a second is nothing beside what either of them is already doing.
+
 ## The state directory
 
 `$XDG_STATE_HOME/fbtodo` (`~/.local/state/fbtodo`, as the XDG spec says), or `FBTODO_HOME`
@@ -88,9 +110,9 @@ updates it would leave the pane reading a file nobody writes. `FBTODO_HOME` is n
 | `fbtodo-state.json` | watcher | the current rendered state (below) |
 | `fbtodo-tasks.jsonl` | watcher | the task log's evidence: **one event per line, appended and never edited** |
 | `fbtodo-tasks.json` | watcher | the fold of that stream — every step it saw run, by `(session, task)`, with the model that ran it, and the offset it was folded to (`events`) |
-| `fbtodo-daemon.pid` / `.log` | watcher | the watcher's lock record and its log |
+| `fbtodo-daemon.pid` / `.log` | watcher | the watcher's lock record and its log — including its own reloads, and the builds it held on |
 | `fbtodo-pane-keeper.pid` | keeper | the keeper's claim, carrying the tmux server it belongs to |
-| `fbtodo-pane.log` | keeper | one line per pane that came **back** — never one that did not |
+| `fbtodo-pane.log` | keeper, pane | one line per pane that came **back**, and per pane that **reloaded** itself into a newer build — never one that did not. The pane itself also says which build, on its title chip, for the few seconds after the reload |
 | `fbtodo-pins.json` | `pin` | per-window, per-role side/size |
 | `fbtodo-last.json` | keeper | the layout each pane was last left at, per window and role |
 
@@ -120,6 +142,7 @@ fields that matter:
 | `done`, `total`, `list_id`, `list_version` | progress, and the identity of *this* list |
 | `cleared`, `cleared_turn` | no list is drawn, and which drop caused it. `cleared` is a dropped list: a new session, or a **finished** list the next turn replaced. `cleared_turn` names the second and is what `no_list_reason` prints for it. A drop never touches `list_version` — the number identifies a list, and the new turn's list is what increments it |
 | `turn_ended` | the journal's `shouldEndTurn` — the other half of "finished" |
+| `files_unlisted` | the **boundary guard**: true when the turn ENDED having edited files but having published no `write_todos` since its own last edit, so the list does not account for the work that just landed. Both halves come from the CLI journal (the newest edit's position against the newest list's), so it is the CLI scan's answer alone — the desktop store carries no turn, and the NAS records no end-of-turn. Three consumers: the status chip says `STEPS OPEN` instead of `ALL DONE`, `unlisted_note` names the files in the strip / `status` / `snap`, and the completion bell and phone push are withheld (`todo-bell.decide`). Mid-turn it is false by construction: the boundary is where the bell decides |
 | `lv` (in the task log) | the list version the step was last seen in. Read by `refit_readiness`, which reconstructs whether the young-list clip was consulted on a step: the pace a step inherited came from the steps finished before it in its OWN list, and a session holds many lists — grouping by session would count earlier turns as this step's past. Records written before the field existed group by session, which undercounts and so is the safe direction |
 | `task_times` | per-step `started_ms` / `done_ms` / `elapsed_ms` / `shape`, from the tick that saw it. `shape` is the call tally the step has revealed so far, credited from the turn's own tally by order, and only for the step in flight |
 | `est_ms` / `est_src` (in the task log) | the estimate the pane was showing for the step in flight, and which rung of the ladder produced it (`shape` / `blend` / `pace`), stamped on every poll while it runs. When the step closes, the pair (projection, outcome) is what `fbtodo status` scores as `estimate error`, per source — so "is this getting better?" is answered from records rather than from a tally that could drift |
@@ -131,7 +154,7 @@ fields that matter:
 | `model` | the model the session names; the pace is quoted with it |
 | `patch`, `alert` | the two optional footer facts, read from the logs that produce them |
 | `ts`, `source_updated_ms`, `store_mtime_ms`, `probed_ms`, `heartbeat_ms` | the clocks. `ts` is when the drawn `write_todos` record was written (and `source_updated_ms` mirrors it), which is what the pane's `LIST: #7 · 12m ago` and `status`'s `list written` report; `store_mtime_ms` is the transcript's mtime, and `store_mtime_ms - ts` past `LIST_BEHIND_MS` in a session with every step ticked is the `[STALE?]` marker and `status`'s `list behind` |
-| `turn` | `{start_ms, iterations, verbs, files, truncated}` — this turn, bounded by the request that opened it (the journal logs it on its own record). A boundary and a numerator only: nothing in the store is a denominator, so nothing here is progress. `iterations` counts records carrying `shouldEndTurn`; `verbs` is the tally of the calls `observed` is a slice of; `files` is the distinct files edited (empty on the NAS, which records no inputs); `truncated` means the walk never reached the request, so every count is a lower bound and the pane prints `9+` |
+| `turn` | `{start_ms, iterations, verbs, files, truncated}` — this turn, bounded by the request that opened it (the journal logs it on its own record). A boundary and a numerator only: nothing in the store is a denominator, so nothing here is progress. `iterations` counts records carrying `shouldEndTurn`; `verbs` is the tally of the calls `observed` is a slice of; `files` is the distinct files edited (empty on the NAS, which records no inputs); `truncated` means the walk never reached the request, so every count is a lower bound and the pane prints `9+`. The scan also tracks `last_edit_key` while the turn is open — the newest edit's walk position, compared with the newest `write_todos` to set `files_unlisted` — but it is a walk key (a tuple), so it is popped before the turn is written to the state |
 | `status`, `stop_reason` | why the watcher is where it is |
 | `tool_version` | the build that wrote it |
 
@@ -258,11 +281,26 @@ the decision and the "already sent" record. Each is optional: a missing script i
 | ask | `ask-bell.py --quiet` | `--ask-seconds` (3) |
 | stall | `pause-bell.py --watch-pid PID --quiet` | `--pause-seconds` (30) |
 | pane | `pane-bell.py --quiet --keeper PATH` | `--pane-bell-seconds` (60) |
+| locks | `locks-bell.py --quiet` | `locks --watch -i` (5) |
 
 Every one of them also takes `--print` (resolve and report, send nothing) plus
 `--title`/`--message`/`--priority`/`--tags` to send something specific, which is how you
 debug one by hand. Sends are handed to `phone.sh` detached, so a poll never waits on a
 network.
+
+The `locks` notifier is the fifth and the only one whose subject is a CLAIM, so it is not
+run on the watcher's clocks: it rides `fbtodo locks --watch`, which reads the audit once per
+`-i` and hands a **new finding** to the ball. The keying matters as much as the send —
+findings are keyed by the thing that is wrong (`orphan:<role>:<pid>`, `tie:<role>:<pid>`),
+so a standing finding is printed once and never re-announced, a claim being born draws
+nothing, and the watch suppresses a finding about its own pid. The bell reads
+`fbtodo locks --json` for itself and keeps its OWN record of what it pushed (`--print`
+resolves and sends nothing, exit 78 when there is nothing configured), so a watch restarted
+mid-incident cannot double-send. Two facts make this the only surface that can report
+either finding: a process whose claim name was replaced holds a lock on an inode no reader
+can find, and a free file whose record names a live pid is the same name↔inode split — both
+are invisible in every store, and both are things that HAPPEN rather than states, which is
+what a snapshot cannot see.
 
 ## The pane lifecycle
 
@@ -275,16 +313,433 @@ network.
    changed row is one addressed rewrite, and only a frame whose shape moved (a resize, the
    first paint) is painted whole. Measured on a pane whose step clock and footer are running:
    3,384 → 773 B/s, and one screen clear instead of one per tick.
-4. When the instance exits, the pane exits; the watcher drops its lock and stops; the keeper
+4. The pane keeps itself **current**: once a second it asks whether any source is newer than
+   the moment this process started (`source_newer_than`), and if one is, it re-execs itself
+   through `self_argv` — same pane, same pid, same tty, new code. It is deferred while
+   `source_syntax_error` finds a file that will not parse (a reload into half-saved code would
+   take the pane away exactly when its owner is looking at it) or while `reload_probe_error`
+   finds a tree that parses but will not load (a pane that execs into a corpse is a pane the
+   keeper reopens, into the same broken tree, over and over), and it pays a compile and a
+   probe only when a source actually changed. Before this, an upgrade left the list drawn by the build
+   the pane had imported until somebody respawned it by hand: measured 2026-10-01, a pane
+   started the day before a release still rendering the day-before's fields beside a watcher
+   that had already been replaced. The watcher and the keeper now replace themselves the same
+   way (below), and `live_watcher_pid` is the backstop for a watcher that cannot — a holder
+   whose build is gone.
+   The reload also says so **on the pane**: for `RELOAD_NOTE_S` (5 s) the title chip reads what
+   `reload_note` makes of the hand-over — `RELOADED 4.30.2 → 4.30.3`, or just the build when
+   the version did not move — and then it is `FREEBUFF TODOS` again. The note rides on the frame
+   rather than beside it because the chip is the one slot that belongs to the process instead
+   of the list: no data row is spent, the frame's rows and widths do not move, and the only row
+   that changes is the top border. What one image cannot know about the other crosses the exec
+   in the environment (`FBTODO_PANE_RELOADED`: the old `VERSION` and the file that changed),
+   since memory is exactly what an exec throws away; the note's clock starts at the first frame
+   it can be part of, so a reload whose first poll is an ssh round trip still gets to show it.
+5. When the instance exits, the pane exits; the watcher drops its lock and stops; the keeper
    stops once no freebuff is left (after a grace period, because the wrapper splits the pane
    *before* the CLI exists).
-5. The keeper's other job is the repair: every 3 s, re-derive the pane geometry and
-   `move-pane` a drifted pane back **in place** — same process, same scrollback, same step
-   clocks.
+6. The keeper's other job is the repair, in two kinds. Every 3 s it re-derives the pane
+   geometry and `move-pane` a drifted pane back **in place** — same process, same scrollback,
+   same step clocks. And a pane found on a different interpreter than its watcher's is
+   reopened in place with the pinned command (`repair_drifted_panes`): same pane id, same
+   slot, a new process on the pin (`tmux respawn-pane -k`), so a pane that drifted fixes
+   itself instead of waiting for a hand — and it says so on its title chip for a few seconds,
+   so the process replaced under the owner's eyes is not a silent one. The interpreter read is
+   the pane's whole **tree** (`tree_pythons`), not only its own line: a watcher, a bell or a
+   tmux child under it on another Python is the same drift one level down. The keeper is also the third
+   long-running image to start itself over when the build under it changes (below).
 
 The keeper has its own lock on purpose: sharing the watcher's meant a watcher for another
 source could hold the lock while a local window's pane was gone, and the pane never came
 back.
+
+A keeper is one per tmux **server**, and a server has one name: the socket path, asked of
+the server itself (`tmux display-message -p '#{socket_path}'`), which answers the same string
+inside a session (where `TMUX` also carries the server's pid and the session id) and from a
+process outside tmux (where an ask from the autostart that spawns the watcher, or from the
+desktop integration, has no `TMUX` at all). Measured
+2026-10-02: spelled as the raw `TMUX` value on one side and `-default` on the other, the two
+asks read as two servers and each killed the other's keeper several times an hour. `FBTODO_TMUX`
+is still the name verbatim — a forced server is named deliberately — and `None` is the honest
+answer when nothing can be asked: an ask that cannot name a server does not evict a keeper it
+cannot judge (`keeper_serves`), so only a keeper for a genuinely different server, or from an
+older build, is replaced.
+
+Naming is not comparing. `same_tmux_server` decides whether two written names are one server
+by reducing each to the socket it denotes (`tmux_socket_of`): the raw `TMUX` value without
+its last two comma fields, `-default` as the default server's own socket (`$TMUX_TMPDIR` or
+`/tmp`, under `tmux-<uid>/`), a forced `tmux -L name` / `-S path`, and the canonical path
+itself — compared by real path, so a symlinked spelling is one file too. A record written by
+an older build, or by a context that forced its server, is therefore a spelling of the same
+server rather than a reason to replace the keeper; only names that reduce to different
+sockets are different servers.
+
+Two asks can also arrive together, and each starts a keeper before either has claimed: the
+kernel's claim decides (`write_lock`), and the loser sees the winner and stands down. What
+the loser's ask must not do is call that a failure. `ensure_pane_keeper` waits for the CLAIM,
+not for its own child — the pid it returns is the holder's, whoever that is — for up to
+`KEEPER_CLAIM_WAIT_S`, so a second ask's keeper has time to claim. The subtle half is
+`lock_holder`: it takes a free file to ask whether anyone holds it, and it used to remove
+whatever it found there as a stale record. A claim is created empty and locked a breath
+later, so a poll could remove the winner's newborn claim and leave it keeping every pane on
+an unlinked inode, nothing on disk to name it — both asks then logged `never claimed the
+lock` while keepers ran. Only a free record that names a pid is a leftover now; an empty
+file is a claim being born, and a probe leaves it alone — and asks without creating one
+where no file exists at all, because a question's empty claim file was itself read as a
+claim by the next existence check. `fbtodo status` answers the same question before anyone
+asks: `keeper server : …` prints the name the record denotes and whether the pane's ask
+(from the status context, when it is a pane) and the watcher's (`tmux_identity_outside`,
+the autostart's/desktop's ask from outside tmux) agree with it — a disagreement names the
+ask that would replace the keeper. `--json` carries the same answer as a `keeper` object —
+`running`, `pid`, `server`, the record's own spelling `recorded`, both `asks` reduced to the
+sockets they name (`null` when that context cannot name one), `agree`, `would_replace` and
+the row's `note` — so a script can watch for the churn instead of parsing the sentence.
+`status --watch` is that watching as a command: it polls the same reader, prints the state
+once (`now`), and then only moves — `pid` when the keeper is replaced (or `gone` when it
+stops answering, `appeared` when one starts), `churn` when the asks stop naming its server,
+`agree` when they name it again — staying silent between them (`-i` sets the poll; Ctrl-C
+ends it; `--json` is one event object per line, the same fields).
+
+The last window in that moment is the file itself: opening it and locking it are two steps,
+and a probe can slip between them. It takes the free file — the leftover cleanup above —
+and removes it, and the claimer then locks an inode the name no longer points at: a keeper
+running invisibly, while a second one could claim a fresh file of the same name. So every
+answer about a claim is tied to the NAME, not just the file. `_same_file` compares the
+device and inode of the locked fd with what the path resolves to now; `lock_holder`
+believes a lock or a record only while that tie holds, removes a record only under it —
+never a name that has become somebody else's claim — and re-asks, bounded, when the name
+moves under it. On the claimer's side, `_lock_named` re-checks after every lock and drops a
+lock the name has left behind instead of holding it, `write_lock` re-checks on every later
+write through a held fd, and `lock_adopt` checks the name once more after confirming the
+inherited lock, so a name replaced while the exec ran is let go rather than adopted unseen.
+The self-check holds the window open with a wrapped `lock_open` and threads: the claim is
+taken again, visible by name, and a probe never removes a name that is not the file it
+locked.
+
+The keeper and the local watcher are the holders that can lose their name and keep running,
+so each watches for it. The file can be removed or replaced under it (a probe's leftover
+sweep, an admin's `rm`, a test), and the kernel lock survives on the unlinked inode while
+`lock_peek` reports the role as not running and the process half of the audit names the
+holder an orphan — the very finding `locks --fix` ends. So the keeper asks `lock_ours` about its own name every
+`KEEPER_CLAIM_CHECK_S` (1 s), beside pane passes that `--pane-seconds` still paces: a short
+claim tick must not turn each wake into a tmux survey, so the pane work waits for its own
+pass while the claim is asked on the shorter clock. A name that has moved costs one `stat`
+and, when it moved, a re-claim (`keeper_reclaim`): `write_lock` drops the registry entry that
+no longer points at the name and takes the name as it is now — FREE or absent is the same
+keeper claiming again, and a name a live process HOLDS is another keeper's, so this one
+stands down on the rule its start uses. The rewritten record carries the original
+`started_ms`, so a keeper of several hours is not reported as one that just began, and the
+re-claim is written to the pane log (`keeper re-claimed its name`), where a wound in a
+background process is otherwise invisible.
+
+The watcher asks the same question on its own clock — its render loop already ticks at
+`-i`, so `lock_ours` is checked each pass and no second clock is needed — and heals the same
+way: `write_lock` takes a free or replaced name again, and a name a live process holds is
+that process's, so the watcher stands down on the rule its start uses. It keeps one case the
+keeper does not distinguish: a name that moved is judged against the directory's IDENTITY,
+not its existence (`st_dev`, `st_ino` of the claim's own directory, captured at claim time).
+A claim file that was removed or replaced leaves the directory's inode alone, so the name is
+taken back; a state ROOT that was removed — even one this watcher's own state write puts
+back, because `atomic_write` re-creates the directory — is a different inode, so the watcher
+stops and leaves the tombstone unwritten rather than resurrect a home somebody removed.
+Existence alone would be a race: the write that lands alongside the removal would re-create
+the directory and the watcher would re-claim into it. The re-claim is written to the daemon
+log (`watcher re-claimed its name`).
+
+The questions a claim can be asked are a command now: `fbtodo locks` audits every claim file
+this root knows — the watcher's, the keeper's, the NAS pane watcher's, and the legacy root's
+while they are still there — and answers with the same machinery the readers use, with no
+write anywhere (the probe `lock_holder` removes a leftover it finds; an audit exists to say
+so instead). Holder: the record's pid, tested for life. Name↔inode: a held claim blocks this
+process's own open of the name, so the name's own file is what is claimed; a record naming a
+LIVE pid while the file is free is the tie broken — a leftover, a claim being born, or a claim
+left on an inode the name has moved off — and this process's own registry is checked exactly
+(`lock_ours`), the same mismatch seen from the inside. Stale record: free with a pid inside,
+which is what `lock_holder` sweeps. Clearing: end a held claim's holder (the kernel drops the
+lock with it; unlinking does not), wait for the next ask on a leftover, leave an empty free
+file alone — it may be about to be locked. The self-check pins each state, the command
+through text and `--json`, and that not a byte of a claim file changes.
+
+A claim file can only name a holder that still ties to its name, so the audit has a second
+half the file cannot produce: a watcher or keeper whose name was replaced under it holds a
+lock on an unlinked inode, and the file it left behind reads `absent` or `free` while the
+process keeps running. `claim_processes` asks the process table instead: every watcher,
+keeper and NAS watcher whose command line is an fbtodo invocation of that subcommand (the
+token right after the launcher, or the package's own `__init__.py`; the `--foreground` that
+distinguishes a running watcher from a bare spawn that only starts one) and whose
+environment names this state root. The read is the interesting half. It is the copy the
+kernel made at `exec` — the root a process was STARTED with, which is the question being
+asked, not whatever a later `putenv` left in its own memory — and this platform will not
+always hand it over. It is asked of `/proc/<pid>/environ` first (the same copy as a file),
+then `ps -Eww`, and only if neither names a root is the kernel's own copy added: `sysctl
+KERN_PROCARGS2`, read directly by number instead of through a fork, and carrying the one
+thing `ps` cannot report — how many bytes the kernel copied. That count is what a clip looks
+like here: measured 2026-10-02, `ps` does not clip (a 250 KB environment printed whole), but
+the kernel does, per process — every GUI process launched by LaunchServices came back with a
+copy of 1012–1132 bytes while `ps` printed 516–974 of it, against 1644 for a launcher run
+with two variables and 3044–3844 for the roles. So a copy in the `KERNEL_COPY_FLOOR` (512)
+to `KERNEL_COPY_CAP` (1200) band is marked clipped, `ps`'s own share of one (1.16–2.09)
+overlapping a complete copy's (1.10–1.15) too closely to stand in for the count. Two rules follow, and
+both keep a guess out of a kill: a blob with no `KEY=value` in it is a command line, not an
+environment, so it names no root and is never placed on the default one; and a blob that
+names no root after coming back clipped is not placed either — it is reported with this root
+ASSUMED, and `locks --fix` will not end it. A root that IS named is reduced the way the
+program reads it (FBTODO_HOME, XDG_STATE_HOME, the default). `claim_orphans`
+then keeps the ones no claim names (a held claim names its holder; a free or absent file
+ties nobody; anything younger than `ORPHAN_MIN_AGE_S` is a start or a stand-down, not an
+orphan), and `fbtodo locks` prints them under the claim that cannot see them, with the one
+clearing that applies — end the process, because there is no file left to unlink. The
+self-check pins the argv rule, the root filter, each claim state's answer and the age
+guard on injected tables — plus the environment read itself: which blobs count as an
+environment at all, a command line that is not one, the clip band and the floor below it, and
+that a missing second source is never an invented clip. It also reads two real processes: a
+child started with `FBTODO_HOME` in its environment, which is placed by it, and pid 1, whose
+environment this platform will not hand over and which therefore reads as NO environment
+rather than as the default root. `_proc_environ` is the program's ONE such read, and the
+self-check's own reader of a process's environment goes through it too: `keeper_aim` asks
+each live `pane-watch` process for its state root and tmux server to keep a test keeper from
+going off keeping the OWNER's panes, and reading that with a bare `ps -Eww` would have made a
+command-line-only answer (no `FBTODO_HOME`, so "a keeper elsewhere") and a kernel-clipped
+copy (the root cut off) both look like the leak it exists to catch. It now carries `_read`
+and `_clipped` for the shapes it cannot place, and the guard flags a keeper whose environment
+it could not account for instead of skipping it. Then it drives both real cases on a private server: a CURRENT
+keeper whose name is removed and then replaced by a foreign file takes the name back within
+a tick — same pid, same server, same `started_ms` — so `locks` has no orphan to offer and
+`--fix` no kill to plan, while a keeper that CANNOT heal (the stand-in for one from a build
+older than the re-claim, down to the argv shape the rule reads) is still named under a
+claim that reads `absent`, and still ended.
+
+Every reader that only LOOKS goes through `lock_peek` for the same reason, not just the
+audit: `doctor`'s watcher row, `status` (which used to read the daemon claim through
+`daemon_pid()`, the destructive probe, and would empty a dead watcher's leftover as it
+reported on it) and `nas --status` (which used to read its claim through
+`nas_pane_daemon_pid` — `lock_holder` again, and for a watcher from another build it even
+kills the process and clears the claim). The self-check seeds the three claim records with
+a dead pid and runs the whole look-only family — `status`, `why`, `ledger`, `locks`,
+`doctor`, `nas --status`, `bar`, `pin --list` — asserting each leaves every record
+byte-identical and still present, and nothing else under the state root moved; the
+task-log writers `snap` and `json` are held to the claim files only, since recording
+tracking events in the log is what they are for. Then it holds the daemon claim and checks
+the row and `--json` name the holder, with no byte moving either.
+
+Every remaining `lock_holder` caller is a path that ACTS, and each says so in place: the
+start guard (`spawn_daemon`'s wait, `daemon_loop`, `ensure_pane_keeper`), the stop
+(`cmd_stop`, `nas --stop`), the pane's own poll, a keeper pass (`ensure_local_panes`),
+`claim_or_force` (`--force` is ending the holder) and `live_watcher_pid` (which replaces a
+watcher left on another build, killing it). They must probe because they are *doing*
+something to the claim: a free record naming a dead pid is a leftover to clear, and a start
+that read it as a live watcher would report a keeper that is not running or stand down for
+one that is not there. The self-check pins both halves — the looks leave the records
+byte-identical, then `daemon_pid` removes the very leftover they refused to touch.
+
+`fbtodo locks --fix` is that audit with the hand that acts, and it is the one command here
+that ends processes. What it will do is computed first (`locks_fix_plan`) and shown before
+anything moves: free leftovers are cleared through the same probe the next ask uses, so a
+claim born between the audit and the fix is not deleted, and untied role processes are
+ended — their lock is on an unlinked inode, so ending them is the only repair, and the next
+ask re-claims. Only two things are ever planned. A process whose environment could not be
+read is *named*, never ended: `claim_processes` assumes an unreadable blob is ours so the
+audit can say something true, and `root_named` is the line that keeps that assumption out of
+a kill. Anything that would end a process asks first — terminal or `--yes` — and a run that
+cannot ask exits 66 having changed nothing; `--dry-run` changes nothing by design. A kill is
+confirmed with `pid_running`, not `pid_alive`, because the process ended here is usually
+somebody else's child, and an unreaped one answers `kill(pid, 0)` from beyond the grave.
+
+On its own, a fix starts nothing: it frees the claims and the next ask re-claims them — and
+that ask can be hours away, on a machine where no session starts. `--restart` is the opt-in
+that runs it now (`restart_claims`): the same `ensure_daemon` a session start uses, which
+asks for the keeper before it consults the watcher's lock, so one command can leave the root
+watched again. It is gated exactly like the act it follows — only once something was actually
+applied (a declined or unconfirmed fix changed nothing, and a start on top of that would be a
+change nobody approved), and never under `--dry-run` — and it reports each role by what it
+looked like BEFORE and after (`before` in `--json`, `already running` in the text), so a
+no-op where a watcher was already there is visible rather than mistaken for a spawn. It never
+ends anything to make room: any ending was `--fix`'s own job, already done. The flag belongs
+to `locks --fix`, not to `locks`, and the guard says so.
+
+### The pane's environment is pinned, not inherited
+
+tmux rebuilds a pane's `PATH` from the **server's** environment, not the client's, so a pane
+command that names `fbtodo` (a PATH lookup) and leans on `#!/usr/bin/env python3` can come up
+on a different interpreter than the process that opened the pane. Measured 2026-10-01 on this
+machine: a pane on `/usr/bin/python3` 3.9.6 beside a watcher on Homebrew's 3.14, because the
+pane had been respawned into a server whose PATH no longer had Homebrew on it. It is not only a
+version question — the same PATH decides the interpreter for `scripts/notify/*.py` (their
+shebangs are `env python3`), so a bell and the watcher that rang it could be two different
+Pythons.
+
+So every pane command is built by `pane_command`: `/usr/bin/env PATH=<the opener's, interpreter
+first>` in front of `self_argv()`, which already names the interpreter and the launcher
+absolutely. The interpreter's own directory comes **first** in that PATH, because the pane is on
+`sys.executable` by construction while the scripts it starts by name (`env python3` shebangs in
+`scripts/notify/`) are not: without that, the pane runs one Python and its own bells run another.
+`env`
+carries the assignment rather than a bare `VAR=value command` prefix because the login shell
+that runs a pane command may be fish, which has no such prefix form; and the assignment is
+written into the command string on purpose, because it rides along in `pane_start_command` —
+what the keeper, `status` and `why` read back — so a `tmux respawn-pane` of that same string
+brings the pin with it. The shell wrapper (`fb`) does the same thing from the other side: it
+resolves the interpreter, the launcher and the PATH in the owner's own shell, which is the last
+place that PATH is known.
+
+With the pin in place a pane and its watcher agree about the interpreter, and `fbtodo status`
+prints what came of it: `pane python : … (same as the watcher)`. The pane's is
+read from its process line and the nearest descendants under it (`pane_python` — a login shell
+does not always hand its number over for a command that starts with an assignment), the
+watcher's from its own line (`python_of`). It is a diagnostic first: this whole pin was found
+by noticing two processes that disagreed, and this is the line that says so.
+
+What that line reports, the keeper now repairs. A pane whose interpreter differs from its
+watcher's **by real path** (`pane_drifted` — two spellings of one interpreter are not a drift)
+is reopened in place with the pin the keeper itself would split with (`repair_drifted_panes`,
+`respawn-pane -k`): the pane keeps its id and its row of the layout, and the geometry pass in
+the same sweep does not have to re-place it. Nothing is respawned on a guess — no watcher to
+compare against, or a pane still starting, answers "leave it alone" — and a pane whose command
+is **already this build's pin** is left alone too: respawning it would re-run what it is
+running, so the pair that still disagrees is the keeper's own interpreter against the
+watcher's, which the pane log says once rather than acting on every pass. One attempt per
+pane is remembered for `DRIFT_RETRY_S`, so a tmux that refused is asked again later, not in a
+loop. Reading the pin back needed one correction: tmux reports `pane_start_command` quoted the
+way a shell would quote it (`'X Y'`, `"X 'Y'"`), so `pane_start_command()` decodes what
+`pane_rows` hands out — before this, comparing the reported command with the pin it was
+started from was false forever.
+
+What the repair leaves behind is a note the pane it reopened reads on its first breath. It
+cannot ride the environment the way a reload's does: `respawn-pane` starts a fresh command in
+the SERVER's environment, with no exec of the keeper's to carry anything, so the reason waits
+at a path instead (`PANE_NOTE_PATH`, keyed by pane id) — written before the respawn, claimed
+once by the pane whose own `TMUX_PANE` matches (`pane_note_take`), and dropped unshown after
+`PANE_NOTE_S` so a later process taking that id is never told it was repaired. The chip says
+`REOPENED (was on /usr/bin/python3)` — or `(a child was on …)` for the tree case — for the
+same few seconds `RELOAD_NOTE_S` shows a reload's note, and then the pane's own name is back.
+
+The repair is the keeper's, not the operator's, so it can be told to stand down: a pane marked
+with the tmux user option `@fbtodo_repair off` (`pane_repair_off` — read per pane, and
+inherited from a window or the whole server, since tmux resolves the option up the chain) is
+kept as it is. The diagnosis still runs — the log names the interpreter the keeper saw and the
+knob it obeyed, once per pane rather than once per pass — and so does the telling: with no
+`respawn-pane` coming to deliver a note, the note is written as `kept` and claimed by the
+RUNNING pane's own poll (`cmd_pane`, once a second, `sweep=False` so it touches no other
+pane's entry), so the title chip says `KEPT (was on …)` where a repaired pane says
+`REOPENED (was on …)`. The kinds are filtered at the claim, which is what keeps the two from
+stealing each other's note: a running pane asks for `kept` only, so it can never swallow the
+`reopen` note waiting for the process that will replace it. Turning the option back on (or
+unsetting it) resumes the repair on the next pass — the option is read every pass, not
+remembered, because the switch belongs to the operator and not to the keeper's uptime.
+`fbtodo keep` is the switch as a command — `off`/`on`/`default`, the pane you are in or one
+named with `--pane %3`, one window with `--window TARGET` (`window_of` resolves a session,
+`session:index` or id to the id the write lands on, and `window_repair_value` reads the same
+rung back), `--server` for every pane, and no verb to print what is in force — so the tmux
+incantation is not something to remember.
+
+The read is over the pane's whole tree (`tree_pythons`), not only its own line, because a pane
+is not one process: the watcher it started, a bell through either, a tmux child. The pane's own
+answer (`pane_python`'s — first in tree order) is the reference and every other member is
+compared with it by real path (`tree_drift`), so a child on another Python is the same
+disagreement one level down and gets the same repair: the pane is reopened on the pin, and the
+log names the child that was on the other one. A pane whose command is already the pin is the
+case a respawn cannot mend — the pin is what ran, so the child's interpreter came from
+somewhere else — and the keeper says so once (`held %id: a child (pid N) is on …`) instead of
+respawning on every pass.
+
+A bell is the one member of that tree no repair can ever reach: it lives for as long as it
+takes to send and is gone by the time the keeper reads the process table, so its interpreter is
+fixed at the launch instead. Every bell in `scripts/notify/` is an `env python3` script whose
+shebang resolves in the PATH of whoever ran it, and that PATH is not always the pane's — a
+watcher started by the shell autostart, or a keeper started from the desktop integration,
+carries its own. `notify_argv` runs a bell AS ITSELF (never `python3 <script>`, so a
+replacement written in any other language keeps working) behind an explicit `PATH=<this
+process's pin>`: `/usr/bin/env PATH=… <script> …`. The shebang then resolves in the pin of the
+process that rang it, wherever that process came from.
+
+The question is not only asked while someone reads `status`: `doctor` puts it to the machine on
+purpose, as one row (`one python`) — the pane, its watcher and the keeper, each read from the
+processes (`pane_python`, `python_of`) and compared by real path. All of them on one
+interpreter is `ok` with that interpreter shortened (`_short_python`); a disagreement is a
+**warn** that prints every role with its whole path, because the two heads are the diagnosis a
+shortened line would hide, and the words say what happens next (`the keeper reopens a pane on
+its watcher's pin`). Fewer than two roles running is `ok` as well — `nothing to compare yet` —
+because a question that cannot be answered must not look like a failure. The keeper's pid here
+comes from the record it writes and whether that pid is alive, which is the pane bell's read
+(`keeper_alive`); it deliberately does not go through `lock_holder`, whose contract is
+destructive by design — a claim it finds free means the record is a leftover, and it removes
+it — and `doctor` was only asked to look. The state root's own "a live watcher or keeper owns
+this" answer is read from that same record (`_claim_live`), so emptying it would erase the fact
+the line above had just reported (the self-check's state-root case is what caught it).
+`lock_holder` is also what the WATCHER row used to ask, and there the removal is just as wrong:
+a doctor run over a dead watcher's leftovers deleted `fbtodo-daemon.pid` — the record
+`_claim_live` decides the state root from and `one python` reads a pid from. The watcher row
+now asks `lock_peek`, the read-only twin of the probe: open and try the lock, with no unlink
+and no write anywhere, answering held-or-free and the pid the record names (0 when it names
+none). The self-check pins the whole contract: daemon, keeper and NAS-pane records seeded with
+a dead pid — free, the exact case a cleanup removes — and a held daemon claim are all
+byte-identical after a `doctor` run.
+
+### The watcher reloads itself too, across its claim
+
+The watcher is a long-running process for the same reason the pane is, and it was the other
+half of the same problem: an upgrade left the old build **polling**, writing the old layout
+into the state file until the next `fbtodo` start noticed the version (`live_watcher_pid`) and
+killed it. It now asks the same question the pane asks — `source_newer_than` against `STARTED_AT`,
+every `BUILD_CHECK_S` — and re-execs itself through `self_argv` on the same terms: same pid,
+same log, and it holds while `source_syntax_error` finds a file that will not parse or
+`reload_probe_error` finds one that parses but will not load.
+
+What the pane does not have to solve is the claim. The watcher's whole standing is the `flock`
+it holds on `fbtodo-daemon.pid`, and a gap — even the moment of an exec — is a moment a second
+watcher could claim it, so the claim is carried THROUGH the exec instead of being dropped and
+re-taken. An exec keeps the pid and the descriptor table (the open file description, and with
+it the kernel lock), but `_LOCK_FDS` is memory, and memory is what an exec throws away; Python
+also opens descriptors close-on-exec, so the lock would be dropped on the way through. So
+`lock_handoff` makes the claim's fd inheritable and writes `<pid>:<fd>` into
+`FBTODO_DAEMON_LOCK_FD`; `lock_adopt`, at the top of `daemon_loop`, pops that name, checks the
+fd is open, is the claim file (the same inode test `lock_ours` makes) and STILL holds the lock,
+and registers it again. Only then is the start guard skipped: `daemon_pid()` with the carried
+claim in hand names the restarting process itself — an `flock` is per open file description, so
+a second fd in the same process is refused — and the guard would stand down the watcher it had
+just restarted. A hand-over that fails any check is ignored rather than obeyed: that is then a
+plain start, and the ordinary guard and claim decide.
+
+The keeper reloads itself on the same terms, and its claim has its own reason not to blink: the
+keeper is what puts a pane back, so a keeper that stood down between the hand-off and the
+take-back would leave the panes unwatched while its record still named it. So
+`cmd_pane_watch` takes its claim back at the top (`lock_adopt(PANE_KEEPER_PATH)`), and skips
+the "already running" record guard only when it did (`carried` — a fresh `fbtodo pane-watch`
+still goes through the guard and the claim as before); its record, `tmux` and all, is then
+re-written through the adopted fd. The build check runs in the keeper's own loop on the same
+`BUILD_CHECK_S` clock, with the same hold while `source_syntax_error` finds a file that will
+not parse or `reload_probe_error` finds a tree that parses but will not load: `keeper
+reloading: …`, `keeper holding, source does not parse: …` or `keeper holding, the new build
+does not load: …` goes to `fbtodo-pane.log`, the file `--help` points at.
+
+The second of those checks is the one a parse cannot make. A self-reload does not re-import;
+it EXECS, so the honest question is not "does the new build compile" but "can it BECOME a
+process". A tree can compile file by file and still be internally inconsistent — a name
+imported from a module that no longer defines it, an arity changed at a call site that runs at
+import, a `raise` left at module scope — and then the exec replaces a running image with one
+that dies on its own first line. `reload_probe_error` asks the new build itself: the same
+command line the reload is about to exec (`self_argv`), run once in a child with
+`FBTODO_RELOAD_PROBE` set, in which `main` hands off to `probe_answer` — BEFORE
+`init_state_root`, the first thing that touches disk, so a probe creates nothing, moves
+nothing and claims nothing. `probe_answer` does more than let the import happen. Importing runs
+the module-level code and NOTHING else: a function body is name-resolved only when it runs, so
+a global that was renamed or deleted hides until the one command that reaches that line is
+called — and the exec has already replaced a working image with it by then. So the probe
+exercises the entry point every invocation goes through — it BUILDS THE COMMAND PARSER, so
+`build_parser`'s own body and every default it computes run — and then asks
+`undefined_global_names` the deep question: for every scope of every module of the package,
+resolved with `symtable`, does every name the code LOADS as a global still exist in the
+module's live namespace (which already holds what its imports and `from .x import *` bound) or
+in the builtins? A missing name is printed with its module and enclosing function and the exit
+is 70, so the caller holds; zero is a yes. It is not a linter — attribute names are not
+symbols, locals and closure variables are not globals, and a name bound at run time passes,
+because the lookup is the live namespace. Exit 0 is a yes; a nonzero exit, a signal, or a hang past
+`RELOAD_PROBE_TIMEOUT_S` is a reason to hold. The child's last stderr line is what the log
+names, so the hold says WHY (`… the new build does not load: RuntimeError: …`). Holding is the
+fallback the name promises: the process keeps the build it is running — the last one that
+provably loaded — and re-asks on the next `BUILD_CHECK_S`, so a tree fixed a moment later is
+reloaded into by the very same pid. The probe runs only after a parse passed and a source has
+actually changed, so it is one child process per real reload, not per tick.
 
 ### What a side decides, and what it does not
 
@@ -382,7 +837,10 @@ push the list the pane was pointed at out of view.
   that is alive and never was a watcher; `clear_lock` refuses to unlink a claim it does not
   hold (unlinking does not lift the holder's lock, and a third process would then claim a
   fresh file of the same name — two watchers, one scratch dir). The build is still checked,
-  and a version-stale holder is stopped and replaced rather than adopted.
+  and a version-stale holder is stopped and replaced rather than adopted. The one claim that is
+  carried rather than re-taken is the watcher's own across its self-reload: an exec keeps the
+  open file description, so `lock_handoff`/`lock_adopt` pass the locked fd over it (see
+  [The watcher reloads itself too](#the-watcher-reloads-itself-too-across-its-claim)).
 - **Discovery asks `/proc` first, then one batched `lsof`** — `/proc/<pid>/cwd` is a readlink
   with no subprocess (Linux), and a machine with no `lsof` at all can still follow its own
   session. A process is the CLI when a TOKEN is one: `argv[0]` a bare `freebuff` that PATH

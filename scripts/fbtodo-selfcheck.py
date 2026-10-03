@@ -15,16 +15,20 @@ from __future__ import annotations
 import ast
 import builtins
 import importlib
+import importlib.util
 import json
 import math
 import os
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
 import shutil
 import sys
+import threading
 import time
+import types
 
 HOME = os.path.expanduser("~")
 # This suite lives in `scripts/`; the checkout it drives is the directory above it, so the
@@ -108,13 +112,24 @@ def keeper_aim() -> dict:
     """Live `pane-watch` processes → the tmux server each one is aimed at, from its own env.
 
     The environment is the only place that decision is written down (`tmux_identity()`
-    takes FBTODO_TMUX, then TMUX, then the default server), and it is what makes a keeper
+    takes FBTODO_TMUX, then asks the server for its socket, then falls back to `TMUX`), and
+    it is what makes a keeper
     started by a TEST hook inside the owner's own pane dangerous: it goes off keeping the
     OWNER's panes with the test state root — invisible (its log is a file in a home the
     suite wipes) and immortal (the owner's server always has panes and a freebuff, so it
     never reaches the pass that would let go), so it went on moving the owner's list pane
     back to the default side for as long as it lived. Keyed by pid, so a caller can tell
     what THIS run added from what was already on the machine.
+
+    The read is the program's own two-source one (`_proc_environ`: `/proc/<pid>/environ`,
+    then `ps -Eww`, then the kernel's copy), not a bare `ps -Eww`. That distinction is the
+    whole point here: a `ps -Eww` answer that is only a command line is not an environment,
+    and a copy the kernel cut short may have dropped the very `FBTODO_HOME` this check
+    exists to find — either way a keeper that IS a leak would read as one aimed somewhere
+    else, which is the one failure this guard must not have. Each pid therefore also carries
+    `_read` (was an environment obtained at all) and `_clipped` (did it come back capped),
+    the two facts a caller needs to treat an environment it could not account for as
+    suspect rather than as a keeper running elsewhere.
     """
     aims = {}
     listing = subprocess.run(
@@ -124,35 +139,50 @@ def keeper_aim() -> dict:
         pid, _, args = line.strip().partition(" ")
         if not pid.isdigit() or "pane-watch" not in args or "grep" in args:
             continue
-        try:
-            with open(f"/proc/{pid}/environ", "rb") as handle:  # linux
-                blob = handle.read().decode("utf-8", "replace")
-        except OSError:  # macOS: `ps -E` appends the environment to the args column
-            blob = subprocess.run(
-                ["ps", "-Eww", "-p", pid], capture_output=True, text=True
-            ).stdout
+        blob, clipped = module._proc_environ(int(pid))
         fields = {}
         for token in blob.replace("\0", " ").split():
             key, _, value = token.partition("=")
             if value and key in ("FBTODO_HOME", "FBTODO_TMUX", "TMUX"):
                 fields[key] = value
+        fields["_read"] = module._env_read(blob)
+        fields["_clipped"] = clipped
         aims[pid] = fields
     return aims
 
 
-def keeper_leaks(before: dict, home: str, server: str | None) -> list:
+def keeper_leaks(before: dict, home: str, server: str | None,
+                 aims: dict | None = None) -> list:
     """Keepers this run ADDED that keep `server`'s panes while running with `home`.
 
     Nothing should ever be one: a keeper reads the state root it was given and it keeps
     whatever panes the tmux server in its environment has, so a test home pointed at a
     live server is a keeper that edits the owner's layout from a scratch file.
+
+    When the read could PLACE the keeper — a named root, or a readable environment that
+    names none and so runs on the default one — the comparison is exact, as before. When it
+    could not (no environment read at all, or a copy the kernel clipped before the root), a
+    keeper whose state root cannot be accounted for is reported rather than waved through:
+    a guard that quietly skips the one case it cannot read is the trap this whole read
+    exists to close. `aims` is the injection point, so the rule is pinned without depending
+    on what is running.
     """
     out = []
-    for pid, fields in keeper_aim().items():
-        if pid in before or fields.get("FBTODO_HOME") != home:
+    for pid, fields in (keeper_aim() if aims is None else aims).items():
+        if pid in before:
             continue
+        named = fields.get("FBTODO_HOME")
+        if named is not None:
+            if named != home:
+                continue  # a readable root that is not this test's
+        elif fields.get("_read") and not fields.get("_clipped"):
+            continue  # read, and names no root: a keeper on the default root, not this test's
         if (fields.get("FBTODO_TMUX") or fields.get("TMUX") or None) == server:
             out.append((pid, fields.get("TMUX"), fields.get("FBTODO_TMUX")))
+        elif named is None:
+            # the environment could not be read (or came back clipped with no root), so
+            # even the server cannot be compared: a keeper this run cannot account for
+            out.append((pid, None, None))
     return out
 
 
@@ -219,6 +249,19 @@ def load_fbtodo(home: str | None = None) -> object:
     for name in [n for n in sys.modules if n == "fbtodo" or n.startswith("fbtodo.")]:
         del sys.modules[name]
     return importlib.import_module("fbtodo")
+
+
+def load_module(path: str, name: str) -> object:
+    """A file as a module, by path — how the kit's scripts are read where they live.
+
+    The notification kit is not importable (its scripts sit in `scripts/notify/`, run by
+    their own shebang and found through `~/.config/freebuff-notify/`), so a test that wants
+    to ask one a question loads it by path. Same idea as `load_fbtodo`, one file at a time.
+    """
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def set_knob(mod, name, value):
@@ -568,7 +611,12 @@ try:
     assert run("stop").returncode == 0
     say("stop is a no-op when nothing runs: ok")
 
-    # ---- a watcher whose lock vanishes stops instead of re-creating its home
+    # ---- the watcher's own claim NAME can move without the kernel lock moving. Nothing
+    #      outside can see that — `lock_peek` reports the role as not running, the process
+    #      half of `locks` names it an orphan — so the watcher notices it itself and takes
+    #      the name back, the way the keeper does. Two accidents heal, and a name a LIVE
+    #      process holds is the one it must stand down for.
+    lk = load_fbtodo()  # this row's own reader; `module` is bound later in the suite
     victim_l = spawn_quiet("sleep", "600")
     daemon_l = subprocess.Popen(
         [sys.executable, FB, "daemon", "--foreground", "--quiet",
@@ -576,14 +624,108 @@ try:
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL, start_new_session=True, env=env, cwd=CWD,
     )
-    deadline = time.time() + 10
-    while time.time() < deadline and not os.path.exists(lock_path):
-        time.sleep(0.1)
-    os.unlink(lock_path)
-    assert daemon_l.wait(timeout=15) == 0, "watcher ignored a removed lock"
-    assert not os.path.exists(lock_path), "a stopped watcher left a lock"
-    kill_tree(victim_l)
-    say("a removed lock stops the watcher without resurrecting its home: ok")
+
+    def watcher_reclaimed(seconds: float = 10.0) -> bool:
+        # The record, not `lock_holder`: a probe TAKES the free name for the moment it asks,
+        # so polling with it could stand the watcher down mid-accident. The watcher writes
+        # its record through the locked fd, so a record naming it means it holds the name.
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if (lk.read_json(lock_path, {}) or {}).get("pid") == daemon_l.pid:
+                return True
+            time.sleep(0.1)
+        return False
+
+    holder = None
+    try:
+        assert watcher_reclaimed(), "the watcher never claimed"
+        assert lk.lock_holder(lock_path) == daemon_l.pid, "the watcher never claimed"
+        # (1) the file is REMOVED under it: the name is free, so the same watcher takes it
+        #     again — same pid, same record — instead of writing on with nothing on disk.
+        os.unlink(lock_path)
+        assert not os.path.exists(lock_path), "the fixture lock was not removed"
+        assert watcher_reclaimed(), "the watcher did not re-claim its removed name"
+        assert daemon_l.poll() is None, "the watcher stopped instead of re-claiming"
+        assert lk.lock_holder(lock_path) == daemon_l.pid, "the re-claimed name is not held"
+        # (2) the file is REPLACED — a rename onto the name is what "replaced" means, since
+        #     writing into the held file keeps the lock and only rewrites the record.
+        foreign = os.path.join(TEST_HOME, "claim-foreign.pid")
+        with open(foreign, "w") as fh:
+            fh.write("{}\n")
+        os.replace(foreign, lock_path)
+        assert watcher_reclaimed(), "the watcher did not re-claim its replaced name"
+        assert daemon_l.poll() is None, "the watcher stopped on a replaced name"
+        assert lk.lock_holder(lock_path) == daemon_l.pid, "the re-claimed file is not held"
+        # (3) a name a LIVE process HOLDS belongs to that process: the watcher stands down
+        #     rather than fight it. A helper locks a fresh file first and is renamed onto the
+        #     name, so there is no moment where the name is free for either side.
+        holder_script = os.path.join(TEST_HOME, "claim-holder.py")
+        with open(holder_script, "w") as fh:
+            fh.write(
+                "import fcntl, json, os, sys, time\n"
+                "path = sys.argv[1]\n"
+                "fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)\n"
+                "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                "os.ftruncate(fd, 0)\n"
+                "os.write(fd, (json.dumps({'pid': os.getpid()}) + '\\n').encode())\n"
+                "print('held', flush=True)\n"
+                "time.sleep(600)\n"
+            )
+        held_file = os.path.join(TEST_HOME, "claim-held.pid")
+        holder = subprocess.Popen(
+            [sys.executable, holder_script, held_file],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True, cwd=CWD,
+        )
+        assert holder.stdout.readline().strip() == b"held", "the helper did not take the name"
+        os.replace(held_file, lock_path)
+        assert lk.lock_holder(lock_path) == holder.pid, "the helper does not hold the name"
+        assert daemon_l.wait(timeout=15) == 0, "the watcher fought a live holder"
+        assert lk.lock_holder(lock_path) == holder.pid, "the helper's claim went away"
+        say("a watcher whose claim name moves re-claims a free or replaced name as the same "
+            "pid, and stands down for a live holder: ok")
+    finally:
+        if holder is not None:
+            kill_tree(holder)
+        if daemon_l.poll() is None:
+            daemon_l.terminate()
+            try:
+                daemon_l.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                kill_tree(daemon_l)
+        kill_tree(victim_l)
+        if os.path.exists(lock_path):
+            os.unlink(lock_path)
+
+    # ---- ...and a state root that is GONE is the one case the watcher stops for: it must
+    #      not resurrect a home somebody removed. A root of its own, so nothing here is
+    #      shared with the fixture above.
+    gone_root = os.path.join(TEST_HOME, "gone-root")
+    victim_g = spawn_quiet("sleep", "600")
+    env_gone = {**env, "FBTODO_HOME": gone_root}
+    daemon_g = subprocess.Popen(
+        [sys.executable, FB, "daemon", "--foreground", "--quiet",
+         "--instance-pid", str(victim_g.pid), "--cwd", CWD, "-i", "0.2"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True, env=env_gone, cwd=CWD,
+    )
+    try:
+        gone_lock = os.path.join(gone_root, "fbtodo-daemon.pid")
+        deadline = time.time() + 10
+        while time.time() < deadline and not os.path.exists(gone_lock):
+            time.sleep(0.1)
+        assert os.path.exists(gone_lock), "the gone-root watcher never claimed"
+        shutil.rmtree(gone_root, ignore_errors=True)
+        assert daemon_g.wait(timeout=15) == 0, "the watcher did not stop on a removed root"
+        # ...and it did NOT re-claim. A state write already in flight may put the directory
+        # back, so the directory's existence is not the question — the claim is: a removed
+        # root must not be healed the way a moved name is.
+        assert not os.path.exists(gone_lock), "the watcher re-claimed a removed state root"
+        say("a removed state root stops the watcher instead of being re-claimed: ok")
+    finally:
+        kill_tree(daemon_g)
+        kill_tree(victim_g)
+        shutil.rmtree(gone_root, ignore_errors=True)
 
     # ---- json/bar/snap contracts, against the same fixture root the watcher read: the
     # operator's live session is not a fixture and cannot be asserted about.
@@ -822,6 +964,779 @@ try:
     assert module.live_watcher_pid(lock_path) is None
     say("locks: a leftover record whose pid is alive is not a watcher, and is cleaned up: ok")
 
+    # ---- a claim being BORN is not a leftover. `write_lock` creates the file a breath
+    #      before it can lock it, and a probe that takes a free file used to remove it as a
+    #      stale record. Two asks arriving together then each removed the other's newborn
+    #      claim: each keeper went on with its claim on an unlinked inode — nothing on disk
+    #      to name it — and each ask logged "never claimed the lock" while a keeper was
+    #      running. A free file that NAMES A PID is still cleaned up (the test above); an
+    #      EMPTY one is a claim about to be locked, and a probe leaves it alone.
+    missing = os.path.join(TEST_HOME, "claim-missing.pid")
+    if os.path.exists(missing):
+        os.unlink(missing)
+    assert module.lock_holder(missing) is None, "a missing claim was read as held"
+    assert not os.path.exists(missing), "a probe created a claim file where none existed"
+    newborn = os.path.join(TEST_HOME, "claim-newborn.pid")
+    if os.path.exists(newborn):
+        os.unlink(newborn)
+    fd = module.lock_open(newborn)             # what `write_lock` does first...
+    assert module.lock_holder(newborn) is None, "an empty claim was read as a holder"
+    assert os.path.exists(newborn), "a probe removed a claim before it was locked"
+    assert module.lock_take(fd), "the newborn claim could not be locked after the probe"
+    module._LOCK_FDS[newborn] = fd             # ...and what it keeps once the lock is held
+    assert module.write_lock(CWD, None, path=newborn, extra={"tmux": "probe"})
+    assert module.lock_holder(newborn) == os.getpid(), \
+        "a claim stayed hidden after a probe raced it"
+    module.clear_lock(path=newborn)
+    say("locks: a claim being born survives a probe and stays visible once locked: ok")
+
+    # ---- and the last window in that same moment: a claim file REPLACED between opening
+    #      and locking. `write_lock` opens the file, then locks it; in between, a probe can
+    #      take the free file and remove it (the leftover cleanup above) — the claimer would
+    #      then lock an inode the name no longer points at, keeping every pane with nothing
+    #      on disk to name it, while a second keeper could claim a fresh file of the same
+    #      name. `write_lock` re-checks the name against the locked inode and takes the
+    #      name again instead. The window is held open here with a wrapped `lock_open`: the
+    #      claimer pauses after opening (a breath a probe can step into), the probe runs its
+    #      leftover cleanup, and the claimer resumes over the removed name.
+    race_path = os.path.join(TEST_HOME, "claim-race.pid")
+    keep_path = os.path.join(TEST_HOME, "claim-kept.pid")
+    gates = {race_path: {"first": True, "opened": threading.Event(), "go": threading.Event()},
+             keep_path: {"first": True, "opened": threading.Event(), "go": threading.Event()}}
+    real_open = module.lock_open
+
+    def paused_open(p, *a, **k):
+        fd = real_open(p, *a, **k)
+        slot = gates.get(p)
+        if slot and slot["first"]:
+            slot["first"] = False
+            slot["opened"].set()
+            assert slot["go"].wait(timeout=10), "the race never resumed"
+        return fd
+
+    set_knob(module, "lock_open", paused_open)
+    try:
+        module.atomic_write_json(race_path, {"pid": os.getpid(), "cwd": CWD, "started_ms": 0,
+                                             "instance_pid": None, "version": module.VERSION})
+        held = {}
+
+        def claim_race():
+            held["ok"] = module.write_lock(CWD, None, path=race_path)
+
+        racer = threading.Thread(target=claim_race)
+        racer.start()
+        assert gates[race_path]["opened"].wait(timeout=10), "the claim was never opened"
+        assert module.lock_holder(race_path) is None, "a free record was read as a holder"
+        assert not os.path.exists(race_path), "the probe did not clear the stale record"
+        gates[race_path]["go"].set()
+        racer.join(timeout=30)
+        assert not racer.is_alive(), "the racing claim never finished"
+        assert held.get("ok") is True, held
+        # ...and the keeper that lost its name to the probe is VISIBLE again: the name
+        # holds a claim, and it is this process's
+        assert os.path.exists(race_path), "a claim removed under the claimer stayed removed"
+        assert module.lock_holder(race_path) == os.getpid(), \
+            "a claim replaced between opening and locking left a keeper invisible"
+        say("locks: a claim replaced between opening and locking is taken again, never left "
+            "nameless: ok")
+
+        # ---- and the inverse must hold too: a probe that opened one file must never remove
+        #      the NAME once it has been replaced by somebody else's claim — that would
+        #      strand the second keeper exactly the same way. The probe is paused after its
+        #      open, the name moves on to a fresh, HELD claim, and the probe resumes: it must
+        #      answer about the file the name points at, and leave it alone.
+        module.atomic_write_json(keep_path, {"pid": os.getpid(), "cwd": CWD, "started_ms": 0,
+                                             "instance_pid": None, "version": module.VERSION})
+        probed = {}
+
+        def keep_probe():
+            probed["pid"] = module.lock_holder(keep_path)
+
+        probe = threading.Thread(target=keep_probe)
+        probe.start()
+        assert gates[keep_path]["opened"].wait(timeout=10), "the probe never opened the claim"
+        os.unlink(keep_path)                 # the name moves...
+        kfd = module.lock_open(keep_path)    # ...to a fresh claim, held here
+        assert module.lock_take(kfd), "the replacement claim could not be locked"
+        module._LOCK_FDS[keep_path] = kfd
+        assert module.write_lock(CWD, None, path=keep_path, extra={"who": "replacement"})
+        gates[keep_path]["go"].set()
+        probe.join(timeout=30)
+        assert not probe.is_alive(), "the probe never finished"
+        assert os.path.exists(keep_path), "a probe removed a name that was not its own file"
+        assert probed.get("pid") == os.getpid(), probed
+        assert module.lock_holder(keep_path) == os.getpid(), \
+            "the replacement claim went invisible"
+        say("locks: a probe never removes a name that is not the file it locked: ok")
+    finally:
+        set_knob(module, "lock_open", real_open)
+        module.clear_lock(path=race_path)
+        module.clear_lock(path=keep_path)
+
+    # ---- the audit `fbtodo locks` asks: who holds each claim, whether the lock and the
+    #      NAME are one file, whether a record is stale, and what clearing it takes — asked
+    #      WITHOUT writing anything. The probe `lock_holder` would remove a free leftover;
+    #      an audit exists to say so instead, so every one of these checks re-reads the
+    #      file afterwards: the states are absent, a dead-pid leftover, a live-pid free
+    #      record (the tie broken — a birth, a leftover, or an orphan), a held claim, and
+    #      this process's OWN claim with the name moved off it.
+    audit_absent = os.path.join(TEST_HOME, "claim-audit-absent.pid")
+    if os.path.exists(audit_absent):
+        os.unlink(audit_absent)
+    entry = module.claim_audit(audit_absent)
+    assert entry["state"] == "absent" and not os.path.exists(audit_absent), entry
+
+    audit_dead = os.path.join(TEST_HOME, "claim-audit-dead.pid")
+    victim_audit = spawn_quiet("sleep", "600")
+    dead_pid_audit = victim_audit.pid
+    kill_tree(victim_audit)
+    module.atomic_write_json(audit_dead, {"pid": dead_pid_audit, "cwd": CWD, "started_ms": 0,
+                                          "instance_pid": None, "version": module.VERSION})
+    entry = module.claim_audit(audit_dead)
+    assert entry["state"] == "free" and entry["leftover"] is True, entry
+    assert entry["pid"] == dead_pid_audit and entry["pid_alive"] is False, entry
+    assert entry["name_inode"] is None, entry
+    assert "leftover" in entry["note"] and "safe to remove" in entry["clearing"], entry
+    assert os.path.exists(audit_dead), "the audit removed the file it was reading"
+
+    # a free file whose record names a LIVE process: the name-to-inode tie is the thing
+    # broken — the named process does not hold the file this name points at
+    module.atomic_write_json(audit_dead, {"pid": os.getpid(), "cwd": CWD, "started_ms": 0,
+                                          "instance_pid": None, "version": module.VERSION})
+    entry = module.claim_audit(audit_dead)
+    assert entry["state"] == "free" and entry["pid_alive"] is True, entry
+    assert entry["name_inode"] == "mismatch" and "does not hold" in entry["note"], entry
+    os.unlink(audit_dead)
+
+    # held: the lock blocks this process's own open of the name, so the name IS what is
+    # claimed — and clearing means ending the holder, never unlinking the file
+    audit_held = os.path.join(TEST_HOME, "claim-audit-held.pid")
+    module.atomic_write_json(audit_held, {"pid": os.getpid(), "cwd": CWD, "started_ms": 0,
+                                          "instance_pid": None, "version": module.VERSION})
+    held_fd = module.lock_open(audit_held)
+    assert module.lock_take(held_fd), "the audited claim could not be locked"
+    entry = module.claim_audit(audit_held)
+    assert entry["state"] == "held" and entry["name_inode"] == "match", entry
+    assert entry["pid"] == os.getpid() and entry["pid_alive"] is True, entry
+    assert "end the holder" in entry["clearing"], entry
+    assert os.path.exists(audit_held), "the audit removed a held claim"
+    # ...and the same claim with the NAME moved off it: the audit sees the orphan from the
+    # inside — the registry entry is ours, the name is another file
+    module._LOCK_FDS[audit_held] = held_fd
+    module.atomic_write_json(audit_held, {"pid": os.getpid(), "cwd": CWD, "started_ms": 1,
+                                          "instance_pid": None, "version": module.VERSION})
+    entry = module.claim_audit(audit_held)
+    assert entry["ours_claimed"] is True and entry["ours_named"] is False, entry
+    assert entry["name_inode"] == "mismatch", entry
+    assert "no longer points at the name" in entry["note"], entry
+    assert "re-claim" in entry["clearing"], entry
+    module._LOCK_FDS.pop(audit_held, None)
+    os.close(held_fd)
+    os.unlink(audit_held)
+    say("locks: the audit names each claim's holder, its name-to-inode tie, a stale record "
+        "and what clearing takes — without writing anything, its own claim included: ok")
+
+    # ---- and the command over the state root's own files: the watcher's leftover, the
+    #      keeper's claim held by this process, the NAS file absent — text and JSON say the
+    #      same four facts, and the run does not change a byte (flush the rows, then read
+    #      the files back)
+    module.atomic_write_json(module.LOCK_PATH, {"pid": dead_pid_audit, "cwd": CWD,
+                                                "started_ms": 0, "instance_pid": None,
+                                                "version": module.VERSION})
+    module.atomic_write_json(module.PANE_KEEPER_PATH, {"pid": os.getpid(), "cwd": CWD,
+                                                       "started_ms": 0, "instance_pid": None,
+                                                       "version": module.VERSION})
+    if os.path.exists(module.NAS_LOCK_PATH):
+        os.unlink(module.NAS_LOCK_PATH)
+    audit_fd = module.lock_open(module.PANE_KEEPER_PATH)
+    assert module.lock_take(audit_fd), "the keeper claim could not be locked"
+    module._LOCK_FDS[module.PANE_KEEPER_PATH] = audit_fd
+    try:
+        before_audit = {p: open(p, "rb").read()
+                        for p in (module.LOCK_PATH, module.PANE_KEEPER_PATH)}
+        ran = run("locks")
+        assert ran.returncode == 0, (ran.returncode, ran.stdout, ran.stderr)
+        out = STRIP(ran.stdout)
+        assert "watcher" in out and "leftover" in out, out
+        assert "keeper" in out and f"pid {os.getpid()}" in out and "held by" in out, out
+        assert "nas pane" in out and "no file — no claim" in out, out
+        doc = json.loads(run("locks", "--json").stdout)
+        by_role = {c["role"]: c for c in doc["claims"]}
+        assert by_role["watcher"]["state"] == "free", by_role["watcher"]
+        assert by_role["watcher"]["leftover"] is True, by_role["watcher"]
+        assert by_role["watcher"]["pid"] == dead_pid_audit, by_role["watcher"]
+        assert by_role["keeper"]["state"] == "held", by_role["keeper"]
+        assert by_role["keeper"]["pid"] == os.getpid() and by_role["keeper"]["pid_alive"], \
+            by_role["keeper"]
+        assert by_role["keeper"]["name_inode"] == "match", by_role["keeper"]
+        assert by_role["nas pane"]["state"] == "absent", by_role["nas pane"]
+        after_audit = {p: open(p, "rb").read()
+                       for p in (module.LOCK_PATH, module.PANE_KEEPER_PATH)}
+        assert after_audit == before_audit, "the audit wrote to a claim file"
+        say("locks: the command audits the watcher's leftover, the held keeper and the "
+            "absent NAS file — text and JSON, and not a byte written: ok")
+    finally:
+        module.clear_lock(path=module.PANE_KEEPER_PATH)
+        if os.path.exists(module.LOCK_PATH):
+            os.unlink(module.LOCK_PATH)
+
+    # ---- ...and the audit has a second half the name cannot see: a running watcher or
+    #      keeper whose claim file was replaced under it holds a lock on an inode no name
+    #      points at — the file reads `absent` or `free` while the process goes on keeping
+    #      panes. `claim_processes` finds the processes by their argv (the subcommand right
+    #      after the launcher, so a system daemon whose line merely contains the word is not
+    #      one) and keeps only those whose environment names THIS state root; `claim_orphans`
+    #      matches them against what the claim's own audit says. Injected tables and blobs,
+    #      so the rule is pinned without depending on what is running on this machine —
+    #      and the end-to-end case with a real keeper comes later, in the keeper block.
+    #
+    # The argv rule first, on strings: the subcommand right after the launcher (or the
+    # package's own entry file), never a word that merely appears in the line.
+    assert module._fbtodo_subcommand(
+        f"{sys.executable} /p/fbtodo daemon --foreground") == "daemon"
+    assert module._fbtodo_subcommand(
+        f"{sys.executable} /p/fbtodo/__init__.py pane-watch --foreground") == "pane-watch"
+    assert module._fbtodo_subcommand("/usr/sbin/distnoted daemon") is None
+    assert module._fbtodo_subcommand("python /p/fbtodo") is None
+    assert module._fbtodo_subcommand(
+        "grep -n 'pane-watch' /p/fbtodo") is None, "a mention is not a run"
+    say("locks: a role process is recognized by its launcher token and the subcommand "
+        "right after it, never by a word in the line: ok")
+
+    PROC_BLOBS = {
+        900: f"FBTODO_HOME={TEST_HOME}",      # a watcher for this root: ours
+        901: f"FBTODO_HOME={TEST_HOME}",      # a keeper for this root: ours
+        902: f"FBTODO_HOME=/elsewhere/state",  # another checkout's: not ours
+        903: "",                                # unreadable environment: assumed ours
+        904: f"FBTODO_HOME={TEST_HOME}",
+        905: f"FBTODO_HOME={TEST_HOME}",      # launcher-less copy: the entry file's shape
+        906: f"FBTODO_HOME={TEST_HOME}",      # a bare spawn: it only STARTS a watcher
+        907: f"FBTODO_HOME={TEST_HOME}",
+        # the answer `ps -Eww` gives for a process whose environment the kernel will not
+        # copy: its command line and nothing else. No assignment in it, so it is not an
+        # environment, and no root may be invented from it.
+        908: "    1 ??   219:10.15 /sbin/launchd",
+    }
+    proc_table = {
+        900: (1, f"{sys.executable} /p/fbtodo daemon --foreground --quiet --cwd /x"),
+        901: (1, f"{sys.executable} /p/fbtodo pane-watch --foreground --quiet"),
+        902: (1, f"{sys.executable} /p/fbtodo daemon --foreground"),
+        903: (1, f"{sys.executable} /p/fbtodo nas -f --quiet"),
+        904: (1, "/usr/sbin/distnoted daemon"),
+        905: (1, f"{sys.executable} /p/fbtodo/__init__.py pane-watch --quiet"),
+        906: (1, f"{sys.executable} /p/fbtodo daemon --quiet"),
+        907: (1, f"{sys.executable} /p/fbtodo nas --quiet"),
+        908: (1, f"{sys.executable} /p/fbtodo daemon --foreground --quiet"),
+    }
+    saved_ages = module.ages_for
+    set_knob(module, "ages_for", lambda pids: {p: 400 for p in pids})
+    try:
+        procs = module.claim_processes(root=TEST_HOME, table=proc_table, environs=PROC_BLOBS)
+        by_pid = {p["pid"]: p for p in procs}
+        assert set(by_pid) == {900, 901, 903, 905, 908}, by_pid
+        assert by_pid[900]["role"] == "watcher" and by_pid[901]["role"] == "keeper", by_pid
+        assert by_pid[903]["role"] == "nas pane" and by_pid[905]["role"] == "keeper", by_pid
+        assert by_pid[900]["root"] == TEST_HOME and by_pid[900]["age_s"] == 400, by_pid[900]
+        # the launcher-less copy's python is its own line's, read not assumed
+        assert by_pid[905]["python"] == sys.executable, by_pid[905]
+        # ...and whether the environment was READ at all. An unreadable one is still assumed
+        # to be ours for the AUDIT's sentence ("a false positive is a sentence, not a
+        # kill"); the fix is the other side of that promise, so the row says which it is.
+        assert by_pid[900]["root_named"] is True and by_pid[905]["root_named"] is True, by_pid
+        assert by_pid[903]["root_named"] is False, by_pid[903]
+        # a command line is not an environment: it is reported (this root assumed for the
+        # sentence) and never placed, so `locks --fix` cannot end it
+        assert by_pid[908]["root_named"] is False, by_pid[908]
+        assert by_pid[908]["root"] == TEST_HOME and by_pid[908]["env_clipped"] is False, \
+            by_pid[908]
+        assert by_pid[900]["env_clipped"] is False, by_pid[900]
+        say("locks: the cross-check finds the watcher, keeper and NAS watcher running with "
+            "this state root — launcher or entry file alike — leaves another root's "
+            "processes alone, and ignores the bare spawns that only START a watcher: ok")
+        # ---- the environment read itself. `ps -Eww` answers with a command line whether or
+        #      not the kernel let it copy the environment, and reading that as an environment
+        #      places a process on the DEFAULT root it never named. Measured on this machine
+        #      2026-10-02: the kernel CAPS its copy for a process it will not expose — every
+        #      launchd/GUI process came back with 1012–1132 bytes while `ps` printed 516–974
+        #      of them, a launcher run with two variables got 1644, the roles 3044–3844, and a
+        #      250 KB environment 257612 — so the size of the kernel's own copy is the signal,
+        #      and both halves are pinned here.
+        assert module._env_read("FBTODO_HOME=/x PATH=/bin") is True
+        assert module._env_read("    1 ??   219:10.15 /sbin/launchd") is False
+        assert module._env_read("") is False and module._env_read("PID TTY TIME CMD") is False
+        assert module._env_names("PATH=/bin FBTODO_HOME=/x") == {"PATH", "FBTODO_HOME"}
+        assert module._env_root("FBTODO_HOME=/x") is True
+        assert module._env_root("XDG_STATE_HOME=/y PATH=/bin") is True
+        assert module._env_root("PATH=/bin SHELL=/bin/zsh") is False
+        assert module._environ_clipped("    1 ??  0:01 /sbin/launchd", 78) is False, \
+            "a short command line was read as a clipped environment"
+        assert module._environ_clipped("x" * 516, 1012) is True, "a capped copy was read whole"
+        assert module._environ_clipped("x" * 766, 1284) is False, "a whole copy was called capped"
+        assert module._environ_clipped("x" * 3383, 3844) is False, "a full copy was called capped"
+        assert module._environ_clipped("", 1012) is False and \
+            module._environ_clipped("x" * 40, 0) is False, "a missing source invented a clip"
+        assert module.KERNEL_COPY_FLOOR <= 1012 <= module.KERNEL_COPY_CAP < 1284
+        say("locks: a `ps -Eww` answer with no assignment in it is a command line, not an "
+            "environment — it is never believed, and never read as the default root: ok")
+        say("locks: the clip is the kernel's own byte count (1012 bytes is the capped kind "
+            "`ps` printed 516 of, 3844 is a whole copy), a short command line is not a clip, "
+            "and a missing second source is never an invented one: ok")
+        # ...and the same read on real processes: a child run with a root in its environment
+        # is placed by it, and a platform binary — whose environment this platform will not
+        # hand over — reads as no environment at all rather than as the default root.
+        kid = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            env={"PATH": os.environ.get("PATH", ""), "FBTODO_HOME": TEST_HOME},
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            kid_blob, kid_clipped = module._proc_environ(kid.pid)
+            assert module._env_read(kid_blob) and module._env_root(kid_blob), kid_blob[:200]
+            assert module._proc_root(kid_blob) == TEST_HOME, module._proc_root(kid_blob)
+            assert kid_clipped is False, "a child's own environment was called clipped"
+        finally:
+            kid.terminate()
+            kid.wait(timeout=10)
+        one_blob, _one_clip = module._proc_environ(1)
+        assert module._env_read(module._environ_ps(1)) is False, module._environ_ps(1)[:200]
+        assert module._env_read(one_blob) is False, one_blob[:200]
+        assert module._proc_root(one_blob) == os.path.join(os.path.expanduser("~"),
+                                                           ".local", "state", "fbtodo")
+        say("locks: a real child's root comes from the environment it was started with, and "
+            "a platform binary's env — which this platform will not hand over — reads as NO "
+            "environment, not as the default root: ok")
+        # a HELD claim names its holder: every other running process of that role is untied
+        held_audit = {"state": "held", "pid": 900, "pid_alive": True, "name_inode": "match"}
+        assert [p["pid"] for p in module.claim_orphans(held_audit, [by_pid[900], by_pid[901]])] \
+            == [901], "a held claim's other process was not reported"
+        # a free file whose record names a LIVE pid: the tie is broken — the leftover
+        # cleanup took that process's name and it went on running — so it is an orphan
+        free_audit = {"state": "free", "pid": 900, "pid_alive": True, "name_inode": "mismatch"}
+        assert [p["pid"] for p in module.claim_orphans(free_audit, [by_pid[900], by_pid[901]])] \
+            == [900, 901], "a free file's running processes were not reported"
+        # ...and a DEAD pid's record is the same free file with a different note: it ties
+        # nothing either, so the processes running with this root are still the answer
+        dead_audit = {"state": "free", "pid": 999999, "pid_alive": False, "name_inode": None}
+        assert [p["pid"] for p in module.claim_orphans(dead_audit, [by_pid[900]])] == [900], \
+            dead_audit
+        # a file with nothing on it at all: every running process of the role is untied
+        absent_audit = {"state": "absent", "pid": None, "pid_alive": False, "name_inode": None}
+        assert [p["pid"] for p in module.claim_orphans(absent_audit, [by_pid[900], by_pid[903]])] \
+            == [900, 903], "a process nothing names was not reported"
+        say("locks: the orphan rule — a held claim names its holder, a free or absent file "
+            "ties nobody, so every running process of that role is reported: ok")
+        # ...and a process YOUNGER than the grace is left out: a watcher between its start
+        # and its claim, and a second watcher standing down, both look untied for a moment
+        young = dict(by_pid[900], age_s=0.5)
+        assert module.claim_orphans(absent_audit, [young]) == [], young
+        old = dict(by_pid[900], age_s=None)
+        assert [p["pid"] for p in module.claim_orphans(absent_audit, [old])] == [900], old
+        say("locks: a just-started process is not an orphan, and an unreadable age hides "
+            "nothing: ok")
+        # ...and the fix's plan, which is those two reads put together: a FREE record that
+        # NAMES a pid is a leftover to clear, a placed untied process is ended, an
+        # unplaceable one is only named (an unreadable environment must never be a kill),
+        # and a healthy held claim is left entirely alone.
+        fix_rows = [
+            ("watcher", {"state": "free", "leftover": True, "path": "/p/daemon.pid"}),
+            ("keeper", {"state": "free", "leftover": False, "path": "/p/keeper.pid"}),
+            ("nas pane", {"state": "free", "leftover": True, "path": "/p/nas.pid"}),
+        ]
+        clears, kills, skipped = module.locks_fix_plan(fix_rows, [by_pid[900], by_pid[903]])
+        assert [label for label, _e in clears] == ["watcher", "nas pane"], clears
+        assert [p["pid"] for _l, p in kills] == [900], kills
+        assert [p["pid"] for _l, p in skipped] == [903], skipped
+        held_rows = [("watcher", {"state": "held", "leftover": False,
+                                  "path": "/p/daemon.pid"})]
+        assert module.locks_fix_plan(held_rows, [by_pid[900]]) == ([], [], []), \
+            "a held claim with its name was planned for"
+        say("locks --fix: an audit and a process table become a plan — a free leftover "
+            "cleared, a placed untied process ended, an unplaceable one only named, a held "
+            "claim untouched: ok")
+    finally:
+        set_knob(module, "ages_for", saved_ages)
+
+    def soon(pred, seconds: float = 20.0) -> bool:
+        """Wait for a REAL process to get somewhere, bounded: a watch polls on its own clock."""
+        limit = time.time() + seconds
+        while time.time() < limit and not pred():
+            time.sleep(0.1)
+        return pred()
+
+    # ---- ...and the safety read that uses the same two-source rule. `keeper_aim` asks every
+    #      live `pane-watch` process for its state root and tmux server, and a bare `ps -Eww`
+    #      here would inherit both traps — a command line read as an environment, and a copy
+    #      the kernel clipped before FBTODO_HOME — and then report a real leak as aimed
+    #      somewhere else. That is precisely the leak this guard exists to catch, so the read
+    #      it uses is pinned: a stand-in pane-watch process with a real environment, then the
+    #      command-line-only and clipped shapes forced through the sources.
+    aim_pkg = os.path.join(TEST_HOME, "aim-build", "fbtodo")
+    os.makedirs(aim_pkg, mode=0o700, exist_ok=True)
+    with open(os.path.join(aim_pkg, "__init__.py"), "w", encoding="utf-8") as fh:
+        fh.write("import time\n\ntime.sleep(600)\n")
+    aim_proc = subprocess.Popen(
+        [sys.executable, os.path.join(aim_pkg, "__init__.py"), "pane-watch"],
+        env={"FBTODO_HOME": TEST_HOME, "FBTODO_TMUX": "aim-socket", "TMUX": "aim-server",
+             "PATH": os.environ.get("PATH", "")},
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True,
+    )
+    saved_sources = {name: getattr(module, name)
+                     for name in ("_environ_proc", "_environ_ps", "_kernel_copy")}
+    try:
+        assert soon(lambda: str(aim_proc.pid) in keeper_aim()), keeper_aim()
+        aimed = keeper_aim()[str(aim_proc.pid)]
+        assert aimed.get("FBTODO_HOME") == TEST_HOME and aimed["_read"] is True, aimed
+        assert aimed.get("FBTODO_TMUX") == "aim-socket", aimed
+        assert aimed.get("TMUX") == "aim-server" and aimed["_clipped"] is False, aimed
+        # (a) the command-line-only shape: what `ps -Eww` answers for a process the kernel
+        #     will not expose. It is not an environment, so the aim must say so rather than
+        #     invent a keeper on the default root.
+        set_knob(module, "_environ_proc", lambda pid: "")
+        set_knob(module, "_environ_ps",
+                 lambda pid: "  123 ??   0:01.00 /usr/sbin/distnoted daemon")
+        set_knob(module, "_kernel_copy", lambda pid: ("", 0))
+        blind = keeper_aim()[str(aim_proc.pid)]
+        assert blind["_read"] is False and blind["_clipped"] is False, blind
+        assert "FBTODO_HOME" not in blind and "FBTODO_TMUX" not in blind, blind
+        # (b) the clipped shape: `ps` printed a command line and the kernel copy is the ~1 KB
+        #     kind a root could have been cut off in. `_read` is still false, and `_clipped`
+        #     records the capped copy the caller refuses to place on it.
+        set_knob(module, "_kernel_copy", lambda pid: ("", 1012))
+        capped = keeper_aim()[str(aim_proc.pid)]
+        assert capped["_read"] is False and capped["_clipped"] is True, capped
+        # (c) each source alone answers: /proc with the environment, or only `ps` with it.
+        #     The read is their union, so either is enough.
+        set_knob(module, "_environ_proc",
+                 lambda pid: "FBTODO_HOME=/p/home FBTODO_TMUX=proc-socket TMUX=proc-server")
+        set_knob(module, "_environ_ps", lambda pid: "")
+        set_knob(module, "_kernel_copy", lambda pid: ("", 0))
+        from_proc = keeper_aim()[str(aim_proc.pid)]
+        assert from_proc.get("FBTODO_HOME") == "/p/home" and from_proc["_read"] is True, \
+            from_proc
+        set_knob(module, "_environ_proc", lambda pid: "")
+        set_knob(module, "_environ_ps",
+                 lambda pid: "FBTODO_HOME=/p/home2 FBTODO_TMUX=ps-socket TMUX=ps-server")
+        from_ps = keeper_aim()[str(aim_proc.pid)]
+        assert from_ps.get("FBTODO_HOME") == "/p/home2" and from_ps["_read"] is True, from_ps
+        say("keeper aim: a live keeper's state root and tmux server come from the "
+            "program's two-source environment read — a command-line-only answer and a "
+            "kernel-clipped copy are reported as unaccounted for, never as the default "
+            "root: ok")
+    finally:
+        for name, fn in saved_sources.items():
+            set_knob(module, name, fn)
+        kill_tree(aim_proc)
+    # ...and the guard that consumes the aim, on injected aims: a test-home keeper keeping
+    # this server is a leak, another root's is not, a readable default-root keeper is not,
+    # and one whose environment could not be read is reported rather than skipped.
+    assert keeper_leaks({}, TEST_HOME, "owner-server",
+                        aims={1: {"FBTODO_HOME": TEST_HOME, "TMUX": "owner-server"}}) \
+        == [(1, "owner-server", None)]
+    assert keeper_leaks({}, TEST_HOME, "owner-server",
+                        aims={1: {"FBTODO_HOME": "/other", "TMUX": "owner-server"}}) == []
+    assert keeper_leaks({}, TEST_HOME, "owner-server",
+                        aims={1: {"_read": True, "_clipped": False, "TMUX": "owner-server"}}) \
+        == []
+    assert keeper_leaks({}, TEST_HOME, "owner-server",
+                        aims={1: {"_read": False, "_clipped": False}}) == [(1, None, None)]
+    assert keeper_leaks({1: {}}, TEST_HOME, "owner-server",
+                        aims={1: {"FBTODO_HOME": TEST_HOME, "TMUX": "owner-server"}}) == []
+    say("keeper aim: the leak guard flags a test-home keeper on the live server, leaves "
+        "another root's and a default-root keeper alone, and reports one it could not "
+        "read: ok")
+
+    # ---- the same audit as a WATCH, which is the only way either failure is ever heard
+    #      outside a terminal: an orphan (a role process running with no claim naming it)
+    #      and a broken tie (a free file whose record names a live pid) are both things that
+    #      HAPPEN, and a snapshot taken at the wrong moment says nothing about either. The
+    #      unit is a keyed SET, so a watch can tell a new finding from a standing one, and
+    #      a resolution from silence.
+    watch_rows = [
+        ("keeper", {"path": "/p/fbtodo-pane-keeper.pid", "state": "absent", "pid": None,
+                    "pid_alive": False, "leftover": False, "name_inode": None}),
+        ("watcher", {"path": "/p/fbtodo-daemon.pid", "state": "free", "pid": os.getpid(),
+                     "pid_alive": True, "leftover": True, "name_inode": "mismatch"}),
+        ("nas pane", {"path": "/p/fbtodo-nas-pane.pid", "state": "free", "pid": 1,
+                      "pid_alive": False, "leftover": True, "name_inode": "mismatch"}),
+        ("legacy keeper", {"path": "/old/fbtodo-pane-keeper.pid", "state": "held", "pid": 900,
+                           "pid_alive": True, "leftover": False, "name_inode": "match"}),
+    ]
+    watch_procs = [dict(by_pid[901], role="keeper", age_s=400)]
+    found = module.locks_findings(watch_rows, watch_procs)
+    assert set(found) == {f"tie:watcher:{os.getpid()}", "orphan:keeper:901"}, found
+    assert found[f"tie:watcher:{os.getpid()}"]["kind"] == "tie", found
+    assert found["orphan:keeper:901"]["kind"] == "orphan", found
+    assert found["orphan:keeper:901"]["path"] == "/p/fbtodo-pane-keeper.pid", found
+    assert "pid 901" in module.locks_watch_line("open", found["orphan:keeper:901"])
+    assert "no claim names it" in module.locks_watch_line("open", found["orphan:keeper:901"])
+    assert "a claim names it again" in module.locks_watch_line("clear", found["orphan:keeper:901"])
+    assert "the name and the inode parted" in \
+        module.locks_watch_line("open", found[f"tie:watcher:{os.getpid()}"]), found
+    # ...and the two states that are NOT findings: a dead pid in a free record (the next ask
+    # clears it, and it is not a live tie), and a held claim that names its own holder.
+    assert not [k for k in found if k.startswith("tie:nas")], "a dead leftover was a tie"
+    assert not [k for k in found if k.startswith("tie:legacy")], found
+    # ...and a watch does not report itself: this process is a live pid too.
+    self_row = module.locks_findings(watch_rows, [dict(by_pid[901], pid=os.getpid(),
+                                                       role="keeper", age_s=400)])
+    assert not [k for k in self_row if k.startswith("orphan:")], self_row
+    say("locks watch: an orphan and a broken tie are the findings, keyed by the thing "
+        "itself — a dead leftover, a held claim that names its holder, and this process "
+        "are not: ok")
+
+    # ---- ...and the watch on a real root. A tie is seeded by hand — a FREE claim file whose
+    #      record names a live pid, which is exactly what a replaced file looks like from
+    #      outside — then `locks --watch` must announce it, ask the kit once, and announce it
+    #      cleared once the tie is whole again.
+    saved_lock = None
+    if os.path.exists(lock_path):
+        with open(lock_path, "rb") as fh:
+            saved_lock = fh.read()
+    asked = os.path.join(TEST_HOME, "locks-bell-asked.log")
+    stub_bell = os.path.join(TEST_HOME, "locks-bell")
+    with open(stub_bell, "w") as fh:
+        fh.write(f"#!/bin/sh\necho \"$*\" >> {asked}\n")
+    os.chmod(stub_bell, 0o755)
+    module.atomic_write_json(lock_path, {"pid": os.getpid(), "cwd": CWD, "started_ms": 0,
+                                         "instance_pid": None, "version": module.VERSION})
+    watch_log = os.path.join(TEST_HOME, "locks-watch.jsonl")
+
+    def watch_events() -> list:
+        try:
+            with open(watch_log) as fh:
+                return [json.loads(line) for line in fh if line.strip()]
+        except (OSError, ValueError):
+            return []
+
+    try:
+        with open(watch_log, "w") as handle:
+            watcher = subprocess.Popen(
+                [sys.executable, FB, "locks", "--watch", "--json", "-i", "6"],
+                env={**env, "FBTODO_LOCKS_BELL": stub_bell}, stdout=handle,
+                stderr=subprocess.DEVNULL, cwd=CWD,
+            )
+            try:
+                key = f"tie:watcher:{os.getpid()}"
+                assert soon(lambda: any(e["event"] == "open" and e["key"] == key
+                                        for e in watch_events())), watch_events()
+                opened = next(e for e in watch_events() if e["key"] == key and
+                              e["event"] == "open")
+                assert opened["kind"] == "tie" and opened["pid"] == os.getpid(), opened
+                assert isinstance(opened["at_ms"], int), opened
+                assert soon(lambda: os.path.exists(asked)), "the watch never asked the kit"
+                os.unlink(lock_path)  # the tie is whole again: no file, no tie
+                assert soon(lambda: any(e["event"] == "clear" and e["key"] == key
+                                        for e in watch_events())), watch_events()
+                time.sleep(1.0)
+                assert [e["event"] for e in watch_events() if e["key"] == key] == \
+                    ["open", "clear"], watch_events()
+                with open(asked) as fh:
+                    asks = fh.read().splitlines()
+                assert asks and len(asks) == 1, asks  # once per new finding, not per tick
+                assert asks[0].strip() == "--quiet", asks
+            finally:
+                watcher.terminate()
+                watcher.wait(timeout=15)
+        say("locks --watch: a seeded tie is announced as it appears, the kit is asked once "
+            "about it, and the resolution is announced too: ok")
+        # ...and the kit's own reading of the audit is the same reading: the bell is loaded
+        # from the repository by path and asked about the same document, and the findings it
+        # sees are the findings the watch would print. Two implementations, one document.
+        module.atomic_write_json(lock_path, {"pid": os.getpid(), "cwd": CWD, "started_ms": 0,
+                                             "instance_pid": None, "version": module.VERSION})
+        bell = load_module(os.path.join(ROOT, "scripts", "notify", "locks-bell.py"),
+                           "locks_bell")
+        doc = json.loads(run("locks", "--json").stdout)
+        theirs = bell.findings(doc)
+        mine = module.locks_findings(
+            [(label, module.claim_audit(path)) for label, path in module.claim_files()],
+            module.claim_processes())
+        assert set(theirs) == set(mine), (sorted(theirs), sorted(mine))
+        assert f"tie:watcher:{os.getpid()}" in theirs, theirs
+        say("locks watch: the bell and the watcher read one audit document the same way — "
+            "the seeded tie is a tie to both: ok")
+    finally:
+        if os.path.exists(lock_path):
+            os.unlink(lock_path)
+        if saved_lock is not None:
+            with open(lock_path, "wb") as fh:
+                fh.write(saved_lock)
+
+    # ---- the claim crosses the watcher's own self-reload. The watcher re-execs itself when
+    #      the build under it changes (the row after this one), and the claim has to cross
+    #      that exec or a second watcher could take it in the gap: an exec keeps the pid and
+    #      the descriptor table, so `lock_handoff` marks the locked fd inheritable and names
+    #      it in the environment, and `lock_adopt` takes it back on the other side. Which of
+    #      that is true is the kernel's to say, not this file's, so the proof is a REAL exec
+    #      — and a second run WITHOUT the hand-over, where the same probe loses the claim,
+    #      because Python's descriptors are close-on-exec: that is what the machinery is for,
+    #      and a build that dropped it would fail the first run and pass the second.
+    probe = os.path.join(TEST_HOME, "reload-claim-probe.py")
+    with open(probe, "w") as fh:
+        fh.write(
+            "import json, os, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from fbtodo.locks import lock_adopt, lock_handoff, lock_holder, lock_ours, write_lock\n"
+            "lib, path, mode, cwd = sys.argv[1:5]\n"
+            "if mode != 'adopt':\n"
+            "    assert write_lock(cwd, None, path=path), 'the probe could not claim'\n"
+            "    if mode == 'handoff':\n"
+            "        fd = lock_handoff(path)\n"
+            "        assert fd is not None and os.get_inheritable(fd), 'the claim cannot exec'\n"
+            "    os.execv(sys.executable, [sys.executable, __file__, lib, path, 'adopt', cwd,\n"
+            "                              str(os.getpid())])\n"
+            "before = int(sys.argv[5])\n"
+            "print(json.dumps({'adopted': lock_adopt(path), 'ours': lock_ours(path),\n"
+            "                  'same_pid': os.getpid() == before,\n"
+            "                  'holder': lock_holder(path), 'pid': os.getpid()}))\n"
+        )
+    carry_path = os.path.join(TEST_HOME, "reload-claim.pid")
+    for mode in ("handoff", "nohandoff"):
+        ran = subprocess.run([sys.executable, probe, SRC, carry_path, mode, CWD],
+                             capture_output=True, text=True, timeout=60)
+        assert ran.returncode == 0, (mode, ran.returncode, ran.stdout, ran.stderr)
+        answer = json.loads(ran.stdout.strip().splitlines()[-1])
+        assert answer["same_pid"] is True, f"the exec did not keep the pid: {answer}"
+        if mode == "handoff":
+            assert answer["adopted"] is True and answer["ours"] is True, answer
+            assert answer["holder"] == answer["pid"], \
+                f"the handed-over claim is not held after the exec: {answer}"
+        else:
+            assert answer["adopted"] is False and answer["ours"] is False, answer
+            assert answer["holder"] is None, f"a claim crossed an exec with no hand-over: {answer}"
+    # ...and a hand-over that is not this process's own is never believed: a stale variable,
+    # a failed exec's leftover, or a number somebody typed must not hand out a claim.
+    for junk in ("0:0", f"{os.getpid()}:0", "not-a-number", "3"):
+        os.environ[module.LOCK_FD_ENV] = junk
+        assert module.lock_adopt(carry_path) is False, f"a junk hand-over was believed: {junk}"
+        assert module.LOCK_FD_ENV not in os.environ, f"{junk!r} was left in the environment"
+    for junk_path in (probe, carry_path):
+        if os.path.exists(junk_path):
+            os.remove(junk_path)
+    say("reload: the claim survives the watcher's own exec, and only through a hand-over: ok")
+
+    # ---- the watcher starts itself over when the build under it changes, and the claim goes
+    #      through the exec with it. The pane's own row asked the question; this drives the
+    #      answer through a real watcher: a COPY of the build (never this checkout — touching
+    #      its sources would reload the owner's own pane and watcher), a source written after
+    #      it started, and the watcher must come back as the SAME pid, still holding its
+    #      claim and still writing state, with the reload in its log. A source that does not
+    #      parse must HOLD instead: a watcher that exec'd into a half-written file would die
+    #      in the middle of the save that is replacing it.
+    build = os.path.join(TEST_HOME, "reload-build")
+    shutil.rmtree(build, ignore_errors=True)
+    os.makedirs(build)
+    shutil.copytree(os.path.join(ROOT, "src", "fbtodo"), os.path.join(build, "src", "fbtodo"))
+    shutil.copy(os.path.join(ROOT, "fbtodo"), os.path.join(build, "fbtodo"))
+    reload_src = os.path.join(build, "src", "fbtodo")
+    victim_rl = spawn_quiet("sleep", "600")
+    repl = subprocess.Popen(
+        [sys.executable, os.path.join(build, "fbtodo"), "daemon", "--foreground", "--quiet",
+         "--cwd", CWD, "--instance-pid", str(victim_rl.pid), "-i", "0.2",
+         "--ask-seconds", "0", "--pause-seconds", "0", "--pane-seconds", "0",
+         "--pane-bell-seconds", "0"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+        start_new_session=True, env=env, cwd=CWD,
+    )
+
+    def beats() -> int:
+        return int((module.read_json(module.STATE_PATH, {}) or {}).get("heartbeat_ms") or 0)
+
+    def wait_for(pred, seconds: float = 25.0) -> bool:
+        deadline = time.time() + seconds
+        while time.time() < deadline and not pred():
+            time.sleep(0.1)
+        return pred()
+
+    def log_text() -> str:
+        try:
+            with open(module.LOG_PATH) as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and not os.path.exists(lock_path):
+            time.sleep(0.1)
+        assert module.lock_holder(lock_path) == repl.pid, "the copied watcher never claimed"
+        beat = beats()
+        assert wait_for(lambda: beats() > beat), "the copied watcher never wrote state"
+        # a source newer than the watcher landed: it must start itself over, keeping both the
+        # pid and the claim (a stand-down here would leave no watcher at all)
+        with open(os.path.join(reload_src, "zz_reload.py"), "w") as fh:
+            fh.write("x = 1\n")
+        assert wait_for(lambda: "watcher reloading:" in log_text()), log_text()[-400:]
+        beat = beats()
+        assert repl.poll() is None and os.path.exists(lock_path), "the reload took it down"
+        assert module.lock_holder(lock_path) == repl.pid, "the claim changed hands across a reload"
+        assert wait_for(lambda: beats() > beat), "the reloaded watcher is not serving"
+        # a source that does not parse: hold, and do not exec into it
+        with open(os.path.join(reload_src, "zz_broken.py"), "w") as fh:
+            fh.write("def half(\n")
+        assert wait_for(lambda: "watcher holding" in log_text()), log_text()[-400:]
+        time.sleep(2.5)
+        assert repl.poll() is None, "the watcher died on a source that does not parse"
+        assert log_text().count("watcher reloading:") == 1, "it reloaded into a broken file"
+        os.remove(os.path.join(reload_src, "zz_broken.py"))
+        with open(os.path.join(reload_src, "zz_reload2.py"), "w") as fh:
+            fh.write("y = 2\n")
+        assert wait_for(lambda: log_text().count("watcher reloading:") == 2), log_text()[-400:]
+        assert module.lock_holder(lock_path) == repl.pid and repl.poll() is None
+        beat = beats()
+        assert wait_for(lambda: beats() > beat), "the second reload left nobody serving"
+        # ...and a copy whose launcher is gone still reloads, through `self_argv`'s fallback to
+        # the package's own entry file — the very path a launcher-less copy runs, guard and all
+        os.rename(os.path.join(build, "fbtodo"), os.path.join(build, "fbtodo.gone"))
+        with open(os.path.join(reload_src, "zz_reload3.py"), "w") as fh:
+            fh.write("z = 3\n")
+        assert wait_for(lambda: log_text().count("watcher reloading:") == 3), log_text()[-400:]
+        assert repl.poll() is None and module.lock_holder(lock_path) == repl.pid
+        beat = beats()
+        assert wait_for(lambda: beats() > beat), "the launcher-less reload left nobody serving"
+        # ...and a tree that PARSES but will not BECOME a process must never be executed into.
+        # `source_syntax_error` is silent about it — every file still compiles — while the
+        # import dies, so the probe (`reload_probe_error`) is what holds it. A raise at module
+        # scope in a module the package actually loads is the shape: without the probe the
+        # exec would replace a running watcher with one that never starts.
+        render_copy = os.path.join(reload_src, "render.py")
+        with open(render_copy) as fh:
+            render_orig = fh.read()
+        with open(render_copy, "a") as fh:
+            fh.write("\nraise RuntimeError('internally inconsistent')\n")
+        with open(os.path.join(reload_src, "zz_reload4.py"), "w") as fh:
+            fh.write("w = 4\n")
+        assert wait_for(lambda: "does not load" in log_text()), log_text()[-500:]
+        assert module.source_syntax_error(here=render_copy) is None, \
+            "the unloadable tree does not parse cleanly, so the probe was not what held it"
+        time.sleep(2.5)
+        assert repl.poll() is None, "the watcher exec'd into a build that will not load"
+        assert module.lock_holder(lock_path) == repl.pid, "the claim moved on a held reload"
+        assert log_text().count("watcher reloading:") == 3, "it reloaded into an unfit build"
+        # ...and once the tree is coherent again, the SAME watcher reloads into it — the hold
+        # is a wait, not a surrender.
+        with open(render_copy, "w") as fh:
+            fh.write(render_orig)
+        assert wait_for(lambda: log_text().count("watcher reloading:") == 4), log_text()[-500:]
+        assert repl.poll() is None and module.lock_holder(lock_path) == repl.pid
+        beat = beats()
+        assert wait_for(lambda: beats() > beat), "the recovered reload left nobody serving"
+        say("reload: the watcher replaces itself across an exec — claim, pid and heartbeat — "
+            "holds while the sources do not parse OR the new build will not load, and "
+            "reloads through `self_argv`'s fallback: ok")
+    finally:
+        repl.send_signal(signal.SIGTERM)
+        deadline = time.time() + 10
+        while time.time() < deadline and repl.poll() is None:
+            time.sleep(0.1)
+        kill_tree(repl)
+        kill_tree(victim_rl)
+        deadline = time.time() + 10
+        while time.time() < deadline and module.lock_holder(lock_path):
+            time.sleep(0.1)
+        shutil.rmtree(build, ignore_errors=True)
+
     # ---- discovery, including the platform this machine is not: /proc answers first where
     #      it exists, lsof covers the rest, and the machine's own answer still works
     victim_cwd = os.path.join(TEST_HOME, "victimcwd")
@@ -937,6 +1852,12 @@ try:
                 args = [*_node.args.args, *_node.args.kwonlyargs,
                         *getattr(_node.args, "posonlyargs", [])]
                 bound |= {a.arg for a in args}
+                # `*args`/`**kwargs` bind their names too — a variadic helper's body reads
+                # them like any other parameter, and leaving them out reported a name
+                # nothing provided (measured on `_joined(*blobs)` in locks.py).
+                for _var in (_node.args.vararg, _node.args.kwarg):
+                    if _var is not None:
+                        bound.add(_var.arg)
             elif isinstance(_node, ast.ExceptHandler) and _node.name:
                 bound.add(_node.name)
             elif isinstance(_node, (ast.Import, ast.ImportFrom)):
@@ -1030,6 +1951,1363 @@ try:
         "the no-launcher fallback names the package's entry, not the file that asked"
     say("argv: the re-invocations name the launcher, or the package when there is none: ok")
 
+    # ---- the pane's own staleness, asked by the pane about itself. A pane keeps the build it
+    #      imported, so an upgrade used to leave the list drawn by the old one until somebody
+    #      respawned the pane by hand; `source_newer_than` is the question that lets it start
+    #      itself over. Three answers matter: a source written AFTER the start counts (that is
+    #      code this process is not running, whatever `VERSION` says), a write still landing
+    #      does NOT (an editor halfway through a save must not be exec'd into), and a file that
+    #      will not parse is a reason to WAIT rather than restart — a pane dies on the import,
+    #      and it would die in front of the person editing it.
+    src_copy = os.path.join(TEST_HOME, "source-newer", "src", "fbtodo")
+    shutil.rmtree(os.path.dirname(os.path.dirname(src_copy)), ignore_errors=True)
+    os.makedirs(src_copy)
+    older = os.path.join(src_copy, "older.py")
+    newer = os.path.join(src_copy, "newer.py")
+    for path, age in ((older, 3600), (newer, 10)):
+        with open(path, "w") as fh:
+            fh.write("x = 1\n")
+        os.utime(path, (time.time() - age, time.time() - age))
+    here = os.path.join(src_copy, "base.py")
+    started = time.time() - 60
+    assert module.source_newer_than(started, settle=0, here=here) == newer, \
+        "the newest source written after the start is the answer, not the first one found"
+    assert module.source_newer_than(time.time(), settle=0, here=here) is None, \
+        "nothing written after the start means this process IS the build on disk"
+    assert module.source_newer_than(started, settle=60, here=here) is None, \
+        "a write inside the settle window is not believed yet: ask again, do not restart"
+    assert module.source_newer_than(started, settle=0,
+                                    here=os.path.join(TEST_HOME, "no-such", "base.py")) is None, \
+        "a source tree that cannot be read is not a reason to rebuild"
+    assert module.source_syntax_error(here=here) is None, "two one-line files parse"
+    broken_src = os.path.join(src_copy, "broken.py")
+    with open(broken_src, "w") as fh:
+        fh.write("def half(\n")
+    why = module.source_syntax_error(here=here)
+    assert why and broken_src in why and "line" in why, why
+    os.remove(broken_src)
+    assert module.source_syntax_error(here=here) is None, "and it parses again once the file goes"
+    say("source staleness: newer than the start counts, a save still landing waits, and a file "
+        "that will not parse is a reason to wait rather than restart: ok")
+
+    # ---- and a tree that PARSES can still fail to BECOME a process. The self-reload does not
+    #      re-import, it EXECS, so a build that dies at import would replace a running image
+    #      with a corpse — a watcher or keeper gone, a pane respawned into the same broken
+    #      tree. The probe runs the same command line in a child and asks only whether it
+    #      loads, so the caller can HOLD instead.
+    assert module.reload_probe_error() is None, "the probe rejected the checkout it runs from"
+    assert module.reload_probe_error(timeout=0.001) is not None, \
+        "a probe that could not finish was read as a yes"
+    probe_build = os.path.join(TEST_HOME, "probe-build")
+    shutil.rmtree(probe_build, ignore_errors=True)
+    os.makedirs(probe_build)
+    shutil.copytree(os.path.join(ROOT, "src", "fbtodo"),
+                    os.path.join(probe_build, "src", "fbtodo"))
+    shutil.copy(os.path.join(ROOT, "fbtodo"), os.path.join(probe_build, "fbtodo"))
+    probe_base = os.path.join(probe_build, "src", "fbtodo", "base.py")
+    with open(os.path.join(probe_build, "src", "fbtodo", "render.py"), "a") as fh:
+        fh.write("\nraise RuntimeError('internally inconsistent')\n")
+    assert module.source_syntax_error(here=probe_base) is None, \
+        "the probe build does not parse, so this would test the parser instead"
+    bad = module.reload_probe_error(here=probe_base)
+    assert bad and "internally inconsistent" in bad, bad
+    shutil.rmtree(probe_build, ignore_errors=True)
+    say("the reload probe: a tree that parses but cannot import is a reason to HOLD, not a "
+        "build to exec into: ok")
+
+    # ---- ...and a tree that IMPORTS cleanly can still hide a name a FUNCTION uses. A function
+    #      body is name-resolved only when it runs, so a global that was renamed or deleted
+    #      waits for the one command that reaches that line — and by then the reload has
+    #      already replaced a working image with it. The probe now exercises the entry points
+    #      it safely can (the command parser is built) and then resolves every global the
+    #      package's functions LOAD, so a name used only inside a command that is never called
+    #      still fails the pre-flight. The bait is a function nobody calls, naming a global
+    #      that does not exist; the control is the same shape with the name actually defined.
+    name_build = os.path.join(TEST_HOME, "probe-name-build")
+    shutil.rmtree(name_build, ignore_errors=True)
+    os.makedirs(name_build)
+    shutil.copytree(os.path.join(ROOT, "src", "fbtodo"),
+                    os.path.join(name_build, "src", "fbtodo"))
+    shutil.copy(os.path.join(ROOT, "fbtodo"), os.path.join(name_build, "fbtodo"))
+    name_base = os.path.join(name_build, "src", "fbtodo", "base.py")
+    with open(name_base, "a", encoding="utf-8") as fh:
+        fh.write("\n_PROBE_PRESENT = 1\n\ndef _probe_fine():\n    return _PROBE_PRESENT\n")
+    assert module.reload_probe_error(here=name_base) is None, \
+        "a global that IS defined, used only inside a function, was read as missing"
+    with open(name_base, "a", encoding="utf-8") as fh:
+        fh.write("\ndef _probe_bait():\n    return FBTODO_PROBE_MISSING_NAME\n")
+    assert module.source_syntax_error(here=name_base) is None, \
+        "the bait tree does not parse, so this would test the parser instead"
+    named = module.reload_probe_error(here=name_base)
+    assert named and "FBTODO_PROBE_MISSING_NAME" in named and "_probe_bait" in named, named
+    shutil.rmtree(name_build, ignore_errors=True)
+    assert module.undefined_global_names() is None, "the checkout names everything it uses"
+    say("the reload probe: a function body's globals are resolved too — a name used only "
+        "inside a command that was never called still fails the pre-flight: ok")
+
+    # ---- the pane's environment, pinned rather than inherited. tmux REBUILDS a pane's PATH,
+    #      so a pane command resolved through it can come up on a different Python than the
+    #      process that asked for the pane — measured 2026-10-01, a pane on `/usr/bin/python3`
+    #      3.9.6 beside a watcher on Homebrew's 3.14. `pane_command` names the interpreter
+    #      absolutely and hands the pane the opener's own PATH; `python_of`/`pane_python` are
+    #      what let `fbtodo status` say which Python that turned out to be. The flags must
+    #      survive the pin: the keeper finds a pane by reading them back out of the line.
+    cmd = module.local_pane_command(4242)
+    parts = shlex.split(cmd)
+    assert parts[0] == "/usr/bin/env" and f"PATH={module.pinned_path()}" in parts, cmd
+    assert module.self_argv()[0] in parts and module.self_argv()[1] in parts, cmd
+    assert module.PANE_WATCH_RE.search(cmd).group(1) == "4242", cmd
+    nas = module.nas_pane_command(types.SimpleNamespace(
+        nas_host="h", nas_root="/r", nas_project="p", fb_marker="/m"))
+    assert "/usr/bin/env PATH=" in nas and "--no-daemon" in shlex.split(nas), nas
+    assert module.PANE_INSTANCE_RE.search(
+        module.pane_command(["x", "--instance-of", "7"])).group(1) == "7"
+    # The PIN's shape: the interpreter's own directory first (so anything the pane starts by
+    # name — an `env python3` shebang under `scripts/notify/` — is the same Python the pane is
+    # on), the opener's PATH kept behind it, and no directory listed twice. FBTODO_PATH
+    # replaces that base, never the leading directory.
+    here = os.path.dirname(sys.executable)
+    pin = module.pinned_path().split(os.pathsep)
+    assert pin[0] == here, pin[:3]
+    assert pin.count(here) == 1, pin[:3]
+    os.environ["FBTODO_PATH"] = os.pathsep.join([here, "/usr/bin", here])
+    deduped = module.pinned_path().split(os.pathsep)
+    assert deduped[0] == here and deduped.count(here) == 1, deduped[:3]
+    os.environ["FBTODO_PATH"] = "/pinned/once"
+    assert module.pinned_path() == os.pathsep.join([here, "/pinned/once"]), \
+        "FBTODO_PATH replaces the base, and the interpreter still leads"
+    del os.environ["FBTODO_PATH"]
+
+    assert module.python_of("/opt/homebrew/bin/python3.14 /p/fbtodo --watch-pid 1") == \
+        "/opt/homebrew/bin/python3.14"
+    # the two spellings a pin takes, and the one answer that must NOT be given: a shell is not
+    # a python, and saying it was one is what would make `status` lie about a pane
+    assert module.python_of(
+        "/usr/bin/env PATH=/usr/bin:/bin /a/Python.app/Contents/MacOS/Python /p/fbtodo") == \
+        "/a/Python.app/Contents/MacOS/Python", "macOS names its interpreter `Python`"
+    assert module.python_of("-zsh -c 'fbtodo --instance-of 1'") is None
+    rows = [{"pane": "%1", "pid": 900, "window": "@1", "start": "pinned"}]
+    table = {900: (1, "-zsh -c '/usr/bin/env PATH=/x /usr/bin/python3 /p/fbtodo'"),
+             901: (900, "/opt/homebrew/bin/python3.14 /p/fbtodo --instance-of 1")}
+    assert module.pane_python("%1", rows=rows, table=table) == \
+        "/opt/homebrew/bin/python3.14", "a pane whose command is a shell answers from its child"
+    assert module.pane_python("%2", rows=rows, table=table) is None, "no such pane, no answer"
+    say("pane environment: the interpreter is named absolutely under the opener's PATH, the "
+        "flags survive it, and the pane's own Python can be read back: ok")
+
+    # ---- the keeper's other repair: a pane found on a different interpreter than its
+    #      watcher's is reopened with the pinned command IN PLACE, so it puts itself right
+    #      instead of `status` telling somebody to respawn it. The decision is read from the
+    #      processes at BOTH ends and compared by real path — one interpreter under two names
+    #      is not a drift — and it refuses to guess: no watcher, or a pane whose own line
+    #      names no interpreter (still starting), is left alone. The repair itself is driven
+    #      through a real private tmux server, because `respawn-pane -k` is the whole point:
+    #      the pane keeps its id and its slot and comes back on the pin, and a pane already
+    #      carrying this build's pin is not respawned again (which would be a storm, once per
+    #      pass, on a keeper that is itself the one out of step).
+    drift_dir = os.path.join(TEST_HOME, "pane-python")
+    os.makedirs(drift_dir, exist_ok=True)
+    real_py = os.path.join(drift_dir, "python3")
+    with open(real_py, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\nexit 0\n")
+    os.chmod(real_py, 0o755)
+    twin_py = os.path.join(drift_dir, "python3-link")
+    if os.path.lexists(twin_py):
+        os.remove(twin_py)
+    os.symlink(real_py, twin_py)
+    d_rows = [{"pane": "%1", "pid": 900, "window": "@1", "start": "fbtodo --watch-pid 4242"}]
+    d_table = {900: (1, "-zsh"), 901: (900, f"{real_py} /p/fbtodo --watch-pid 4242")}
+    assert module.pane_drifted("%1", real_py, rows=d_rows, table=d_table) is None, \
+        "a pane on the watcher's interpreter is not a drift"
+    assert module.pane_drifted("%1", "/usr/bin/python3", rows=d_rows, table=d_table) == real_py, \
+        "a pane on another interpreter is the drift the keeper repairs"
+    assert module.pane_drifted("%1", twin_py, rows=d_rows, table=d_table) is None, \
+        "one interpreter under two names is not a drift: the comparison is by real path"
+    assert module.pane_drifted("%1", None, rows=d_rows, table=d_table) is None, \
+        "no watcher to compare against is not a reason to respawn a pane"
+    shell_table = {900: (1, "-zsh -c '/p/fbtodo --watch-pid 4242'")}
+    assert module.pane_drifted("%1", "/usr/bin/python3", rows=d_rows, table=shell_table) is None, \
+        "a pane whose line names no interpreter (still starting) is left alone"
+    # ...and the command a pane reports is read back as the COMMAND: tmux quotes it the way
+    # a shell would (`'X Y'`, `"X 'Y'"`) when it needs quoting, and a pinned command always
+    # does. Compared raw, the pin a pane was started from never equals what tmux says it is,
+    # which is how a keeper that believed the comparison would respawn on every pass.
+    assert module.pane_start_command('"sleep 300"') == "sleep 300"
+    assert module.pane_start_command("'X\"Y'") == 'X"Y'
+    assert module.pane_start_command('"X \\"Y\\""') == 'X "Y"'
+    assert module.pane_start_command("nosuchcmd") == "nosuchcmd"
+    assert module.pane_start_command("a\\b") == "a\\b", "an unwrapped value is left alone"
+    assert module.pane_start_command("'unbalanced") == "'unbalanced"
+    # A pane whose command is ALREADY this build's pin is not the one out of step — respawning
+    # it would re-run what it is running — so it stays, and the pane log says once which side
+    # to look at. `%9999` is on purpose: no such pane exists, and nothing may reach tmux for
+    # one that is only here to make the guard fire.
+    def pane_log_text() -> str:
+        try:
+            with open(module.PANE_LOG_PATH, encoding="utf-8") as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    log_before_held = pane_log_text()
+    assert module.repair_drifted_panes(
+        {4242: "@1"}, "/usr/bin/python3",
+        rows=[{"pane": "%9999", "pid": 900, "window": "@1",
+               "start": module.local_pane_command(4242)}],
+        table=d_table,
+    ) == [], "a pane already carrying the pin was respawned"
+    assert "already carries this build's pin" in pane_log_text()[len(log_before_held):], \
+        pane_log_text()[-300:]
+
+    # ...and the repair through a real server. `FBTODO_PANE_SECONDS=0` and `FBTODO_HOME` in
+    # the server's environment are load-bearing: the pane the respawn starts calls
+    # `ensure_daemon`, and a keeper or watcher built for a stand-in pane would outlive it.
+    if shutil.which("tmux"):
+        pin_sock = "fbtpinsock"
+        tmux_pin = ["tmux", "-L", pin_sock]
+        subprocess.run(tmux_pin + ["kill-server"], capture_output=True)
+        made = subprocess.run(
+            tmux_pin + [
+                "new-session", "-d", "-s", "pinsess", "-x", "80", "-y", "24",
+                "-c", TEST_HOME,
+                "-e", f"FBTODO_HOME={TEST_HOME}",
+                "-e", "FBTODO_PANE_SECONDS=0",
+                "-e", "FBTODO_NO_AUTOSTART=1",
+                "sleep 300",
+            ],
+            capture_output=True, text=True,
+        )
+        assert made.returncode == 0, made.stderr
+        saved_tmux = list(module.TMUX_BIN)
+        set_knob(module, "TMUX_BIN", list(tmux_pin))
+        try:
+            listed = subprocess.run(
+                tmux_pin + ["list-panes", "-t", "pinsess", "-F", "#{pane_id} #{pane_pid}"],
+                capture_output=True, text=True,
+            ).stdout.split()
+            live_pane, live_pid = listed[0], int(listed[1])
+            live_rows = [{"pane": live_pane, "pid": live_pid, "window": "@1",
+                          "start": "fbtodo --watch-pid 4242"}]
+            live_table = {live_pid: (1, "-zsh"),
+                          live_pid + 1: (live_pid, f"{real_py} /p/fbtodo --watch-pid 4242")}
+            # The knob, before any attempt is made: a pane marked `@fbtodo_repair off` — a
+            # tmux user option, so it is per pane by construction — is kept exactly as it
+            # is, and the keeper still says what it saw: the log names the drift, and the
+            # note is the `kept` one the RUNNING pane picks up (nothing is restarting to
+            # deliver a reopen note). `on`/`0`/unset are read back the way the manager
+            # writes them, and turning it back on resumes the repair with no keeper restart.
+            subprocess.run(tmux_pin + ["set", "-p", "-t", live_pane, "@fbtodo_repair", "off"],
+                           capture_output=True)
+            assert module.pane_repair_off(live_pane) is True, \
+                "the `@fbtodo_repair off` mark was not read"
+            module._DRIFT_TRIED.clear()
+            module._DRIFT_KEPT.clear()
+            kept_mark = len(pane_log_text())
+            assert module.repair_drifted_panes({4242: "@1"}, "/usr/bin/python3",
+                                               rows=live_rows, table=live_table) == [], \
+                "a pane marked repair-off was respawned"
+            assert "repair is off (@fbtodo_repair)" in pane_log_text()[kept_mark:], \
+                pane_log_text()[-300:]
+            kept_note = module.pane_note_take(live_pane, kind="kept")
+            assert kept_note and kept_note.get("was") == real_py, kept_note
+            assert module.reopen_note(kept_note) == \
+                f"KEPT (was on {module._short_python(real_py)})", module.reopen_note(kept_note)
+            assert subprocess.run(
+                tmux_pin + ["list-panes", "-t", "pinsess", "-F", "#{pane_id}"],
+                capture_output=True, text=True,
+            ).stdout.split() == [live_pane], "the kept pane was replaced anyway"
+            subprocess.run(tmux_pin + ["set", "-p", "-t", live_pane, "@fbtodo_repair", "on"],
+                           capture_output=True)
+            assert module.pane_repair_off(live_pane) is False, "`on` did not turn it back"
+            subprocess.run(tmux_pin + ["set", "-p", "-t", live_pane, "@fbtodo_repair", "0"],
+                           capture_output=True)
+            assert module.pane_repair_off(live_pane) is True, "the `0` spelling was not read"
+            subprocess.run(tmux_pin + ["set", "-p", "-u", "-t", live_pane, "@fbtodo_repair"],
+                           capture_output=True)
+            assert module.pane_repair_off(live_pane) is False, \
+                "an unset option stayed off (the repair never comes back)"
+            # ...and the same knob as a COMMAND, so nobody has to remember the
+            # incantation: `fbtodo keep off/on/default` against this pane, the same verbs
+            # server-wide, an explicit `on` winning over a server-wide `off`, and the
+            # target rules (a pane can be named from outside it; no target outside tmux is
+            # the caller's error, not a guess). `FBTODO_TMUX` is how the launcher names a
+            # private server, which is exactly what the flag is for.
+            keep_env = dict(env, FBTODO_TMUX=f"tmux -L {pin_sock}")
+
+            def keep(*argv):
+                return subprocess.run(
+                    [sys.executable, FB, "keep", *argv], capture_output=True, text=True,
+                    env=keep_env, cwd=CWD, timeout=60,
+                )
+
+            def keep_line(*argv) -> str:
+                out = keep(*argv).stdout
+                rows = [ln for ln in STRIP(out).splitlines() if "repair" in ln]
+                assert rows, out[-300:]
+                return rows[0]
+
+            assert "repair : on" in keep_line("--pane", live_pane), keep_line("--pane", live_pane)
+            ran = keep("off", "--pane", live_pane)
+            assert ran.returncode == 0 and "repair : off" in ran.stdout, \
+                (ran.returncode, ran.stdout, ran.stderr)
+            assert "kept as it is" in ran.stdout, ran.stdout[-200:]
+            assert module.pane_repair_off(live_pane) is True, "the CLI did not set the knob"
+            ran = keep("default", "--pane", live_pane)
+            assert ran.returncode == 0 and module.pane_repair_off(live_pane) is False, ran
+            # an explicit `on` wins over a server-wide `off`; `default` gives both back
+            assert keep("off", "--server").returncode == 0, "the server-wide knob was refused"
+            assert module.pane_repair_off(live_pane) is True, "the server-wide knob was not read"
+            ran = keep("on", "--pane", live_pane)
+            assert ran.returncode == 0 and module.pane_repair_off(live_pane) is False, ran
+            assert "reopened on its pin" in ran.stdout, ran.stdout[-200:]
+            bare = {k: v for k, v in keep_env.items() if k != "TMUX_PANE"}
+            ran = subprocess.run([sys.executable, FB, "keep", "off"],
+                                 capture_output=True, text=True, env=bare, cwd=CWD, timeout=60)
+            assert ran.returncode == 64 and "--pane" in ran.stderr, (ran.returncode, ran.stderr)
+            assert keep("default", "--server").returncode == 0, "the server-wide unset was refused"
+            assert module.pane_repair_off(live_pane) is False, \
+                "the server-wide unset did not stick"
+            # ...and the MIDDLE scope, a window: the knob written with `-w` belongs to that
+            # window's panes and to no pane in a sibling, `default` hands the window back to
+            # the server's answer again, and a target that names no window is tmux's silence
+            # (69), never a guess. `--window` takes the same TARGET shapes `pin`/`why` do —
+            # a session, `session:index`, a window id — resolved through tmux, with the
+            # report naming the id the write actually landed on.
+            made = subprocess.run(
+                tmux_pin + ["new-window", "-d", "-t", "pinsess", "-n", "sibling",
+                            "-c", TEST_HOME, "sleep 300"],
+                capture_output=True, text=True,
+            )
+            assert made.returncode == 0, made.stderr
+            win_rows = [line.split() for line in subprocess.run(
+                tmux_pin + ["list-windows", "-t", "pinsess",
+                            "-F", "#{window_id} #{window_name}"],
+                capture_output=True, text=True,
+            ).stdout.splitlines()]
+            assert len(win_rows) == 2, win_rows
+            first_win, other_win = win_rows[0][0], win_rows[1][0]
+            assert module.window_repair_value("@9999") is None, \
+                "a window target that exists nowhere must read as no answer, not as unset"
+            other_pane = subprocess.run(
+                tmux_pin + ["list-panes", "-t", other_win, "-F", "#{pane_id}"],
+                capture_output=True, text=True,
+            ).stdout.split()[0]
+            # The row above left live_pane with its own pane-level `on` — that pin is about
+            # a pane outranking the server — and a pane's own choice also outranks a
+            # window's, so it is cleared first: these rows are about the rung BELOW the
+            # pane, and the window's write has to be visible through it.
+            assert keep("default", "--pane", live_pane).returncode == 0, \
+                "the pane-level choice would not clear"
+            assert "repair : on" in keep_line("--window", first_win), \
+                keep_line("--window", first_win)
+            ran = keep("off", "--window", "pinsess")
+            assert ran.returncode == 0 and "repair : off" in ran.stdout, \
+                (ran.returncode, ran.stdout, ran.stderr)
+            assert f"window {first_win}" in ran.stdout, ran.stdout
+            assert (module.tmux_run("show-options", "-w", "-v", "-t", first_win,
+                                    "@fbtodo_repair") or "").strip() == "off", \
+                "the write did not land on the window rung"
+            assert module.pane_repair_off(live_pane) is True, \
+                "a pane in the window did not inherit the write"
+            assert module.pane_repair_off(other_pane) is False, \
+                "a pane in a sibling window inherited the write"
+            assert "repair : on" in keep_line("--window", other_win), \
+                keep_line("--window", other_win)
+            ran = keep("default", "--window", "pinsess")
+            assert ran.returncode == 0 and "the server's choice applies again" in ran.stdout, \
+                (ran.returncode, ran.stdout)
+            assert module.tmux_run("show-options", "-w", "-v", "-t", first_win,
+                                   "@fbtodo_repair") is None, \
+                "default left the window's own choice in place"
+            # the window rung outranks the server's: a server-wide off reads through both
+            # windows, and a window's own `on` reads through its own panes only
+            assert keep("off", "--server").returncode == 0
+            assert module.pane_repair_off(live_pane) is True \
+                and module.pane_repair_off(other_pane) is True, "the server-wide off did not read"
+            ran = keep("on", "--window", other_win)
+            assert ran.returncode == 0 and module.pane_repair_off(other_pane) is False, ran
+            assert module.pane_repair_off(live_pane) is True, \
+                "a window's `on` leaked into a sibling window"
+            assert keep("default", "--window", other_win).returncode == 0
+            assert module.pane_repair_off(other_pane) is True, \
+                "default did not hand the window back to the server's off"
+            # the scopes are one per call, and a window that does not exist is named as such
+            ran = keep("off", "--window", first_win, "--pane", live_pane)
+            assert ran.returncode == 64 and "--window" in ran.stderr, (ran.returncode, ran.stderr)
+            ran = keep("off", "--server", "--window", first_win)
+            assert ran.returncode == 64 and "--server" in ran.stderr, (ran.returncode, ran.stderr)
+            ran = keep("--window", "no-such-window")
+            assert ran.returncode == 69 and "no such window" in ran.stderr, \
+                (ran.returncode, ran.stderr)
+            assert keep("default", "--server").returncode == 0, "the server-wide unset was refused"
+            assert module.pane_repair_off(live_pane) is False, \
+                "the server-wide unset did not stick (after the window rows)"
+            module._DRIFT_TRIED.clear()
+            repaired = module.repair_drifted_panes({4242: "@1"}, "/usr/bin/python3",
+                                                   rows=live_rows, table=live_table)
+            assert repaired == [live_pane], (repaired, live_pane)
+            after = subprocess.run(
+                tmux_pin + ["list-panes", "-t", "pinsess",
+                            "-F", "#{pane_id}|#{pane_start_command}"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            got_pane, got_start = after.split("|", 1)
+            got_start = module.pane_start_command(got_start)
+            assert got_pane == live_pane, "the repair changed the pane's id"
+            assert got_start == module.local_pane_command(4242), got_start
+            # The next pass reads that command back from tmux and finds the pin on it, so the
+            # pane is left alone — no second respawn, however often the keeper looks.
+            module._DRIFT_TRIED.clear()
+            assert module.repair_drifted_panes(
+                {4242: "@1"}, "/usr/bin/python3",
+                rows=[{"pane": got_pane, "pid": live_pid, "window": "@1", "start": got_start}],
+                table=live_table,
+            ) == [], "a pane already carrying the pin was respawned again"
+        finally:
+            set_knob(module, "TMUX_BIN", saved_tmux)
+            subprocess.run(tmux_pin + ["kill-server"], capture_output=True)
+        say("pane interpreter drift: a pane on another Python than its watcher is reopened on "
+            "the pinned command in place, one already on the pin is left alone, and one "
+            "marked `@fbtodo_repair off` is kept as it is — diagnosed, logged and told on its "
+            "own chip — and `fbtodo keep` flips the knob, pane, window or server, without "
+            "the incantation: ok")
+
+    # ---- ...and the drift repair reads the pane's whole TREE now, not only its own line:
+    #      what a pane starts under itself — a keeper, a bell through its watcher, a tmux
+    #      child — is part of the same promise (one interpreter for the session), and a
+    #      reader that stops at the pane can never see a child that resolved differently.
+    #      `tree_pythons` answers with every interpreter in the subtree, the pane's own
+    #      first; `tree_drift` names the first member on another one by REAL PATH; the
+    #      keeper treats that as the same drift and reopens the pane on the pin when its
+    #      command is not the pin already — and when it IS, re-running it cannot change what
+    #      a child resolved, so the child is named once and the launch is left to the pin
+    #      (`notify_argv`, whose shape is asserted here too).
+    tree_dir = os.path.join(TEST_HOME, "pane-tree")
+    os.makedirs(tree_dir, exist_ok=True)
+    other_py = os.path.join(tree_dir, "python3")
+    with open(other_py, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\nexit 0\n")
+    os.chmod(other_py, 0o755)
+    t_rows = [{"pane": "%1", "pid": 900, "window": "@1", "start": "fbtodo --watch-pid 4242"}]
+    # the pane's own line is a login shell — its nearest descendant is the answer
+    # `pane_python` would give — and a tmux child under that resolved elsewhere
+    t_shell = {900: (1, "-zsh -c '/p/fbtodo --watch-pid 4242'")}
+    t_tree = {
+        901: (900, f"{real_py} /p/fbtodo --watch-pid 4242"),
+        902: (901, f"{other_py} /p/fbtodo --watch-pid 4242"),
+    }
+    got_tree = module.tree_pythons("%1", rows=t_rows, table={**t_shell, **t_tree})
+    assert got_tree[0] == (901, real_py), "the pane's nearest answer does not lead the tree"
+    assert sorted(got_tree) == sorted([(901, real_py), (902, other_py)]), got_tree
+    assert module.tree_drift("%1", rows=t_rows, table={**t_shell, **t_tree}) == (902, other_py), \
+        "a child on another interpreter is the drift the tree reader exists for"
+    assert module.tree_drift(
+        "%1", rows=t_rows,
+        table={**t_shell, 901: (900, f"{real_py} /p/fbtodo --watch-pid 4242"),
+               902: (901, f"{twin_py} /p/fbtodo --watch-pid 4242")},
+    ) is None, "one interpreter under two names is not a drift: the comparison is by real path"
+    assert module.tree_drift("%1", rows=t_rows, table=t_shell) is None, \
+        "a tree with no interpreter in it has nothing to compare"
+    assert module.tree_pythons("%404", rows=t_rows, table=t_shell) == []
+    # every bell runs behind an explicit PATH=<pin>, so the `env python3` in its shebang
+    # resolves in the asking process's pin rather than in whatever PATH it inherited
+    bell = module.notify_argv([os.path.join(TEST_HOME, "bell.py"), "--quiet"])
+    assert bell[0] == ("/usr/bin/env" if os.path.exists("/usr/bin/env") else "env"), bell
+    assert bell[1] == f"PATH={module.pinned_path()}" and bell[2].endswith("bell.py"), bell
+    assert bell[3:] == ["--quiet"], bell
+
+    # ---- and the pane a keeper reopened SAYS SO on its title chip. The log was the only
+    #      place the repair spoke, which is the wrong way round — the person watching is
+    #      looking at the pane when its process is replaced under them. The note cannot ride
+    #      the environment the way a reload's does (`respawn-pane` starts a fresh command in
+    #      the server's environment, with no exec to carry it), so it waits at a path: written
+    #      by the keeper before the respawn, claimed once by the pane it names (its own id is
+    #      `TMUX_PANE`), and dropped unshown when it has waited too long.
+    long_py = ("/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/"
+               "Versions/3.14/Resources/Python.app/Contents/MacOS/Python")
+    assert module.reopen_note({"was": "/usr/bin/python3"}) == \
+        "REOPENED (was on /usr/bin/python3)"
+    assert module.reopen_note({"was": long_py, "child": 4242}) == \
+        f"REOPENED (a child was on {module._short_python(long_py)})", \
+        "a long interpreter path is not shortened on the chip"
+    assert module.reopen_note(None) is None and module.reopen_note({}) is None
+    assert module.reopen_note({"was": ""}) == "REOPENED ON THE PIN", \
+        "a note without the name still does not say which act it was"
+    # ...and the knob's note: the keeper SAW the drift and kept the pane, so the chip says
+    # that instead of `REOPENED` — with the same evidence, and with the knob's own words
+    # when there was nothing to name
+    assert module.reopen_note({"was": long_py, "child": 4242, "kind": "kept"}) == \
+        f"KEPT (a child was on {module._short_python(long_py)})"
+    assert module.reopen_note({"was": "/usr/bin/python3", "kind": "kept"}) == \
+        "KEPT (was on /usr/bin/python3)"
+    assert module.reopen_note({"kind": "kept"}) == "KEPT (repair off)"
+    # ...and the two kinds never steal each other's note: the running pane's poll takes
+    # `kept` only, so a `reopen` note stays for the process that will replace it
+    module.pane_note_write("%noteD", "/usr/bin/python3")
+    assert module.pane_note_take("%noteD", kind="kept", sweep=False) is None, \
+        "the running pane took the note meant for its replacement"
+    got_d = module.pane_note_take("%noteD")
+    assert got_d and (got_d.get("kind") or "reopen") == "reopen", got_d
+    module.pane_note_write("%noteE", "/usr/bin/python3", kind="kept")
+    got_e = module.pane_note_take("%noteE", kind="kept", sweep=False)
+    assert got_e and got_e.get("kind") == "kept", got_e
+    assert module.pane_note_take("%noteE", kind="kept", sweep=False) is None, \
+        "a kept note was shown twice"
+    module.pane_note_write("%noteA", "/usr/bin/python3")
+    got_note = module.pane_note_take("%noteA")
+    assert got_note and got_note.get("was") == "/usr/bin/python3" \
+        and got_note.get("child") is None, got_note
+    assert module.pane_note_take("%noteA") is None, "a note was shown twice"
+    assert module.pane_note_take(None) is None and module.pane_note_take("%nobody") is None
+    module.pane_note_write("%noteB", long_py, child=7)
+    stale = module.read_json(module.PANE_NOTE_PATH, {}) or {}
+    stale["%noteB"] = dict(stale["%noteB"],
+                           at_ms=int((time.time() - module.PANE_NOTE_S - 5) * 1000))
+    with open(module.PANE_NOTE_PATH, "w", encoding="utf-8") as fh:
+        json.dump(stale, fh)
+    assert module.pane_note_take("%noteB") is None, "a stale note was shown"
+    module.pane_note_write("%noteC", "/usr/bin/python3")
+    module.pane_note_forget("%noteC")
+    assert module.pane_note_take("%noteC") is None, "a withdrawn note was shown"
+    # ...and the whole path once through the real command: a pane started with a note for
+    # the id it reports says it on the frame's title chip, and the note is gone afterwards
+    module.pane_note_write("%fbnote", "/usr/bin/python3")
+    note_env = dict(env, TERM="xterm-256color", COLORTERM="truecolor", FORCE_COLOR="1",
+                    TMUX_PANE="%fbnote")
+    note_env.pop("NO_COLOR", None)
+    note_run = subprocess.run(
+        [sys.executable, FB, "pane", "--once", "--no-daemon", "--stale-after", "0"],
+        capture_output=True, text=True, env=note_env, cwd=CWD, timeout=60,
+    )
+    assert note_run.returncode == 0, (note_run.returncode, note_run.stderr[-400:])
+    assert "REOPENED (was on /usr/bin/python3)" in note_run.stdout, \
+        note_run.stdout.splitlines()[0] if note_run.stdout else note_run.stderr[-300:]
+    assert "%fbnote" not in (module.read_json(module.PANE_NOTE_PATH, {}) or {}), \
+        "the pane did not claim its note"
+    # ...and the same way for a pane the keeper KEPT — the chip explains what was seen even
+    # though nothing was restarted: written for a running pane to claim, and shown by it
+    module.pane_note_write("%fbkept", "/usr/bin/python3", kind="kept")
+    kept_run = subprocess.run(
+        [sys.executable, FB, "pane", "--once", "--no-daemon", "--stale-after", "0"],
+        capture_output=True, text=True, env=dict(note_env, TMUX_PANE="%fbkept"),
+        cwd=CWD, timeout=60,
+    )
+    assert kept_run.returncode == 0, (kept_run.returncode, kept_run.stderr[-400:])
+    assert "KEPT (was on /usr/bin/python3)" in kept_run.stdout, \
+        kept_run.stdout.splitlines()[0] if kept_run.stdout else kept_run.stderr[-300:]
+    assert "%fbkept" not in (module.read_json(module.PANE_NOTE_PATH, {}) or {}), \
+        "the pane did not claim its kept note"
+    say("pane repair note: a pane the keeper acted on says so on its title chip for a few "
+        "seconds — `REOPENED (was on …)` for a respawn, `KEPT (was on …)` for one it left "
+        "alone — and claims the note once, and a stale one is never shown: ok")
+
+    # ...and the repair through a real server, on tree evidence: the pane keeps its id and
+    # comes back on the pin. `FBTODO_PANE_SECONDS=0` and `FBTODO_HOME` in the server's
+    # environment are load-bearing, the same as in the row above.
+    if shutil.which("tmux"):
+        tree_sock = "fbtreesock"
+        tmux_tree = ["tmux", "-L", tree_sock]
+        subprocess.run(tmux_tree + ["kill-server"], capture_output=True)
+        tree_script = os.path.join(TEST_HOME, "fbtodo-tree-pane.py")
+        with open(tree_script, "w", encoding="utf-8") as fh:
+            fh.write("import time\ntime.sleep(300)\n")
+        made = subprocess.run(
+            tmux_tree + [
+                "new-session", "-d", "-s", "treesess", "-x", "80", "-y", "24",
+                "-c", TEST_HOME,
+                "-e", f"FBTODO_HOME={TEST_HOME}",
+                "-e", "FBTODO_PANE_SECONDS=0",
+                "-e", "FBTODO_NO_AUTOSTART=1",
+                f"{sys.executable} {tree_script} --watch-pid 4242",
+            ],
+            capture_output=True, text=True,
+        )
+        assert made.returncode == 0, made.stderr
+        saved_tmux = list(module.TMUX_BIN)
+        set_knob(module, "TMUX_BIN", list(tmux_tree))
+        try:
+            listed = subprocess.run(
+                tmux_tree + ["list-panes", "-t", "treesess", "-F", "#{pane_id} #{pane_pid}"],
+                capture_output=True, text=True,
+            ).stdout.split()
+            tree_pane, tree_pid = listed[0], int(listed[1])
+            live_rows, live_table = module.pane_rows(), module.process_table()
+            # the real tree, read from the real processes: one interpreter, read the same
+            # way by both readers
+            live_tree = module.tree_pythons(tree_pane, live_rows, live_table)
+            assert live_tree, "the live pane's own interpreter was not read"
+            assert module.tree_drift(tree_pane, live_rows, live_table) is None, live_tree
+            assert module.pane_python(tree_pane, live_rows, live_table) == live_tree[0][1]
+            # a tree that genuinely disagrees: the child's line names an interpreter this
+            # machine does not run the tree on, which is what the decision below is about
+            elsewhere = os.path.join(tree_dir, "elsewhere", "python3")
+            drift_table = {
+                tree_pid: (1, f"{sys.executable} {tree_script} --watch-pid 4242"),
+                tree_pid + 1: (tree_pid, f"{elsewhere} /p/fbtodo --watch-pid 4242"),
+            }
+            # the keeper's own wiring, with tmux stubbed: the note is written BEFORE the
+            # respawn (a pane cannot read a file that is not there yet) and taken back when
+            # the respawn did not happen, so nothing else can claim it
+            seen = {}
+
+            def fake_tmux(*argv, timeout=10.0):
+                seen["argv"] = argv
+                seen["note"] = module.read_json(module.PANE_NOTE_PATH, {}) or {}
+                return None
+
+            real_tmux = module.tmux_run
+            set_knob(module, "tmux_run", fake_tmux)
+            try:
+                module._DRIFT_TRIED.clear()
+                module._DRIFT_HELD.clear()
+                assert module.repair_drifted_panes({4242: "@1"}, None, rows=live_rows,
+                                                   table=drift_table) == []
+                assert tuple(seen["argv"][:3]) == ("respawn-pane", "-k", "-t"), seen["argv"]
+                assert seen["note"].get(tree_pane, {}).get("was") == elsewhere, seen["note"]
+                assert seen["note"].get(tree_pane, {}).get("child"), seen["note"]
+                left = module.read_json(module.PANE_NOTE_PATH, {}) or {}
+                assert tree_pane not in left, "a note stayed when the respawn was abandoned"
+            finally:
+                set_knob(module, "tmux_run", real_tmux)
+            module._DRIFT_TRIED.clear()
+            module._DRIFT_HELD.clear()
+            log_before_tree = pane_log_text()
+            repaired = module.repair_drifted_panes({4242: "@1"}, None, rows=live_rows,
+                                                   table=drift_table)
+            assert repaired == [tree_pane], (repaired, tree_pane)
+            after = subprocess.run(
+                tmux_tree + ["list-panes", "-t", "treesess",
+                             "-F", "#{pane_id}|#{pane_start_command}"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            got_pane, got_start = after.split("|", 1)
+            assert got_pane == tree_pane, "the repair changed the pane's id"
+            assert module.pane_start_command(got_start) == module.local_pane_command(4242), got_start
+            # a pane that already carries the pin is not respawned for a child: re-running
+            # the pin cannot change what that child resolved, so it is named once instead
+            module._DRIFT_TRIED.clear()
+            module._DRIFT_HELD.clear()
+            held_rows = [{"pane": tree_pane, "pid": tree_pid, "window": "@1",
+                          "start": module.local_pane_command(4242)}]
+            assert module.repair_drifted_panes({4242: "@1"}, None, rows=held_rows,
+                                               table=drift_table) == [], \
+                "a pane already carrying the pin was respawned for a child"
+            since = pane_log_text()[len(log_before_tree):]
+            assert "a child (pid" in since and "carries this build's pin" in since, \
+                since[-300:]
+        finally:
+            set_knob(module, "TMUX_BIN", saved_tmux)
+            subprocess.run(tmux_tree + ["kill-server"], capture_output=True)
+        say("pane tree drift: a child under a pane on another interpreter is the drift too, "
+            "and the pane is reopened on the pin — or the child is named once when the pin "
+            "cannot change it: ok")
+
+    # ---- the keeper starts itself over when the build under it changes — the third of the
+    #      three long-running images to learn it (the pane first, then the watcher, then this
+    #      one): a keeper left on an old build would keep reopening panes with its OLDER pin,
+    #      so every repair it made would be made by code it no longer is. Driven through a
+    #      real keeper, on a private tmux server and a COPY of the build (never this checkout,
+    #      whose sources belong to the owner's own pane, watcher and keeper), and the claim
+    #      has to cross the exec and be taken back on the other side: the keeper is the one
+    #      process that must not stand down in between, or the panes go unwatched with a
+    #      record still naming it. A source that does not parse must HOLD — the same promise
+    #      the watcher makes — never exec into a save that is still landing.
+    if shutil.which("tmux"):
+        keep_sock = "fbtkeepsock"
+        tmux_keep = ["tmux", "-L", keep_sock]
+        subprocess.run(tmux_keep + ["kill-server"], capture_output=True)
+        made = subprocess.run(
+            tmux_keep + [
+                "new-session", "-d", "-s", "keepsess", "-x", "80", "-y", "24",
+                "-c", TEST_HOME,
+                "-e", f"FBTODO_HOME={TEST_HOME}",
+                "-e", "FBTODO_PANE_SECONDS=0",
+                "-e", "FBTODO_NO_AUTOSTART=1",
+                "sleep 300",
+            ],
+            capture_output=True, text=True,
+        )
+        assert made.returncode == 0, made.stderr
+        keeper_build = os.path.join(TEST_HOME, "keeper-reload-build")
+        shutil.rmtree(keeper_build, ignore_errors=True)
+        os.makedirs(keeper_build)
+        shutil.copytree(os.path.join(ROOT, "src", "fbtodo"),
+                        os.path.join(keeper_build, "src", "fbtodo"))
+        shutil.copy(os.path.join(ROOT, "fbtodo"), os.path.join(keeper_build, "fbtodo"))
+        keeper_src = os.path.join(keeper_build, "src", "fbtodo")
+        keep_env = dict(env, FBTODO_TMUX=f"tmux -L {keep_sock}")
+        keep = subprocess.Popen(
+            [sys.executable, os.path.join(keeper_build, "fbtodo"), "pane-watch",
+             "--foreground", "--quiet", "--pane-seconds", "0.5"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            start_new_session=True, env=keep_env, cwd=CWD,
+        )
+
+        def keeper_log_text() -> str:
+            try:
+                with open(module.PANE_LOG_PATH, encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                return ""
+
+        def keeper_stamp() -> int:
+            return int((module.read_json(module.PANE_KEEPER_PATH, {}) or {}).get("started_ms") or 0)
+
+        try:
+            assert wait_for(lambda: module.lock_holder(module.PANE_KEEPER_PATH) == keep.pid), \
+                "the copied keeper never claimed"
+            stamp = keeper_stamp()
+            assert stamp, "the copied keeper wrote no record"
+            # Only what THIS keeper wrote: the log is append-only across the whole suite.
+            base_len = len(keeper_log_text())
+
+            def keeper_since() -> str:
+                return keeper_log_text()[base_len:]
+
+            # a source newer than the keeper landed: it must start itself over, keeping both
+            # the pid and the claim (a stand-down here would leave nobody keeping a pane)
+            with open(os.path.join(keeper_src, "zz_reload.py"), "w") as fh:
+                fh.write("x = 1\n")
+            assert wait_for(lambda: "keeper reloading:" in keeper_since()), keeper_since()[-400:]
+            assert keep.poll() is None and os.path.exists(module.PANE_KEEPER_PATH), \
+                "the reload took the keeper down"
+            assert module.lock_holder(module.PANE_KEEPER_PATH) == keep.pid, \
+                "the claim changed hands across the keeper's reload"
+            # ...and the record's clock is the proof the image AFTER the exec is the one
+            # serving: only a keeper that adopted the claim and ran writes it afresh.
+            assert wait_for(lambda: keeper_stamp() > stamp), \
+                "the reloaded keeper never refreshed its record"
+            stamp = keeper_stamp()
+            # a source that does not parse: hold, and do not exec into it
+            with open(os.path.join(keeper_src, "zz_broken.py"), "w") as fh:
+                fh.write("def half(\n")
+            assert wait_for(lambda: "keeper holding" in keeper_since()), keeper_since()[-400:]
+            time.sleep(2.5)
+            assert keep.poll() is None, "the keeper died on a source that does not parse"
+            assert keeper_since().count("keeper reloading:") == 1, \
+                "it reloaded into a broken file"
+            os.remove(os.path.join(keeper_src, "zz_broken.py"))
+            with open(os.path.join(keeper_src, "zz_reload2.py"), "w") as fh:
+                fh.write("y = 2\n")
+            assert wait_for(lambda: keeper_since().count("keeper reloading:") == 2), \
+                keeper_since()[-400:]
+            assert module.lock_holder(module.PANE_KEEPER_PATH) == keep.pid and keep.poll() is None
+            assert wait_for(lambda: keeper_stamp() > stamp), \
+                "the second reload left nobody keeping"
+            # ...and a tree that PARSES but will not load is held on, not exec'd into: the
+            # keeper would otherwise replace itself with one that never starts, leaving every
+            # pane unwatched. `source_syntax_error` is silent (every file compiles), so the
+            # probe (`reload_probe_error`) is what must hold it.
+            render_keep = os.path.join(keeper_src, "render.py")
+            with open(render_keep) as fh:
+                keep_orig = fh.read()
+            with open(render_keep, "a") as fh:
+                fh.write("\nraise RuntimeError('internally inconsistent')\n")
+            with open(os.path.join(keeper_src, "zz_reload3.py"), "w") as fh:
+                fh.write("z = 3\n")
+            assert wait_for(lambda: "does not load" in keeper_since()), keeper_since()[-500:]
+            assert module.source_syntax_error(here=render_keep) is None, \
+                "the unloadable keeper tree parses cleanly, so the probe was what held it"
+            time.sleep(2.5)
+            assert keep.poll() is None, "the keeper exec'd into a build that will not load"
+            assert module.lock_holder(module.PANE_KEEPER_PATH) == keep.pid, \
+                "the claim moved on a held keeper reload"
+            assert keeper_since().count("keeper reloading:") == 2, \
+                "it reloaded into an unfit keeper build"
+            with open(render_keep, "w") as fh:
+                fh.write(keep_orig)
+            assert wait_for(lambda: keeper_since().count("keeper reloading:") == 3), \
+                keeper_since()[-500:]
+            assert keep.poll() is None and module.lock_holder(module.PANE_KEEPER_PATH) == keep.pid
+            say("reload: the pane keeper replaces itself across an exec — claim, pid and "
+                "record — and holds while the sources do not parse or the new build will "
+                "not load: ok")
+        finally:
+            keep.send_signal(signal.SIGTERM)
+            deadline = time.time() + 10
+            while time.time() < deadline and keep.poll() is None:
+                time.sleep(0.1)
+            kill_tree(keep)
+            deadline = time.time() + 10
+            while time.time() < deadline and module.lock_holder(module.PANE_KEEPER_PATH):
+                time.sleep(0.1)
+            assert module.lock_holder(module.PANE_KEEPER_PATH) is None, \
+                "the keeper's claim survived it"
+            subprocess.run(tmux_keep + ["kill-server"], capture_output=True)
+            shutil.rmtree(keeper_build, ignore_errors=True)
+
+    # ---- one keeper per SERVER, and a server has one name. A pane spells its tmux as the
+    #      `TMUX` value — socket, server pid, session id — while the desktop integration,
+    #      launched outside tmux, has no `TMUX` at all and used to say only `-default`. Both
+    #      name the same server, and compared raw they read as two: measured 2026-10-02,
+    #      each ask killed the other's keeper several times an hour (`replacing keeper …`),
+    #      leaving the panes unwatched until the next ask. The name is now asked of the
+    #      server itself (`display-message -p '#{socket_path}'`), which answers the same
+    #      string inside a session and outside one, and an ask that cannot name a server at
+    #      all does not evict a keeper it cannot judge — only one for a genuinely different
+    #      server, or from an older build, is replaced.
+    if shutil.which("tmux"):
+        ident_sock = "fbtidentsock"
+        tmux_ident = ["tmux", "-L", ident_sock]
+        subprocess.run(tmux_ident + ["kill-server"], capture_output=True)
+        made = subprocess.run(
+            tmux_ident + [
+                "new-session", "-d", "-s", "identsess", "-x", "80", "-y", "24",
+                "-c", TEST_HOME,
+                "-e", f"FBTODO_HOME={TEST_HOME}",
+                "-e", "FBTODO_NO_AUTOSTART=1",
+                "sleep 300",
+            ],
+            capture_output=True, text=True,
+        )
+        assert made.returncode == 0, made.stderr
+        saved_tmux_ident = list(module.TMUX_BIN)
+        saved_env_ident = {k: os.environ.get(k) for k in ("TMUX", "FBTODO_TMUX")}
+        set_knob(module, "TMUX_BIN", list(tmux_ident))
+        try:
+            sock = subprocess.run(
+                tmux_ident + ["display-message", "-p", "#{socket_path}"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            assert sock, "the private server did not answer its own socket path"
+            os.environ.pop("FBTODO_TMUX", None)
+            # a `TMUX` value carries a server pid and a session id besides the socket, and
+            # two panes on one server differ in exactly those: neither changes the name
+            os.environ["TMUX"] = f"{sock},4242,7"
+            assert module.tmux_identity() == os.path.realpath(sock), module.tmux_identity()
+            os.environ["TMUX"] = f"{sock},9999,8"
+            assert module.tmux_identity() == os.path.realpath(sock), \
+                "a second session on the same server got a name of its own"
+            # ...and the desktop integration's context: outside tmux, no `TMUX` at all
+            del os.environ["TMUX"]
+            assert module.tmux_identity() == os.path.realpath(sock), \
+                "an ask outside tmux named a different server than the one it talks to"
+            # a forced server is named deliberately and verbatim, the same string anywhere
+            os.environ["FBTODO_TMUX"] = f"tmux -L {ident_sock}"
+            assert module.tmux_identity() == f"tmux -L {ident_sock}"
+            del os.environ["FBTODO_TMUX"]
+            # with no server to ask and no `TMUX` to read there is no name to be had — and
+            # `-default` must not stand in for one, which is how the two askers fought
+            set_knob(module, "TMUX_BIN", ["tmux", "-L", "fbtidentgone"])
+            assert module.tmux_identity() is None, module.tmux_identity()
+            os.environ["TMUX"] = "/private/tmp/tmux-501/gone,1,2"
+            assert module.tmux_identity() == os.path.realpath("/private/tmp/tmux-501/gone"), \
+                "with a dead server, `TMUX` is the only name there is"
+            assert module.tmux_identity_outside() is None, \
+                "the outside ask fell back to the pane's `TMUX`"
+            del os.environ["TMUX"]
+            set_knob(module, "TMUX_BIN", list(tmux_ident))
+            # ...and the rule the churn broke, before any process is started
+            same = {"version": module.VERSION, "tmux": sock}
+            assert module.keeper_serves(same, sock) is True
+            assert module.keeper_serves(same, None) is True, \
+                "an ask that cannot name a server evicted one it cannot judge"
+            assert module.keeper_serves(same, "/x/other") is False, \
+                "an ask naming another server kept a keeper that cannot serve it"
+            assert module.keeper_serves({"version": "0.0.0", "tmux": sock}, sock) is False, \
+                "a keeper from an older build was kept"
+            assert module.keeper_serves({}, None) is False, "a lock with no record is no keeper"
+            # ...and the comparison is a SERVER comparison, not a string one: the spellings
+            # a record and an ask can meet in — the raw `TMUX` value, the old `-default`, a
+            # forced `-L`/`-S`, the canonical path — are reduced to the socket each denotes,
+            # and two of them are one server exactly when their sockets are one file.
+            link = os.path.join(TEST_HOME, "tmux-link")
+            real = os.path.join(TEST_HOME, "tmux-real")
+            os.makedirs(real, exist_ok=True)
+            if not os.path.islink(link):
+                os.symlink(real, link)
+            assert module.same_tmux_server(os.path.join(link, "s"), os.path.join(real, "s")), \
+                "two spellings of one path were read as two servers"
+            assert module.same_tmux_server(f"{sock},4242,7", sock), "a raw `TMUX` value"
+            default_sock = os.path.realpath(os.path.join(
+                os.environ.get("TMUX_TMPDIR") or "/tmp", f"tmux-{os.getuid()}", "default"))
+            assert module.same_tmux_server("-default", default_sock), \
+                "the old placeholder stopped meaning the default server"
+            assert module.same_tmux_server(f"tmux -L {ident_sock}", sock), \
+                "a forced server written as a name and as its socket"
+            assert module.same_tmux_server(f"tmux -S {sock}", sock)
+            assert not module.same_tmux_server("-default", sock), \
+                "the default server and a private one were read as one"
+            assert not module.same_tmux_server("/x/one", "/x/two"), \
+                "distinct names were read as one"
+            assert not module.same_tmux_server(None, "/x/one") and \
+                module.same_tmux_server(None, None), "nameless names"
+            assert module.same_tmux_server("/x/one", "/x/one"), "equal names were read as two"
+            # TMUX_TMPDIR moves tmux's whole socket directory, and a forced name follows it
+            os.environ["TMUX_TMPDIR"] = os.path.join(TEST_HOME, "tmuxdir")
+            moved = os.path.realpath(os.path.join(
+                os.environ["TMUX_TMPDIR"], f"tmux-{os.getuid()}", ident_sock))
+            assert module.tmux_socket_of(f"tmux -L {ident_sock}") == moved, \
+                "a forced `-L` ignored TMUX_TMPDIR"
+            os.environ.pop("TMUX_TMPDIR")
+            say("keeper identity: names written by different builds are compared as servers, "
+                "not as strings — the raw `TMUX` value, `-default` and a forced server all "
+                "name the socket they denote: ok")
+
+            # ...and then the two asks that used to fight, against a real keeper: the
+            # pane's (with `TMUX`), the desktop integration's (none) and a second pane
+            # session's — one keeper across all three, its record naming the server once,
+            # canonically. The keeper is spawned from this checkout on purpose (nothing
+            # here edits the sources), pointed at the private server by `TMUX` and at the
+            # throwaway home by the environment it inherits.
+            ident_args = types.SimpleNamespace(pane_seconds=2.0, quiet=True)
+
+            def ident_log() -> str:
+                try:
+                    with open(module.PANE_LOG_PATH, encoding="utf-8") as fh:
+                        return fh.read()
+                except OSError:
+                    return ""
+
+            base_len = len(ident_log())
+            # The status context for everything below: a pane on the private server
+            # (`TMUX`) with the server forced by name (`FBTODO_TMUX`), so one run reads
+            # both asks. `keeper server` names them, and `--json` carries the same facts
+            # for a script: the server, both asks, and which ask would replace the keeper.
+            env_status = dict(env, FBTODO_TMUX=f"tmux -L {ident_sock}", TMUX=f"{sock},4242,7")
+
+            def keeper_status_line() -> str:
+                out = subprocess.run(
+                    [sys.executable, FB, "status"], capture_output=True, text=True,
+                    env=env_status, cwd=CWD,
+                ).stdout
+                rows = [ln for ln in STRIP(out).splitlines() if "keeper server" in ln]
+                assert rows, out[-500:]
+                return rows[0]
+
+            def keeper_status_json() -> dict:
+                out = subprocess.run(
+                    [sys.executable, FB, "status", "--json"], capture_output=True, text=True,
+                    env=env_status, cwd=CWD,
+                ).stdout
+                doc = json.loads(out)
+                assert "keeper" in doc, sorted(doc)
+                return doc["keeper"]
+
+            # nothing running yet: the machine-readable answer says so, and names no server
+            none_yet = keeper_status_json()
+            assert none_yet["running"] is False and none_yet["server"] is None, none_yet
+            assert none_yet["would_replace"] == [] and none_yet["agree"] is False, none_yet
+            os.environ["TMUX"] = f"{sock},4242,7"
+            first = module.ensure_pane_keeper(ident_args)
+            assert first, "the first ask started no keeper"
+            assert wait_for(lambda: module.lock_holder(module.PANE_KEEPER_PATH) == first), \
+                "the keeper never claimed"
+            assert wait_for(
+                lambda: (module.read_json(module.PANE_KEEPER_PATH, {}) or {}).get("tmux")
+                == os.path.realpath(sock)
+            ), (module.read_json(module.PANE_KEEPER_PATH, {}) or {})
+            del os.environ["TMUX"]
+            assert module.ensure_pane_keeper(ident_args) == first, \
+                "the desktop integration replaced the pane's keeper"
+            os.environ["TMUX"] = f"{sock},9999,8"
+            assert module.ensure_pane_keeper(ident_args) == first, \
+                "a second session's ask replaced the keeper"
+            assert "replacing keeper" not in ident_log()[base_len:], ident_log()[base_len:][-300:]
+            # ...and `status` names both at once: the server the keeper holds and whether
+            # the asks that could replace it agree. The pane's ask is read from a pane
+            # context (`TMUX`), the watcher's from outside tmux — here both point at the
+            # forced private server, the way the desktop integration names one.
+            line = keeper_status_line()
+            assert os.path.realpath(sock) in line, line
+            assert "asks name it" in line, line
+            # ...and the same facts for a script, from the same reader: the server, both
+            # asks reduced to the sockets they name, and no churn due
+            view = keeper_status_json()
+            assert view["running"] is True and view["pid"] == first, view
+            assert view["server"] == os.path.realpath(sock), view
+            assert view["recorded"] == os.path.realpath(sock), view
+            assert view["asks"] == {"pane": os.path.realpath(sock),
+                                    "watcher": os.path.realpath(sock)}, view
+            assert view["agree"] is True and view["would_replace"] == [], view
+            assert "asks name it" in view["note"], view
+            # ...and a record written by an OLDER build — the raw `TMUX` value, which names
+            # this same server with a server pid and a session id on it — is that server
+            # too: a different spelling, not a reason to replace the keeper.
+            rec = module.read_json(module.PANE_KEEPER_PATH, {}) or {}
+            rec["tmux"] = f"{sock},4242,7"
+            with open(module.PANE_KEEPER_PATH, "w", encoding="utf-8") as fh:
+                json.dump(rec, fh)
+            assert module.ensure_pane_keeper(ident_args) == first, \
+                "an older build's spelling of the same server replaced the keeper"
+            assert "replacing keeper" not in ident_log()[base_len:], ident_log()[base_len:][-300:]
+            # the record's spelling is old, the server is not: `status` prints the name it
+            # denotes and says where the spelling came from, without calling it a difference
+            line = keeper_status_line()
+            assert os.path.realpath(sock) in line and "recorded as" in line, line
+            assert "asks name it" in line, line
+            view = keeper_status_json()
+            assert view["server"] == os.path.realpath(sock), view
+            assert view["recorded"] == f"{sock},4242,7", view
+            assert view["agree"] is True and view["would_replace"] == [], view
+            say("status: the keeper's server is named canonically, and the asks that could "
+                "replace it are compared: ok")
+            # ...and the snapshot is not the only way to read it: `status --watch` prints
+            # the keeper's state once and then only CHANGES — the pid moving (replaced,
+            # gone, appeared), churn offered, churn cleared — and stays silent while the
+            # keeper stands still. Text for a person, and `--json` one event object per
+            # line for a script, carrying the same facts the snapshot's `keeper` object
+            # does. The record below is driven by hand at `-i 0.2`, so the test runs at
+            # the speed of its mutations rather than of real churn.
+            watch_log = os.path.join(TEST_HOME, "status-watch.log")
+
+            def watch_text() -> str:
+                try:
+                    with open(watch_log, encoding="utf-8") as fh:
+                        return fh.read()
+                except OSError:
+                    return ""
+
+            settled = module.read_json(module.PANE_KEEPER_PATH, {}) or {}
+            churn_rec = {**settled, "tmux": "/private/tmp/tmux-501/elsewhere"}
+            watch_env = dict(env_status, FBTODO_HOME=TEST_HOME)
+
+            def write_record(payload: dict) -> None:
+                # In place, like the identity rows above: the record IS the claim file, and
+                # the keeper holds its lock — a rename over the name would orphan that
+                # claim, and the next ask would start a second keeper instead of replacing
+                # this one.
+                with open(module.PANE_KEEPER_PATH, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh)
+
+            def start_watch(*extra):
+                handle = open(watch_log, "w", encoding="utf-8")
+                proc = subprocess.Popen(
+                    [sys.executable, FB, "status", "--watch", "-i", "0.2", *extra],
+                    stdout=handle, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                    env=watch_env, cwd=CWD, start_new_session=True,
+                )
+                return proc, handle
+
+            watch, watch_handle = start_watch()
+            try:
+                assert wait_for(lambda: "now     keeper : " in watch_text()), \
+                    watch_text()[-300:]
+                base = watch_text()
+                assert f"now     keeper : {first}  (" in base, base
+                # nothing moved, nothing said — the silence is half the contract
+                time.sleep(0.6)
+                assert watch_text() == base, "the watch spoke with the keeper standing still"
+                # the pid moved, then the keeper stopped answering, then came back
+                write_record({**settled, "pid": os.getpid()})
+                assert wait_for(lambda: f"pid     keeper : {os.getpid()}  "
+                                        f"(was {first}, replaced)" in watch_text()), \
+                    watch_text()[-400:]
+                write_record({**settled, "pid": 999999999})
+                assert wait_for(lambda: f"gone    keeper : — none running  "
+                                        f"(was {os.getpid()})" in watch_text()), \
+                    watch_text()[-400:]
+                write_record(settled)
+                assert wait_for(lambda: f"pid     keeper : {first}  (appeared)" in watch_text()), \
+                    watch_text()[-400:]
+                # churn offered, then cleared — the row's own words, as events
+                write_record(churn_rec)
+                assert wait_for(lambda: "churn   keeper : " in watch_text()), \
+                    watch_text()[-400:]
+                assert "the next ask replaces this keeper" in watch_text(), watch_text()[-400:]
+                write_record(settled)
+                assert wait_for(lambda: "agree   keeper : " in watch_text()), watch_text()[-400:]
+                quiet = watch_text()
+                time.sleep(0.6)
+                assert watch_text() == quiet, "the watch spoke after the churn cleared"
+            finally:
+                watch.terminate()
+                watch.wait(timeout=10)
+                watch_handle.close()
+                write_record(settled)
+            # ...and the same stream as JSON: one object per line, each naming the event
+            # and carrying the state the snapshot's `keeper` object would.
+            watch, watch_handle = start_watch("--json")
+            try:
+                assert wait_for(lambda: watch_text().strip()), watch_text()
+                event = json.loads(watch_text().strip().splitlines()[0])
+                assert event["event"] == "now" and event["pid"] == first, event
+                assert event["would_replace"] == [] and event["agree"] is True, event
+                assert isinstance(event["at_ms"], int) and event["note"], event
+                write_record(churn_rec)
+                assert wait_for(lambda: '"churn"' in watch_text()), watch_text()[-300:]
+                churn = json.loads(watch_text().strip().splitlines()[-1])
+                assert churn["event"] == "churn" and churn["would_replace"], churn
+                assert churn["pid"] == first and churn["previous_pid"] == first, churn
+            finally:
+                watch.terminate()
+                watch.wait(timeout=10)
+                watch_handle.close()
+                write_record(settled)
+            say("status --watch reports the keeper's changes only — a pid that moved, one "
+                "that stopped answering, churn offered and cleared — in text and as one "
+                "JSON object per line, and says nothing while the keeper stands still: ok")
+            # ...and a keeper recorded for a DIFFERENT server is still replaced: the rule
+            # must evict what it can judge foreign, or another server's keeper would keep
+            # answering for this one.
+            rec = module.read_json(module.PANE_KEEPER_PATH, {}) or {}
+            rec["tmux"] = "/private/tmp/tmux-501/elsewhere"
+            with open(module.PANE_KEEPER_PATH, "w", encoding="utf-8") as fh:
+                json.dump(rec, fh)
+            # a script can see the churn coming: both asks name a server this keeper is not
+            churn = keeper_status_json()
+            assert churn["server"] == "/private/tmp/tmux-501/elsewhere", churn
+            assert churn["would_replace"] == ["pane", "watcher"], churn
+            assert churn["agree"] is False, churn
+            assert "replaces this keeper" in churn["note"], churn
+            os.environ["TMUX"] = f"{sock},4242,7"
+            replaced = module.ensure_pane_keeper(ident_args)
+            assert replaced and replaced != first, "a keeper for another server was kept"
+            assert "replacing keeper" in ident_log()[base_len:], "the replacement was not logged"
+            assert wait_for(lambda: module.lock_holder(module.PANE_KEEPER_PATH) == replaced), \
+                "the replacement never claimed"
+            for _keeper in (first, replaced):
+                try:
+                    os.kill(int(_keeper), signal.SIGTERM)
+                except OSError:
+                    pass
+            assert wait_for(lambda: module.lock_holder(module.PANE_KEEPER_PATH) is None), \
+                "a keeper's claim survived it"
+            say("keeper identity: the pane's ask and the desktop integration's name the same "
+                "server and share one keeper, a second session's ask does not disturb it, "
+                "and a keeper for a different server is still replaced: ok")
+
+            # ...and two asks arriving TOGETHER converge on one keeper. Each starts a keeper
+            # before either has claimed; exactly one wins the claim, the other sees the
+            # winner and stands down — and the ask that spawned the stand-down returns the
+            # WINNER, silently. It used to log "never claimed the lock" instead: the loser's
+            # own poll could remove the winner's newborn claim before it was locked, and
+            # then no ask — and no reader — could see a keeper that was running. Threads, so
+            # the asks really overlap; the keepers are processes either way.
+            race_mark = len(ident_log())
+            race_pids = []
+            race_line = threading.Barrier(2)
+
+            def race_ask():
+                race_line.wait()
+                race_pids.append(module.ensure_pane_keeper(ident_args))
+
+            racers = [threading.Thread(target=race_ask) for _ in range(2)]
+            for racer in racers:
+                racer.start()
+            for racer in racers:
+                racer.join()
+            assert len(race_pids) == 2 and all(race_pids), race_pids
+            assert race_pids[0] == race_pids[1], \
+                f"two simultaneous first asks did not converge: {race_pids}"
+            assert module.lock_holder(module.PANE_KEEPER_PATH) == race_pids[0], \
+                "the converged keeper does not hold the claim"
+            race_log = ident_log()[race_mark:]
+            assert "never claimed" not in race_log, race_log[-400:]
+            assert "replacing keeper" not in race_log, race_log[-400:]
+            assert race_log.count("keeper started") == 1, race_log[-400:]
+            try:
+                os.kill(int(race_pids[0]), signal.SIGTERM)
+            except OSError:
+                pass
+            assert wait_for(lambda: module.lock_holder(module.PANE_KEEPER_PATH) is None), \
+                "the converged keeper's claim survived it"
+            say("keeper race: two asks arriving together converge on one keeper, and the "
+                "ask that lost adopts the winner instead of logging a failure: ok")
+
+            # ---- ...and the keeper HEALS its own claim. A claim is a lock AND a name, and
+            #      the name half can go without the lock going: the file is removed or
+            #      replaced under a running keeper (a probe's leftover cleanup, an admin's
+            #      `rm`), and the kernel lock survives on the unlinked inode. Left alone the
+            #      keeper watches panes invisibly — `claim_audit` reads the role `absent`,
+            #      the process table calls it an orphan, and `locks --fix` ends it — so the
+            #      keeper takes its name back itself, within a tick: `locks` then has no
+            #      orphan to offer and no kill to plan. Both accidents, in order.
+            healer = module.ensure_pane_keeper(ident_args)
+            assert healer, "the healing test's keeper never started"
+            assert wait_for(lambda: module.lock_holder(module.PANE_KEEPER_PATH) == healer), \
+                "the healing test's keeper never claimed"
+            first_rec = module.read_json(module.PANE_KEEPER_PATH, {}) or {}
+            os.unlink(module.PANE_KEEPER_PATH)  # the name is gone; the keeper is not
+            assert wait_for(
+                lambda: module.lock_holder(module.PANE_KEEPER_PATH) == healer, seconds=8
+            ), "the keeper did not take its removed name back"
+            healed = module.read_json(module.PANE_KEEPER_PATH, {}) or {}
+            assert healed.get("pid") == healer, (first_rec, healed)
+            assert healed.get("tmux") == first_rec.get("tmux"), (first_rec, healed)
+            assert healed.get("started_ms") == first_rec.get("started_ms"), \
+                "the re-claimed record forgot when the keeper started"
+            assert wait_for(lambda: "keeper re-claimed its name" in ident_log()), \
+                "the re-claim was not written down"
+            # ...and a name REPLACED by another file is the same story. A fresh INODE is
+            # what replaced means: writing into the file the keeper holds keeps the same
+            # lock and only rewrites the record.
+            incoming = module.PANE_KEEPER_PATH + ".incoming"
+            with open(incoming, "w", encoding="utf-8") as fh:
+                json.dump({"pid": 1, "version": "0.0.1"}, fh)
+            os.replace(incoming, module.PANE_KEEPER_PATH)
+            assert wait_for(
+                lambda: module.lock_holder(module.PANE_KEEPER_PATH) == healer, seconds=8
+            ), "the keeper did not take its replaced name back"
+            healed = module.read_json(module.PANE_KEEPER_PATH, {}) or {}
+            assert healed.get("pid") == healer and healed.get("version") == module.VERSION, \
+                healed
+            assert healed.get("started_ms") == first_rec.get("started_ms"), healed
+            doc = json.loads(run("locks", "--json").stdout)
+            keeper_row = next(c for c in doc["claims"] if c["role"] == "keeper")
+            assert keeper_row["state"] == "held" and keeper_row["pid"] == healer, keeper_row
+            assert keeper_row["orphans"] == [], keeper_row
+            assert json.loads(run("locks", "--fix", "--json", "--dry-run").stdout) \
+                ["planned"]["kills"] == [], "the fix planned to end a keeper that healed"
+            say("keeper claim: a name removed or replaced under the keeper is taken back "
+                "by the keeper itself — same pid, same server and start time, no orphan "
+                "left behind and nothing for `locks --fix` to end: ok")
+            try:
+                os.kill(int(healer), signal.SIGTERM)
+            except OSError:
+                pass
+            assert wait_for(lambda: module.lock_holder(module.PANE_KEEPER_PATH) is None), \
+                "the healer's claim survived it"
+            try:
+                os.unlink(module.PANE_KEEPER_PATH)  # no name under the stand-in either
+            except OSError:
+                pass
+
+            # ---- ...and an untied keeper that CANNOT heal — one from an older build,
+            #      whose loop knows nothing of the re-claim. The name-based read is blind to
+            #      it (`claim_audit` says `absent`), so the process table is the only place
+            #      it can be found: the audit must still name it, and `locks --fix` must
+            #      still be the hand for it. A stand-in process with a keeper's argv shape
+            #      and nothing else of it — the cross-check reads exactly three things off
+            #      it, its command line, its environment and its age, and this is those
+            #      three. Its environment is short on purpose: `ps -Eww` truncates long
+            #      ones, and a root the cross-check cannot read is one it cannot place.
+            fake_pkg = os.path.join(TEST_HOME, "old-build", "fbtodo")
+            os.makedirs(fake_pkg, mode=0o700, exist_ok=True)
+            with open(os.path.join(fake_pkg, "__init__.py"), "w", encoding="utf-8") as fh:
+                fh.write("import time\n\ntime.sleep(600)\n")
+            orphan = subprocess.Popen(
+                [sys.executable, os.path.join(fake_pkg, "__init__.py"), "pane-watch"],
+                env={"FBTODO_HOME": TEST_HOME, "PATH": os.environ.get("PATH", "")},
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, start_new_session=True,
+            )
+            orphan_keeper = orphan.pid
+            time.sleep(2.5)  # past the cross-check's grace: it is a settled process now
+            blind = module.claim_audit(module.PANE_KEEPER_PATH)
+            assert blind["state"] == "absent" and blind["pid"] is None, blind
+            seen_orphan = run("locks")
+            assert seen_orphan.returncode == 0, (seen_orphan.returncode, seen_orphan.stderr)
+            out = STRIP(seen_orphan.stdout)
+            assert f"running: pid {orphan_keeper} (keeper) with this state root" in out, out
+            assert "no file — no claim" in out, out  # the name-based half is blind
+            doc = json.loads(run("locks", "--json").stdout)
+            keeper_row = next(c for c in doc["claims"] if c["role"] == "keeper")
+            assert keeper_row["state"] == "absent", keeper_row
+            assert [o["pid"] for o in keeper_row["orphans"]] == [orphan_keeper], keeper_row
+            assert keeper_row["orphans"][0]["role"] == "keeper", keeper_row["orphans"][0]
+            say("locks: an untied keeper that does not heal — a build older than the "
+                "re-claim — is still named: the file reads absent, and the process table "
+                "says who is running: ok")
+            # ...and `locks --fix` is the hand for that finding. A dry run names it and
+            # changes nothing; a run that cannot ask refuses with 66 and still changes
+            # nothing (a kill is never taken on a guess, and never half-applied); `--yes`
+            # ends it, which is the only repair there is — its lock lives on an unlinked
+            # file, so nothing on disk can free it.
+            dry_fix = run("locks", "--fix", "--dry-run")
+            assert dry_fix.returncode == 0 and "would end" in STRIP(dry_fix.stdout), \
+                dry_fix.stdout
+            assert module.pid_alive(orphan_keeper), "--dry-run ended a process"
+            refused = subprocess.run(
+                [sys.executable, FB, "locks", "--fix"], capture_output=True, text=True,
+                env=env, cwd=CWD, stdin=subprocess.DEVNULL, timeout=60,
+            )
+            assert refused.returncode == 66, (refused.returncode, refused.stdout[-200:])
+            assert "without confirmation" in refused.stderr, refused.stderr
+            assert module.pid_alive(orphan_keeper), "a refused fix ended a process"
+            fixed_fix = run("locks", "--fix", "--yes", "--json")
+            doc_fix = json.loads(fixed_fix.stdout)
+            assert fixed_fix.returncode == 0, (fixed_fix.returncode, fixed_fix.stderr[-200:],
+                                               doc_fix["planned"], doc_fix["ended"])
+            assert orphan_keeper in [k["pid"] for k in doc_fix["planned"]["kills"]], doc_fix
+            ended_row = next(e for e in doc_fix["ended"] if e["pid"] == orphan_keeper)
+            assert ended_row == {"role": "keeper", "pid": orphan_keeper, "outcome": "ended"}, \
+                doc_fix["ended"]
+            # `pid_running`, not `pid_alive`: this keeper is the SUITE's own child, and an
+            # unreaped one keeps answering `kill(pid, 0)` after it is gone — the exact
+            # distinction the fix had to learn (see `pid_running`).
+            assert wait_for(lambda: not module.pid_running(orphan_keeper)), \
+                "the untied keeper survived the fix"
+            assert not os.path.exists(module.PANE_KEEPER_PATH)
+            assert json.loads(run("locks", "--fix", "--json", "--yes").stdout)["planned"] \
+                ["kills"] == [], "the fix planned the same kill twice"
+            say("locks --fix: an untied keeper is named by a dry run, a run without "
+                "confirmation refuses with 66 and changes nothing, and `--yes` ends it: ok")
+            try:
+                os.kill(int(orphan_keeper), signal.SIGTERM)
+            except OSError:
+                pass
+            # Reaped, not merely signalled: an unreaped child stays a zombie, which is what
+            # `pid_running` exists to see through (see the fix's own wait). The suite leaves
+            # no process of its own behind either way.
+            try:
+                orphan.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                orphan.kill()
+            assert wait_for(lambda: module.lock_holder(module.PANE_KEEPER_PATH) is None), \
+                "the orphan's name came back"
+        finally:
+            holder = module.lock_holder(module.PANE_KEEPER_PATH)
+            if holder:
+                try:
+                    os.kill(int(holder), signal.SIGTERM)
+                except OSError:
+                    pass
+                deadline = time.time() + 10
+                while time.time() < deadline and module.lock_holder(module.PANE_KEEPER_PATH):
+                    time.sleep(0.1)
+                if module.lock_holder(module.PANE_KEEPER_PATH):
+                    # it would not go: `start_new_session` made it the leader of its group
+                    try:
+                        os.killpg(int(holder), signal.SIGKILL)
+                    except OSError:
+                        pass
+            set_knob(module, "TMUX_BIN", saved_tmux_ident)
+            for _key, _val in saved_env_ident.items():
+                if _val is None:
+                    os.environ.pop(_key, None)
+                else:
+                    os.environ[_key] = _val
+            subprocess.run(tmux_ident + ["kill-server"], capture_output=True)
+
+    # ---- a pane that reloaded says WHICH BUILD it is now, on its own title chip, for a few
+    #      seconds. The old image cannot know the new build's `VERSION` — that is in code it
+    #      never imported — so it leaves its own behind in the environment (which, with the
+    #      open fds, is what an exec carries) and the new image answers with the number it is
+    #      running. The chip is the one slot of the frame that belongs to the PROCESS rather
+    #      than the list, so the note must cost no row and move nothing: the frame has to be
+    #      identical but for its top border.
+    assert module.reload_note(None) is None and module.reload_note("not json") is None, \
+        "a hand-over that is not a hand-over was read as one"
+    assert module.reload_note(json.dumps({"from": module.VERSION, "file": "base.py"})) == \
+        f"RELOADED {module.VERSION}", "an edit between releases still names the build"
+    assert module.reload_note(json.dumps({"from": "1.2.3", "file": "base.py"})) == \
+        f"RELOADED 1.2.3 → {module.VERSION}", "an upgrade names the build it came from"
+    st_note = {
+        "backend": "cli", "session": "S", "todos": [{"task": "t", "completed": False}],
+        "done": 0, "total": 1, "goal": "a note on the chip", "model": "gpt-5",
+    }
+    now_note = 1_700_000_000_000
+    plain_frame = module.render(st_note, True, watching=4242, width=68, now_ms=now_note)
+    noted_frame = module.render(st_note, True, watching=4242, width=68, now_ms=now_note,
+                                reloaded=f"RELOADED 1.2.3 → {module.VERSION}")
+    a_rows, b_rows = plain_frame.splitlines(), noted_frame.splitlines()
+    assert len(a_rows) == len(b_rows), "the note changed how many rows the frame has"
+    changed = [i for i, (a, b) in enumerate(zip(a_rows, b_rows)) if a != b]
+    assert changed == [0], f"the note disturbed the frame: rows {changed} changed"
+    assert "FREEBUFF TODOS" in STRIP(a_rows[0]) and "FREEBUFF TODOS" not in STRIP(b_rows[0])
+    assert f"RELOADED 1.2.3 → {module.VERSION}" in STRIP(b_rows[0]), STRIP(b_rows[0])
+    assert "watcher: pid 4242" in STRIP(b_rows[0]), "the note cost the border its metadata"
+    # a narrow pane gives up the note's tail, never the right-hand slot's existence
+    for w in (34, 40, 68, 80):
+        line = STRIP(module.render(st_note, True, watching=4242, width=w, now_ms=now_note,
+                                   reloaded=f"RELOADED 1.2.3 → {module.VERSION}").splitlines()[0])
+        assert module._cell_width(line) <= w, (w, line)
+    assert module.render(st_note, False, width=50, reloaded="RELOADED 9.9.9") == \
+        module.render(st_note, False, width=50), "a plain frame has no chip to note on"
+    say("reload note: a reloaded pane names the build on its title chip, and the frame is "
+        "untouched but for that one row: ok")
+
     # ---- doctor: the machine's own answer, as a gate. A machine with the tools a pane
     #      needs passes and exits 0; one that cannot even write its scratch dir says so and
     #      exits non-zero, which is what makes this callable from a wrapper or CI.
@@ -1050,7 +3328,292 @@ try:
     )
     assert broken.returncode != 0, (broken.returncode, broken.stdout[-300:])
     assert "FAIL" in broken.stdout and "tmux" in broken.stdout, broken.stdout[-300:]
-    say("doctor: a healthy machine passes, and a missing tool fails with a non-zero exit: ok")
+    # ...and the interpreter question as its own line: the pane, its watcher and the keeper
+    # on ONE Python — `ok` when they are (or with nothing to compare), a `warn` naming each
+    # role and its WHOLE path when they are not, because those paths are the diagnosis
+    py_a, py_b = "/usr/bin/python3", "/opt/homebrew/opt/python@3.14/bin/python3.14"
+    empty = module.one_python_check([])
+    assert empty[0] == "ok" and "nothing to compare" in empty[1], empty
+    alone = module.one_python_check([("pane", None), ("watcher", py_a), ("keeper", None)])
+    assert alone[0] == "ok" and py_a in alone[1], alone
+    agree = module.one_python_check([("pane", py_a), ("watcher", py_a), ("keeper", py_a)])
+    assert agree[0] == "ok" and "pane, watcher and keeper" in agree[1] and py_a in agree[1], agree
+    mixed = module.one_python_check([("pane", py_a), ("watcher", py_b), ("keeper", py_a)])
+    assert mixed[0] == "warn" and py_a in mixed[1] and py_b in mixed[1], mixed
+    assert all(role in mixed[1] for role in ("pane", "watcher", "keeper")), mixed
+    # a symlinked spelling is one interpreter, the same rule every other reader here uses
+    link_real = os.path.join(TEST_HOME, "doctor-py")
+    link_alias = os.path.join(TEST_HOME, "doctor-py-link")
+    os.makedirs(link_real, exist_ok=True)
+    if not os.path.islink(link_alias):
+        os.symlink(link_real, link_alias)
+    twinned = module.one_python_check([("pane", os.path.join(link_alias, "py")),
+                                       ("watcher", os.path.join(link_real, "py"))])
+    assert twinned[0] == "ok", twinned
+    named = {c["name"]: c for c in djson["checks"]}
+    assert "one python" in named and named["one python"]["level"] in ("ok", "warn") \
+        and named["one python"]["detail"], named.keys()
+    say("doctor: the pane, its watcher and the keeper are compared as one interpreter — and "
+        "a disagreement names each role with its path: ok")
+
+    # ---- and a doctor run is a LOOK: it leaves every claim record exactly as it found it,
+    #      byte for byte. The watcher row asked `lock_holder`, whose free-claim answer REMOVES
+    #      the record it finds — a doctor run over a dead watcher's leftovers deleted
+    #      `fbtodo-daemon.pid`, the record `_claim_live` decides the state root from and `one
+    #      python` reads the watcher's pid from. The row now reads through `lock_peek` (open,
+    #      try the lock; no unlink, no write), and this pins the whole contract: records for
+    #      the daemon, the keeper and the NAS pane seeded with a DEAD pid — free, the exact
+    #      case a cleanup would have removed — must survive a run byte-identical, and so must
+    #      the same record while a claim is HELD, with the row naming its holder.
+    doctor_victim = spawn_quiet("sleep", "600")
+    dead_pid = doctor_victim.pid
+    kill_tree(doctor_victim)
+    deadline = time.time() + 5
+    while time.time() < deadline and module.pid_alive(dead_pid):
+        time.sleep(0.05)
+    claim_paths = [module.LOCK_PATH, module.PANE_KEEPER_PATH, module.NAS_LOCK_PATH]
+
+    def watcher_row(text: str) -> str:
+        rows = [ln for ln in STRIP(text).splitlines() if re.match(r"\s*\S+\s+watcher\s", ln)]
+        assert rows, text[-400:]
+        return rows[0]
+
+    try:
+        for p in claim_paths:
+            module.atomic_write_json(p, {"pid": dead_pid, "cwd": CWD, "started_ms": 0,
+                                         "instance_pid": None, "version": module.VERSION})
+        before = {p: open(p, "rb").read() for p in claim_paths}
+        seen = run("doctor")
+        assert seen.returncode == 0, (seen.returncode, seen.stdout[-300:])
+        after = {p: open(p, "rb").read() for p in claim_paths}
+        assert after == before, "doctor rewrote a claim record it was only asked to read"
+        assert all(os.path.exists(p) for p in claim_paths), "doctor removed a claim record"
+        row = watcher_row(seen.stdout)
+        assert "not running" in row, row
+        # ...and again while the daemon claim is HELD: the row names the holder, and not a
+        # byte moves (a probe would have been free to tidy the keeper's leftover)
+        assert module.write_lock(CWD, None, path=module.LOCK_PATH)
+        held_before = {p: open(p, "rb").read() for p in claim_paths}
+        held_seen = run("doctor")
+        assert held_seen.returncode == 0, (held_seen.returncode, held_seen.stdout[-300:])
+        row = watcher_row(held_seen.stdout)
+        assert f"pid {os.getpid()} holds" in row, row
+        assert {p: open(p, "rb").read() for p in claim_paths} == held_before, \
+            "doctor rewrote a claim record while a claim was held"
+        say("doctor: a run leaves every claim record byte-identical — seeded daemon and "
+            "keeper records, dead pids and a held claim alike: ok")
+    finally:
+        module.clear_lock(path=module.LOCK_PATH)
+        for p in (module.PANE_KEEPER_PATH, module.NAS_LOCK_PATH):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    # ---- ...and not just `doctor`: EVERY command that only looks keeps the same promise.
+    #      `status` was the last one left on `daemon_pid()` — the destructive probe whose
+    #      free-claim answer removes the record it then reports on — and `nas --status` read
+    #      its claim through `nas_pane_daemon_pid` (`lock_holder` again, which for a watcher
+    #      from another build even KILLS it and clears the claim). Both now read through
+    #      `lock_peek` like the doctor's row. This pins the family: with the daemon, keeper
+    #      and NAS records seeded with a DEAD pid (free — the exact case a cleanup would
+    #      have removed), each look-only command must leave every claim record byte-identical
+    #      and still present, and the state root otherwise untouched. The task log is
+    #      deliberately outside the pin: `snap` and `json` record tracking events in it by
+    #      design (`track_tasks`), so they are held to the claims half of the contract only,
+    #      and the whole-root comparison starts after their write.
+    look_paths = [module.LOCK_PATH, module.PANE_KEEPER_PATH, module.NAS_LOCK_PATH]
+
+    def scratch_bytes() -> dict:
+        """Every file under the test state root, by path — what a look may not move."""
+        out = {}
+        for base, _dirs, names in os.walk(TEST_HOME):
+            for name in names:
+                path = os.path.join(base, name)
+                try:
+                    with open(path, "rb") as fh:
+                        out[path] = fh.read()
+                except OSError:
+                    out[path] = None
+        return out
+
+    def watcher_claim_row(text: str) -> str:
+        rows = [ln for ln in STRIP(text).splitlines() if re.match(r"\s*watcher\s+:", ln)]
+        assert rows, text[-400:]
+        return rows[0]
+
+    look_victim = spawn_quiet("sleep", "600")
+    look_dead = look_victim.pid
+    kill_tree(look_victim)
+    deadline = time.time() + 5
+    while time.time() < deadline and module.pid_alive(look_dead):
+        time.sleep(0.05)
+    try:
+        for p in look_paths:
+            module.atomic_write_json(p, {"pid": look_dead, "cwd": CWD, "started_ms": 0,
+                                         "instance_pid": None, "version": module.VERSION})
+        before = {p: open(p, "rb").read() for p in look_paths}
+        # The two that record tracking events: the claims are the promise, the task log is
+        # their business, so their write happens before the whole-root comparison begins.
+        for argv in (["snap"], ["json"]):
+            seen = run(*argv)
+            assert seen.returncode == 0, (argv, seen.returncode, seen.stderr[-200:])
+        assert {p: open(p, "rb").read() for p in look_paths} == before, \
+            "snap/json rewrote a claim record they were only asked to read"
+        assert all(os.path.exists(p) for p in look_paths), \
+            "snap/json removed a claim record"
+        # The dead-pid records are FREE, and every look says so — from the records it leaves
+        # behind to say it next time.
+        assert "— not running" in watcher_claim_row(run("status").stdout), "status row"
+        assert json.loads(run("status", "--json").stdout)["watcher_pid"] is None, "status json"
+        assert json.loads(run("nas", "--status", "--json").stdout)["watcher_pid"] is None, \
+            "nas status json"
+        scratch_before = scratch_bytes()
+        for argv in (
+            ["status"], ["status", "--json"],
+            ["why"], ["why", "--json"],
+            ["ledger"], ["ledger", "--json"],
+            ["locks"], ["locks", "--json"],
+            ["doctor"], ["doctor", "--json"],
+            ["nas", "--status"], ["nas", "--status", "--json"],
+            ["bar"], ["pin", "--list"],
+        ):
+            seen = run(*argv)
+            assert seen.returncode == 0, (argv, seen.returncode, seen.stderr[-200:])
+        after = {p: open(p, "rb").read() for p in look_paths}
+        assert after == before, "a look-only command rewrote a claim record it was only asked to read"
+        assert all(os.path.exists(p) for p in look_paths), \
+            "a look-only command removed a claim record"
+        assert scratch_bytes() == scratch_before, "a look-only command wrote into the state root"
+        # ...and the same with the daemon claim HELD: the row and the JSON name the holder,
+        # and still not a byte moves (a held claim is the case neither a probe nor a peek
+        # may tidy).
+        assert module.write_lock(CWD, None, path=module.LOCK_PATH)
+        held_before = {p: open(p, "rb").read() for p in look_paths}
+        held_row = watcher_claim_row(run("status").stdout)
+        m = re.match(r"\s*watcher\s+:\s*(\d+)\s*$", held_row)
+        assert m and int(m.group(1)) == os.getpid(), held_row
+        assert json.loads(run("status", "--json").stdout)["watcher_pid"] == os.getpid()
+        assert {p: open(p, "rb").read() for p in look_paths} == held_before, \
+            "status rewrote a claim record while a claim was held"
+        # ...and the other half of the contract: the paths that ACT still PROBE. A stop or
+        # a start has to be able to clear a dead record, which is what `daemon_pid` is for
+        # (the looks above refused to touch the same file), so the probe must still remove
+        # the leftover — dropping it would leave a watcher that is not running reported as
+        # one the next look reads.
+        module.clear_lock(path=module.LOCK_PATH)
+        module.atomic_write_json(module.LOCK_PATH, {"pid": look_dead, "cwd": CWD,
+                                                    "started_ms": 0, "instance_pid": None,
+                                                    "version": module.VERSION})
+        assert module.daemon_pid() is None and not os.path.exists(module.LOCK_PATH), \
+            "the acting probe stopped clearing a dead record"
+        say("looks: every command that only looks — status, why, ledger, locks, doctor, nas "
+            "--status, bar and pin --list, plus the tracking snap/json — leaves every claim "
+            "record byte-identical, reports a dead pid as not running, and a held claim by "
+            "its holder, while the acting probe still clears a dead record: ok")
+    finally:
+        module.clear_lock(path=module.LOCK_PATH)
+        for p in (module.PANE_KEEPER_PATH, module.NAS_LOCK_PATH):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    # ---- ...and `locks --fix` is the same read with a hand: the free records the looks just
+    #      refused to touch are CLEARED (through the ask's own probe, which re-checks the
+    #      name under the lock), nothing else is, and the plan comes first so an operator can
+    #      see it before anything moves. A fix with no untied process to end asks nothing —
+    #      there is no kill in it — and a second run finds nothing to clear, which is what
+    #      makes it safe on a schedule. The flag belongs to its command, like `--watch`.
+    fix_paths = [module.LOCK_PATH, module.PANE_KEEPER_PATH, module.NAS_LOCK_PATH]
+    fix_victim = spawn_quiet("sleep", "600")
+    fix_dead = fix_victim.pid
+    kill_tree(fix_victim)
+    deadline = time.time() + 5
+    while time.time() < deadline and module.pid_alive(fix_dead):
+        time.sleep(0.05)
+    try:
+        for p in fix_paths:
+            module.atomic_write_json(p, {"pid": fix_dead, "cwd": CWD, "started_ms": 0,
+                                         "instance_pid": None, "version": module.VERSION})
+        dry_fix = json.loads(run("locks", "--fix", "--dry-run", "--json").stdout)
+        assert dry_fix["dry_run"] is True and dry_fix["applied"] is False, dry_fix
+        assert [c["role"] for c in dry_fix["planned"]["clears"]] == \
+            ["watcher", "keeper", "nas pane"], dry_fix["planned"]
+        assert all(os.path.exists(p) for p in fix_paths), "--dry-run removed a claim record"
+        fixed = json.loads(run("locks", "--fix", "--json", "--yes").stdout)
+        assert fixed["applied"] is True and fixed["reason"] is None, fixed
+        assert [c["role"] for c in fixed["cleared"]] == ["watcher", "keeper", "nas pane"] \
+            and all(c["removed"] for c in fixed["cleared"]), fixed["cleared"]
+        assert all(not os.path.exists(p) for p in fix_paths), "the fix left a leftover record"
+        again = json.loads(run("locks", "--fix", "--json", "--yes").stdout)
+        assert again["planned"]["clears"] == [], "the fix planned the same clear twice"
+        assert run("status", "--fix").returncode == 2, "the --fix guard did not hold"
+        say("locks --fix: the free leftovers a look refuses to touch are cleared — planned "
+            "first with --dry-run, applied through the ask's own probe, idempotent on a "
+            "second run: ok")
+    finally:
+        for p in fix_paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    # ---- `--restart` is the opt-in that runs the ask after the repair. On its own, `locks
+    #      --fix` leaves the claims it ended FREE — nothing re-claims them until the next
+    #      session start, which can be hours — so this is the one command that leaves the
+    #      machine watched again. It runs the same ask a session start uses (`ensure_daemon`),
+    #      it is firmly opt-in (`--dry-run` still only plans; the flag belongs to `locks
+    #      --fix`, not to `locks`), and it is idempotent: a second run keeps the watcher the
+    #      first one started instead of spawning another.
+    restart_victim = spawn_quiet("sleep", "600")
+    restart_lock = os.path.join(TEST_HOME, "fbtodo-daemon.pid")
+    # A keeper ask here would name the operator's own tmux server; `FBTODO_NO_PANE` makes the
+    # restart exercise the watcher half alone, against this fixture root.
+    restart_env = {**env, "FBTODO_NO_PANE": "1"}
+
+    def restart_run(*extra):
+        return json.loads(subprocess.run(
+            [sys.executable, FB, "locks", "--fix", "--restart", *extra, "--json",
+             "--watch-pid", str(restart_victim.pid), "-i", "0.2"],
+            capture_output=True, text=True, env=restart_env, cwd=CWD, timeout=60,
+        ).stdout)
+
+    try:
+        if os.path.exists(restart_lock):
+            os.unlink(restart_lock)
+        assert run("locks", "--restart").returncode == 2, "the --restart guard did not hold"
+        assert run("status", "--restart").returncode == 2, "the --restart guard did not hold"
+        # a dry run plans the restart and starts nothing
+        planned = restart_run("--dry-run")
+        assert planned["dry_run"] is True and planned["applied"] is False, planned
+        assert planned["restarted"] == {}, planned["restarted"]
+        assert not os.path.exists(restart_lock), "a dry run started a watcher"
+        # the real run brings a watcher back on this root, through the normal ask
+        done = restart_run("--yes")
+        row = done["restarted"]["watcher"]
+        assert row["pid"] and row["before"] is None, row
+        assert module.lock_holder(restart_lock) == row["pid"], "the restart left no watcher"
+        assert module.pid_alive(row["pid"]), "the restarted watcher is not alive"
+        # ...and a second run keeps the one it started — the ask is not a restart loop
+        kept = restart_run("--yes")
+        assert kept["restarted"]["watcher"] == {"pid": row["pid"], "before": row["pid"]}, \
+            kept["restarted"]
+        say("locks --fix --restart: a dry run plans it and starts nothing, the real run "
+            "re-claims the watcher through the normal ask, and a second run keeps it: ok")
+    finally:
+        holder = module.lock_holder(restart_lock)
+        if holder:
+            try:
+                os.kill(int(holder), signal.SIGTERM)
+            except OSError:
+                pass
+            deadline = time.time() + 10
+            while time.time() < deadline and module.pid_alive(int(holder)):
+                time.sleep(0.1)
+        if os.path.exists(restart_lock):
+            os.unlink(restart_lock)
+        kill_tree(restart_victim)
 
     # ---- state root: the XDG directory by default, the legacy `~/.freebuff` moved there
     #      ONCE, and only when nothing is still writing it. Driven through child processes
@@ -1115,7 +3678,12 @@ try:
         os.path.join(c_home, ".local", "state", "fbtodo", "fbtodo-state.json")
     ), "copied out from under a live watcher"
     # ...and the keeper counts too: moving ITS claim would leave the running keeper writing a
-    # record nothing reads, and a second keeper would start on top of it.
+    # record nothing reads, and a second keeper would start on top of it. The record has to
+    # still be there after the doctor run for the same reason it is read at all: `_claim_live`
+    # decides the move from it, and `one python` reads the keeper's interpreter from it, so a
+    # diagnostic that cleaned up after itself would erase the fact it had just reported —
+    # `doctor` used to ask `lock_holder`, whose free-claim answer REMOVES the record instead of
+    # believing it (found here, 2026-10-02).
     d_home = os.path.join(root, "d")
     checks = state_checks(
         d_home,
@@ -1388,6 +3956,43 @@ try:
     assert "the finished step" not in after_frame, after_frame
     assert "Other live thread" in after_frame and "other three" in after_frame, after_frame
     say("desktop: a pane stacks the live threads, each under its own heading: ok")
+
+    # ---- the app's own live signal: the store commits a row only when a turn CLOSES, so
+    #      a thread that is WORKING has no list to read yet. `threads.turn_state` and
+    #      `turn_alive_at` do move mid-turn, and the pane names the turn rather than
+    #      blaming the agent for never calling `write_todos`.
+    turned = os.path.join(TEST_HOME, "turnstore")
+    os.makedirs(turned, exist_ok=True)
+    turn_db = os.path.join(turned, "desktop-v2.db")
+    if os.path.exists(turn_db):
+        os.remove(turn_db)
+    con = sqlite3.connect(turn_db)
+    con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, status TEXT,"
+                " turn_state TEXT, turn_alive_at INTEGER, sidebar_archived_at INTEGER)")
+    con.execute("CREATE TABLE messages (seq INTEGER, thread_id TEXT, parts_json TEXT, ts INTEGER)")
+    con.execute("INSERT INTO threads VALUES ('R0', 'Working thread', 'open', 'running', ?, NULL)",
+                (DESK_NOW - 2_000,))
+    con.commit()
+    con.close()
+
+    def reason_with(state, beat_age_ms):
+        c2 = sqlite3.connect(turn_db)
+        c2.execute("UPDATE threads SET turn_state = ?, turn_alive_at = ?",
+                   (state, DESK_NOW - beat_age_ms))
+        c2.commit()
+        c2.close()
+        st = module.read_desktop(turn_db, thread_id="R0", source="pinned", now_ms=DESK_NOW)
+        return st, module.no_list_reason(st)
+
+    st, why = reason_with("running", 2_000)
+    assert st["turn_running"] is True and why == "turn running · no list yet", (st, why)
+    # A `running` state whose heartbeat has stopped is a turn that DIED, not one in flight
+    st, why = reason_with("running", 10 * 60_000)
+    assert st["turn_running"] is False, st
+    assert why == "no write_todos call yet in this session", why
+    st, why = reason_with("idle", 2_000)
+    assert st["turn_running"] is False, st
+    say("desktop: a running turn says so instead of blaming the agent: ok")
 
     # ---- the big goal heading a list: the AGENT's own line, and drift since
     goals = os.path.join(TEST_HOME, "goalstore")
@@ -1673,6 +4278,48 @@ try:
     st_t = module.read_cli(goals)
     assert st_t["turn_ended"] is False, st_t
     say("turn_ended: false again when a newer request has no answer yet: ok")
+
+    # ---- the boundary guard (`files_unlisted`): a turn that edited files but published no
+    #      `write_todos` SINCE ITS LAST EDIT is not a finish, whatever the boxes say. Both
+    #      halves are the journal's own — the newest edit's position, and the newest list's.
+    write_journal(
+        [
+            rec(prompt="land the fix"),
+            rec(todos=[{"task": "t", "completed": True}]),
+            rec(calls=[{"toolName": "str_replace", "input": {"paths": ["/x/y.py"]}}]),
+            rec(ended=True, prose="done"),
+        ]
+    )
+    st_t = module.read_cli(goals)
+    assert st_t["turn_ended"] is True and st_t["files_unlisted"] is True, st_t
+    assert "changed, list not rewritten" in module.unlisted_note(st_t), st_t
+    say("files_unlisted: true when files change after the list and the turn ends: ok")
+
+    # the SAME turn with its list rewritten after the last edit: the list accounts for the
+    # work, so the guard is silent and the bell may ring
+    write_journal(
+        [
+            rec(prompt="land the fix"),
+            rec(calls=[{"toolName": "str_replace", "input": {"paths": ["/x/y.py"]}}]),
+            rec(todos=[{"task": "t", "completed": True}]),
+            rec(ended=True, prose="done"),
+        ]
+    )
+    st_t = module.read_cli(goals)
+    assert st_t["turn_ended"] is True and st_t["files_unlisted"] is False, st_t
+    say("files_unlisted: false once the list is rewritten past its last edit: ok")
+
+    # ...and mid-turn there is no boundary to guard: the agent may still be about to write
+    write_journal(
+        [
+            rec(prompt="land the fix"),
+            rec(todos=[{"task": "t", "completed": True}]),
+            rec(calls=[{"toolName": "str_replace", "input": {"paths": ["/x/y.py"]}}]),
+        ]
+    )
+    st_t = module.read_cli(goals)
+    assert st_t["files_unlisted"] is False, st_t
+    say("files_unlisted: silent mid-turn — the boundary is where the bell decides: ok")
 
     # ---- the agent's own line is the heading: the journal keeps prose in fullResponse,
     # nowhere else, and AGENTS.md is what makes the agent write it
@@ -2269,6 +4916,13 @@ try:
         # so every check below was asserting against a two-line error frame. Cleared, the
         # shape still comes from the live `json` and the list is really rendered.
         error=None,
+        # ...and `turn_ended` is machine state too, with a worse symptom: the checks below
+        # read the state chip's WORD from it and assert a WORKING chip, so a fixture that
+        # inherited it passed or failed with the moment the suite happened to run — FALSE
+        # mid-turn, TRUE in the seconds after one. The list drawn here is mid-turn by
+        # construction (a step is unfinished), so the fixture says so, and a machine with
+        # no live session to inherit from cannot change the answer.
+        turn_ended=False,
         task_history={},        # no remembered pace: the default keeps `~2m` in the strip
         # `now`, `nudge` and the patch/alert pair ride along in the live `json`, and each one
         # can add a ROW to the frame. Measured 2026-09-29: a request arriving mid-run put a
@@ -3559,6 +6213,19 @@ try:
             # this check picked rather than for the pty's unset 0x0
             os.environ["FBTODO_HOME"] = draw_home
             os.environ["COLUMNS"], os.environ["LINES"] = str(draw_cols), str(draw_rows)
+            # ...and a REAL terminal, because which frame the pane draws is decided from
+            # one: `use_color` reads TERM, and under the `dumb` a runner's environment
+            # carries the pane draws its plain, unboxed layout — so these frame
+            # assertions failed on the machine the suite ran on, not on the code. Pinned
+            # here rather than inherited so the row is one check everywhere; COLORTERM
+            # rides along for the designed palette, and NO_COLOR is dropped because a
+            # developer's own "no colour" must not decide a test's frame either. The
+            # whole suite must still pass with TERM=dumb and no colour environment —
+            # `ci.yml`'s `dumb-terminal` lane holds that — so this pin stays in the
+            # child: the rest of the suite keeps seeing the terminal it was run in.
+            os.environ["TERM"] = "xterm-256color"
+            os.environ["COLORTERM"] = "truecolor"
+            os.environ.pop("NO_COLOR", None)
             os.execv(sys.executable, [sys.executable, PANES, "pane", "--watch-pid",
                                       str(victim.pid), "--no-daemon", "-i", "0.2"])
         os.set_blocking(fd, False)

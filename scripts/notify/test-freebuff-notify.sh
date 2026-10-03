@@ -82,7 +82,7 @@ install_bell() {
 # Every one of these is RUN BY PATH — from the wrapper, from fbtodo's watcher, from the
 # skill's commands — so a missing exec bit is a feature that silently does nothing (the
 # sandbox copies are chmod'ed, which is exactly how that hid for a whole session).
-for f in bell.sh drop-bell.py phone.sh session-timer.sh session-task.py todo-bell.py ask-bell.py pause-bell.py pane-bell.py; do
+for f in bell.sh drop-bell.py phone.sh session-timer.sh session-task.py todo-bell.py ask-bell.py pause-bell.py pane-bell.py locks-bell.py; do
   check "$f is executable where it lives" "$([ -x "$HERE/$f" ] && echo yes || echo no)" "yes"
 done
 
@@ -642,6 +642,16 @@ out=$(tb_run --print)
 check "silent through a long command, with every box ticked" "$(tb_plays)" "2"
 check_match "--print names the turn, not the tick boxes" "$out" \
   'all 3 done, but the agent has not finished its turn'
+
+# the boundary guard: every box ticked and the turn ended, but the journal shows files
+# changed AFTER the newest write_todos — the list is not the last word, so this is not a
+# finish to announce (fbtodo's `files_unlisted`)
+UNLISTED='{"backend":"cli","session":"s1","list_id":"L1","done":3,"total":3,"turn_ended":true,"files_unlisted":true,"turn":{"files":["a.py","b.py"]}}'
+tb_state "$UNLISTED"
+out=$(tb_run --print)
+check "silent when files changed after the list" "$(tb_plays)" "2"
+check_match "--print says why the finish was withheld" "$out" \
+  'all 3 done, but 2 files changed after the list'
 
 tb_state "$NOLIST"
 tb_run_silent
@@ -1783,6 +1793,107 @@ check "...and is not claimed" "$([ -e "$PN/fresh.json" ] && echo claimed || echo
 : >"$PN/why.json"
 check_match "an unanswerable layout is silent, not an error" \
   "$(pn_run 30 --print)" '^silent: fbtodo could not answer'
+echo "== the locks watch: a claim no reader can find, and a name that parted from its inode =="
+# The audit is the only place either failure exists — `fbtodo locks` reads the claim files
+# AND the process table, and nothing else does — and it is never run by itself, so this bell
+# is what turns a broken claim into something you hear about. The unit is the OCCURRENCE,
+# like every bell here: a claim that cleared and came back is new news, and one that has
+# been broken for an hour is not news again.
+LB="$SANDBOX/locks-bell"
+mkdir -p "$LB/bin" "$LB/notify" "$LB/home"
+cp "$HERE/locks-bell.py" "$LB/notify/"
+chmod +x "$LB/notify/locks-bell.py"
+# Bodies carry newlines, so a send is flattened to `~` and terminated: one line per push,
+# and the count is the number of pushes.
+printf '#!/bin/sh\ncase "$*" in *--print*) printf "url=stub topic=set\\n"; exit 0;; esac\nprintf "%%s\\n" "$*" | tr "\\n" "~" >>"%s"\nprintf "\\n" >>"%s"\n' \
+  "$LB/sends.log" "$LB/sends.log" >"$LB/notify/phone.sh"
+chmod +x "$LB/notify/phone.sh"
+# fbtodo answers with one audit document; what the bell does with it is the whole question.
+printf '#!/bin/sh\ncat "%s" 2>/dev/null\n' "$LB/audit.json" >"$LB/bin/fbtodo"
+chmod +x "$LB/bin/fbtodo"
+lb_orphan() { # pid — one untied role process, as the process half of the audit reports it
+  printf '{"pid":%s,"role":"keeper","ppid":1,"argv":"fbtodo pane-watch","root":"/x","root_named":true,"env_clipped":false,"age_s":400}' "$1"
+}
+lb_doc() { # orphan-or-empty, tie-pid-or-empty
+  local orphans="${1:-}" tie="${2:-}" watcher
+  if [ -n "$tie" ]; then
+    watcher='{"role":"watcher","path":"/x/fbtodo-daemon.pid","state":"free","pid":'"$tie"',"pid_alive":true,"name_inode":"mismatch","leftover":true,"orphans":[]}'
+  else
+    watcher='{"role":"watcher","path":"/x/fbtodo-daemon.pid","state":"held","pid":7,"pid_alive":true,"name_inode":"match","leftover":false,"orphans":[]}'
+  fi
+  printf '{"version":"x","scratch":"/x","claims":[%s,{"role":"keeper","path":"/x/fbtodo-pane-keeper.pid","state":"absent","pid":null,"pid_alive":false,"name_inode":null,"leftover":false,"orphans":[%s]}]}\n' \
+    "$watcher" "$orphans" >"$LB/audit.json"
+}
+lb_sends() { if [ -r "$LB/sends.log" ]; then wc -l <"$LB/sends.log" | tr -d ' '; else echo 0; fi; }
+lb_run() { # grace, args... — wait for a detached push to land before counting it
+  local grace="$1" before
+  shift
+  before=$(lb_sends)
+  PATH="$LB/bin:$PATH" HOME="$LB/home" FREEBUFF_FBTODO="$LB/bin/fbtodo" \
+    FREEBUFF_PHONE_SH="$LB/notify/phone.sh" FREEBUFF_LOCKS_GRACE="$grace" \
+    FREEBUFF_LOCKS_BELL_STATE="$LB/state.json" \
+    python3 "$LB/notify/locks-bell.py" "$@"
+  case " $* " in *--print*) : ;; *) wait_for_change 1 lb_sends "$before" ;; esac
+  return 0
+}
+
+# every claim held by a live process, nothing running untied
+lb_doc
+check_match "nothing wrong is silent" \
+  "$(lb_run 0 --print)" '^silent: every claim is held by a live process, and nothing is running untied'
+check "...and sends nothing" "$(lb_sends)" "0"
+
+# ...and a finding younger than the grace is the claim being born, not news yet
+lb_doc "$(lb_orphan 4242)"
+check_match "a claim that has only just gone wrong waits for the grace" \
+  "$(lb_run 30 --print)" '^silent: a claim has been wrong for 0s .needs 30s.'
+check "...and stays quiet" "$(lb_sends)" "0"
+
+check_match "an untied process is reported" \
+  "$(lb_run 0 --print)" '^LOCKS: orphans — keeper: pid 4242 is running with no claim naming it'
+lb_run 0 --quiet >/dev/null
+check "it pushes once" "$(lb_sends)" "1"
+check_match "...through phone.sh, high priority" "$(cat "$LB/sends.log")" 'priority high'
+check_match "...naming the pid and the claim file" "$(cat "$LB/sends.log")" 'pid 4242.*fbtodo-pane-keeper.pid'
+check_match "...and saying what to run" "$(cat "$LB/sends.log")" 'locks --fix'
+lb_run 0 --quiet >/dev/null
+check "the same claim does not repeat" "$(lb_sends)" "1"
+check_match "...and says why" "$(lb_run 0 --print)" '^silent: already announced'
+
+# the recurrence a cooldown gets wrong: the claim is whole again, and goes wrong again
+lb_doc
+lb_run 0 --quiet >/dev/null
+lb_doc "$(lb_orphan 4242)"
+lb_run 0 --quiet >/dev/null
+check "a claim that goes wrong again is new news" "$(lb_sends)" "2"
+
+# the other finding: a claim file that is FREE while its record names a live pid. The name
+# and the inode have parted, which is what the audit's comparison exists to catch.
+lb_doc "" 7
+check_match "a broken tie is reported as a tie" \
+  "$(lb_run 0 --print)" '^LOCKS: ties — watcher: fbtodo-daemon.pid is free while pid 7 is alive'
+check_match "...and says the name and the inode parted" "$(lb_run 0 --print)" 'parted'
+lb_run 0 --quiet >/dev/null
+check "a tie pushes too" "$(lb_sends)" "3"
+
+# a dead pid in a free record is a leftover the next ask clears, not a live tie
+lb_doc ""
+check_match "a whole claim clears every finding" \
+  "$(lb_run 0 --print)" '^silent: every claim is held'
+
+# no sender: the caller's back-off signal, and nothing claimed so it can still push later
+lb_doc "$(lb_orphan 4242)"
+out=$(PATH="$LB/bin:$PATH" HOME="$LB/home" FREEBUFF_FBTODO="$LB/bin/fbtodo" \
+  FREEBUFF_PHONE_SH="$LB/notify/nope.sh" FREEBUFF_LOCKS_GRACE=0 \
+  FREEBUFF_LOCKS_BELL_STATE="$LB/fresh.json" \
+  python3 "$LB/notify/locks-bell.py" 2>&1); rc=$?
+check "a finding with nothing configured to send to exits 78" "$rc" "78"
+check "...and is not claimed" "$([ -e "$LB/fresh.json" ] && echo claimed || echo pending)" "pending"
+
+# an audit fbtodo could not answer for at all is silence, not a crash
+: >"$LB/audit.json"
+check_match "an unanswerable audit is silent, not an error" \
+  "$(lb_run 0 --print)" '^silent: fbtodo could not answer'
 echo
 [ "$fails" = 0 ] && echo "ALL PASS" || echo "$fails CHECK(S) FAILED"
 exit "$fails"

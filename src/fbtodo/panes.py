@@ -279,13 +279,12 @@ def nas_pane_command(args) -> str:
     file). The pane exits by itself when the far session goes, so a killed watcher still
     cannot leave a pane behind.
     """
-    argv = [
+    return pane_command([
         *self_argv(), "-s", "nas", "--stale-after", "0",
         "--no-daemon", "--quiet",
         "--nas-host", args.nas_host, "--nas-root", args.nas_root,
         "--nas-project", args.nas_project, "--fb-marker", args.fb_marker,
-    ]
-    return " ".join(shlex.quote(part) for part in argv)
+    ])
 
 
 def nas_pane_kill(pane: str) -> None:
@@ -363,6 +362,33 @@ def pane_repaint(previous: list | None, frame: list, rows: int) -> str:
     return out
 
 
+def pane_start_command(reported: str) -> str:
+    """`#{pane_start_command}` as the command itself, not as tmux's quoting of it.
+
+    In plain words: tmux re-quotes a format value the way a SHELL would quote it when it
+    needs it — single quotes where the value holds a double quote (`X"Y` is reported as
+    `'X"Y'`), double quotes with `"` and `\\` escaped when it holds a space or a single
+    quote (`sleep 300` as `"sleep 300"`, `X "Y"` as `"X \\"Y\\""`), and nothing when
+    it needs nothing (measured 2026-10-02 against the tmux on this machine). A pinned
+    command always has spaces, so it always comes back wrapped — and reading it back and
+    comparing it with
+    the pin it was started from was false forever, which a keeper must not believe: it
+    would respawn a pane that is already running its pin, once per pass.
+
+    `shlex.split` is the reader that undoes exactly this encoding: a value tmux quoted
+    comes back as the one word it was. A value tmux left alone is returned untouched,
+    backslashes and all — this only decodes what is wrapped.
+    """
+    if len(reported) >= 2 and reported[0] in "'\"" and reported[-1] == reported[0]:
+        try:
+            parts = shlex.split(reported)
+        except ValueError:  # an unbalanced quote is not ours to repair
+            return reported
+        if len(parts) == 1:
+            return parts[0]
+    return reported
+
+
 def pane_rows() -> list[dict]:
     """Every pane, with what deciding about it needs: its id, its window, its shell."""
     # The field separator is a printable `|`, not a tab: a tab inside a `-F` format does not
@@ -380,7 +406,7 @@ def pane_rows() -> list[dict]:
                 "pane": parts[0],
                 "window": parts[1],
                 "pid": int(parts[2]) if parts[2].isdigit() else 0,
-                "start": parts[3],
+                "start": pane_start_command(parts[3]),
             }
         )
     return rows
@@ -871,13 +897,173 @@ def window_of(target: str | None) -> str | None:
 # first passes of a fresh keeper see no instance at all.
 KEEPER_GRACE = 90.0
 
+# How long an ask waits for SOME keeper to claim before it reports that none did. A claim
+# is normally taken in well under a second; the margin is spent only when a second ask's
+# keeper is racing for the same claim — each ask starts a keeper before either has claimed
+# — or when the machine is loaded enough that python and tmux are slow to start.
+KEEPER_CLAIM_WAIT_S = 5.0
 
-def tmux_identity() -> str:
-    """Which tmux this program talks to: the `-L`/`-f` form when one is forced, else the
-    socket this shell is inside. A keeper belongs to exactly one server, so this is part
-    of its record — a keeper left polling a server that has gone cannot serve the one you
-    are in, and it must not stand in the way of the one that can."""
-    return os.environ.get("FBTODO_TMUX") or os.environ.get("TMUX") or "-default"
+# How often the keeper asks whether its claim's NAME still points at it.
+#
+# A lock is only a claim while a reader can find it: the file can be removed or replaced
+# under a running keeper (a probe's leftover cleanup, an admin's `rm`, a test), and the
+# keeper then holds a lock on a file the name has left behind — `lock_peek` says the role is
+# not running, the process half of the audit names it an orphan, and `locks --fix` ends it.
+# A keeper reported dead and killed for it is the one failure this tick exists to prevent,
+# so it is short: one `stat` per second next to a pane pass that walks tmux many times a
+# second is nothing. The pane passes keep their own cadence (`--pane-seconds`); this only
+# decides how often the claim is re-asked.
+KEEPER_CLAIM_CHECK_S = 1.0
+
+
+def _tmux_socket_dir() -> str:
+    """Where tmux keeps its sockets: `$TMUX_TMPDIR` or `/tmp`, under `tmux-<uid>/`."""
+    return os.path.join(os.environ.get("TMUX_TMPDIR") or "/tmp", f"tmux-{os.getuid()}")
+
+
+def _tmux_default_socket() -> str:
+    """The socket of the default server — what bare `tmux` talks to."""
+    return os.path.join(_tmux_socket_dir(), "default")
+
+
+def tmux_socket_of(name: str | None) -> str | None:
+    """The socket a tmux name denotes, or None when the name names no server we can read.
+
+    In plain words: a server is named by whichever spelling its context had, and the
+    spellings have to be comparable — an ask must tell "the same server, written
+    differently" from "another server", because the two askers write their own and used
+    to read each other's as a stranger. Four spellings exist. The canonical one is the
+    socket path itself (what `display-message -p '#{socket_path}'` answers). A raw `TMUX`
+    value is `socket,server pid,session id` — the last two fields say which pane asked,
+    not which server it is, so the socket is what is left of its last two commas. A
+    forced `FBTODO_TMUX` is a command line: `-S path` names the socket outright, `-L
+    name` the one in tmux's own directory, and no such flag means the default server,
+    like bare `tmux`. `-default` is this program's old placeholder for exactly that
+    default server, kept here so a record written before the name was canonicalised
+    still compares as the server it meant. Anything else is no answer, and only string
+    equality is left to it.
+    """
+    if not name:
+        return None
+    if name == "-default":
+        return os.path.realpath(_tmux_default_socket())
+    if " " in name:
+        # the forced form — `tmux -L work`, or `tmux -S /path/sock -f conf` — and only
+        # when its own command word is tmux; a socket path may hold a space of its own
+        try:
+            parts = shlex.split(name)
+        except ValueError:
+            return None
+        if parts and os.path.basename(parts[0]).lower().startswith("tmux"):
+            sock = None
+            for at, tok in enumerate(parts[1:], start=1):
+                if tok == "-S" and at + 1 < len(parts):
+                    sock = parts[at + 1]
+                elif tok == "-L" and at + 1 < len(parts):
+                    sock = os.path.join(_tmux_socket_dir(), parts[at + 1])
+                elif tok.startswith("-S") and len(tok) > 2:
+                    sock = tok[2:]
+                elif tok.startswith("-L") and len(tok) > 2:
+                    sock = os.path.join(_tmux_socket_dir(), tok[2:])
+            return os.path.realpath(sock or _tmux_default_socket())
+    if name.startswith("/"):
+        # a socket path, or a raw `TMUX` value with the server pid and session id on it
+        if name.count(",") >= 2:
+            name = name.rsplit(",", 2)[0]
+        return os.path.realpath(name)
+    return None
+
+
+def same_tmux_server(a: str | None, b: str | None) -> bool:
+    """Whether two tmux names denote one SERVER — the comparison every keeper ask makes.
+
+    In plain words: an ask and a record are written by different processes, often of
+    different builds, and each writes the spelling its own context had — the raw `TMUX`
+    value (socket, server pid, session id), the old `-default`, a forced `-L work`, the
+    canonical socket. Compared as strings those read as two servers, and the ask replaces
+    a keeper that is already on the right one: measured 2026-10-02, the pane and the path
+    that spawns the watcher did exactly that several times an hour. Both names are reduced
+    to the socket each denotes (`tmux_socket_of`) and compared by real path. A name that
+    reduces to nothing — an empty record, a stanza nobody recognises — is equal only to
+    itself, so a difference stays a difference rather than becoming a guess.
+    """
+    if a == b:
+        return True
+    if a is None or b is None:
+        return False
+    sock_a, sock_b = tmux_socket_of(a), tmux_socket_of(b)
+    return sock_a is not None and sock_a == sock_b
+
+
+def tmux_identity() -> str | None:
+    """Which tmux server this program talks to, named the one way every context agrees on.
+
+    In plain words: a pane spells its tmux as the `TMUX` value — socket, server pid and
+    session id — while the desktop integration, launched outside tmux, has no `TMUX` at all
+    and used to say only `-default`. Both name the same server, and compared raw they read
+    as two: measured 2026-10-02, each ask killed the other's keeper (`replacing keeper …`)
+    several times an hour. So the name is the one thing both contexts can spell identically
+    — the SERVER's own socket path, asked of the server itself (`display-message -p
+    '#{socket_path}'`), which answers the same string inside a session and from a shell with
+    no `TMUX` at all. `FBTODO_TMUX` is that override verbatim: a forced server is named
+    deliberately, and it is the same string in every context that sets it. None is the
+    honest answer when nothing can be asked and there is no `TMUX` to read: this context
+    cannot NAME a server, and callers must not read that as a different one. Naming is not
+    comparing, though — a name written by another build or another spelling is read back
+    through `same_tmux_server`.
+    """
+    forced = os.environ.get("FBTODO_TMUX")
+    if forced:
+        return forced
+    out = tmux_run("display-message", "-p", "#{socket_path}")
+    if out and out.strip():
+        return os.path.realpath(out.strip())
+    tmux = os.environ.get("TMUX")
+    if tmux:
+        # A dead server still has its name in `TMUX`; the socket is the name, and the
+        # pid and session id after it say which pane asked, not which server it is.
+        return tmux_socket_of(tmux) or tmux
+    return None
+
+
+def tmux_identity_outside() -> str | None:
+    """The name an ask from OUTSIDE tmux writes: the shell autostart's, the desktop's.
+
+    `tmux_identity` answers for the context it runs in — with `TMUX` set that is the
+    pane's server, without it the default one — while the ask that spawns a watcher comes
+    from outside any pane: the autostart runs before a pane exists, and the desktop
+    integration is not in tmux at all. `status` compares that ask with the keeper's record
+    even when `status` itself is typed inside a pane, so `TMUX` is taken away for the one
+    question and put back. `FBTODO_TMUX` still answers verbatim: a forced server is named
+    deliberately, and that name is the same from every context.
+    """
+    saved = os.environ.pop("TMUX", None)
+    try:
+        return tmux_identity()
+    finally:
+        if saved is not None:
+            os.environ["TMUX"] = saved
+
+
+def keeper_serves(rec: dict, target: str | None) -> bool:
+    """Whether the keeper a record names is the one this ask needs: current, same server.
+
+    In plain words: a keeper is one per server, so an ask that names a server needs the
+    keeper to be recording that same one — compared as a SERVER, not as a string
+    (`same_tmux_server`), because an ask and a record are written by different builds with
+    different spellings: the raw `TMUX` value, the old `-default`, a forced server and the
+    canonical socket all reduce to the socket they denote. An ask that names NONE (no
+    server to ask, no `TMUX` to read) has nothing to compare, so it must not evict what it
+    cannot judge — even with one spelling, an ask that cannot tell one server from another
+    would kill the keeper of the server it is not on. A keeper from an older build is
+    served by neither rule — nothing re-imports a running process, so an upgrade has to
+    replace it.
+    """
+    if rec.get("version") != VERSION:
+        return False
+    if target is None:
+        return True
+    return same_tmux_server(rec.get("tmux"), target)
 
 
 def ensure_pane_keeper(args, quiet: bool = True) -> int | None:
@@ -894,12 +1080,16 @@ def ensure_pane_keeper(args, quiet: bool = True) -> int | None:
     target = tmux_identity()
     rec = read_json(PANE_KEEPER_PATH, {}) or {}
     pane_log(
-        f"asked for a keeper (tmux {target}; record "
-        + (f"{rec.get('pid')} for {rec.get('tmux')}" if rec.get("pid") else "none")
+        f"asked for a keeper (tmux {target or 'unnameable'}; record "
+        + (f"{rec.get('pid')} for {rec.get('tmux') or 'unnameable'}"
+           if rec.get("pid") else "none")
         + ")"
     )
+    # An ask is an ACTOR too: `lock_holder` both answers "is somebody keeping panes" and
+    # removes a leftover record that names a dead pid, so the keeper it decides to start
+    # is not blocked by a name nothing holds.
     pid = lock_holder(PANE_KEEPER_PATH)
-    if pid and rec.get("version") == VERSION and rec.get("tmux") == target:
+    if pid and keeper_serves(rec, target):
         return int(pid)
     if pid:
         # An older build, or a keeper for another server: it cannot serve this one, and
@@ -915,7 +1105,10 @@ def ensure_pane_keeper(args, quiet: bool = True) -> int | None:
                 break
             time.sleep(0.05)
         clear_lock(int(pid), path=PANE_KEEPER_PATH)
-        pane_log(f"replacing keeper {pid} (tmux {rec.get('tmux')} -> {target})")
+        pane_log(
+            f"replacing keeper {pid} (tmux {rec.get('tmux') or 'unnameable'} -> "
+            f"{target or 'unnameable'})"
+        )
     argv = [
         *self_argv(), "pane-watch",
         "--foreground", "--quiet", "--pane-seconds", str(args.pane_seconds),
@@ -930,7 +1123,18 @@ def ensure_pane_keeper(args, quiet: bool = True) -> int | None:
         return None
     finally:
         log.close()
-    for _ in range(40):
+    # Wait for the claim — whoever won it. Two asks arrive together (the pane's own
+    # `ensure_daemon` and the shell autostart, or two panes opening in one breath), each
+    # starts a keeper before either has claimed, and exactly one wins: the other sees the
+    # winner and stands down (`keeper_serves`, or `write_lock` failing). The ask that
+    # spawned the stand-down has still got a keeper — the winner's — so the pid returned
+    # is the HOLDER's, not necessarily this child's: a loss is an answer, not a failure.
+    # Asking `lock_holder` is what makes it so, and it is also what used to break it: the
+    # loser's own poll could take the winner's just-created claim (free, still empty) and
+    # remove it as a leftover, so the winner kept every pane with nothing on disk to name
+    # it and the ask logged "never claimed the lock" (the empty-file rule is in locks.py).
+    deadline = time.monotonic() + KEEPER_CLAIM_WAIT_S
+    while time.monotonic() < deadline:
         time.sleep(0.05)
         pid = lock_holder(PANE_KEEPER_PATH)
         if pid:
@@ -941,6 +1145,32 @@ def ensure_pane_keeper(args, quiet: bool = True) -> int | None:
     return None
 
 
+def keeper_reclaim(target: str | None, started_ms=None) -> str:
+    """Take the keeper's claim BY NAME again after the name moved, or stand down.
+
+    In plain words: a claim is a lock AND a name, and the keeper can lose the name half
+    without losing the lock — the file is removed or replaced, and the kernel lock on the
+    unlinked inode keeps answering `lock_ours` yes about a file nobody can find. Left alone
+    the keeper watches panes invisibly until an operator notices: the audit's process half
+    names it an orphan (nothing on disk ties it), and `locks --fix` ends it as dead weight.
+    So the keeper re-takes the name it writes every pane record through: a FREE or ABSENT
+    name is claimed again (`write_lock` re-claims on its own, dropping the registry entry
+    that no longer points at the name), and a name a live process already HOLDS belongs to
+    that process — another keeper serves this root now, so this one stands down rather than
+    fight it, exactly as its start does.
+
+    `started_ms` travels into the rewritten record, so a keeper that has been watching for
+    hours is not reported as one that started a second ago. Returns `"reclaimed"`, or the
+    stop reason when the claim is somebody else's.
+    """
+    extra = {"tmux": target}
+    if started_ms:
+        extra["started_ms"] = started_ms
+    if not write_lock(os.getcwd(), None, path=PANE_KEEPER_PATH, extra=extra):
+        return "claim taken by another keeper"
+    return "reclaimed"
+
+
 def cmd_pane_watch(args) -> int:
     """Keep every local session's todo pane open, for as long as there are sessions.
 
@@ -948,12 +1178,24 @@ def cmd_pane_watch(args) -> int:
     watched, so it cannot watch itself, and a watcher is bound to the lock it holds while
     this has none of its own to lose. It reads the process table and tmux the way the rest
     of this program does, keeps every session's pane (not just one), and leaves when the
-    last freebuff does — so it never outlives what it is for.
+    last freebuff does — so it never outlives what it is for. Like the pane and the
+    watcher, it starts itself over when the build under it changes, carrying its claim
+    through the exec.
     """
+    # A keeper that re-execs itself (see the build check in the loop below) hands its claim
+    # over the exec — same pid, same open file description — so the claim is taken BACK
+    # before anything asks whether one is free. Without this the record still names this
+    # very process, and the guard would stand down the keeper it just restarted; with it,
+    # the claim is already in hand and `write_lock` below merely refreshes the record
+    # through the same fd. Nothing to take is an ordinary start.
+    carried = lock_adopt(PANE_KEEPER_PATH)
     target = tmux_identity()
+    # The keeper is an ACTOR: the probe is the right question here, because a free record
+    # is a leftover this keeper may claim (and must not be told is a holder), while only a
+    # HELD claim is a keeper already serving this server.
     running = lock_holder(PANE_KEEPER_PATH)
     rec = (read_json(PANE_KEEPER_PATH, {}) or {}) if running else {}
-    if running and rec.get("version") == VERSION and rec.get("tmux") == target and not args.force:
+    if not carried and running and keeper_serves(rec, target) and not args.force:
         if not args.quiet:
             print(f"pane keeper already running (pid {running})", file=sys.stderr)
         return 0
@@ -962,7 +1204,24 @@ def cmd_pane_watch(args) -> int:
             print("pane keeper already running (another process holds the lock)",
                   file=sys.stderr)
         return 0
-    pane_log(f"keeper started (pid {os.getpid()}, tmux {target}, every {args.pane_seconds:.0f}s)")
+    # When this keeper began, carried across a re-claim (see `keeper_reclaim`): a record
+    # rewritten an hour in must still say when the watch started.
+    claim_started = (read_json(PANE_KEEPER_PATH, {}) or {}).get("started_ms")
+    pane_log(
+        f"keeper started (pid {os.getpid()}, tmux {target or 'unnameable'}, "
+        f"every {args.pane_seconds:.0f}s)"
+    )
+
+    # When the keeper next asks whether it is still the build on disk. The same question the
+    # pane and the watcher ask, for the same reason: nothing re-imports a running process, so
+    # a keeper left over from an earlier version would keep reopening panes with its older
+    # pin — and every pane it repaired would be running code the keeper itself is not. The
+    # claim crosses that exec with it (`lock_handoff`/`lock_adopt`, taken back at the top):
+    # a keeper standing down in between would leave the panes unwatched with a record still
+    # naming it. `held_note` remembers the broken save already logged, so a half-written
+    # file is noted once rather than once per tick.
+    next_build_check = 0.0
+    held_note = None
 
     stop_reason, code = "stopped", 0
 
@@ -977,8 +1236,76 @@ def cmd_pane_watch(args) -> int:
             signal.signal(sig, shutdown)
     empty_since = None
     gone_passes = 0
+    next_claim_check = 0.0  # the claim is asked about before the first pass
+    next_pass = 0.0
     try:
         while True:
+            now = time.time()
+            # The claim, before the panes: a lock whose name has moved is not a claim, and a
+            # keeper that keeps panes while nobody can find it is the orphan the audit names
+            # and `locks --fix` ends. Ask every tick, take the name again, or stand down for
+            # the keeper that holds it now.
+            if now >= next_claim_check:
+                next_claim_check = now + KEEPER_CLAIM_CHECK_S
+                if not lock_ours(PANE_KEEPER_PATH):
+                    gone = not os.path.exists(PANE_KEEPER_PATH)
+                    outcome = keeper_reclaim(target, claim_started)
+                    if outcome != "reclaimed":
+                        stop_reason = outcome
+                        break
+                    pane_log(
+                        f"keeper re-claimed its name (pid {os.getpid()}, the file was "
+                        + ("removed)" if gone else "replaced)")
+                    )
+            if now < next_pass:
+                # Waiting for the next pass — or for the next claim check, whichever comes
+                # first. A short claim tick must not turn every wake into a tmux survey, so
+                # the pane work below is what `--pane-seconds` paces.
+                time.sleep(min(KEEPER_CLAIM_CHECK_S, next_pass - now))
+                continue
+            next_pass = now + max(0.5, min(args.pane_seconds, 30.0))
+            if now >= next_build_check:
+                next_build_check = now + BUILD_CHECK_S
+                changed = source_newer_than(STARTED_AT, now)
+                if changed:
+                    # A parse is not enough to hand the process over to: a tree that compiles
+                    # file by file can still die at import (an imported name that no longer
+                    # exists, a raise at module scope), and the exec below would replace a
+                    # running keeper with one that never starts — leaving every pane unwatched.
+                    # So the new build is asked to load first (`reload_probe_error`); only a
+                    # build that answers yes is executed into, and an unfit one is held on,
+                    # keeping the last build that provably loaded.
+                    broken = source_syntax_error()
+                    unfit = broken or reload_probe_error()
+                    if unfit:
+                        if unfit != held_note:  # once per distinct problem, not once a tick
+                            held_note = unfit
+                            pane_log(
+                                f"keeper holding, source does not parse: {unfit}" if broken
+                                else f"keeper holding, the new build does not load: {unfit}",
+                            )
+                    else:
+                        pane_log(f"keeper reloading: {changed} changed after this "
+                                 "process started")
+                        fd = lock_handoff(PANE_KEEPER_PATH)
+                        argv = self_argv()
+                        try:
+                            os.execv(argv[0], [*argv, *sys.argv[1:]])
+                        except OSError as exc:
+                            # Still this keeper: put the claim's fd back the way this process
+                            # keeps it, and record that the reload did not happen — once per
+                            # distinct failure, because the source is still newer on the next
+                            # tick and a line every tick is a flood, not a note.
+                            if fd is not None:
+                                os.environ.pop(LOCK_FD_ENV, None)
+                                try:
+                                    os.set_inheritable(fd, False)
+                                except OSError:
+                                    pass
+                            note = f"reload failed: {exc.__class__.__name__}"
+                            if note != held_note:
+                                held_note = note
+                                pane_log(f"keeper {note}")
             # A tmux server always has at least one pane, so an empty list means the
             # server this keeper belongs to is gone — and a keeper watching a dead server
             # can never put a pane back. Three passes, because a server can be busy for a
@@ -1006,7 +1333,8 @@ def cmd_pane_watch(args) -> int:
             elif time.monotonic() - empty_since > KEEPER_GRACE:
                 stop_reason = "no instance"
                 break
-            time.sleep(max(0.5, min(args.pane_seconds, 30.0)))
+            # Waiting for the next pass happens at the top of the loop, where it shares one
+            # clock with the claim check; a second sleep here would pace the tick twice.
     except SystemExit:
         pass
     except Exception as exc:
@@ -1019,12 +1347,436 @@ def cmd_pane_watch(args) -> int:
     return code
 
 
+def pane_command(argv) -> str:
+    """A pane's command line: an absolute interpreter, under an explicit PATH.
+
+    In plain words: the pane gets the environment its opener meant, not the one the tmux server
+    hands it. `self_argv()` already names the interpreter and the launcher absolutely, so the
+    pin's other half is the PATH in front of them — the one that decides what the pane's own
+    children resolve: `#!/usr/bin/env python3` in `scripts/notify/`, `tmux`, `ssh`, and the
+    watcher the pane starts.
+
+    `env` carries the assignment rather than a bare `VAR=value command` prefix, because the
+    pane command is run by the owner's login shell and fish has no such prefix form. The
+    assignment is written into the command string on purpose: it rides along in
+    `pane_start_command`, which is what `fbtodo status`, `fbtodo why` and the keeper read back
+    — so a pane respawned by hand (`tmux respawn-pane`) gets the same pin back with no help.
+    """
+    # `/usr/bin/env` where it exists, the plain name elsewhere: this runs before the pane's own
+    # PATH can have been fixed, so resolving `env` by name is the one lookup that must not
+    # matter. On every system this runs on it is there.
+    env = "/usr/bin/env" if os.path.exists("/usr/bin/env") else "env"
+    return " ".join(shlex.quote(part) for part in [env, f"PATH={pinned_path()}", *argv])
+
+
+def pane_python(pane: str, rows=None, table=None) -> str | None:
+    """The interpreter a pane is actually running, or None when it cannot be told.
+
+    In plain words: the pin says what that pane SHOULD be on, and this says what it is. Read
+    from the process table rather than asked of the pane: a pinned pane's line names its
+    interpreter outright, so `fbtodo status` can print it beside the watcher's and settle the
+    question from outside — which is how this whole pin was discovered, by noticing two
+    processes that disagreed.
+
+    The pane's own process is asked first, then its nearest descendants: the login shell that
+    runs a pane command does not always hand its number over (zsh forks rather than execs when
+    the command starts with a variable assignment, which is exactly what a pinned command
+    string begins with), so looking one level down is what makes an answer arrive in both
+    shapes — measured, with a stub server, before this walk was added.
+    """
+    rows = pane_rows() if rows is None else rows
+    table = process_table() if table is None else table
+    pid = next((row["pid"] for row in rows if row["pane"] == pane), 0)
+    if not pid:
+        return None
+    for cand in (pid, *(one for one, _depth in descendant_pids(table, pid))):
+        found = python_of((table.get(cand) or (0, ""))[1])
+        if found:
+            return found
+    return None
+
+
+def tree_pythons(pane: str, rows=None, table=None) -> list[tuple[int, str]]:
+    """Every interpreter under a pane, in tree order — the pane's own answer first.
+
+    In plain words: `pane_python` stops at the first answer because its question is "what
+    is this pane on". A pane does not run alone, though — a keeper under it, a watcher it
+    started, a notify bell through either, a tmux child — and one of those resolving a
+    different Python is a disagreement a reader that stops at the pane can never see. So
+    this walks the whole subtree and answers with every process whose line names an
+    interpreter, the pane's pid first: the first entry is exactly what `pane_python` would
+    have said, and the rest is what the tree is made of.
+
+    Bounded by the process table, not by guessing: a descendant that has gone, or one whose
+    line is a shell or a tmux client, is no entry at all (`python_of`).
+    """
+    rows = pane_rows() if rows is None else rows
+    table = process_table() if table is None else table
+    pid = next((row["pid"] for row in rows if row["pane"] == pane), 0)
+    if not pid:
+        return []
+    found = []
+    for cand in (pid, *(one for one, _depth in descendant_pids(table, pid))):
+        python = python_of((table.get(cand) or (0, ""))[1])
+        if python:
+            found.append((cand, python))
+    return found
+
+
+def tree_drift(pane: str, rows=None, table=None) -> tuple[int, str] | None:
+    """(pid, interpreter) of the first process under a pane on another Python, else None.
+
+    In plain words: the pane's own interpreter is the reference — the tree is supposed to
+    agree with the process it serves — and every other member is compared with it by REAL
+    PATH, the same rule `pane_drifted` uses, because two spellings of one interpreter are
+    not a drift. What comes back is the EVIDENCE, not just a yes: the pid and the
+    interpreter that disagreed, which is what the keeper's log names when the pane is
+    reopened, and the only way to tell which child was the odd one when a tree has several.
+
+    None is "no answer" as much as "agrees": a pane with no interpreter anywhere in its
+    tree (still starting, or a plain shell) has nothing to compare, and nothing is repaired
+    on a guess.
+    """
+    found = tree_pythons(pane, rows, table)
+    if not found:
+        return None
+    _first, reference = found[0]
+    want = os.path.realpath(reference)
+    for at, python in found[1:]:
+        if os.path.realpath(python) != want:
+            return at, python
+    return None
+
+
+# How long a keeper leaves a drifted pane alone after one attempt at it. The repair is a
+# single tmux call, but a pane that cannot be put right — a tmux that refuses, a pane that
+# left between the read and the call — would otherwise be asked again on every pass, and a
+# pass is seconds apart.
+DRIFT_RETRY_S = 60.0
+
+# What this keeper has already tried, and what it has already said, about a pane: the same
+# kind of memory `_SETTLED` and `_LAST_SEEN` keep for placement, and per process on purpose
+# — a keeper that restarts has no idea what the last one did, which is what a fresh start
+# should mean. `_DRIFT_HELD` is the pin case (the pane is already on this build's pin) and
+# `_DRIFT_KEPT` the knob case (`@fbtodo_repair off`); both are said once per pane, in the
+# log and on the pane's chip, not once per pass.
+_DRIFT_TRIED: dict[str, float] = {}
+_DRIFT_HELD: set[str] = set()
+_DRIFT_KEPT: set[str] = set()
+
+# How long a note left for a pane waits to be claimed. A reopened pane claims it within its
+# own startup (`cmd_pane`), seconds at the outside; past this the note is dropped unshown,
+# because a process that takes that pane id later — a split reusing it, a hand respawn — is
+# not the repair it was meant for and must not be told it was repaired.
+PANE_NOTE_S = 15.0
+
+
+def pane_note_write(pane: str, was: str, child: int | None = None,
+                    kind: str = "reopen") -> None:
+    """Leave the note a pane the keeper acted on will read (see `pane_note_take`).
+
+    In plain words: the log says which pane was reopened and from what, and the pane itself
+    says it on its title chip so the person who was watching it is not left with a process
+    they did not restart. Written BEFORE the respawn — the pane cannot read a file that is
+    not there yet — and the entry is keyed by pane id, so a pass that reopens two panes
+    leaves two notes and each claims its own. `kind` says which act: `reopen` for a
+    respawn, claimed by the process it starts; `kept` for a drift the keeper left alone
+    because repair is off (@fbtodo_repair) — no restart is coming to deliver that one, so
+    the RUNNING pane picks it up on its own (see `cmd_pane`).
+    """
+    note = read_json(PANE_NOTE_PATH, {}) or {}
+    if not isinstance(note, dict):
+        note = {}
+    note[pane] = {"at_ms": int(time.time() * 1000), "was": was, "child": child,
+                  "kind": kind}
+    try:
+        atomic_write_json(PANE_NOTE_PATH, note)
+    except OSError:
+        pass
+
+
+def pane_note_forget(pane: str) -> None:
+    """Take back a note whose repair never happened, so nothing else can claim it."""
+    note = read_json(PANE_NOTE_PATH, {}) or {}
+    if isinstance(note, dict) and note.pop(pane, None) is not None:
+        try:
+            atomic_write_json(PANE_NOTE_PATH, note)
+        except OSError:
+            pass
+
+
+def pane_note_take(pane: str | None, kind: str | None = None,
+                   sweep: bool = True) -> dict | None:
+    """Claim the note left for this pane, once — or None when there is none, or it is stale.
+
+    In plain words: a pane asks this on its first breath, naming itself by `TMUX_PANE`; the
+    entry is removed whether or not it is fresh, so a note is shown once and an old one is
+    gone rather than waiting for the next process to take that id. `kind` filters the
+    claim: a running pane's own poll asks for `kept` only, so it can never swallow the
+    `reopen` note waiting for the process that will replace it; the startup claim asks for
+    any kind. The startup claim also sweeps other panes' stale entries, which is what keeps
+    the file to the panes being repaired right now rather than to every pane ever repaired
+    (`atomic_write_json` each pass, so a reader never sees half of it) — a running pane
+    asks every second and passes `sweep=False`, leaving the file alone when there is
+    nothing of its own to take.
+    """
+    if not pane:
+        return None
+    note = read_json(PANE_NOTE_PATH, {}) or {}
+    if not isinstance(note, dict):
+        return None
+    now_ms = time.time() * 1000
+    mine = note.get(pane) if isinstance(note.get(pane), dict) else None
+    if mine is not None and kind is not None and (mine.get("kind") or "reopen") != kind:
+        return None  # not this reader's note: leave it for the one that will show it
+    mine = note.pop(pane, None)
+    stale = [other for other, entry in note.items()
+             if not isinstance(entry, dict)
+             or now_ms - float(entry.get("at_ms") or 0) > PANE_NOTE_S * 1000]
+    if sweep:
+        for other in stale:
+            del note[other]
+    if mine is not None or (sweep and stale):
+        try:
+            atomic_write_json(PANE_NOTE_PATH, note)
+        except OSError:
+            pass
+    if isinstance(mine, dict) and now_ms - float(mine.get("at_ms") or 0) <= PANE_NOTE_S * 1000:
+        return mine
+    return None
+
+
+# The spellings that MEAN off. A person may write any of them; anything else — including
+# unset, which reads as an empty string — leaves the repair running.
+REPAIR_OFF_WORDS = ("off", "no", "0", "false")
+
+
+def repair_is_off(value: str | None) -> bool:
+    """Whether a `@fbtodo_repair` value marks the knob off — unset is not off."""
+    return (value or "").strip().lower() in REPAIR_OFF_WORDS
+
+
+def pane_repair_value(pane: str) -> str | None:
+    """The knob's effective value for `pane` ('' when unset), or None when tmux cannot answer.
+
+    Asked through `display-message`, so tmux resolves it the way it resolves everything
+    else — pane, then window, then server — and an unset pane inherits whatever was chosen
+    above it, which is exactly what the keeper reads (`pane_repair_off`). The pane's own id
+    is read in the same breath, because a target that does not exist is NOT a pane with the
+    option unset: tmux answers an empty string for both (measured 2026-10-02), so an empty
+    id is the "no such pane" answer, not a knob that happens to be off.
+    """
+    out = tmux_run("display-message", "-p", "-t", pane, "#{pane_id} #{@fbtodo_repair}")
+    if out is None:
+        return None
+    ident, _, value = out.partition(" ")
+    return value.strip() if ident.strip() else None
+
+
+def set_pane_repair(target: str | None, value: str | None) -> bool:
+    """Set the knob for `target` (None = the whole server); None as the VALUE unsets it.
+
+    The scope is the one the knob documents: `-p -t <pane>` is one pane, `-g` the server
+    every pane inherits from, and `-u` removes the choice at that scope instead of writing
+    a value over it, so "default" really inherits again. False means tmux refused — a
+    target that is gone, or no server at all — never a guess. The middle rung has its own
+    writer (`set_window_repair`), because `-p` needs a pane and a window target is not one.
+    """
+    argv = ["set-option", "-g"] if target is None else ["set-option", "-p", "-t", target]
+    if value is None:
+        return tmux_run(*argv, "-u", "@fbtodo_repair") is not None
+    return tmux_run(*argv, "@fbtodo_repair", value) is not None
+
+
+def window_repair_value(window: str) -> str | None:
+    """The knob's effective value for `window` ('' when unset), or None when tmux cannot answer.
+
+    The middle rung of the chain `pane_repair_value` reads: asked through `display-message`
+    against a window target, tmux resolves window, then server — the pane rung is simply
+    not part of a window's inheritance — and an empty window id is the "no such window"
+    answer the same way an empty pane id is for a pane.
+    """
+    out = tmux_run("display-message", "-t", window, "-p", "#{window_id} #{@fbtodo_repair}")
+    if out is None:
+        return None
+    ident, _, value = out.partition(" ")
+    return value.strip() if ident.strip() else None
+
+
+def set_window_repair(window: str, value: str | None) -> bool:
+    """Set the knob for one WINDOW (None as the VALUE unsets it there); False = tmux refused.
+
+    `-w -t <window>` is the rung `set_pane_repair`'s `-p` and `-g` straddle: every pane in
+    the window inherits it, panes in its siblings do not, and `-u` removes this window's own
+    choice so the server's applies again instead of a value being written over it.
+    """
+    argv = ["set-option", "-w", "-t", window]
+    if value is None:
+        return tmux_run(*argv, "-u", "@fbtodo_repair") is not None
+    return tmux_run(*argv, "@fbtodo_repair", value) is not None
+
+
+def pane_repair_off(pane: str) -> bool:
+    """Whether the keeper's automatic repair is OFF for this pane — the `@fbtodo_repair` knob.
+
+    In plain words: a machine can mix interpreters on purpose — a pane held on an older
+    Python while everything else runs the pin — and the automatic repair would fight that
+    choice on every pass, respawning the pane the person deliberately started. The knob is
+    a tmux user option, so it is per PANE by construction and needs no list of ids:
+    `tmux set -p -t %3 @fbtodo_repair off` — or `-w` / `-g` for a window or the whole
+    server, since tmux resolves the option up the chain and this reads it back the same
+    way (`pane_repair_value`). Anything but off/no/0/false leaves the repair running: unset
+    is the old behaviour, which is also what a machine that never heard of the knob gets.
+    `fbtodo keep` is this sentence as a command, so nobody has to remember the incantation.
+    The pane is still DIAGNOSED either way — the keeper logs what it saw and leaves a note
+    the running pane shows on its chip (`KEPT (was on …)`); only the respawn is withheld.
+    """
+    return repair_is_off(pane_repair_value(pane))
+
+
+def pane_drifted(pane: str, watcher_python: str | None, rows=None, table=None) -> str | None:
+    """The interpreter a pane is on when it disagrees with the watcher's, else None.
+
+    In plain words: `pane_python` says what a pane is running and the watcher's own line
+    says what it is running, and the pin (`pane_command`) exists to make the two the same.
+    This is the question that finds the one that is not — `/usr/bin/python3` staring back
+    at a pane whose watcher is on Homebrew's. Both ends are read from the processes, never
+    assumed, and they are compared by REAL PATH: `/opt/homebrew/bin/python3` and the
+    Cellar's `python3.14` are one interpreter, and calling that a drift would have the
+    keeper respawn a pane that is already right.
+
+    None is "no answer", not "fine": a pane that has not finished starting, a line that
+    names no interpreter, or no watcher to compare against are all cases where a respawn
+    would be a guess. The pane's interpreter is returned only when both ends are known and
+    really differ.
+    """
+    if not watcher_python:
+        return None
+    pane_py = pane_python(pane, rows, table)
+    if pane_py and os.path.realpath(pane_py) != os.path.realpath(watcher_python):
+        return pane_py
+    return None
+
+
+def repair_drifted_panes(wanted, watcher_python, rows=None, table=None) -> list[str]:
+    """Reopen every pane that is on a different interpreter than its watcher's, in place.
+
+    In plain words: `ensure_local_panes` already reopens a pane that is GONE; this is the
+    sibling repair for one that is there but on the wrong Python. `respawn-pane -k` runs the
+    pinned command in the SAME pane — same id, same window, same row of the layout the
+    geometry pass just verified — which is exactly what a hand would have done after
+    `fbtodo status` said the two disagreed. The keeper can deliver it because it is the
+    process that would have opened the pane in the first place: the pin it reopens with is
+    its own `self_argv()` (`local_pane_command`), the same one a fresh split gets, and the
+    assignment rides in the command string so the PATH comes with it.
+
+    The disagreement is read twice over. First the pane itself, against the watcher's own
+    line (`pane_drifted`), as before. Then — when those two agree — the pane's whole TREE:
+    a notify bell or a tmux child that resolved another Python than the pane's is a
+    disagreement of the same shape one level down (`tree_drift`), and the pane is reopened
+    on the pin so the tree it starts next starts from the pin.
+
+    Three things keep that from becoming a respawn loop. A pane whose command is already this
+    build's pin is left alone: respawning it would re-run the command it is running, so the
+    pane is not the one out of step — the keeper's own interpreter is, or a child started
+    from a PATH the pane's pin cannot change — and either is said in the pane log once, not
+    acted on every pass. A pane the operator marked `@fbtodo_repair off` is left alone the
+    same way and for the opposite reason: the mix is deliberate, so the keeper keeps the
+    pane, says what it saw in the log and on the pane's own chip (`KEPT (was on …)`) — but
+    does not respawn it (`pane_repair_off`). And an attempt is remembered (`DRIFT_RETRY_S`),
+    so a repair that could not be delivered is retried, not hammered. A pane still starting
+    answers nothing (`pane_drifted`), which is the last brake: the repair only ever acts on
+    ends that can both be read.
+    """
+    rows = pane_rows() if rows is None else rows
+    table = process_table() if table is None else table
+    repaired = []
+    for inst in wanted:
+        pin = local_pane_command(inst)
+        for pane in local_pane_ids(inst, rows, table):
+            # First the pane's own line against the watcher's — and when those two agree,
+            # the tree under it: a notify bell or a tmux child that resolved another
+            # Python is the same disagreement one level down (`tree_drift`), and the
+            # repair is the same: the pane goes back on the pin, and the tree it starts
+            # next starts from that pin.
+            was = pane_drifted(pane, watcher_python, rows, table)
+            child = None
+            if not was:
+                child = tree_drift(pane, rows, table)
+                if not child:
+                    continue
+                was = child[1]
+            started_with = next((row["start"] for row in rows if row["pane"] == pane), "")
+            if started_with == pin:
+                if pane not in _DRIFT_HELD:
+                    _DRIFT_HELD.add(pane)
+                    if child is None:
+                        pane_log(
+                            f"held {pane}: it is on {was} while the watcher is on "
+                            f"{watcher_python}, but its command already carries this "
+                            "build's pin"
+                        )
+                    else:
+                        pane_log(
+                            f"held {pane}: a child (pid {child[0]}) is on {was} while the "
+                            "pane carries this build's pin — re-running the pin cannot "
+                            "change what that child resolved, so the launch is what has to"
+                        )
+                continue
+            # The knob, checked before any attempt is made: a pane marked `@fbtodo_repair off`
+            # is kept as it is — the diagnosis still happens, and the pane is told what the
+            # keeper saw, but the respawn is withheld. The entry is dropped the moment the
+            # knob is back on, so a later hold is said again rather than swallowed. Read
+            # every pass on purpose: the option is the operator's, and turning it back on has
+            # to resume the repair without restarting the keeper.
+            if pane_repair_off(pane):
+                if pane not in _DRIFT_KEPT:
+                    _DRIFT_KEPT.add(pane)
+                    pane_note_write(pane, was, child=child[0] if child else None, kind="kept")
+                    from_what = (f"it is on {was} while the watcher is on {watcher_python}"
+                                 if child is None
+                                 else f"a child (pid {child[0]}) is on {was} while the "
+                                      f"watcher is on {watcher_python}")
+                    pane_log(f"kept {pane}: {from_what} — repair is off (@fbtodo_repair)")
+                continue
+            _DRIFT_KEPT.discard(pane)
+            # `None`, not `0.0`, for "never tried": `time.monotonic()` is not promised to be
+            # far from zero (measured 2026-10-02: 0.57 s on this machine, so the first attempt
+            # at a pane was read as one made 0.57 s ago and skipped for a minute).
+            tried = _DRIFT_TRIED.get(pane)
+            now = time.monotonic()
+            if tried is not None and now - tried < DRIFT_RETRY_S:
+                continue
+            _DRIFT_TRIED[pane] = now
+            # The note goes down before the respawn (the pane cannot read a file that is not
+            # there yet) and comes back up if the respawn did not happen — a note whose
+            # repair never ran must not be claimed by whatever process comes next.
+            pane_note_write(pane, was, child=child[0] if child else None)
+            if tmux_run("respawn-pane", "-k", "-t", pane, pin) is None:
+                pane_note_forget(pane)
+                continue
+            repaired.append(pane)
+            from_what = (f"was {was}; watcher {watcher_python}" if child is None
+                         else f"a child, pid {child[0]}, was on {was}")
+            pane_log(f"reopened {pane} on the pinned interpreter ({from_what})")
+    # What was remembered about a pane that is gone is not about the next one that takes
+    # its id: the same sweep `forget_settled` makes for placement, and it is what keeps
+    # these two memories bounded by the panes on screen rather than by the keeper's uptime.
+    alive = {row["pane"] for row in rows}
+    for pane in [p for p in _DRIFT_TRIED if p not in alive]:
+        del _DRIFT_TRIED[pane]
+    for pane in [p for p in _DRIFT_HELD if p not in alive]:
+        _DRIFT_HELD.discard(pane)
+    for pane in [p for p in _DRIFT_KEPT if p not in alive]:
+        _DRIFT_KEPT.discard(pane)
+    return repaired
+
+
 def local_pane_command(instance_pid) -> str:
-    argv = [
+    return pane_command([
         *self_argv(),
         "--watch-pid", str(instance_pid), "--stale-after", "0",
-    ]
-    return " ".join(shlex.quote(part) for part in argv)
+    ])
 
 
 def local_pane_open(cwd: str, instance_pid, window: str, rows=None, table=None) -> str | None:
@@ -1061,11 +1813,23 @@ def ensure_local_panes(quiet: bool = True) -> list[str]:
 
     The panes it opens are named after the instance (`--watch-pid <pid>`), so the next
     pass recognises them and this stays a no-op: a pane that is there is never re-split,
-    and one that is already placed is never moved.
+    and one that is already placed is never moved. One drift of this shape is not about
+    position at all — a pane on a different interpreter than the watcher's — and it is
+    repaired by the same pass (`repair_drifted_panes`).
     """
     if pane_off():
         return []
     rows, table = pane_rows(), process_table()
+    # The interpreter these panes have to agree with: the local watcher's, read from its
+    # own process line. None when no local watcher is running (a `-s nas` daemon follows
+    # nothing here), and then there is nothing to compare a pane against and no repair to
+    # make — a pane is never respawned on a guess.
+    # Acting path, so the PROBE is right: a pass opens and moves panes, and a free record
+    # naming a dead pid is a leftover — `daemon_pid` removes it instead of handing back a
+    # watcher that is not there (whose "interpreter" would then be compared against every
+    # pane). A command that only looks uses `lock_peek` (see `daemon_pid`'s own note).
+    watcher = daemon_pid()
+    watcher_python = python_of((table.get(watcher) or (0, ""))[1]) if watcher else None
     wanted = session_windows(rows, table)
     missing = {inst: win for inst, win in wanted.items() if inst not in instances_with_pane(rows, table)}
     # No lock around this: the keeper is one process per tmux server (see
@@ -1110,6 +1874,10 @@ def ensure_local_panes(quiet: bool = True) -> list[str]:
             # server that went down — comes back at the size it was left, the side it was
             # put on, instead of at the default.
             remember_layout(window, "local", pane, rects, here["side"], inst_pane)
+    # The other drift: a pane that is there but on a different Python than the watcher's
+    # (see `repair_drifted_panes`). Read from the same table the geometry pass used — a
+    # respawn does not move a pane, so nothing above needs to run again.
+    drifted = repair_drifted_panes(wanted, watcher_python, rows, table)
     forget_settled({row["pane"] for row in pane_rows()})
     for pane in moved:
         # Quiet or not, written down: a pane that came back is the one thing worth being
@@ -1128,21 +1896,48 @@ def ensure_local_panes(quiet: bool = True) -> list[str]:
                 + ", ".join(f"{pane} ({source})" for pane, source in sized),
                 file=sys.stderr,
             )
+        if drifted:
+            print(
+                "fbtodo pane(s) reopened on the pinned interpreter: "
+                + ", ".join(drifted),
+                file=sys.stderr,
+            )
     return opened
+
+
+def notify_argv(argv: list) -> list:
+    """A notify script as a command line: its own shebang, under THIS process's pin.
+
+    In plain words: every bell in `scripts/notify/` is an `env python3` script, and which
+    Python that means is decided by the PATH of whoever runs it. Inside a pane's tree that
+    is the pin — but a watcher started by the shell autostart, or a keeper started from
+    another context, carries its own PATH, and a bell launched from there can end up on a
+    different interpreter than the pane it is reporting about. That is exactly the drift
+    the keeper reads (`tree_drift`) — and a bell is gone by the time it is seen, so the
+    only place it can be repaired is at the launch. Running it behind an explicit
+    `PATH=<pin>` makes the shebang resolve in this process's pin wherever the launcher
+    came from. The script is still exec'd AS ITSELF, never `python3 <script>`, so a
+    replacement written in any other language keeps working: only PATH is fixed, and only
+    for the script's own shebang to resolve in.
+    """
+    env = "/usr/bin/env" if os.path.exists("/usr/bin/env") else "env"
+    return [env, f"PATH={pinned_path()}", *argv]
 
 
 def nas_notify_once(args, quiet: bool = True) -> int | None:
     """Ask the phone notifier about the live NAS session: one pass, None when absent.
 
-    Run through its shebang rather than `python3 <script>` so a replacement written in
-    anything else still works. Exit 78 means "no topic to send to" and the caller stops
-    asking for a while; a session must not respawn a script that has nothing to send.
+    Run through its shebang rather than `python3 <script>` (`notify_argv`) so a replacement
+    written in anything else still works, under this process's pin so the shebang resolves
+    to the same Python as the tree that rang it. Exit 78 means "no topic to send to" and
+    the caller stops asking for a while; a session must not respawn a script that has
+    nothing to send.
     """
     if not os.path.exists(NAS_NOTIFY):
         return None
     try:
         proc = subprocess.run(
-            [NAS_NOTIFY, "--nas-watch", "--once", "--quiet"],
+            notify_argv([NAS_NOTIFY, "--nas-watch", "--once", "--quiet"]),
             capture_output=True, text=True, timeout=60,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -1170,7 +1965,7 @@ def ask_notify_once(args, quiet: bool = True) -> int | None:
         return None
     try:
         proc = subprocess.run(
-            [ASK_NOTIFY, "--quiet"], capture_output=True, text=True, timeout=60,
+            notify_argv([ASK_NOTIFY, "--quiet"]), capture_output=True, text=True, timeout=60,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         if not quiet:
@@ -1196,7 +1991,7 @@ def pane_notify_once(args, quiet: bool = True) -> int | None:
     """
     if not os.path.exists(PANE_NOTIFY):
         return None
-    argv = [PANE_NOTIFY, "--quiet", "--keeper", PANE_KEEPER_PATH]
+    argv = notify_argv([PANE_NOTIFY, "--quiet", "--keeper", PANE_KEEPER_PATH])
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=90)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -1207,6 +2002,35 @@ def pane_notify_once(args, quiet: bool = True) -> int | None:
         detail = (proc.stderr or proc.stdout).strip().splitlines()
         print(
             f"pane watch exited {proc.returncode}: {(detail[-1] if detail else '')[:120]}",
+            file=sys.stderr,
+        )
+    return proc.returncode
+
+
+def locks_notify_once(args, quiet: bool = True) -> int | None:
+    """Ask the locks watch whether a claim has gone wrong: one pass, None when absent.
+
+    The fifth notifier, and the only one whose subject is a CLAIM: a role process running
+    with no name pointing at it, or a claim file whose name and inode have parted. It reads
+    `fbtodo locks --json` for itself — the same rows the watch just printed — and keeps its
+    own record of what it pushed, so `locks --watch` running for hours pushes once per
+    occurrence. Exit 78 means there is nothing configured to send to, the same signal the
+    other four use.
+    """
+    if not os.path.exists(LOCKS_NOTIFY):
+        return None
+    try:
+        proc = subprocess.run(
+            notify_argv([LOCKS_NOTIFY, "--quiet"]), capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        if not quiet:
+            print(f"locks watch failed: {exc.__class__.__name__}", file=sys.stderr)
+        return None
+    if proc.returncode and not quiet:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        print(
+            f"locks watch exited {proc.returncode}: {(detail[-1] if detail else '')[:120]}",
             file=sys.stderr,
         )
     return proc.returncode
@@ -1226,7 +2050,7 @@ def pause_notify_once(args, instance_pid, quiet: bool = True) -> int | None:
     if pane:
         argv += ["--pane", pane]
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(notify_argv(argv), capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as exc:
         if not quiet:
             print(f"stall watch failed: {exc.__class__.__name__}", file=sys.stderr)
@@ -1259,7 +2083,7 @@ def nas_drop_once(args, death: dict, quiet: bool = True) -> int | None:
     if death.get("where"):
         argv += ["--cwd", str(death["where"])]
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(notify_argv(argv), capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as exc:
         if not quiet:
             print(f"nas drop watch failed: {exc.__class__.__name__}", file=sys.stderr)
@@ -1283,6 +2107,10 @@ def live_watcher_pid(path: str) -> int | None:
     added. That is how a pre-fix NAS watcher stayed "live" forever, and how an upgrade
     could leave the pane rendering yesterday's shape.
     """
+    # The probe, not a peek, and it MUST be: this path replaces — it is what a start or a
+    # stop does, so a free leftover is removed, and a watcher left on another build is
+    # killed and its claim cleared below. A command that only LOOKS (`nas --status` is the
+    # one that used to come through here) reads with `lock_peek` instead.
     pid = lock_holder(path)  # the claim, not the number: a leftover record is not a watcher
     if not pid:
         return None
@@ -1333,7 +2161,14 @@ def cmd_nas(args) -> int:
             print(f"fbtodo nas watcher stopped (pid {pid})", file=sys.stderr)
         return 0
     if args.status:
-        pid = nas_pane_daemon_pid()
+        # A status is a LOOK: `nas_pane_daemon_pid` is `lock_holder`, whose free-claim
+        # answer removes a leftover record — and, for a watcher from another build, KILLS
+        # it and clears the claim. Neither belongs to a command that was only asked what
+        # is out there. `lock_peek` asks the same question with no unlink and no kill: a
+        # held claim is a running watcher, and the record's pid is the answer. Stop and
+        # start keep `live_watcher_pid`'s replacement — they are the paths that act.
+        held, pid = lock_peek(NAS_LOCK_PATH)
+        pid = pid if held else None
         state = read_json(NAS_STATE_PATH, {}) or {}
         panes = nas_pane_ids()
         # Which pane the session's ssh is in, i.e. what a list pane is placed against.
@@ -1593,8 +2428,19 @@ __all__ = [
     "load_pins", "window_key", "pin_for_window", "load_last", "save_last",
     "pin_value", "pane_layout", "source_note", "_SETTLED", "_LAST_SEEN", "resize_pane_to",
     "hold_pane_size", "forget_settled", "remember_layout", "save_pins", "window_of",
-    "KEEPER_GRACE", "tmux_identity", "ensure_pane_keeper", "cmd_pane_watch",
-    "local_pane_command", "local_pane_open", "ensure_local_panes", "nas_notify_once",
-    "ask_notify_once", "pane_notify_once", "pause_notify_once", "nas_drop_once",
+    "KEEPER_GRACE", "KEEPER_CLAIM_CHECK_S", "keeper_reclaim",
+    "PANE_NOTE_S", "pane_note_write", "pane_note_forget", "pane_note_take",
+    "tmux_identity", "tmux_identity_outside", "tmux_socket_of", "same_tmux_server",
+    "keeper_serves",
+    "ensure_pane_keeper", "cmd_pane_watch",
+    "pane_command", "pane_python", "pane_start_command", "DRIFT_RETRY_S",
+    "pane_drifted", "repair_is_off", "pane_repair_value", "set_pane_repair", "pane_repair_off",
+    "window_repair_value", "set_window_repair",
+    "tree_pythons", "tree_drift", "repair_drifted_panes",
+    "_DRIFT_TRIED", "_DRIFT_HELD", "_DRIFT_KEPT",
+    "local_pane_command", "local_pane_open",
+    "ensure_local_panes", "notify_argv", "nas_notify_once",
+    "ask_notify_once", "pane_notify_once", "locks_notify_once", "pause_notify_once",
+    "nas_drop_once",
     "live_watcher_pid", "nas_pane_daemon_pid", "cmd_nas", "spawn_nas_daemon", "nas_watch_loop",
 ]

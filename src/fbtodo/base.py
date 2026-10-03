@@ -16,6 +16,7 @@ read on their own.
 
 from __future__ import annotations
 
+import builtins
 import copy
 try:
     import fcntl
@@ -28,6 +29,7 @@ import re
 import shlex
 import shutil as _shutil
 import subprocess
+import symtable
 import sys
 import tempfile
 import textwrap
@@ -35,6 +37,27 @@ import time
 import unicodedata
 
 VERSION = "4.30.2"
+
+
+# In plain words: when this process read the package off disk. Nothing re-imports a running
+# Python process, so this is the divider between "the build I am running" and "the build that
+# is there now": a source written after this moment is code this process does not have (see
+# `source_newer_than`). Stamped here, as early as it can be, because base is imported before
+# anything that could care about it.
+STARTED_AT = time.time()
+
+
+# How long to wait after a source write before believing it. An editor caught halfway through
+# a save would otherwise exec a pane into a half-written file, and the pane is the one place
+# that must not die: the person editing is the person looking at it.
+SOURCE_SETTLE_S = 2.0
+
+
+# How often a long-running process asks whether it is still the build on disk. Both askers —
+# the pane and the watcher — re-exec themselves when the answer is no, and one listing a
+# second is nothing beside the poll either of them already does, especially the ssh round trip
+# a `-s nas` poll can be. The answer only changes when somebody writes a file.
+BUILD_CHECK_S = 1.0
 
 
 HOME = os.path.expanduser("~")
@@ -197,6 +220,251 @@ def self_argv(here: str = "") -> list:
     return [sys.executable, os.path.join(os.path.dirname(here), "__init__.py")]
 
 
+def _package_sources(here: str = "") -> list:
+    """Every `.py` beside the asker, plus the launcher `self_argv` names — the program.
+
+    The list is the whole program by construction: everything fbtodo can do is in the
+    package, and the launcher beside it is what every re-invocation runs. A copy carrying
+    the package without a launcher answers with the package's own entry file, which is
+    already in the list — asking twice about one file costs a second `stat` and nothing else.
+    Nothing outside the package counts: `docs/`, `scripts/` and the tests are not the build a
+    pane runs, and a commit that touches only those has not made the pane stale.
+    """
+    here = os.path.abspath(here or __file__)
+    folder = os.path.dirname(here)
+    try:
+        names = sorted(n for n in os.listdir(folder) if n.endswith(".py"))
+    except OSError:
+        return []  # nothing readable to ask about, which is not a reason to rebuild
+    return [os.path.join(folder, n) for n in names] + [self_argv(here)[1]]
+
+
+def source_newer_than(started: float, now: float | None = None,
+                      settle: float = SOURCE_SETTLE_S, here: str = "") -> str | None:
+    """The source file written after `started`, or None when this process is the build on disk.
+
+    In plain words: "am I still the code that is there?" A long-running pane keeps the build
+    it imported while the checkout underneath it moves, and an upgrade then leaves the list
+    drawn by the OLD one until somebody respawns the pane by hand — measured 2026-10-01, when
+    a pane started the day before a release still rendered the day-before's fields. Nothing
+    re-imports a running Python process, so the honest answer is to ask the filesystem and
+    start over.
+
+    `started` is the moment this process imported the package (`STARTED_AT`): any source
+    newer than that is code this process is NOT running, whatever the version says — which is
+    the point of asking the clock rather than `VERSION`, since files change between releases
+    too. `settle` holds the answer back for a moment after the write, so a save still landing
+    is not read as a finished one; a newer file inside the settle window is not "no change",
+    it is "ask again on the next tick". The newest such file comes back as a path, for the
+    log rather than for a decision.
+    """
+    if now is None:
+        now = time.time()
+    newest = None
+    for path in _package_sources(here):
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            continue  # the launcher a package-only copy does not have
+        if mtime <= started or now - mtime < settle:
+            continue
+        if newest is None or mtime > newest[1]:
+            newest = (path, mtime)
+    return newest[0] if newest else None
+
+
+def source_syntax_error(here: str = "") -> str | None:
+    """The first source file that will not parse, or None when the package still compiles.
+
+    In plain words: a reason NOT to restart. The pane is the one process whose whole job is to
+    be on the screen, and it is looked at precisely while its owner is editing — so a restart
+    into half-saved code would take the pane away at the worst moment, with a traceback where
+    the list was. Asking is a parse per file and only ever happens when a source has actually
+    changed (`source_newer_than`), so the cost is a compile of the package per save, not per
+    tick. The answer names the file and the line, because that is what the pane log records
+    while it waits for the save to finish.
+    """
+    for path in _package_sources(here):
+        try:
+            with open(path, "rb") as fh:
+                compile(fh.read(), path, "exec")
+        except SyntaxError as exc:
+            return f"{path}: line {exc.lineno}: {exc.msg}"
+        except OSError:
+            continue
+    return None
+
+
+# The variable that makes a child answer one question and stop: does this build WORK? A
+# self-reload runs the SAME command line in a child with this set, and `main` answers through
+# `probe_answer` — it builds the parser and resolves every global the functions load — before
+# it can create, move or claim anything (see `reload_probe_error`).
+RELOAD_PROBE_ENV = "FBTODO_RELOAD_PROBE"
+
+# How long the probe may take. Importing this package is a few hundred milliseconds, and the
+# deep name pass is a parse of each module on top; the bound exists only so a build that HANGS
+# on import (a lock, a network call added at module scope) is a reason to hold rather than a
+# way to wedge the process that is waiting on it.
+RELOAD_PROBE_TIMEOUT_S = 20.0
+
+
+def reload_probe_error(timeout: float | None = None, here: str = "") -> str | None:
+    """Would the build on disk work? None when it would, else the reason to hold.
+
+    In plain words: a parse is not enough, because the self-reload does not re-import — it
+    EXECS. A tree can compile file by file and still be internally inconsistent (a name
+    imported from a module that no longer defines it, a call added at module scope with the
+    wrong arity, a module that raises on import), and then the reload replaces a running
+    image with one that dies on its own first line: the watcher or the keeper simply
+    disappears, and for the pane the keeper then reopens it into the same broken tree and the
+    two of them loop. `source_syntax_error` catches none of that, so this asks the new build
+    itself: the same command line the reload is about to exec (`self_argv`), run once in a
+    child with `RELOAD_PROBE_ENV` set, in which `main` answers through `probe_answer`. That
+    answer is deeper than the import: the command parser is built (so `build_parser`'s body
+    and every default it computes actually run), and `undefined_global_names` then resolves
+    every name the package's functions load as a global — the ones an import never touches,
+    because a function body is name-resolved only when it runs. A reference to a global that
+    was renamed or deleted therefore fails here instead of waiting for the one command that
+    reaches it. Nothing is claimed and nothing is written — the child stops before
+    `init_state_root`, the first thing that touches disk — so a build that answers here is
+    safe to BECOME. Anything else (a nonzero exit, a signal, a hang past `timeout`) is the
+    answer and the caller holds, keeping the image it is already running: the last build that
+    provably loaded is the one it keeps.
+    """
+    argv = self_argv(here)
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True,
+            timeout=RELOAD_PROBE_TIMEOUT_S if timeout is None else timeout,
+            env={**os.environ, RELOAD_PROBE_ENV: "1"},
+        )
+    except subprocess.TimeoutExpired:
+        return f"the new build did not finish loading in {timeout or RELOAD_PROBE_TIMEOUT_S:.0f}s"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"the new build could not be probed ({exc.__class__.__name__})"
+    if proc.returncode == 0:
+        return None
+    lines = (proc.stderr or proc.stdout or "").strip().splitlines()
+    return (lines[-1][:240] if lines else f"the new build exited {proc.returncode}")
+
+
+def _undefined_in(table, known: set, path: str, scope: str = "") -> str | None:
+    """The first global name a scope LOADS that `known` does not hold, walking children.
+
+    `symtable` already separates the three kinds a name can be: a local (assigned here), a
+    free/cell variable (a closure's), and a GLOBAL — the only kind this asks about. A global
+    load is exactly what the interpreter resolves at run time and what an import does not
+    touch, so it is the whole surface of the fault being hunted.
+    """
+    for child in table.get_children():
+        here = child.get_name() or scope
+        for sym in child.get_symbols():
+            if sym.is_referenced() and sym.is_global() and sym.get_name() not in known:
+                return f"{path}: {here}: {sym.get_name()!r} is used but never defined"
+        deeper = _undefined_in(child, known, path, here)
+        if deeper:
+            return deeper
+    return None
+
+
+def undefined_global_names() -> str | None:
+    """The first global a FUNCTION in this build loads that is not defined — the deep half.
+
+    In plain words: importing a package runs the module-level code and NOTHING else. A
+    function body is name-resolved only when it RUNS, so a reference to a global that was
+    renamed or deleted — a constant, a helper, a whole module — looks healthy right up until
+    the one command that reaches that line is next called, and by then a self-reload has
+    already replaced a working image with a time bomb. The reload probe cannot CALL every
+    function (they stop watchers, open panes, write files), so it asks the question the
+    interpreter would ask before each of those calls: does every name the code loads as a
+    GLOBAL still exist? Every scope of every module of this package is parsed with
+    `symtable`, each global load is looked up in the module's own namespace (which already
+    holds what `from .x import *` and its imports bound) and in the builtins, and the first
+    name that is nowhere is the answer — with the module and the enclosing function, because
+    that is what the log needs to point at.
+
+    It is deliberately not a linter. Attribute names are not symbols, so `os.path` and
+    `pane["pid"]` are not asked about; a name a module binds at run time passes, because
+    the lookup is the live namespace, not the parse; and a local or a closure variable is
+    not a global at all. What it can still get wrong is a name a FUTURE build injects into a
+    module some other way, which is why the self-check pins both sides: this checkout (which
+    must pass) and a copy whose function uses a name that was deleted (which must fail).
+    """
+    for name in sorted(sys.modules):
+        if not (name == "fbtodo" or name.startswith("fbtodo.")):
+            continue
+        mod = sys.modules[name]
+        path = getattr(mod, "__file__", None)
+        if not path or not path.endswith(".py"):
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                src = fh.read()
+        except OSError:
+            continue
+        try:
+            top = symtable.symtable(src, path, "exec")
+        except (SyntaxError, ValueError):
+            continue  # a file that will not parse is `source_syntax_error`'s answer
+        known = set(vars(mod)) | set(dir(builtins))
+        missing = _undefined_in(top, known, path)
+        if missing:
+            return missing
+    return None
+
+
+def pinned_path() -> str:
+    """The PATH every pane — and every child of this program — is handed explicitly.
+
+    In plain words: stop asking tmux. A pane's environment is REBUILT by the server, so a pane
+    command that names `fbtodo` on PATH and leans on `#!/usr/bin/env python3` can come up on a
+    different interpreter than the process that asked for it. Measured 2026-10-01 on this
+    machine: a pane respawned into the running server came up on `/usr/bin/python3` (3.9.6)
+    while its watcher was Homebrew's 3.14 — and the pane and the watcher then disagree about
+    the Python under them, which is not a version question but a reproducibility one: the
+    same PATH decides the interpreter for `scripts/notify/*.py`, so a bell and the watcher that
+    rang it could be two different Pythons.
+
+    The answer is the PATH the opener itself had — the owner's own, at the moment they asked —
+    carried into the pane's command line on purpose (`pane_command` in panes.py), so nothing
+    about it is left to the server's rebuild. `FBTODO_PATH` replaces the base for a machine
+    that needs a specific one; a pane that was opened pinned needs nothing special to pass its
+    own pin on, since the pin IS a PATH and that is what the opener reads.
+
+    This interpreter's own directory goes FIRST, ahead of whatever the opener had: the pane is
+    on `sys.executable` by construction, but everything the pane then starts by name is not —
+    `#!/usr/bin/env python3` in `scripts/notify/` is the interpreter question all over again,
+    one level down, and "the pane and its watcher agree about the Python" is only true if the
+    same rule holds there. A duplicate of that directory is dropped from the rest, so the
+    result is still a PATH and not a search path with one entry twice.
+    """
+    here = os.path.dirname(sys.executable)
+    base = os.environ.get("FBTODO_PATH") or os.environ.get("PATH") or ""
+    rest = [p for p in base.split(os.pathsep) if p and os.path.realpath(p) != os.path.realpath(here)]
+    return os.pathsep.join([here, *rest])
+
+
+def python_of(command: str) -> str | None:
+    """The interpreter a command line names, or None when it names none.
+
+    In plain words: which python is that process on? Read from the line rather than assumed,
+    and written to survive the two ways a pin is spelled: `/usr/bin/env PATH=… python3 …`
+    (the `env` and its assignment are skipped) and a bare absolute interpreter. Anything whose
+    basename is not a python is no answer rather than a wrong one — a pane whose command is
+    still a shell, or a process that has gone, must not be reported as running `/bin/zsh`.
+
+    The name is matched without regard to case on purpose: the interpreter Homebrew names
+    `python3.14` is named `Python` where macOS keeps its own, inside the framework bundle
+    (`…/Python.app/Contents/MacOS/Python`) — the exact line a machine that has both produces,
+    and the one a case-sensitive `python` test silently refused to answer about.
+    """
+    for token in shlex.split(command)[:3]:
+        if token.endswith("env") or "=" in token:
+            continue
+        return token if os.path.basename(token).lower().startswith("python") else None
+    return None
+
+
 LOCK_PATH = os.path.join(SCRATCH, "fbtodo-daemon.pid")
 
 
@@ -219,6 +487,15 @@ PANE_KEEPER_PATH = os.path.join(SCRATCH, "fbtodo-pane-keeper.pid")
 
 
 PANE_LOG_PATH = os.path.join(SCRATCH, "fbtodo-pane.log")
+
+
+# What a keeper leaves for a pane it is about to reopen: `{"%499": {"at_ms": …, "was": …,
+# "child": …}}`. The chip note cannot ride the environment the way a pane's reload does —
+# `respawn-pane` starts a fresh command in the SERVER's environment, with no exec of this
+# process's to carry it — so it waits at a path instead: written before the respawn, claimed
+# by the pane on its first breath (its own id is `TMUX_PANE`), and dropped unshown when it
+# has waited too long.
+PANE_NOTE_PATH = os.path.join(SCRATCH, "fbtodo-pane-note.json")
 
 
 # Where the list pane goes, per window, per role (`fbtodo pin`):
@@ -251,6 +528,7 @@ def _state_paths(root: str) -> dict:
         "NAS_LOCK_PATH": os.path.join(root, "fbtodo-nas-pane.pid"),
         "PANE_KEEPER_PATH": os.path.join(root, "fbtodo-pane-keeper.pid"),
         "PANE_LOG_PATH": os.path.join(root, "fbtodo-pane.log"),
+        "PANE_NOTE_PATH": os.path.join(root, "fbtodo-pane-note.json"),
         "PINS_PATH": os.path.join(root, "fbtodo-pins.json"),
         "LAST_PATH": os.path.join(root, "fbtodo-last.json"),
         "NAS_STATE_PATH": os.path.join(root, "fbtodo-nas-pane.json"),
@@ -345,6 +623,19 @@ PANE_NOTIFY = os.path.expanduser(
 )
 
 
+# The locks watch: the fifth bell, and the only one whose subject is a CLAIM rather than a
+# session. A watcher/keeper/NAS watcher running with no claim a reader can find (an orphan),
+# or a claim file whose name and inode have parted (the tie broken), is invisible from every
+# store — the audit that sees both (`fbtodo locks`) is the only place either exists, and
+# nothing runs it unless somebody types it. Asked by `locks --watch` when a NEW finding
+# appears; reads `locks --json` itself, and keeps its own record of what it has pushed, so a
+# watch that runs for hours pushes once per occurrence. Optional, like the other four.
+LOCKS_NOTIFY = os.path.expanduser(
+    os.environ.get("FBTODO_LOCKS_BELL")
+    or os.path.join(HOME, ".config", "freebuff-notify", "locks-bell.py")
+)
+
+
 # tmux overridable so tests drive a private server instead of the owner's.
 TMUX_BIN = shlex.split(os.environ.get("FBTODO_TMUX") or "tmux")
 
@@ -356,11 +647,14 @@ TMUX_SUBCOMMANDS = (
     "split-window",
     "move-pane",
     "resize-pane",
+    "respawn-pane",
     "kill-pane",
     "list-panes",
     "display-message",
     "list-clients",
     "list-sessions",
+    "set-option",
+    "show-options",
 )
 
 
@@ -849,11 +1143,13 @@ EX_CODES = {
     "usage": 2,
     "ex_usage": 64,
     "dataerr": 65,
+    "ex_software": 70,
     "nofile": 66,
     "noinput": 66,
     "cantcreat": 73,
     "ioerr": 74,
     "tempfail": 75,
+    "unavailable": 69,
     "config": 78,
 }
 
@@ -1005,6 +1301,42 @@ def pid_alive(pid) -> bool:
         return False
     except PermissionError:
         return True
+
+
+def pid_running(pid) -> bool:
+    """Whether `pid` is still a process that can run — `pid_alive` minus the zombies.
+
+    In plain words: the kernel keeps answering for a process that has DIED but whose parent
+    has not reaped it — `kill(pid, 0)` succeeds and `ps` says `Z` — and that answer is right
+    for "the pid is taken" and wrong for "something is still working here". A wait that
+    polls a killed process needs the second question, because the process this program ends
+    is usually somebody ELSE's child: its parent may be busy for a while, and a repair that
+    reported the corpse as a survivor would claim a failure it does not have. So the state
+    is asked in the same two ways the rest of this file asks about processes — the `/proc`
+    stat where there is one (Linux), `ps -o state=` otherwise (macOS) — and an unreadable
+    answer falls back to `pid_alive`, the pre-existing behaviour rather than a new guess.
+    """
+    if not pid_alive(pid):
+        return False
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return True
+    if os.path.isdir(PROC_ROOT):
+        try:
+            with open(os.path.join(PROC_ROOT, str(pid), "stat"), encoding="utf-8") as fh:
+                blob = fh.read()
+        except OSError:
+            return True
+        after = blob.rpartition(")")[2].strip()
+        return not after.startswith("Z") if after else True
+    try:
+        proc = subprocess.run(["ps", "-o", "state=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    state = proc.stdout.strip()
+    return not state.startswith("Z") if state else True
 
 
 def proc_cwds(pids: list[int]) -> dict[int, str]:
@@ -1466,9 +1798,15 @@ __all__ = [
     "_claim_live", "_legacy_claim_live", "_state_root", "init_state_root", "SCRATCH",
     "STATE_NOTE", "STATE_PATH",
     "STATE_FILE_NAME",
-    "TASKS_PATH", "events_path", "self_argv", "LOCK_PATH", "LOG_PATH", "NAS_LOCK_PATH",
-    "PANE_KEEPER_PATH", "PANE_LOG_PATH", "PINS_PATH", "LAST_PATH", "NAS_STATE_PATH",
+    "TASKS_PATH", "events_path", "self_argv", "STARTED_AT", "SOURCE_SETTLE_S", "BUILD_CHECK_S",
+    "RELOAD_PROBE_ENV", "reload_probe_error", "undefined_global_names",
+    "source_newer_than", "source_syntax_error", "pinned_path", "python_of",
+    "LOCK_PATH", "LOG_PATH", "NAS_LOCK_PATH",
+    "pid_alive", "pid_running",
+    "PANE_KEEPER_PATH", "PANE_LOG_PATH", "PANE_NOTE_PATH", "PINS_PATH", "LAST_PATH",
+    "NAS_STATE_PATH",
     "NAS_LOG_PATH", "NAS_NOTIFY", "DROP_NOTIFY", "ASK_NOTIFY", "PAUSE_NOTIFY", "PANE_NOTIFY",
+    "LOCKS_NOTIFY",
     "TMUX_BIN", "TMUX_SUBCOMMANDS", "DEFAULT_DB_GLOB", "DEFAULT_WORKSPACE_STATE",
     "DEFAULT_CLI_ROOT", "NAS_HOST", "NAS_ROOT", "NAS_PROJECT", "NAS_PROC", "NAS_UNCONFIGURED",
     "PATCH_LOG", "PATCH_META", "ALERT_LOG", "NAS_PATCH_LOG", "NAS_ALERT_LOG",
