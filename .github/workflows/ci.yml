@@ -161,3 +161,47 @@ jobs:
           rc=$?
           bash .github/ci-report.sh notify-suite notify.log "$rc"
           exit "$rc"
+
+  # A dumb terminal is a cron job, a service unit, or an editor's own shell: no colour and no
+  # cursor games, and the pane deliberately draws its plain, unboxed frame there. That path is
+  # as much a contract as the coloured one — the suite once passed only where its terminal
+  # happened to be xterm-256color — so this leg runs the self-check exactly there and PROVES
+  # the colour environment is empty first: a FORCE_COLOR exported by anything else in the job
+  # would quietly turn it back into the ordinary lane.
+  dumb-terminal:
+    name: ubuntu · py3.x · TERM=dumb, no colour
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      TERM: dumb
+      FBTODO_NO_AUTOSTART: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: install tmux, lsof and zsh
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux lsof zsh
+
+      - name: prove the terminal is dumb and the colour environment is empty
+        run: |
+          [ "$TERM" = dumb ] || { echo "TERM=$TERM, expected dumb" >&2; exit 1; }
+          for v in COLORTERM NO_COLOR FORCE_COLOR CLICOLOR_FORCE CLICOLOR; do
+            if printenv "$v" >/dev/null; then
+              echo "$v is set — this leg must run with no colour environment" >&2
+              exit 1
+            fi
+          done
+          echo "TERM=dumb; COLORTERM, NO_COLOR, FORCE_COLOR, CLICOLOR_FORCE and CLICOLOR all absent"
+
+      - name: self-check
+        run: |
+          set +e
+          bash .github/ci-timeout.sh 720 selfcheck.log python3 scripts/fbtodo-selfcheck.py
+          rc=$?
+          bash .github/ci-report.sh self-check selfcheck.log "$rc"
+          exit "$rc"

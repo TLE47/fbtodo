@@ -30,6 +30,13 @@
 # `--stale-after 0` is deliberate too: `0` is the tool's "never" for store silence, so a
 # pause in the transcript cannot be mistaken for the session being over.
 #
+# The pane command names the interpreter and the launcher absolutely, and hands the pane
+# this shell's PATH. That is the third deliberate thing: tmux rebuilds a pane's environment,
+# so anything resolved by name can land on a different Python than the process that asked
+# for the pane — and then the pane and the watcher it starts disagree about the Python under
+# them. `FBTODO_PATH` overrides the PATH that is passed on, for a machine that needs a
+# specific one.
+#
 # Tunables, all optional:
 #     FREEBUFF_NO_REFRESH=1  skip the npm refresh. Set this in scripts and tests: the
 #                            refresh is a network round trip on every launch.
@@ -38,6 +45,7 @@
 #                            edge too), or h|v for the splitter's own trailing edge
 #                            (right / below). The default is v — below the session.
 #     FBTODO_PANE_SIZE=N     how many lines (or columns) the pane gets (12).
+#     FBTODO_PATH=DIRS      the PATH this shell hands the pane (its own PATH by default).
 #
 # The refresh is best-effort on purpose: no npm, or a registry having a bad day, still
 # launches the version that is installed — and it says something only when the version
@@ -60,8 +68,26 @@ fb() {
         # does not split an unquoted variable into words, so "-h -b" would arrive as
         # ONE argument there and as two in bash. Same flags, no splitting to rely on.
         _fb_size="${FBTODO_PANE_SIZE:-12}"
+        # Absolute paths, and this shell's PATH, on purpose: tmux REBUILDS a pane's
+        # environment, so a pane command that says `fbtodo` (a PATH lookup) and leans on
+        # `#!/usr/bin/env python3` can come up on a different interpreter than the watcher
+        # it then starts — measured 2026-10-01: a pane on `/usr/bin/python3` 3.9.6 beside a
+        # watcher on Homebrew's 3.14, because the PATH a pane starts with is not the one
+        # this shell has. This shell is the last place that PATH is still known, so the
+        # answer is taken here and carried into the pane's own command line — where it also
+        # survives `tmux respawn-pane`, which re-runs that same string. `env` carries the
+        # assignment because the shell that runs a pane command may be fish, and fish has no
+        # `VAR=value command` form.
+        _fb_py=$(command -v python3 || command -v python)
+        _fb_bin=$(command -v fbtodo)
         # The place rides into the pane, so the keeper reopens in the same corner.
-        _fb_cmd="FBTODO_SPLIT=${FBTODO_SPLIT:-v} fbtodo --instance-of $$ --stale-after 0"
+        if [ -n "$_fb_py" ] && [ -n "$_fb_bin" ]; then
+            _fb_cmd="FBTODO_SPLIT=${FBTODO_SPLIT:-v} /usr/bin/env PATH='$PATH' '$_fb_py' '$_fb_bin' --instance-of $$ --stale-after 0"
+        else
+            # No python or no fbtodo to name absolutely: launch the old way rather than not
+            # at all. This is the fallback, not the design.
+            _fb_cmd="FBTODO_SPLIT=${FBTODO_SPLIT:-v} fbtodo --instance-of $$ --stale-after 0"
+        fi
         case "${FBTODO_SPLIT:-v}" in
             left)    tmux split-window -h -b -l "$_fb_size" -d "$_fb_cmd" ;;
             right|h) tmux split-window -h    -l "$_fb_size" -d "$_fb_cmd" ;;

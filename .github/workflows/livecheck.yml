@@ -1,0 +1,144 @@
+name: livecheck
+
+# Weekly check that the Homebrew tap (TLE47/homebrew-tap) is in step with PyPI
+# for fbtodo. When `brew livecheck` reports a newer release on PyPI than the
+# version the formula carries, this opens (or bumps) an issue labeled `livecheck`;
+# when the tap catches up it closes that issue.
+#
+# No secrets are required: `brew tap` and `brew livecheck` are read-only, and the
+# issue is managed through the default `GITHUB_TOKEN` (declared `issues: write`
+# below so the runner's `gh` can create, comment on, edit, and close issues).
+on:
+  schedule:
+    - cron: "0 9 * * 1"   # Monday 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  livecheck:
+    name: brew livecheck vs PyPI
+    runs-on: macos-latest
+    env:
+      # Match the locale used in ci.yml so issue-body text renders cleanly.
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: tap TLE47/tap
+        run: brew tap TLE47/tap
+
+      - name: run brew livecheck
+        id: livecheck
+        run: |
+          # brew livecheck output examples:
+          #   in sync:  fbtodo: 4.30.2
+          #   drifted:  fbtodo: 4.30.1 ==> 4.30.2
+          set +e
+          output="$(brew livecheck --tap TLE47/tap fbtodo 2>&1)"
+          rc=$?
+          set -e
+          { echo "exit-code=$rc"; echo "output<<'EOF'"; echo "$output"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          echo "--- brew livecheck output ---"
+          echo "$output"
+
+      - name: reconcile the livecheck issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          output="${{ steps.livecheck.outputs.output }}"
+          repo="${GITHUB_REPOSITORY}"
+          label="livecheck"
+
+          # --- parse the fbtodo line from brew livecheck output ---
+          line="$(printf '%s\n' "$output" | grep -i '^fbtodo:' | head -n1 || true)"
+          if [ -z "$line" ]; then
+            echo "::warning::No 'fbtodo' line in brew livecheck output; nothing to reconcile."
+            printf '%s\n' "$output"
+            exit 0
+          fi
+
+          if printf '%s\n' "$line" | grep -q ' ==> '; then
+            formula_version="$(printf '%s\n' "$line" | sed -nE 's/^[^:]+: ([0-9.]+) ==> ([0-9.]+).*/\1/p')"
+            latest_version="$(printf '%s\n' "$line" | sed -nE 's/^[^:]+: ([0-9.]+) ==> ([0-9.]+).*/\2/p')"
+          else
+            formula_version="$(printf '%s\n' "$line" | sed -nE 's/^[^:]+: ([0-9.]+).*/\1/p')"
+            latest_version="$formula_version"
+          fi
+
+          echo "formula_version: $formula_version"
+          echo "latest_version:  $latest_version"
+
+          # --- compare with Python (string comparison is wrong for semver) ---
+          is_behind="$(python3 -c '
+            import sys
+            def tup(v):
+                return tuple(int(x) for x in v.split("."))
+            a, b = tup(sys.argv[1]), tup(sys.argv[2])
+            n = max(len(a), len(b))
+            a += (0,) * (n - len(a))
+            b += (0,) * (n - len(b))
+            print("yes" if b > a else "no")
+          ' "$formula_version" "$latest_version")"
+
+          echo "pypi_ahead: $is_behind"
+
+          if [ "$is_behind" = "no" ]; then
+            echo "::notice::fbtodo is in sync with PyPI ($latest_version); no drift to report."
+            # Close any open livecheck issue — the tap caught up.
+            open_ids="$(gh issue list -l "$label" -s open -R "$repo" --json number --limit 100 \
+                        | python3 -c 'import json,sys; print(" ".join(str(i["number"]) for i in json.load(sys.stdin)))' \
+                        || true)"
+            for num in $open_ids; do
+              echo "Closing issue #$num — formula is now at $latest_version."
+              gh issue close "$num" -R "$repo" \
+                --comment "The fbtodo formula in \`TLE47/homebrew-tap\` is now at $latest_version, matching PyPI. Closing this drift report."
+            done
+            exit 0
+          fi
+
+          # --- PyPI is ahead: open or bump the livecheck issue ---
+          title="fbtodo Homebrew tap behind PyPI: ${formula_version} -> ${latest_version}"
+
+          existing="$(gh issue list -l "$label" -s open -R "$repo" --json number --limit 1 \
+                     | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0]["number"] if d else "")' \
+                     || true)"
+
+          if [ -n "$existing" ]; then
+            echo "Bumping existing issue #$existing — formula still at $formula_version, PyPI at $latest_version."
+            gh issue edit "$existing" -R "$repo" --title "$title"
+            gh issue comment "$existing" -R "$repo" \
+              -b "Still behind: formula at ${formula_version}, PyPI at ${latest_version}."
+          else
+            echo "Creating new livecheck issue."
+            # Build the body with printf; double-quoted strings so backticks
+            # are escaped (\`) rather than interpreted as command substitution.
+            {
+              printf '%s\n' "The \`TLE47/homebrew-tap\` formula for fbtodo is behind the latest PyPI release."
+              printf '%s\n' ""
+              printf '%s\n' "| | Version |"
+              printf '%s\n' "|---|---|"
+              printf '%s\n' "| Formula (\`TLE47/tap/fbtodo\`) | ${formula_version} |"
+              printf '%s\n' "| PyPI latest | ${latest_version} |"
+              printf '%s\n' ""
+              printf '%s\n' "To update the formula, run:"
+              printf '%s\n' ""
+              printf '%s\n' "\`\`\`sh"
+              printf '%s\n' "python3 packaging/homebrew/update-formula.py --version ${latest_version}"
+              printf '%s\n' "\`\`\`"
+              printf '%s\n' ""
+              printf '%s\n' "_Detected by the \`livecheck\` scheduled workflow._"
+            } > /tmp/livecheck-body.md
+            gh issue create -R "$repo" -l "$label" \
+              --title "$title" \
+              --body-file /tmp/livecheck-body.md
+          fi

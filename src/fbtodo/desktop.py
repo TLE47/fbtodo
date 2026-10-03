@@ -160,6 +160,32 @@ def live_threads(cur, followed, others: int, now_ms: int, window_ms: int) -> lis
     return out
 
 
+# The app commits a message row only when a turn CLOSES, so the transcript says nothing
+# about the work in flight and a running thread looks exactly like one that never called
+# `write_todos` — the pane's old "no write_todos call yet in this session", which reads as
+# "the agent forgot" when the truth is "the store has not committed yet". The `threads` row
+# DOES move mid-turn, though: `turn_state` goes `running` and `turn_alive_at` is a
+# heartbeat. That is the one live signal the store offers, and the whole of what this
+# answers. Guarded by `thread_columns`: an older store may not carry the column at all.
+def turn_running(cur, tid, now_ms: int) -> bool:
+    """Is this thread's turn alive right now, per the store's own live signal?"""
+    if not tid:
+        return False
+    cols = thread_columns(cur)
+    if "turn_state" not in cols:
+        return False
+    row = cur.execute("SELECT turn_state FROM threads WHERE id = ?", (tid,)).fetchone()
+    if not row or str(row[0] or "").lower() != "running":
+        return False
+    if "turn_alive_at" not in cols:
+        return True
+    beat = cur.execute("SELECT turn_alive_at FROM threads WHERE id = ?", (tid,)).fetchone()
+    beat = int((beat or [0])[0] or 0)
+    # A `running` state with a stale heartbeat is a turn that died, not one in flight: the
+    # app rewrites the beat every few seconds while it works.
+    return not (beat and now_ms - beat > DESKTOP_RUNNING_MS)
+
+
 def _thread_query(cur, sql, params=()):
     row = cur.execute(sql, params).fetchone()
     if not row:
@@ -219,6 +245,7 @@ def read_desktop(db: str, thread_id=None, source="active", state_path=DEFAULT_WO
             state["active"] = target == active_tab
             state["source"] = "active-tab" if target == active_tab else "pinned"
             state["session"] = target
+            state["turn_running"] = turn_running(cur, target, now_ms)
             return _with_threads(cur, state, target, others, now_ms, window_ms)
         state = _thread_query(
             cur,
@@ -232,6 +259,7 @@ def read_desktop(db: str, thread_id=None, source="active", state_path=DEFAULT_WO
         state["active"] = False
         state["source"] = "last" if source == "last" else "fallback"
         state["session"] = state.get("thread")
+        state["turn_running"] = turn_running(cur, state.get("thread"), now_ms)
         return _with_threads(cur, state, state.get("thread"), others, now_ms, window_ms)
     finally:
         con.close()
@@ -269,7 +297,8 @@ def _with_threads(cur, state: dict, followed, others: int, now_ms: int, window_m
 
 __all__ = [
     "project_path_of", "same_path", "pick_db", "load_workspace", "tab_for_app",
-    "db_for_thread", "thread_columns", "live_threads", "_with_threads", "_thread_query",
+    "db_for_thread", "thread_columns", "turn_running", "live_threads", "_with_threads",
+    "_thread_query",
     "read_desktop",
     "DESKTOP_LIVE_MS", "DESKTOP_RUNNING_MS", "DESKTOP_MAX_THREADS",
 ]

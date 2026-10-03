@@ -42,6 +42,14 @@ is byte-for-byte what it always was, and no other source changes shape. The othe
 bonus on top of a list that has already been read, so a store this build cannot answer the second
 question about returns the first list rather than none.
 
+The store commits a message row only when a turn **closes**, so a thread that is visibly working
+has no list to read yet — and `no write_todos call yet in this session` read as "the agent
+forgot" when the truth was "the store has not committed". The `threads` row *does* move
+mid-turn, so `-s desktop` also reads its own live signal (`turn_state = running`, with
+`turn_alive_at` as the heartbeat that proves the turn is still alive) and a listless thread whose
+turn is alive says `turn running · no list yet` instead. That is what the store can honestly
+say; it is not the list, and the lag itself is [OPEN-PROBLEMS.md](OPEN-PROBLEMS.md) #1.
+
 The instance to follow is found in this order:
 
 1. `--instance-of PID` — the agent process launched by that shell.

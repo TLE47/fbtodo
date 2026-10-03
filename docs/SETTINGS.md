@@ -16,11 +16,26 @@ Precedence is the usual one: a command-line flag, then the environment, then a f
 | `FBTODO_GRADIENT_START` / `_END` | theme | `#rrggbb`, or a raw SGR code like `1;36` for the accent |
 | `FBTODO_TRUECOLOR` | auto | force 24-bit colour on or off |
 | `FBTODO_TMUX` | `tmux` | the tmux binary/args to drive (a test knob) |
+| `FBTODO_PATH` | the opener's `PATH` | the base of the `PATH` handed to a pane in its own command line, instead of whatever the tmux server would rebuild (the interpreter's own directory is always put first, so anything the pane resolves by name is the same Python). Set it when a machine needs a specific one; a pane that was opened pinned passes this value on |
 | `FBTODO_LABEL_FLOOR` | `10` | estimates: a finished span under this many seconds is not evidence — it sets no pace and moves no memory (`0` keeps every span, the pre-4.23.0 behaviour) |
 | `FBTODO_BLEND_WEIGHT` | `0.5` | estimates: how much a *waiting* step's number comes from its wording rather than the list's pace, `0`–`1` (`0` = pace only; `1` = wording only, which drops the pace and mis-sizes the tail) |
 | `FBTODO_GOAL_LINES` | `3` | how many lines the goal heading may take (`0` hides it) |
 | `FREEBUFF_PHONE` | on | `off` / `0` / `false` / `no` / `disabled` mutes the phone, read when a bell sends |
 | `FREEBUFF_NO_REFRESH` | — | the `fb` launcher skips its `npm i -g freebuff` round trip |
+
+Pane repair has a per-pane switch that is not an environment variable, because the pane is
+the scope: the tmux user option **`@fbtodo_repair`** turns the keeper's automatic respawn of a
+pane whose interpreter drifted off for that pane — `tmux set -p -t %3 @fbtodo_repair off`, or
+`-w` / `-g` for a window or the whole server, since tmux resolves the option up the chain.
+`off` / `no` / `0` / `false` disable it; anything else, or unset, leaves the repair running.
+The pane is diagnosed either way — the keeper logs what it saw and the running pane shows
+`KEPT (was on …)` on its title chip for a few seconds — but it is not respawned, and `on`
+resumes the repair on the next pass with no keeper restart. `fbtodo keep off` / `on` /
+`default` is that option as a command: the pane you are in, or one named with `--pane %3`;
+one window with `--window TARGET` (a session, `session:index` or a window id — resolved
+through tmux, and it outranks the server while a pane's own choice outranks it); and
+`--server` for every pane at once (`keep` with no verb prints what is in force). The tmux
+incantation is never needed.
 
 The two estimate knobs are flags as well, so they can be set per run rather than per shell:
 `--label-floor SEC` and `--blend-weight W`. Both are forwarded to the watcher when it is

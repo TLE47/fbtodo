@@ -291,11 +291,16 @@ def _turn_extend(newer: dict, older: dict) -> dict:
     for name in older.get("files") or []:
         if name not in files:
             files.append(name)
+    # The newest edit across both halves: both walk newest-first, so the larger key is the
+    # later edit, whichever chunk it was parsed in.
+    edit_keys = [k for k in (newer.get("last_edit_key"), older.get("last_edit_key"))
+                 if k is not None]
     return {
         "start_ms": older.get("start_ms") or newer.get("start_ms"),
         "iterations": int(newer.get("iterations") or 0) + int(older.get("iterations") or 0),
         "verbs": counts,
         "files": files[:FILE_KEEP],
+        "last_edit_key": max(edit_keys) if edit_keys else None,
         "open": bool(older.get("open")),
     }
 
@@ -324,7 +329,8 @@ def journal_scan(blob: bytes, thread: str, chunk: int = 0):
     # honestly is a boundary and a numerator: how long this work has been going, how many
     # model iterations it has taken, and what it has done so far. `open` means the walk has
     # not reached the request yet — the numbers are then lower bounds and are labelled so.
-    turn = {"start_ms": None, "iterations": 0, "verbs": {}, "files": [], "open": True}
+    turn = {"start_ms": None, "iterations": 0, "verbs": {}, "files": [],
+            "last_edit_key": None, "open": True}
     for order, raw in enumerate(reversed(blob.split(b"\n"))):
         want_call = hit is None and b"write_todos" in raw and b'"todos"' in raw
         want_prompt = b'"prompt"' in raw
@@ -399,6 +405,14 @@ def journal_scan(blob: bytes, thread: str, chunk: int = 0):
             if turn["open"]:
                 for _k, _ts, verb, what in acts:
                     turn["verbs"][verb] = turn["verbs"].get(verb, 0) + 1
+                    if verb in EDIT_VERBS and (
+                        turn["last_edit_key"] is None or key > turn["last_edit_key"]
+                    ):
+                        # Where in the journal this turn last touched a file. The
+                        # boundary guard compares it with the newest `write_todos` to
+                        # ask whether the list was told about the work (see
+                        # `files_unlisted` in `scan_live_log`).
+                        turn["last_edit_key"] = key
                     if what and verb in EDIT_VERBS and what not in turn["files"]:
                         if len(turn["files"]) < FILE_KEEP:
                             turn["files"].append(what)
@@ -627,6 +641,19 @@ def scan_live_log(chat_dir: str) -> dict:
         scan["turn_ended"] = bool(
             newest_turn and newest_turn[1] and (asked is None or newest_turn[0] >= asked[0])
         )
+        # The boundary guard (docs/OPEN-PROBLEMS.md, direction 5): this turn ENDED having
+        # edited files but having published no `write_todos` since its own last edit — so
+        # the list does not account for the work that just landed, and neither the pane's
+        # "all done" nor the completion bell may vouch for it. Computed here because this
+        # is the only place that holds both halves: the turn's edits and the newest list's
+        # position in the journal. `last_edit_key` is a walk key (a tuple), so it is read
+        # and dropped here rather than carried into the JSON state.
+        last_edit = scan["turn"].pop("last_edit_key", None)
+        edits = scan["turn"].get("files") or []
+        scan["files_unlisted"] = bool(
+            scan["turn_ended"] and edits
+            and (hit_key is None or (last_edit is not None and last_edit > hit_key))
+        )
         if len(_SCAN_CACHE) > 8:  # a long-lived watcher that keeps switching sessions
             _SCAN_CACHE.clear()
         if len(chunks) > CACHED_CHUNKS:  # hygiene: the walk reaches the newest ones first
@@ -667,6 +694,10 @@ def read_cli(chat_dir: str) -> dict:
     # same backward pass; the bell rings on "all todos done AND turn ended", so a long
     # command that merely leaves the journal quiet never rings it.
     state["turn_ended"] = bool(scan.get("turn_ended"))
+    # The boundary guard's own fact: the turn ended with file edits the list never got
+    # told about. Carried on the state so the renderers and the bell read one answer
+    # rather than each recomputing it (the bell only ever sees the state file).
+    state["files_unlisted"] = bool(scan.get("files_unlisted"))
     now = scan.get("now")
     # A nudge says the same thing as `now` but names what to do about it, so it wins the
     # slot rather than both lines saying `continue` in different words.

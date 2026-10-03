@@ -177,6 +177,12 @@ def snapshot(root: int, source: str | None = None) -> dict | None:
         return None
 
 
+def unlisted_files(state: dict) -> str:
+    """`3 files` — the count behind the boundary guard, for a reason line."""
+    n = len((state.get("turn") or {}).get("files") or [])
+    return f"{n} file{'' if n == 1 else 's'}"
+
+
 def decide(state: dict, doc: dict) -> tuple[bool, str]:
     """(ring?, why) — the reason is printed either way, because 'no ring' needs a story."""
     if state.get("backend") != "cli":
@@ -189,6 +195,11 @@ def decide(state: dict, doc: dict) -> tuple[bool, str]:
         return False, f"still working ({done}/{total} done)"
     if not state.get("turn_ended"):
         return False, f"all {total} done, but the agent has not finished its turn"
+    # The boundary guard (fbtodo's `files_unlisted`): the turn ended having edited files
+    # without publishing a newer list, so the list does not account for the work and this
+    # is not a finish to announce.
+    if state.get("files_unlisted"):
+        return False, f"all {total} done, but {unlisted_files(state)} changed after the list"
     list_id = state.get("list_id")
     if not list_id:
         return False, "list has no identity to ring once for"
@@ -232,6 +243,8 @@ def phone_decide(state: dict, doc: dict, now_ms: int | None = None) -> tuple[boo
     else:
         if not state.get("turn_ended"):
             return False, f"all {total} done, but the agent has not finished its turn"
+        if state.get("files_unlisted"):
+            return False, f"all {total} done, but {unlisted_files(state)} changed after the list"
         why = f"all {total} todos done and the turn ended"
     if list_id in claims(doc, "pushed"):
         return False, f"already pushed for this list ({done}/{total})"

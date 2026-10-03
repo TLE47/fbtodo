@@ -47,6 +47,11 @@ def no_list_reason(state: dict) -> str:
         return "last turn's list is done — waiting for this turn's list"
     if state.get("cleared"):
         return "new session — old list dropped, waiting for a new one"
+    # The desktop store commits a row only at the turn's close, so a thread that is
+    # visibly working has no list to read yet. Say which one it is: the store has not
+    # committed (this) rather than the agent never called `write_todos` (below).
+    if state.get("turn_running"):
+        return "turn running · no list yet"
     return "no write_todos call yet in this session"
 
 
@@ -69,6 +74,27 @@ def list_behind(state: dict, now_ms: int) -> bool:
     if state.get("turn_ended"):
         return False          # waiting for you, not working past it
     return moved - written >= LIST_BEHIND_MS
+
+
+# In plain words: the boundary guard's sentence (see `files_unlisted`). When a turn ends
+# having edited files but having published no list since its last edit, the work landed
+# unlisted — so the pane must not read as a clean finish. The count is the distinct files
+# the scan tallied, which is a floor (the walk keeps only the newest few).
+def unlisted_note(state: dict, short: bool = False) -> str:
+    """`3 files changed, list not rewritten` — or "" when the list accounts for the work.
+
+    `short` is the pane's form (`3 files unlisted`): a fixed-width strip drops the whole
+    LIST field to make the chip fit, and the count is worth more than the wording there.
+    The full sentence stays for the machine-readable paths — `snap`, `status`.
+    """
+    if not state.get("files_unlisted"):
+        return ""
+    files = (state.get("turn") or {}).get("files") or []
+    n = len(files)
+    plural = "" if n == 1 else "s"
+    if short:
+        return f"{n} file{plural} unlisted"
+    return f"{n} file{plural} changed, list not rewritten"
 
 
 # In plain words: a pane with no list should not just shrug at you. This lists the tools the
@@ -513,7 +539,10 @@ def _render_plain(
     if state.get("list_version"):
         meta.append(f"list #{state['list_version']}")
     if total and done == total:
-        meta.append("all steps done")
+        gap = unlisted_note(state)
+        # The boundary guard reads the same in the machine-readable path: a finished list
+        # that does not account for the turn's edits is not a finish.
+        meta.append(f"steps still open — {gap}" if gap else "all steps done")
     clock = time.strftime("%H:%M:%S", time.localtime(now_ms / 1000))
     # The footer is intentionally tight: in a fixed-height strip, a blank separator
     # costs a visible step.  The bar and status remain the visual anchor, while the
@@ -970,6 +999,7 @@ def _render_rich(
     height: int | None,
     theme: dict | None = None,
     truecolor: bool | None = None,
+    reloaded: str | None = None,
 ) -> str:
     """The framed, high-density pane shown on a colour terminal.
 
@@ -1033,7 +1063,16 @@ def _render_rich(
     model = _clip_cells((state.get("model") or "").split("/")[-1], 14) if state.get("model") else ""
     who = f"watcher: pid {watching}" if watching else _session_label(state)
     right = f"{who} · {model}" if model else who
-    rows = [_top_border(width, frame, "FREEBUFF TODOS", right, badge)]
+    # A pane that has just replaced itself says which build it is now (`reloaded`, from
+    # `cmd_pane`) on its own title chip for a few seconds. The chip is the one slot on the
+    # frame that belongs to the PROCESS rather than to the list, so the note spends no data
+    # row and moves nothing: the ruler beside it just gives the longer label its columns,
+    # and the chip is the pane's own name again when the note expires. Clipped to a budget
+    # that keeps the right-hand metadata its room — the note is transient, the watcher's pid
+    # is not — so a narrow pane loses the note's tail, not the whole right slot, for five
+    # seconds.
+    title = _clip_cells(reloaded, max(8, width - 22)) if reloaded else "FREEBUFF TODOS"
+    rows = [_top_border(width, frame, title, right, badge)]
 
     if state.get("error"):
         rows.append(_divider_row(width, frame))
@@ -1415,7 +1454,9 @@ def _render_rich(
         # overrun, because the footer is where a glance lands.
         word = f"{spin}WORKING"
     elif total and done == total:
-        word = "ALL DONE"
+        # The boundary guard: a complete list that does not account for this turn's edits
+        # is not a finish, so the strip says so instead of `ALL DONE`.
+        word = "STEPS OPEN" if state.get("files_unlisted") else "ALL DONE"
     else:
         word = "IDLE"
     # The age belongs to a state that is waiting: beside a running step its own counter
@@ -1442,12 +1483,16 @@ def _render_rich(
         # A finished list in a session that has written well past it: the one case worth a
         # verdict, and a question mark because it is still a guess (see `list_behind`).
         listed_age += " [STALE?]"
+    # The boundary guard's own field: the work that landed after the list. Its own slot so
+    # the tiers below keep it past the number it is about — the warning outlives the LIST
+    # number and its age on a strip too narrow for all three.
+    gap = unlisted_note(state, short=True)
 
     # An over-budget step keeps the same chip shape but turns it red, so the overrun reads
     # at a glance without adding a word to the strip.
     chip = badge if over_ms <= 0 else (lambda text: c("7;31", text))
 
-    def strip(text: str, keep_list: bool, keep_age: bool) -> str:
+    def strip(text: str, keep_list: bool, keep_age: bool, keep_gap: bool) -> str:
         """The status strip: the state on a badge, then the fields ` │ ` apart."""
         body = chip(f" {text} ")
         fields: list[str] = []
@@ -1460,20 +1505,24 @@ def _render_rich(
             # show (measured on this machine: a bare `json` reports `list #0`) — so the age
             # stays where it used to live rather than going missing.
             body += c(muted, age_text)
+        if gap and keep_gap:
+            fields.append(gap)
         return body + "".join(
             c(st["faint"], " │ ") + c(muted, field) for field in fields + [live_field]
         )
 
     # On a strip too narrow for all of it the list's own age goes first, then LIST: itself —
     # the state chip and the live clock are what the row is for. The tiers are (keep_list,
-    # keep_age). The age is the last field to go because it is the only thing on the row
-    # that says the list has fallen behind the work.
-    for tier in ((word, True, True), (word, True, False), (word, False, False)):
+    # keep_age, keep_gap). The age is the last field to go because it is the only thing on
+    # the row that says the list has fallen behind the work; the guard's field goes even
+    # later, because dropping the warning is exactly how the strip would lie.
+    for tier in ((word, True, True, True), (word, True, False, True),
+                 (word, False, False, True), (word, False, False, False)):
         status = strip(*tier)
         if _cell_width(status) <= inner:
             break
     else:
-        status = _clip_cells(strip(word, False, False), inner)
+        status = _clip_cells(strip(word, False, False, False), inner)
 
     rows += [_frame_row(h, width, frame) for h in head]
     rows.append(_divider_row(width, frame))
@@ -1597,6 +1646,7 @@ def render(
     height: int | None = None,
     theme: dict | None = None,
     truecolor: bool | None = None,
+    reloaded: str | None = None,
 ) -> str:
     """Pick the framed pane (colour terminal) or the plain machine-readable text.
 
@@ -1604,7 +1654,8 @@ def render(
     here from the environment and the theme files, which is how every command calls this; passed
     in, the frame is a function of the arguments alone — the same state and clock give the same
     bytes, whatever the terminal says. That is what makes a recorded frame a contract and lets
-    the pane diff one paint against the last (see `pane_repaint`).
+    the pane diff one paint against the last (see `pane_repaint`). `reloaded` is a transient
+    note for the framed pane's title chip only — a plain frame has no chrome to say it on.
     """
     # The second half of the text filter (see `clean_text`): a state that came off disk —
     # this process's own cache, or a file an older build wrote — is filtered here, so no
@@ -1614,7 +1665,7 @@ def render(
     if color and width >= 30:
         frame = _render_rich(
             state, color, watching, width, now_ms, idle_s, stale_after_s, goal_lines, height,
-            theme=theme, truecolor=truecolor,
+            theme=theme, truecolor=truecolor, reloaded=reloaded,
         )
     else:
         frame = _render_plain(
@@ -1651,7 +1702,8 @@ def bar_text(state: dict) -> str:
 
 
 __all__ = [
-    "_window_anchor", "no_list_reason", "list_behind", "tools_note", "turn_note",
+    "_window_anchor", "no_list_reason", "list_behind", "unlisted_note", "tools_note",
+    "turn_note",
     "observed_rows", "NO_TIMES_TICKED", "NO_TIMES_UNSEEN", "no_times_note", "_render_plain",
     "_frame_row", "_divider_row", "_bottom_row", "_SESSION_RE", "_session_label",
     "_top_border", "THEME_DEFAULTS", "THEME_KEYS", "THEME_FILE_LOCAL", "THEME_FILE_GLOBAL",

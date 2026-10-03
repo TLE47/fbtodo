@@ -88,7 +88,20 @@ fb() {
         # Each arm calls tmux itself: a variable holding "-h -b" would split into one
         # word under zsh and two under bash.
         _fb_size="${FBTODO_PANE_SIZE:-12}"
-        _fb_cmd="FBTODO_SPLIT=${FBTODO_SPLIT:-v} fbtodo --instance-of $$ --stale-after 0"
+        # The pane is named by ABSOLUTE paths and carries this shell's PATH: tmux rebuilds a
+        # pane's environment, so a command resolved through PATH could come up on a different
+        # Python than the watcher it starts beside it (measured 2026-10-01: a pane on
+        # /usr/bin/python3 3.9.6 beside a watcher on Homebrew's 3.14). This shell has the
+        # owner's own PATH, so the answer is taken HERE, where it is still known. `env`
+        # carries the assignment because the login shell that runs a pane command may be
+        # fish, which has no `VAR=value command` form.
+        _fb_py=$(command -v python3 || command -v python)
+        _fb_bin=$(command -v fbtodo)
+        if [ -n "$_fb_py" ] && [ -n "$_fb_bin" ]; then
+            _fb_cmd="FBTODO_SPLIT=${FBTODO_SPLIT:-v} /usr/bin/env PATH='$PATH' '$_fb_py' '$_fb_bin' --instance-of $$ --stale-after 0"
+        else
+            _fb_cmd="FBTODO_SPLIT=${FBTODO_SPLIT:-v} fbtodo --instance-of $$ --stale-after 0"
+        fi
         case "${FBTODO_SPLIT:-v}" in
             left)    tmux split-window -h -b -l "$_fb_size" -d "$_fb_cmd" ;;
             right|h) tmux split-window -h    -l "$_fb_size" -d "$_fb_cmd" ;;
@@ -161,7 +174,19 @@ function fb
             set _fb_where $FBTODO_SPLIT
         end
         # $fish_pid is the interactive shell's pid — the analogue of `$$`.
+        # Absolute paths and an explicit PATH, for the same reason as the POSIX body: tmux
+        # rebuilds a pane's environment, and this shell is the last place the owner's own
+        # PATH is known. `string join : $PATH` because fish holds PATH as a list, and the
+        # assignment inside the branch is BARE on purpose: `set -l` in a block is scoped to
+        # that block, so the pane command would be empty by the time tmux was called —
+        # measured, with a stub tmux, before this line was written.
+        set -l _fb_py (command -v python3; or command -v python)
+        set -l _fb_bin (command -v fbtodo)
+        set -l _fb_path (string join : $PATH)
         set -l _fb_cmd "FBTODO_SPLIT=$_fb_where fbtodo --instance-of $fish_pid --stale-after 0"
+        if test -n "$_fb_py"; and test -n "$_fb_bin"
+            set _fb_cmd "FBTODO_SPLIT=$_fb_where /usr/bin/env PATH='$_fb_path' '$_fb_py' '$_fb_bin' --instance-of $fish_pid --stale-after 0"
+        end
         switch $_fb_where
             case left
                 tmux split-window -h -b -l $_fb_size -d "$_fb_cmd"
