@@ -16,6 +16,7 @@ read on their own.
 
 from __future__ import annotations
 
+import ast
 import builtins
 import copy
 try:
@@ -55,8 +56,8 @@ SOURCE_SETTLE_S = 2.0
 
 # How often a long-running process asks whether it is still the build on disk. Both askers —
 # the pane and the watcher — re-exec themselves when the answer is no, and one listing a
-# second is nothing beside the poll either of them already does, especially the ssh round trip
-# a `-s nas` poll can be. The answer only changes when somebody writes a file.
+# second is nothing beside the poll either of them already does. The answer only changes when
+# somebody writes a file.
 BUILD_CHECK_S = 1.0
 
 
@@ -78,6 +79,10 @@ STATE_DIR = os.path.join(
 
 # What the move carries. Listed as names rather than taken from the paths below, because the
 # root has to be chosen before those are built.
+# What the move carries. Listed as names rather than taken from the paths below, because the
+# root has to be chosen before those are built. The `nas` names are listed although nothing
+# writes them any more: they are what an install that had the remote source leaves in the old
+# dotdir, and a move that skipped them would strand them there forever.
 LEGACY_NAMES = (
     "fbtodo-state.json", "fbtodo-tasks.json", "fbtodo-tasks.jsonl",
     "fbtodo-daemon.pid", "fbtodo-daemon.log",
@@ -302,10 +307,19 @@ def source_syntax_error(here: str = "") -> str | None:
 RELOAD_PROBE_ENV = "FBTODO_RELOAD_PROBE"
 
 # How long the probe may take. Importing this package is a few hundred milliseconds, and the
-# deep name pass is a parse of each module on top; the bound exists only so a build that HANGS
-# on import (a lock, a network call added at module scope) is a reason to hold rather than a
-# way to wedge the process that is waiting on it.
+# deep passes add a parse of each module on top of it (`symtable` and `ast`); the bound is
+# here only so that a build which HANGS on import (a lock, a network call added at module
+# scope) is a reason to hold rather than a way to wedge the process that is waiting on it.
 RELOAD_PROBE_TIMEOUT_S = 20.0
+
+
+# How much of a failed probe's last line is kept. A note is a DIAGNOSIS, and the part that
+# makes it one is at the END — the file, the line, and above all WHY that line can never run.
+# The 240 this replaces was enough on a checkout that lived two directories deep and stopped
+# being enough the moment one did not: the reason fell off the end and left a note saying only
+# that some line is unreachable, which is just as true of a healthy build. A length cap on a
+# diagnosis has to clear the longest path it can be handed, so this one is generous on purpose.
+PROBE_NOTE_CHARS = 420
 
 
 def reload_probe_error(timeout: float | None = None, here: str = "") -> str | None:
@@ -321,11 +335,14 @@ def reload_probe_error(timeout: float | None = None, here: str = "") -> str | No
     itself: the same command line the reload is about to exec (`self_argv`), run once in a
     child with `RELOAD_PROBE_ENV` set, in which `main` answers through `probe_answer`. That
     answer is deeper than the import: the command parser is built (so `build_parser`'s body
-    and every default it computes actually run), and `undefined_global_names` then resolves
-    every name the package's functions load as a global — the ones an import never touches,
-    because a function body is name-resolved only when it runs. A reference to a global that
-    was renamed or deleted therefore fails here instead of waiting for the one command that
-    reaches it. Nothing is claimed and nothing is written — the child stops before
+    and every default it computes actually run), and the parse is then asked the two things
+    an import never touches. `undefined_global_names` resolves every name the package's
+    functions load as a global, because a function body is name-resolved only when it runs —
+    a reference to a global that was renamed or deleted therefore fails here instead of
+    waiting for the one command that reaches it. `unreachable_code` reads the source itself
+    and fails a build whose own parse proves some of it can never run — a statement after a
+    `return`, a constant-false branch — so a path that would silently never execute is a
+    reason to hold too. Nothing is claimed and nothing is written — the child stops before
     `init_state_root`, the first thing that touches disk — so a build that answers here is
     safe to BECOME. Anything else (a nonzero exit, a signal, a hang past `timeout`) is the
     answer and the caller holds, keeping the image it is already running: the last build that
@@ -345,7 +362,7 @@ def reload_probe_error(timeout: float | None = None, here: str = "") -> str | No
     if proc.returncode == 0:
         return None
     lines = (proc.stderr or proc.stdout or "").strip().splitlines()
-    return (lines[-1][:240] if lines else f"the new build exited {proc.returncode}")
+    return (lines[-1][:PROBE_NOTE_CHARS] if lines else f"the new build exited {proc.returncode}")
 
 
 def _undefined_in(table, known: set, path: str, scope: str = "") -> str | None:
@@ -367,7 +384,39 @@ def _undefined_in(table, known: set, path: str, scope: str = "") -> str | None:
     return None
 
 
-def undefined_global_names() -> str | None:
+def _package_modules(here: str = ""):
+    """(path, source, module) for every file of this package, in a fixed order.
+
+    The two static questions the probe asks (an undefined global, code that can never run)
+    both read the SAME module set in the SAME order through this, so neither can quietly
+    disagree with the other about which files this build even has.
+
+    `here` names one file of a COPY of this package, and every file is then read from that
+    copy's directory instead of from where the imported modules live. The names are still
+    resolved against the live namespaces — that is what the question is about — but the TEXT
+    is the copy's, so a reader can ask the question of a tree nobody is editing. A checkout
+    being written while this parses it is otherwise a false failure: a half-written file
+    either stops parsing (and is skipped) or parses into a name that is not defined yet.
+    """
+    root = os.path.dirname(os.path.abspath(here)) if here else ""
+    for name in sorted(sys.modules):
+        if not (name == "fbtodo" or name.startswith("fbtodo.")):
+            continue
+        mod = sys.modules[name]
+        path = getattr(mod, "__file__", None)
+        if not path or not path.endswith(".py"):
+            continue
+        if root:
+            path = os.path.join(root, os.path.basename(path))
+        try:
+            with open(path, encoding="utf-8") as fh:
+                src = fh.read()
+        except OSError:
+            continue
+        yield path, src, mod
+
+
+def undefined_global_names(here: str = "") -> str | None:
     """The first global a FUNCTION in this build loads that is not defined — the deep half.
 
     In plain words: importing a package runs the module-level code and NOTHING else. A
@@ -390,18 +439,7 @@ def undefined_global_names() -> str | None:
     module some other way, which is why the self-check pins both sides: this checkout (which
     must pass) and a copy whose function uses a name that was deleted (which must fail).
     """
-    for name in sorted(sys.modules):
-        if not (name == "fbtodo" or name.startswith("fbtodo.")):
-            continue
-        mod = sys.modules[name]
-        path = getattr(mod, "__file__", None)
-        if not path or not path.endswith(".py"):
-            continue
-        try:
-            with open(path, encoding="utf-8") as fh:
-                src = fh.read()
-        except OSError:
-            continue
+    for path, src, mod in _package_modules(here):
         try:
             top = symtable.symtable(src, path, "exec")
         except (SyntaxError, ValueError):
@@ -411,6 +449,567 @@ def undefined_global_names() -> str | None:
         if missing:
             return missing
     return None
+
+
+# The statements that END a block: nothing after one of these, in the SAME suite, can run.
+# `break` and `continue` are only legal inside a loop, and that is where they always appear.
+_TERMINATOR_WORD = {
+    ast.Return: "return", ast.Raise: "raise", ast.Break: "break", ast.Continue: "continue",
+}
+
+# The fields of a node that hold a SUITE (an ordered list of statements). Walking the tree
+# and reading these is what lets one `while`/`try`/`match` case be checked without a branch
+# here for every compound statement Python has.
+_SUITE_FIELDS = ("body", "orelse", "finalbody")
+
+
+# A value that is not a value: the answer when an expression is not made of literals. A
+# sentinel rather than `None`, because `None` IS a literal whose truth is False.
+_NO_VALUE = object()
+
+
+def _literal_value(node):
+    """The value of an expression made only of literals, or `_NO_VALUE` when it is not one.
+
+    In plain words: what does this actually equal, with nothing left to run? `literal_eval`
+    answers for a literal, a tuple/list/set/dict of them, and a sign in front of a number —
+    and raises for everything else, which is exactly the line this check refuses to cross. A
+    name, a call, an attribute, an f-string with a placeholder, a `not`: none of them have a
+    value until the program runs, so none of them get one here.
+    """
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return _NO_VALUE
+
+
+def _compare_value(node):
+    """True or False when EVERY operand of a comparison is a literal, else `_NO_VALUE`.
+
+    The operators are folded by hand rather than handed to `eval`, and `is` / `is not` are
+    deliberately left unfolded: identity is not a value question (two equal literals are one
+    object in CPython and two in another build), so it is exactly the kind of answer this
+    check must not guess. A chained comparison (`0 < n < 5`, and the literal form too) is
+    folded the way Python runs one — left to right, stopping at the first false link — so a
+    later link that would raise (`1 in 2`, an empty dict as a container) never gets asked.
+    """
+    left = _literal_value(node.left)
+    if left is _NO_VALUE:
+        return _NO_VALUE
+    for op, comparator in zip(node.ops, node.comparators):
+        right = _literal_value(comparator)
+        if right is _NO_VALUE:
+            return _NO_VALUE
+        try:
+            if isinstance(op, ast.Eq):
+                ok = left == right
+            elif isinstance(op, ast.NotEq):
+                ok = left != right
+            elif isinstance(op, ast.Lt):
+                ok = left < right
+            elif isinstance(op, ast.LtE):
+                ok = left <= right
+            elif isinstance(op, ast.Gt):
+                ok = left > right
+            elif isinstance(op, ast.GtE):
+                ok = left >= right
+            elif isinstance(op, ast.In):
+                ok = left in right
+            elif isinstance(op, ast.NotIn):
+                ok = left not in right
+            else:
+                return _NO_VALUE  # `is` / `is not`, or an operator a future Python adds
+        except (TypeError, ValueError):
+            return _NO_VALUE  # a comparison that cannot be made (`1 in 2`) is not a guess
+        if not ok:
+            return False
+        left = right
+    return True
+
+
+def _static_truth(node):
+    """True or False when a test's value is provable from the parse alone, else None.
+
+    Deliberately narrow, and narrow in only these ways: a literal, a `not` around one, or a
+    comparison whose every operand is a literal (`if 1 > 2:`, `while 0 == 1:`). Anything
+    whose value could turn on a name, a call or an attribute is NOT answered, because the
+    answer would be a guess and this check only gets to speak when it is certain.
+    """
+    if isinstance(node, ast.Constant):
+        return bool(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        inner = _static_truth(node.operand)
+        return None if inner is None else (not inner)
+    if isinstance(node, ast.Compare):
+        value = _compare_value(node)
+        return None if value is _NO_VALUE else bool(value)
+    return None
+
+
+def _dead_sentence(path: str, found: tuple[int, str]) -> str:
+    """One finding as the sentence every reader of this pass already prints.
+
+    The ONE place the `path: line N: unreachable — why` shape is written, so the first-only
+    readers (`_unreachable_in`, `_guarded_in`) and the full list (`dead_code`) cannot drift
+    apart: a finding is `(line, why)`, and the sentence is its rendering.
+    """
+    line, why = found
+    return f"{path}: line {line}: unreachable — {why}"
+
+
+def _dead_at(node) -> tuple[int, str] | None:
+    """The arm of `node` a constant test proves can never run, as `(line, why)`, or None.
+
+    Only the shapes whose dead arm is the arm itself: an `if` or a `while` testing a
+    constant (so one whole suite is unreachable) and a conditional expression with one.
+    `while True:` is deliberately NOT reported — a spinning loop is how a loop is usually
+    meant to be written, and a body that is live is not dead code.
+    """
+    truth = _static_truth(node.test)
+    if isinstance(node, ast.While):
+        if truth is False and node.body:
+            return (node.body[0].lineno,
+                    f"the `while` on line {node.lineno} tests a constant false, "
+                    "so its body never runs")
+        return None
+    if isinstance(node, ast.If):
+        if truth is False and node.body:
+            return (node.body[0].lineno,
+                    f"the branch under the constant-false test on line {node.lineno} never runs")
+        if truth is True and node.orelse:
+            return (node.orelse[0].lineno,
+                    f"the branch under the constant-true test on line {node.lineno} never runs")
+        return None
+    if isinstance(node, ast.IfExp) and truth is not None:
+        arm = node.body if truth is False else node.orelse
+        return (arm.lineno,
+                f"this arm of the conditional on line {node.lineno} tests a constant")
+    return None
+
+
+def _unreachable_all(tree, path: str) -> list[tuple[int, str]]:
+    """EVERY stretch of code in `tree` the parse proves can never run, in walk order.
+
+    Two kinds, both certain from the source alone: a statement that follows the one which
+    ends its block (`return`, `raise`, `break`, `continue` — nothing after it in that same
+    suite can run), and the dead arm of a constant conditional (`if False:`, `if True: …
+    else:`, `while False:`, `x if False else y` — and `if 1 > 2:`, a test whose every
+    operand is a literal, folded by `_compare_value`). The order is the walk's, so the
+    first entry is exactly what `_unreachable_in` used to return.
+    """
+    out: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.If, ast.While, ast.IfExp)):
+            found = _dead_at(node)
+            if found:
+                out.append(found)
+        for field in _SUITE_FIELDS:
+            suite = getattr(node, field, None)
+            if not isinstance(suite, list):
+                continue
+            for i, stmt in enumerate(suite):
+                word = _TERMINATOR_WORD.get(type(stmt))
+                if word and i + 1 < len(suite):
+                    after = suite[i + 1]
+                    out.append((after.lineno,
+                                f"nothing runs after the {word} on line {stmt.lineno}"))
+    return out
+
+
+def _unreachable_in(tree, path: str) -> str | None:
+    """The first stretch of code in `tree` the parse proves can never run, or None."""
+    found = _unreachable_all(tree, path)
+    return _dead_sentence(path, found[0]) if found else None
+
+
+# The operators and nodes a test may be built from and still count as SIDE-EFFECT-FREE.
+# `Attribute` and `Subscript` are deliberately absent even though `self.x is None` is a
+# common guard: reading an attribute runs a `__getattribute__` (or a property), and a call
+# between the guard and the later test can change what it returns — which is exactly the
+# kind of value this pass refuses to have an opinion about.
+_PURE_UNARY = (ast.Not, ast.USub, ast.UAdd, ast.Invert)
+_PURE_COMPARE = (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+                 ast.Is, ast.IsNot, ast.In, ast.NotIn)
+
+
+def _pure_names(node):
+    """The names a side-effect-free test loads, or None when it could do anything at all.
+
+    `None` is the only safe answer for a Call, an Await, a lambda, a comprehension, an
+    f-string or a walrus — none of them can be promised to mean the same thing twice, and a
+    guard's whole force is that it does.
+    """
+    if isinstance(node, ast.Name):
+        return {node.id} if isinstance(node.ctx, ast.Load) else None
+    if isinstance(node, ast.Constant):
+        return set()
+    if isinstance(node, ast.UnaryOp):
+        return _pure_names(node.operand) if isinstance(node.op, _PURE_UNARY) else None
+    if isinstance(node, ast.Compare):
+        if not all(isinstance(op, _PURE_COMPARE) for op in node.ops):
+            return None
+        names = _pure_names(node.left)
+        for comparator in node.comparators:
+            got = _pure_names(comparator)
+            if names is None or got is None:
+                return None
+            names |= got
+        return names
+    if isinstance(node, ast.BoolOp):
+        if not isinstance(node.op, (ast.And, ast.Or)):
+            return None
+        names = set()
+        for value in node.values:
+            got = _pure_names(value)
+            if got is None:
+                return None
+            names |= got
+        return names
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        names = set()
+        for elt in node.elts:
+            got = _pure_names(elt)
+            if got is None:
+                return None
+            names |= got
+        return names
+    if isinstance(node, ast.Dict):
+        names = set()
+        for key in node.keys:
+            got = set() if key is None else _pure_names(key)
+            if got is None:
+                return None
+            names |= got
+        for value in node.values:
+            got = _pure_names(value)
+            if got is None:
+                return None
+            names |= got
+        return names
+    return None
+
+
+def _same_expr(a, b) -> bool:
+    """Is `b` the same expression as `a`? Compared structurally, line numbers aside."""
+    return ast.dump(a) == ast.dump(b)
+
+
+# The compare operators CPython defines as EXACT complements of each other. `==` / `!=` and
+# the orderings are deliberately absent: a class may define `__ne__` (or `__ge__`) to answer
+# something that is not `not __eq__` (or `not __lt__`), so treating those as negations would
+# be assuming a value — the one thing this pass never does.
+_NEGATED_COMPARE = {
+    ast.Is: ast.IsNot, ast.IsNot: ast.Is,
+    ast.In: ast.NotIn, ast.NotIn: ast.In,
+}
+
+
+def _is_negation_of(a, b) -> bool:
+    """Is `a` the exact logical negation of `b`, by the language and not by a guess?
+
+    Two shapes qualify. A leading `not` is a negation by construction, either way round. And
+    a single comparison is one when it tests the SAME operands with a complementary operator
+    — but only the pairs in `_NEGATED_COMPARE`, which the language promises are complements.
+    An `and`/`or` test is not answered: `not (p and q)` is not a shape this pass rewrites.
+    """
+    if isinstance(a, ast.UnaryOp) and isinstance(a.op, ast.Not) and _same_expr(a.operand, b):
+        return True
+    if isinstance(b, ast.UnaryOp) and isinstance(b.op, ast.Not) and _same_expr(b.operand, a):
+        return True
+    if isinstance(a, ast.Compare) and isinstance(b, ast.Compare) \
+            and len(a.ops) == 1 and len(b.ops) == 1 \
+            and len(a.comparators) == 1 and len(b.comparators) == 1 \
+            and _same_expr(a.left, b.left) \
+            and _same_expr(a.comparators[0], b.comparators[0]):
+        return _NEGATED_COMPARE.get(type(a.ops[0])) is type(b.ops[0])
+    return False
+
+
+def _assigned_names(node) -> set:
+    """Every name a subtree BINDS: assignment, loop and `with` targets, imports, defs, …
+
+    Deliberately over-inclusive (a name bound inside a nested function is collected too):
+    the only use is to ask "could this sentence have changed since the guard?", and one
+    name too many costs a finding while one too few costs correctness.
+    """
+    out = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
+            out.add(child.id)
+        elif isinstance(child, (ast.Global, ast.Nonlocal)):
+            out.update(child.names)
+        elif isinstance(child, (ast.Import, ast.ImportFrom)):
+            out.update((alias.asname or alias.name).split(".")[0] for alias in child.names)
+        elif isinstance(child, ast.ExceptHandler) and child.name:
+            out.add(child.name)
+        elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(child.name)
+        elif isinstance(child, (ast.MatchAs, ast.MatchStar)) and child.name:
+            out.add(child.name)
+        elif isinstance(child, ast.MatchMapping) and child.rest:
+            out.add(child.rest)
+    return out
+
+
+def _function_locals(func) -> set:
+    """The names this function binds for itself — parameters plus everything it assigns.
+
+    Only a LOCAL can carry a guard's promise: a name this function does not bind is a
+    global or a closure cell, and a call made between the guard and the test can move it
+    without a line of this function changing. Names declared `global` / `nonlocal` are
+    subtracted for the same reason.
+    """
+    args = func.args
+    names = {a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
+    for extra in (args.vararg, args.kwarg):
+        if extra is not None:
+            names.add(extra.arg)
+    declared = set()
+    for child in ast.walk(func):
+        if isinstance(child, (ast.Global, ast.Nonlocal)):
+            declared.update(child.names)
+    for stmt in getattr(func, "body", []):
+        names |= _assigned_names(stmt)
+    return names - declared
+
+
+def _always_terminates(stmts) -> bool:
+    """Does EVERY path through this suite leave it — return, raise, break or continue?
+
+    The half a guard needs. `if P: return` only promises anything if the return is not
+    itself conditional, so an `if`/`else` counts only when both arms terminate, and a
+    `with` counts when its own body does (leaving a `with` leaves it even if `__exit__`
+    swallows the exception). `for` and `while` are not answered: a loop may run zero times,
+    and proving otherwise is a different question from this one.
+    """
+    for stmt in stmts:
+        if type(stmt) in _TERMINATOR_WORD:
+            return True
+        if isinstance(stmt, ast.If) and stmt.orelse \
+                and _always_terminates(stmt.body) and _always_terminates(stmt.orelse):
+            return True
+        if isinstance(stmt, (ast.With, ast.AsyncWith)) and _always_terminates(stmt.body):
+            return True
+        if isinstance(stmt, ast.Try):
+            if _always_terminates(stmt.finalbody):
+                return True
+            if _always_terminates(stmt.body) \
+                    and all(_always_terminates(h.body) for h in stmt.handlers):
+                return True
+    return False
+
+
+def _nested_guard_suites(stmt, path: str, locals_: set, facts):
+    """Guard-check the suites nested in ONE statement, with the facts in force at it.
+
+    The blocks a statement ENTERS are all dominated by whatever held before it — a `with`
+    body, both arms of an `if`, a `try` body and its handlers, and a loop's body and else —
+    so a test there is asked against the same facts. The caller hands in only the facts the
+    statement cannot disturb (so a loop body is entered with the facts its own assignments
+    left standing), and a suite holding another `def` is left to that scope's own turn.
+    """
+    for field in _SUITE_FIELDS:
+        suite = getattr(stmt, field, None)
+        if isinstance(suite, list) and suite:
+            yield from _guard_suites(suite, path, locals_, facts)
+    for handler in getattr(stmt, "handlers", None) or []:
+        yield from _guard_suites(handler.body, path, locals_, facts)
+    for case in getattr(stmt, "cases", None) or []:
+        yield from _guard_suites(case.body, path, locals_, facts)
+
+
+def _guard_suites(stmts, path: str, locals_: set, facts=()):
+    """EVERY branch an earlier guard — here or in a block that dominates this one — rules out.
+
+    In plain words: `if P: return` at the top of a function means P is FALSE for every line
+    below it — control only gets past the guard by not entering it. So a later `if P:` can
+    never run, and a later `if not P:` is always true. `assert P` makes the same promise by
+    the other route: control continues past it only when P held, so the same two branches are
+    dead below it. That is the whole rule, and the four things that keep it honest are all
+    here: the guard must LEAVE on every path (`_always_terminates`) or raise (`assert`), the
+    test must be side-effect-free (so it means the same thing twice), no statement between the
+    two may bind one of the names it reads, and a name this function does not bind at all is
+    somebody else's to change — refused outright.
+
+    The fact also holds inside any block the guard DOMINATES, so it is carried into the bodies
+    of later `if` / `with` / `try` statements and their handlers (`_nested_guard_suites`), where a
+    third look at the same test is caught too. A LOOP body is entered as well, and that is the
+    one place a repeat matters: a later pass through the body sees whatever the previous one
+    left behind, so only the facts the loop cannot disturb go in — a fact whose names the loop
+    ASSIGNS anywhere is dropped first (the same `_assigned_names` filter every statement gets,
+    and for a loop it is also the cross-iteration guarantee). A test settled before the loop
+    and repeated inside a `for`/`while` body is therefore caught, while one the body could
+    have moved is not. One thing is never crossed: a SCOPE boundary (a nested `def`/`class`,
+    whose own turn it gets with its own locals).
+
+    `assert` is believed on purpose, the way every static reader believes it: the pass runs on
+    a build about to be exec'd, never under `-O` (which strips asserts), so a fact taken from
+    one is a fact where this code actually runs.
+    """
+    facts = list(facts)  # [(test node, guard line, {names it loads}, truth, kind)]
+    for stmt in stmts:
+        # Another scope: its body is asked on its own turn, with its own locals — nothing is
+        # carried across the boundary, and its own bindings are not this suite's business.
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        dead = None
+        if isinstance(stmt, ast.If):
+            sent = _pure_names(stmt.test)
+            # `sent <= locals_` is the line that keeps this honest: a name this function
+            # does not bind is a global or a closure cell, and a call in between could
+            # move it without a line of this function changing.
+            if sent is not None and sent and sent <= locals_:
+                for fact in facts:
+                    dead = _dead_arm_at(stmt, fact)
+                    if dead:
+                        break
+        # The first finding for this `if` is emitted before we go on: an `if` can have only
+        # one dead arm, and the walk continues so a later statement can be found too.
+        if dead:
+            yield dead
+        # The bindings this statement performs end any fact about the names it binds: the
+        # sentence would no longer mean what the guard proved. (Its own test was asked
+        # first, above, because a test is evaluated before its body runs.)
+        if facts:
+            rebound = _assigned_names(stmt)
+            facts = [f for f in facts if not (f[2] & rebound)]
+        # Carry what survives into the blocks this statement enters. A loop is entered too:
+        # the filter above already dropped every fact whose names the loop assigns ANYWHERE
+        # (`_assigned_names` walks the whole loop — target, body and else), so what is left is
+        # a fact a previous iteration could not have changed, and a repeat of its test inside
+        # the body is a real dead end. Facts a loop DOES disturb are gone before we descend.
+        yield from _nested_guard_suites(stmt, path, locals_, facts)
+        # A guard records its promise for everything after it, here and in the blocks below:
+        # `if P: <leaves>` and `assert P` are the two shapes. They are asked the same two
+        # questions of the test — that it is pure, and that it reads only this function's own
+        # names — and they differ in ONE way: a guard is passed only when its test is FALSE
+        # (so P holds after it), while an `assert` is passed only when its test is TRUE (the
+        # raise is what an `assert` takes instead of a body to leave with). `truth` carries
+        # that, and `_dead_arm_at` reads it back.
+        if isinstance(stmt, ast.If) and stmt.body and _always_terminates(stmt.body):
+            test, truth, kind = stmt.test, False, "guard"
+        elif isinstance(stmt, ast.Assert):
+            test, truth, kind = stmt.test, True, "assert"
+        else:
+            continue
+        names = _pure_names(test)
+        if names and names <= locals_:
+            facts.append((test, stmt.lineno, names, truth, kind))
+
+
+def _dead_arm_at(stmt, fact) -> tuple[int, str] | None:
+    """The arm of this `if` a prior fact rules out, as `(line, why)` — or None.
+
+    In plain words: a fact says one test was settled before this line, one way or the other.
+    If this `if` asks the SAME test, the answer is known and one of its arms can never run;
+    if it asks the exact NEGATION (again by the language, not by a guess — see
+    `_is_negation_of`), the answer is the other way and the other arm dies. Which arm that is
+    depends on the fact's own polarity: a guard is passed when its test is false, an `assert`
+    when it is true. Reading an unknown test is not an answer, and neither is a test the
+    fact's names do not cover — both return None and the walk goes on.
+    """
+    guard, guard_line, _guard_names, truth, kind = fact
+    sent = _pure_names(stmt.test)
+    if sent is None or not sent:
+        return None
+    same = _same_expr(stmt.test, guard)
+    negated = _is_negation_of(stmt.test, guard)
+    if not (same or negated):
+        return None
+    label = (f"the guard on line {guard_line}" if kind == "guard"
+             else f"the `assert` on line {guard_line}")
+    if truth is False and same:
+        arm, why = stmt.body, f"{label} again, and control only reaches here when it is false"
+    elif truth is False and negated:
+        arm, why = stmt.orelse, f"{label} negated, so it is already true here"
+    elif truth is True and same:
+        arm, why = stmt.orelse, f"{label} again, so it is already true here"
+    else:
+        arm, why = stmt.body, f"{label} negated, so it is already false here"
+    if not arm:
+        return None
+    return (arm[0].lineno, f"the test on line {stmt.test.lineno} is {why}")
+
+
+def _guarded_suites(tree, path: str):
+    """EVERY branch an earlier guard in the SAME function proves can never run, in scope order.
+
+    The scope is walked function by function, never across a boundary: each `def` is asked
+    about its own locals and its own suites, so a guard in one function can never speak for
+    another, and a nested `def` is scanned on its own turn.
+    """
+    scopes = [n for n in ast.walk(tree)
+              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for func in scopes:
+        yield from _guard_suites(getattr(func, "body", []), path, _function_locals(func))
+
+
+def _guarded_in(tree, path: str) -> str | None:
+    """The first branch an earlier guard in the SAME function proves can never run, or None."""
+    found = next(_guarded_suites(tree, path), None)
+    return _dead_sentence(path, found) if found else None
+
+
+def unreachable_code() -> str | None:
+    """The first code in this build that can never run — the other deep half.
+
+    In plain words: a name that no longer exists is one way a build is quietly wrong; code
+    that its own source proves will never execute is the other. A statement after a
+    `return` in the same suite, a whole `if False:` branch, a body under `while False:` —
+    each is invisible to an import (it is valid Python, it compiles), so it survives every
+    check until someone notices the path it should have run is not running. The probe has
+    just asked whether the build CAN be a process; this asks whether the process would do
+    what the source says. Only certainties are reported: a test that is a literal, a `not`
+    around one, or a comparison whose EVERY operand is a literal (`if 1 > 2:`, `while
+    0 == 1:`, a chained `0 < 1 < 0`) — and code the parse can place behind a terminator.
+    Nothing that could depend on a value at run time is guessed at, so a comparison against
+    a name, an `in` that cannot be made (`1 in 2`), or an identity test (`is` is not a value
+    question) is left alone and no live branch is ever called dead.
+
+    The second half reasons about a guard rather than a literal (`_guarded_in`): inside one
+    function, `if P: return` at the top means P is false for every line below it, so a later
+    `if P:` can never run and a later `if not P:` can never take its `else`. The promise is
+    only made where the parse can keep it — a body that leaves on every path, a test with
+    no way to do anything but read locals this function binds, and no statement in between
+    that rebinds one of those names. It is carried into the blocks the guard dominates (a
+    later `if`/`with`/`try` body, a handler, and a loop body — but a loop only with the facts
+    its own assignments leave standing, since a repeat will see the previous pass's work).
+    It never crosses a scope, so no guard is ever asked to speak for a variable another
+    function or another pass controls.
+
+    It is pinned both ways like the name pass: this checkout must pass, and a copy carrying
+    a statement after a `return`, a constant-false branch, a literal comparison that is
+    false, or a branch a guard rules out must fail and name it.
+
+    This is the FIRST finding — what the reload probe needs to hold a build. `dead_code` is
+    the same walk with every finding kept, for `fbtodo dead`.
+    """
+    findings = dead_code()
+    if not findings:
+        return None
+    first = findings[0]
+    return _dead_sentence(first["path"], (first["line"], first["why"]))
+
+
+def dead_code() -> list[dict]:
+    """EVERY piece of code the package's own source proves can never run, across the build.
+
+    The same two passes `unreachable_code` reads — `_unreachable_all` for literals and for
+    what follows a terminator, and `_guarded_suites` for a guard's promise — asked of every
+    file with ALL findings kept instead of the first: `{path, line, why}`, in the order the
+    per-file first-only reader would have met them, so `dead_code()[0]` is exactly what
+    `unreachable_code` reports. A file that will not parse contributes nothing — that is
+    `source_syntax_error`'s answer, not this one's.
+    """
+    out: list[dict] = []
+    for path, src, _mod in _package_modules():
+        try:
+            tree = ast.parse(src, path)
+        except (SyntaxError, ValueError):
+            continue  # a file that will not parse is `source_syntax_error`'s answer
+        for line, why in (*_unreachable_all(tree, path), *_guarded_suites(tree, path)):
+            out.append({"path": path, "line": line, "why": why})
+    return out
 
 
 def pinned_path() -> str:
@@ -444,6 +1043,46 @@ def pinned_path() -> str:
     return os.pathsep.join([here, *rest])
 
 
+# The own-environment settings a pane must be HANDED rather than left to inherit, in the
+# order they are written into a pane command. tmux starts a pane from its SERVER's
+# environment (and `respawn-pane` re-runs the recorded command under that same one), not
+# from the environment of the process that asked for the pane — so each of these is
+# whatever the server was started with, which may be a shell from before this one, or a
+# login shell's own profile. Every key here decides WHERE a pane works or WHICH project it
+# follows: the state root is the pair `_state_root` reads (FBTODO_HOME first, XDG_STATE_HOME
+# second), FBTODO_TMUX names the tmux server a pane drives, and FBTODO_FB_MARKER names the
+# session marker it counts live sessions by. Losing one moves the pane — and the watcher it
+# starts — to another store, another server or another set of sessions, with nothing on
+# screen to say so. The six notify-watch paths are the same argument one step out: they
+# decide WHERE the pane's bells GO, so a machine that points its watches at its own scripts
+# (the shipped notify kit, a stub in a test) must have the pane's watcher use the same ones
+# — otherwise every bell falls back to `~/.config/freebuff-notify/`, which on that machine
+# is either absent or somebody else's. (The watches' cadences are not here either: a number that moves how OFTEN a bell
+# rings is not a path that moves where it goes, and the script it rings is the half that
+# could be lost without a word.)
+PINNED_ENV_KEYS = (
+    "FBTODO_HOME", "XDG_STATE_HOME", "FBTODO_TMUX", "FBTODO_FB_MARKER",
+    "FBTODO_NOTIFY", "FBTODO_DROP", "FBTODO_ASK", "FBTODO_PAUSE",
+    "FBTODO_PANE_BELL", "FBTODO_LOCKS_BELL",
+)
+
+
+def pinned_env() -> list[str]:
+    """`KEY=value` for every own-environment setting that decides where a pane works.
+
+    In plain words: the pane command already names the interpreter and carries the PATH
+    (`pinned_path`); this is the other half — the values the program reads from its OWN
+    environment to choose a state root, a tmux server, the sessions it follows, and the six
+    scripts its bells are sent to. They ride in the same command line, so a `respawn-pane`,
+    the keeper's repair, or a login shell that sources its own profile brings the opener's
+    answer back instead of the server's. Values
+    that are NOT set are left out rather than carried empty: an empty `FBTODO_HOME=` in the
+    command line would read as "this process names the root" to the locks audit, which must
+    keep telling a command line apart from an environment (`_proc_environ` in locks.py).
+    """
+    return [f"{key}={os.environ[key]}" for key in PINNED_ENV_KEYS if os.environ.get(key)]
+
+
 def python_of(command: str) -> str | None:
     """The interpreter a command line names, or None when it names none.
 
@@ -471,17 +1110,13 @@ LOCK_PATH = os.path.join(SCRATCH, "fbtodo-daemon.pid")
 LOG_PATH = os.path.join(SCRATCH, "fbtodo-daemon.log")
 
 
-# The NAS pane watcher: its own lock, log and state, because it is a different question
-# ("has a session started over there?") from the local watcher's ("what is the instance
-# in this directory doing?").
-NAS_LOCK_PATH = os.path.join(SCRATCH, "fbtodo-nas-pane.pid")
+
 
 
 # The pane keeper's claim. A keeper is neither watcher: it has no store, no state file and
 # no instance of its own — only the panes. Its own lock because being kept out by a
-# watcher's lock was the whole problem: a `-s nas` daemon holds that one, and a killed pane
-# then went unopened (measured: the pane never came back while a slow-socket NAS daemon
-# owned the watcher lock). One keeper per tmux server, which is why the record carries the
+# watcher's lock was the whole problem: a second daemon holds that one, and a killed pane
+# then went unopened. One keeper per tmux server, which is why the record carries the
 # server it belongs to.
 PANE_KEEPER_PATH = os.path.join(SCRATCH, "fbtodo-pane-keeper.pid")
 
@@ -498,23 +1133,27 @@ PANE_LOG_PATH = os.path.join(SCRATCH, "fbtodo-pane.log")
 PANE_NOTE_PATH = os.path.join(SCRATCH, "fbtodo-pane-note.json")
 
 
-# Where the list pane goes, per window, per role (`fbtodo pin`):
-#   {`session:index`: {side, size, local: {side, size}, nas: {side, size}}}
-# The flat halves are the window's shared answer (what `--role both` writes, and what
-# every pin written before there was a role is); a `local`/`nas` entry is that pane's own
-# and outranks the shared one for it, so a window holding a session and a NAS ssh can size
-# its two lists differently.
+# Where the list pane goes, per window (`fbtodo pin`):
+#   {`session:index`: {side, size}}
+# The halves are the window's answer, flat. A pin file written while a window held two list
+# panes may carry its answer under a `local` key instead; that half is read as the window's
+# own and dropped on the next write, so an existing file keeps working and cannot disagree
+# with itself afterwards.
 PINS_PATH = os.path.join(SCRATCH, "fbtodo-pins.json")
 
 
-# Where it was left last time, per window and per role: {`session:index`: {local|nas: …}}.
+# Where it was left last time, per window and per role: {`session:index`: {local: …}}.
 LAST_PATH = os.path.join(SCRATCH, "fbtodo-last.json")
 
 
-NAS_STATE_PATH = os.path.join(SCRATCH, "fbtodo-nas-pane.json")
-
-
-NAS_LOG_PATH = os.path.join(SCRATCH, "fbtodo-nas-pane.log")
+# What the pane's own mute key last did: {`until`: "list"|"sticky", `was`: {…}, `at_ms`,
+# `session`, `list_id`}. It is the switch's MEMORY, and it has to be on disk rather than in
+# the pane: a pane re-execs itself into every new build it sees (see `BUILD_CHECK_S`), so a
+# mute held in a variable would be dropped by the very upgrade it was pressed a minute
+# earlier — leaving the switches `off` with nothing left to turn them back on. It also names
+# the list the mute was taken for, so a pane that comes back to a finished list can honour
+# the promise the first one made ("until this list finishes") and unmute on its own.
+MUTE_PATH = os.path.join(SCRATCH, "fbtodo-pane-mute.json")
 
 
 def _state_paths(root: str) -> dict:
@@ -525,14 +1164,12 @@ def _state_paths(root: str) -> dict:
         "TASKS_PATH": os.path.join(root, "fbtodo-tasks.json"),
         "LOCK_PATH": os.path.join(root, "fbtodo-daemon.pid"),
         "LOG_PATH": os.path.join(root, "fbtodo-daemon.log"),
-        "NAS_LOCK_PATH": os.path.join(root, "fbtodo-nas-pane.pid"),
         "PANE_KEEPER_PATH": os.path.join(root, "fbtodo-pane-keeper.pid"),
         "PANE_LOG_PATH": os.path.join(root, "fbtodo-pane.log"),
         "PANE_NOTE_PATH": os.path.join(root, "fbtodo-pane-note.json"),
         "PINS_PATH": os.path.join(root, "fbtodo-pins.json"),
         "LAST_PATH": os.path.join(root, "fbtodo-last.json"),
-        "NAS_STATE_PATH": os.path.join(root, "fbtodo-nas-pane.json"),
-        "NAS_LOG_PATH": os.path.join(root, "fbtodo-nas-pane.log"),
+        "MUTE_PATH": os.path.join(root, "fbtodo-pane-mute.json"),
     }
 
 
@@ -569,19 +1206,18 @@ def init_state_root():
     return root
 
 
-# The phone notifier (the finish notification's sender), asked once per interval while a
-# NAS session runs: it owns the decision AND the "already pushed" record, so fbtodo only
-# has to time it. Optional — a machine without the notify dir simply never asks, and the
-# NAS-side work stays exactly as it was.
-NAS_NOTIFY = os.path.expanduser(
+# The phone notifier (the finish notification's sender): it owns the decision AND the
+# "already pushed" record, so fbtodo only has to point at it. Optional — a machine
+# without the notify dir simply never asks.
+TODO_NOTIFY = os.path.expanduser(
     os.environ.get("FBTODO_NOTIFY")
     or os.path.join(HOME, ".config", "freebuff-notify", "todo-bell.py")
 )
 
 
-# The drop watch: asked when a NAS session STOPS instead of ending. A session can die with
-# the ssh under it — the marker's pid is gone while the marker is still there — and that is
-# a different question from "did the task finish", so it has its own script (and its own
+# The drop watch: asked when a session STOPS instead of ending. A session can die with the
+# terminal under it — the marker's pid is gone while the marker is still there — and that
+# is a different question from "did the task finish", so it has its own script (and its own
 # run-once-per-death record). Optional, like the notifier above.
 DROP_NOTIFY = os.path.expanduser(
     os.environ.get("FBTODO_DROP")
@@ -591,9 +1227,8 @@ DROP_NOTIFY = os.path.expanduser(
 
 # The ask watch: asked while a session runs, and the only notifier here that is about the
 # PRESENT rather than the past — a question is on screen and the agent is stopped until it
-# is answered. It reads panes, not this session's store, so the local watcher and a NAS one
-# both cover the whole tmux server; its own record makes the overlap harmless. Optional,
-# like the other two.
+# is answered. It reads panes, not this session's store, so every watcher covers the whole
+# tmux server; its own record makes the overlap harmless. Optional, like the other two.
 ASK_NOTIFY = os.path.expanduser(
     os.environ.get("FBTODO_ASK")
     or os.path.join(HOME, ".config", "freebuff-notify", "ask-bell.py")
@@ -602,9 +1237,8 @@ ASK_NOTIFY = os.path.expanduser(
 
 # The stall watch: the other half of the ask watch's question. A question is the CLI
 # waiting for YOU; a stall is the CLI having stopped without ending its turn — the step
-# cap cutting a turn short, a loop wedged — while the list still has work in it. Local
-# only: the NAS build writes no `shouldEndTurn`, so nothing there can tell a stop from a
-# slow step. Optional, like the other notifiers.
+# cap cutting a turn short, a loop wedged — while the list still has work in it. Optional,
+# like the other notifiers.
 PAUSE_NOTIFY = os.path.expanduser(
     os.environ.get("FBTODO_PAUSE")
     or os.path.join(HOME, ".config", "freebuff-notify", "pause-bell.py")
@@ -624,7 +1258,7 @@ PANE_NOTIFY = os.path.expanduser(
 
 
 # The locks watch: the fifth bell, and the only one whose subject is a CLAIM rather than a
-# session. A watcher/keeper/NAS watcher running with no claim a reader can find (an orphan),
+# session. A watcher or keeper running with no claim a reader can find (an orphan),
 # or a claim file whose name and inode have parted (the tie broken), is invisible from every
 # store — the audit that sees both (`fbtodo locks`) is the only place either exists, and
 # nothing runs it unless somebody types it. Asked by `locks --watch` when a NEW finding
@@ -633,6 +1267,19 @@ PANE_NOTIFY = os.path.expanduser(
 LOCKS_NOTIFY = os.path.expanduser(
     os.environ.get("FBTODO_LOCKS_BELL")
     or os.path.join(HOME, ".config", "freebuff-notify", "locks-bell.py")
+)
+
+# The notify kit's OWN directory, which is where its two mute switches live: `phone-state`
+# is what `phone.sh` reads (with `FREEBUFF_PHONE` ahead of it) and `state` is what
+# `bell.sh` reads (with `FREEBUFF_BELL` ahead of it). The pane's mute key writes those two
+# words rather than reaching for a script of its own, so muting is the same act whoever
+# performs it — a key, a `FREEBUFF_PHONE=off` in a wrapper, or a hand-edited file — and the
+# scripts need no new switch of their own. `FBTODO_NOTIFY_DIR` points the pane at another
+# kit's (a test's, a second user's); it is deliberately NOT in `PINNED_ENV_KEYS` with the
+# six watches: those decide where a bell is SENT, and this decides where a switch word is
+# written, which the default already gets right through `HOME` like every other notify path.
+NOTIFY_DIR = os.path.expanduser(
+    os.environ.get("FBTODO_NOTIFY_DIR") or os.path.join(HOME, ".config", "freebuff-notify")
 )
 
 
@@ -667,34 +1314,6 @@ DEFAULT_WORKSPACE_STATE = os.path.join(HOME, ".config/freebuff-desktop/state.jso
 DEFAULT_CLI_ROOT = os.path.join(HOME, ".config/manicode/projects")
 
 
-# The remote ("nas") store, as seen from this machine: the freebuff state directory is
-# usually a bind mount on the remote host, so the host reads the journal directly — no
-# docker exec, and nothing to install inside the container. There is no built-in target:
-# set FBTODO_NAS / _ROOT / _PROJECT (or --nas-host / --nas-root / --nas-project), which is
-# also how a project name that is not the login name is spelled.
-NAS_HOST = os.environ.get("FBTODO_NAS") or ""
-
-
-NAS_ROOT = os.environ.get("FBTODO_NAS_ROOT") or ""
-
-
-NAS_PROJECT = os.environ.get("FBTODO_NAS_PROJECT") or ""
-
-
-# The process on the NAS that IS the session: /bin/sh /usr/local/bin/freebuff → node …/freebuff/index.js
-# → /root/.config/manicode/freebuff, and the host sees those pids (docker does not hide them), so this is
-# one cheap pgrep. Liveness is asked about THIS rather than about the local ssh client, because the pane
-# belongs to the freebuff session, not to the terminal that happens to be carrying it.
-NAS_PROC = os.environ.get("FBTODO_NAS_PROC") or "manicode/freebuff"
-
-
-# What `-s nas` says when nobody has told it where the remote store is.
-NAS_UNCONFIGURED = (
-    "the remote source is not configured: set --nas-host, --nas-root and --nas-project "
-    "(or FBTODO_NAS, FBTODO_NAS_ROOT, FBTODO_NAS_PROJECT)"
-)
-
-
 # The two facts about the CLI patches themselves, shown in the pane so neither has to be
 # fetched with an ssh probe: the last outcome of the patch step, and the last alert that
 # was pushed. Each is read from the log the producing step already writes, so the pane
@@ -702,15 +1321,8 @@ NAS_UNCONFIGURED = (
 #
 #   local   ~/.config/freebuff-patch-watch/watch.log   the launchd watcher's own log
 #           ~/.config/freebuff-notify/phone.log        every alert the kit has sent
-#   NAS     $FBTODO_NAS_PATCH_LOG                      the launch hook's log
-#           $FBTODO_NAS_ALERT_LOG                      its notifier's log
 #
-# The two remote paths have no default (every deployment names them differently). Unset,
-# the probe's `tail` reads nothing and that half of the reply comes back empty, which the
-# parser treats as "no fact to show" — the row is simply not drawn.
-# The NAS pair is read at the far end of the ssh the pane already makes (see nas_probe), so
-# a NAS pane pays no extra round trip for it. FBTODO_PATCH_LOG / FBTODO_ALERT_LOG /
-# FBTODO_NAS_PATCH_LOG / FBTODO_NAS_ALERT_LOG point any of the four at a fixture.
+# FBTODO_PATCH_LOG / FBTODO_ALERT_LOG point either at a fixture.
 PATCH_LOG = os.path.expanduser(
     os.environ.get("FBTODO_PATCH_LOG")
     or os.path.join(HOME, ".config", "freebuff-patch-watch", "watch.log")
@@ -729,146 +1341,13 @@ ALERT_LOG = os.path.expanduser(
 )
 
 
-NAS_PATCH_LOG = os.environ.get("FBTODO_NAS_PATCH_LOG") or ""
-
-
-NAS_ALERT_LOG = os.environ.get("FBTODO_NAS_ALERT_LOG") or ""
-
-
 PATCH_TAIL_BYTES = 8192   # both logs are append-only and grow: only the last entries are read
 
 
 PATCH_REASON_MAX = 60     # the row is one line, so a reason is clipped rather than wrapped
 
 
-PATCH_TAIL_LINES = 4      # the NAS tail, arrived in the probe: the outcome, its complaints
-
-
-def nas_pgrep(name: str) -> str:
-    """A `pgrep -f` pattern the probe cannot satisfy by itself.
-
-    The probe's whole script is on the argv of the `sh -c` that runs it, so a plain
-    `manicode/freebuff` matches THAT process: LIVE was always 1, and a NAS with no
-    session at all looked alive. Bracketing the first character keeps the same regex
-    honest — "[m]anicode/freebuff" does not contain "manicode/freebuff".
-    """
-    return f"[{name[0]}]{name[1:]}" if name else name
-
-
-NAS_TIMEOUT = 12.0       # per ssh; the pane is useless if a poll can outlive its interval
-
-
-# Multiplexed ssh: the first poll pays the handshake, the rest ride the same connection, which is the
-# difference between a 1.5s poll and a 0.2s one. ControlPersist closes it 60s after the last poll.
-# Rooted in $HOME, not the scratch dir: a unix socket path is limited to ~104 chars, and ssh appends
-# a 16-char random suffix to %C's 40-char hash (a longer scratch dir overflowed it).
-NAS_CONTROL = os.path.join(HOME, ".fbtodo-ssh-%C")
-
-
-# The NAS build does NOT write tool inputs to its journal (measured: `"todos"` appears 0 times in a
-# 236 KB log.jsonl that names write_todos 29 times — those are tool-NAME lists, not calls), so the only
-# place a todo list exists over there is the conversation store, `chat-messages.json`, which is written
-# per completed turn. Hence an extractor run on the far side: pulling 2.8 MB per poll to parse it here
-# would be absurd, and the parse is skipped outright while the file has not changed.
-NAS_EXTRACT = r'''
-import json, os, sys
-path, prev = sys.argv[1], sys.argv[2]
-try:
-    mt = str(int(os.stat(path).st_mtime))
-    if prev and prev == mt:
-        print("UNCHANGED"); raise SystemExit
-except Exception as exc:
-    print("ERR " + type(exc).__name__ + ": " + str(exc)[:120]); raise SystemExit
-try:
-    doc = json.load(open(path, encoding="utf-8", errors="replace"))
-except Exception as exc:
-    print("ERR " + type(exc).__name__ + ": " + str(exc)[:120]); raise SystemExit
-import re
-# The heading rule the local journal uses, copied rather than imported because this program
-# runs standalone on the NAS; the self-check compares the two so they cannot drift apart.
-GOAL_RE = re.compile(r"^\s*(?:[-*#>]+\s*)?(?:\*\*)?goal(?:\*\*)?\s*[:：]\s*(\S.*)$", re.I)
-# The same continuation test the local journal uses, injected into this source instead of
-# imported because this program runs standalone on the NAS.
-NUDGE_WORDS = set(__NUDGE_WORDS__)
-def is_nudge(text):
-    text = " ".join((text or "").split())
-    if not text or len(text) > __NUDGE_MAX__:
-        return False
-    words = re.findall(r"[a-z']+", text.lower())
-    return bool(words) and all(w in NUDGE_WORDS for w in words)
-found, seen = [], {"goal": None, "goal_n": 0, "user": None, "user_n": 0, "n": 0}
-# What this session has actually called, so a list-less answer can say so: "no
-# write_todos call yet" is a shrug, "called run_terminal_command 20 times and still no
-# list" is a diagnosis. Counted here because this is the only place that sees the store.
-tools = {}
-def text_of(node):
-    c = node.get("content")
-    if isinstance(c, str):
-        return c
-    if isinstance(c, list):
-        bits = [p.get("text") for p in c if isinstance(p, dict) and isinstance(p.get("text"), str)]
-        return "\n".join(bits)
-    return ""
-def goal_in(node):
-    for line in (text_of(node) or "").splitlines():
-        m = GOAL_RE.match(line)
-        if m:
-            return " ".join(m.group(1).split()).strip(" *_`") or None
-    return None
-def walk(node):
-    # Two things are tracked, in transcript order: the AGENT's own `Goal:` line (the
-    # heading) and the user's requests (what "now" compares against). Measured on the real
-    # NAS store, `variant='ai'` messages carry no prose at all — content length 0, tool
-    # blocks only — so a NAS list heads with "none stated" today, and this lights up by
-    # itself if that build ever starts recording prose.
-    if isinstance(node, dict):
-        seen["n"] += 1
-        tn = node.get("toolName")
-        if isinstance(tn, str) and tn:
-            tools[tn] = tools.get(tn, 0) + 1
-        g = goal_in(node)
-        if g:
-            seen["goal"], seen["goal_n"] = g, seen["n"]
-        if node.get("variant") == "user":
-            u = " ".join((text_of(node) or "").split())
-            if u:
-                seen["user"], seen["user_n"] = u, seen["n"]
-        if node.get("toolName") == "write_todos":
-            inp = node.get("input") or node.get("args") or {}
-            if isinstance(inp, dict) and inp.get("todos") is not None:
-                found.append((node, seen["goal"], seen["goal_n"], seen["user_n"]))
-        for v in node.values():
-            walk(v)
-    elif isinstance(node, list):
-        for v in node:
-            walk(v)
-walk(doc)
-if not found:
-    print("NONE " + json.dumps({"tools": tools})); raise SystemExit
-last, goal, goal_n, user_n = found[-1]
-# "now" is a NEWER REQUEST: the agent's line that came after the list if there is one,
-# else the newest user message — unless the list already answers the newest request.
-now, nudge = None, None
-if seen["goal"] and seen["goal_n"] > goal_n:
-    now = seen["goal"]
-elif seen["user"] and seen["user_n"] > user_n:
-    # A continuation ("continue", "go on", "keep going", ...) is not a new task: it asks
-    # for the list to be RE-WRITTEN before the work resumes (AGENTS.md), so it is reported
-    # as a nudge rather than as drift. The transcript is written per completed turn, which
-    # makes this the pane saying "that turn ended on a continue and the list was not
-    # touched" — and a later list clears it, exactly as on the local journal path.
-    if is_nudge(seen["user"]):
-        nudge = seen["user"]
-    else:
-        now = seen["user"]
-# A tool block need not carry a time; the mtime of the transcript itself is the honest
-# fallback, since it is rewritten as each turn completes.
-ts = last.get("timestamp") or last.get("ts") or int(os.stat(path).st_mtime * 1000)
-print(json.dumps({"todos": (last.get("input") or last.get("args") or {}).get("todos"),
-                  "ts": ts, "calls": len(found), "goal": goal, "now": now,
-                  "nudge": nudge, "tools": tools}))
-'''
-
+PATCH_TAIL_LINES = 4      # how much of each log the row may quote
 
 FB_PROC = "bin/freebuff"
 
@@ -901,7 +1380,7 @@ PROMPT_MIN_CHARS = 12
 # A continuation is a request to keep going, not a new task, and it asks for one thing
 # of the agent: re-write the list BEFORE the work resumes (AGENTS.md). Detected on WORDS
 # rather than length, so "continue", "continue please", "go on then" and "keep going
-# with it" all read as nudges while "continue the NAS work" stays a real request.
+# with it" all read as nudges while "continue the other work" stays a real request.
 NUDGE_WORDS = {
     "continue", "cont", "carry", "keep", "going", "go", "proceed", "resume", "next",
     "ahead", "on", "then", "now", "please", "pls", "and", "with", "the", "it", "that",
@@ -910,14 +1389,6 @@ NUDGE_WORDS = {
 
 
 NUDGE_MAX_CHARS = 40  # a nudge is a phrase; longer means it is saying something else
-
-
-# The NAS extractor has no `fbtodo` to import, so the continuation rule is injected into
-# its source text here: one word list, two readers, and the self-check compares them.
-NAS_EXTRACT = (
-    NAS_EXTRACT.replace("__NUDGE_WORDS__", repr(tuple(sorted(NUDGE_WORDS))))
-    .replace("__NUDGE_MAX__", str(NUDGE_MAX_CHARS))
-)
 
 
 GOAL_CHASE_CHUNKS = 4  # extra 1 MiB chunks to look back for a usable goal prompt
@@ -1283,6 +1754,40 @@ def atomic_write_json(path: str, payload: dict, mode: int = 0o600, fsync: bool =
         raise
 
 
+def atomic_write_text(path: str, text: str, mode: int = 0o600, fsync: bool = True) -> None:
+    """`atomic_write_json` for one word — a switch another program reads.
+
+    The notify kit's `phone-state` and `state` are single words read by shell scripts, and
+    a reader that catches one mid-write reads an empty string, which both scripts read as
+    ON. So the swap is by rename here for the same reason it is for the state JSON, and the
+    directory is created `0700` with the file `0600`: these two files decide whether the
+    owner's phone rings.
+    """
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".fbtodo.", suffix=".tmp", dir=d)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            if fsync:
+                os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        if fsync:
+            dfd = os.open(d, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def read_json(path: str, default=None):
     try:
         with open(path, encoding="utf-8") as fh:
@@ -1524,7 +2029,7 @@ def descendant_pids(table: dict, parent_pid: int) -> list[tuple[int, int]]:
     """(pid, depth) for everything under this pid, breadth-first, from a fetched table.
 
     Both lookups that need a process tree share this: the freebuff *instance* under a
-    shell (the shallowest match wins) and the ssh a NAS session runs inside (the pane
+    shell (the shallowest match wins) and the one inside a pane the keeper runs (the pane
     that hosts it). One walk, so neither pays for a second pass over the table.
     """
     kids: dict[int, list[int]] = {}
@@ -1799,20 +2304,22 @@ __all__ = [
     "STATE_NOTE", "STATE_PATH",
     "STATE_FILE_NAME",
     "TASKS_PATH", "events_path", "self_argv", "STARTED_AT", "SOURCE_SETTLE_S", "BUILD_CHECK_S",
-    "RELOAD_PROBE_ENV", "reload_probe_error", "undefined_global_names",
-    "source_newer_than", "source_syntax_error", "pinned_path", "python_of",
-    "LOCK_PATH", "LOG_PATH", "NAS_LOCK_PATH",
+    "RELOAD_PROBE_ENV", "PROBE_NOTE_CHARS", "reload_probe_error", "undefined_global_names", "unreachable_code",
+    "dead_code",
+    "source_newer_than", "source_syntax_error", "pinned_path", "pinned_env", "PINNED_ENV_KEYS",
+    "python_of",
+    "LOCK_PATH", "LOG_PATH",
     "pid_alive", "pid_running",
     "PANE_KEEPER_PATH", "PANE_LOG_PATH", "PANE_NOTE_PATH", "PINS_PATH", "LAST_PATH",
-    "NAS_STATE_PATH",
-    "NAS_LOG_PATH", "NAS_NOTIFY", "DROP_NOTIFY", "ASK_NOTIFY", "PAUSE_NOTIFY", "PANE_NOTIFY",
+    "MUTE_PATH", "NOTIFY_DIR",
+    "TODO_NOTIFY", "DROP_NOTIFY", "ASK_NOTIFY", "PAUSE_NOTIFY", "PANE_NOTIFY",
     "LOCKS_NOTIFY",
     "TMUX_BIN", "TMUX_SUBCOMMANDS", "DEFAULT_DB_GLOB", "DEFAULT_WORKSPACE_STATE",
-    "DEFAULT_CLI_ROOT", "NAS_HOST", "NAS_ROOT", "NAS_PROJECT", "NAS_PROC", "NAS_UNCONFIGURED",
-    "PATCH_LOG", "PATCH_META", "ALERT_LOG", "NAS_PATCH_LOG", "NAS_ALERT_LOG",
-    "PATCH_TAIL_BYTES", "PATCH_REASON_MAX", "PATCH_TAIL_LINES", "nas_pgrep", "NAS_TIMEOUT",
-    "NAS_CONTROL", "NAS_EXTRACT", "FB_PROC", "FB_NAME", "PROC_ROOT", "_FREEBUFF_WHICH",
-    "CHUNK", "MAX_SCAN", "PROMPT_MIN_CHARS", "NUDGE_WORDS", "NUDGE_MAX_CHARS", "NAS_EXTRACT",
+    "DEFAULT_CLI_ROOT",
+    "PATCH_LOG", "PATCH_META", "ALERT_LOG",
+    "PATCH_TAIL_BYTES", "PATCH_REASON_MAX", "PATCH_TAIL_LINES",
+    "FB_PROC", "FB_NAME", "PROC_ROOT", "_FREEBUFF_WHICH",
+    "CHUNK", "MAX_SCAN", "PROMPT_MIN_CHARS", "NUDGE_WORDS", "NUDGE_MAX_CHARS",
     "GOAL_CHASE_CHUNKS", "TASK_MAX_LINES", "GOAL_LINE_RE", "GOAL_MAX_CHARS",
     "SUMMARY_MAX_CHARS", "PROSE_NEEDLE_RE", "MODEL_RE", "HEARTBEAT_GRACE", "HB_REFRESH",
     "STATE_CLOCK_KEYS", "MAX_TASK_RECORDS", "MAX_TASK_AGE_DAYS", "LOG_CAP_BYTES",
@@ -1821,7 +2328,7 @@ __all__ = [
     "LABEL_FLOOR_S", "MIN_LABEL_MS", "BLEND_WEIGHT", "ESTIMATE_KNOBS", "label_floor_ms",
     "blend_weight", "set_estimate_knobs", "LEDGER_FRESH_MS", "REFIT_MIN_SCORED",
     "REFIT_MIN_DECIDED", "EX_CODES", "_ESC_SEQ_RE", "_TEXT_DROP_RE",
-    "clean_text", "clean_observation", "atomic_write_json",
+    "clean_text", "clean_observation", "atomic_write_json", "atomic_write_text",
     "read_json", "pid_alive", "proc_cwds", "lsof_cwds", "cwds_for", "pid_cwd", "parse_etime",
     "ages_for", "installed_freebuff", "is_freebuff_cmd", "freebuff_pids", "process_table",
     "instance_of_parent", "descendant_pids", "descendant_instance", "find_instance",

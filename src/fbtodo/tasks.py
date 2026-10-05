@@ -454,7 +454,7 @@ def sized_entry(shapes: dict | None, bucket: str) -> dict | None:
 # of steps. Used by itself the label model fixes the median and wrecks the tail, which is
 # exactly why it is only ever a half of the answer.
 CLASS_RULES = (
-    ("deploy", ("deploy", "nas", "ssh", "container", "docker", "publish", "push")),
+    ("deploy", ("deploy", "ssh", "container", "docker", "publish", "push")),
     ("run", ("run", "test", "tests", "verify", "execute", "build", "sweep", "selfcheck",
              "check", "profile", "measure", "bench")),
     ("docs", ("document", "docs", "readme", "doc", "comment", "comments", "explain")),
@@ -1199,15 +1199,23 @@ def elapsed_total_ms(times: dict, todos: list, now_ms: int) -> int | None:
     moves every time the owner says something, and not the store's mtime, which
     moves on every poll. None means no step was ever seen running, and a zero
     there would read as "this list took no time" (see NO_TIMES_TICKED).
+
+    The end of the span is `now` only while a clock is still counting. Once every
+    clocked step has stopped, the span is FIXED — first start to last stop — because
+    a finished list must not bill the idle hours after it. Measured to `now`, a list
+    finished two days ago read as `65h59m spent` on a pane that had simply been left
+    open; the number kept climbing with nobody working.
     """
-    starts = [
-        rec.get("started_ms")
+    recs = [
+        rec
         for rec in ((times or {}).get(str(t.get("task", ""))) or {} for t in todos or [])
         if rec.get("started_ms")
     ]
-    if not starts:
+    if not recs:
         return None
-    return max(0, now_ms - min(starts))
+    stops = [rec.get("done_ms") for rec in recs if rec.get("done_ms")]
+    end = max(stops) if len(stops) == len(recs) else now_ms
+    return max(0, end - min(rec["started_ms"] for rec in recs))
 
 
 def total_estimate_ms(
@@ -1230,6 +1238,8 @@ def total_estimate_ms(
     spent = elapsed_total_ms(times, todos, now_ms)
     if spent is None:
         return None
+    # The spent half is frozen once the list is finished (see `elapsed_total_ms`), so a
+    # done list's total stops growing with it while the remaining half is already zero.
     return spent + remaining_estimate_ms(times, todos, now_ms, pace_ms, shapes, calls_mem)
 
 
@@ -1459,7 +1469,7 @@ def list_groups(state: dict) -> list:
     """The lists a state carries, as the groups a renderer draws: one, or one per thread.
 
     A group is `{title, todos, current, running, source_updated_ms}`. With fewer than two
-    threads — every state a CLI journal, a NAS session or a file can produce — the answer is
+    threads — every state a CLI journal or a file can produce — the answer is
     the state's own list with no title, which is why a single-list frame is unchanged to the
     byte. A thread with no steps of its own is KEPT: `0/0` under its own name is the honest
     answer for a thread that has just been opened, and the number of groups is what tells a
@@ -1493,6 +1503,31 @@ def list_groups(state: dict) -> list:
         for t in threads
     ]
     return groups
+
+
+# In plain words: the bar's own two numbers. `done, total` for the list the pane FOLLOWS —
+# and when that list is not there, for the lists it is actually drawing.
+# The followed list can be absent while other threads' lists are on screen: `finish_state`
+# drops a finished list as soon as a newer request or turn arrives, and a stacked pane
+# keeps drawing the other live threads. Counting only the followed list then gave the bar
+# `0% (0/0)` directly under a heading reading `11/11` and eleven ticked steps — the frame
+# contradicting itself, which is what a reader sees as a broken bar rather than as an
+# absent list. So the fallback is the drawn lists: `done/total` summed over the groups the
+# step area paints, which is a number the frame's own steps add up to.
+def drawn_counts(state: dict) -> tuple[int, int]:
+    """`(done, total)` for the progress bar: the followed list, or every list being drawn.
+
+    `(0, 0)` only when there is nothing to draw at all — which both renderers answer with
+    their own no-list frame long before a bar is asked for.
+    """
+    todos = state.get("todos") or []
+    if todos:
+        return sum(1 for t in todos if t.get("completed")), len(todos)
+    drawn = [g for g in list_groups(state) if g.get("todos")]
+    return (
+        sum(1 for g in drawn for t in g["todos"] if t.get("completed")),
+        sum(len(g["todos"]) for g in drawn),
+    )
 
 
 # In plain words: a number written down is not the same as work happening. A step with a
@@ -1558,8 +1593,8 @@ def has_running_clock(state: dict, now_ms: int | None = None) -> bool:
     A counting number is the difference between "alive and working on step 4" and
     "stuck"; the pane redraws on a 1s tick while this is true (instead of the 5s
     idle tick) so it visibly moves rather than jumping in 5-second steps. The pane
-    sleeps in short wakes, not until its next poll, so this holds for the NAS pane
-    too — where a poll is an ssh round trip.
+    sleeps in short wakes, not until its next poll, so this holds however long one
+    poll takes.
     """
     todos = state.get("todos") or []
     idx = current_index(todos)
@@ -1828,7 +1863,8 @@ __all__ = [
     "remaining_estimate_ms", "elapsed_total_ms", "total_estimate_ms", "run_variance_ms",
     "fmt_estimate", "fmt_variance", "fmt_eta", "task_key", "_task_event", "_events_size",
     "_stamp_events_cursor", "append_task_events", "fold_task_events", "compact_task_events",
-    "load_tasklog", "current_index", "list_groups", "live_clock", "step_is_running",
+    "load_tasklog", "current_index", "list_groups", "drawn_counts", "live_clock",
+    "step_is_running",
     "live_elapsed",
     "has_running_clock", "track_tasks",
 ]

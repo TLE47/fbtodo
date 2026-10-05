@@ -1,6 +1,8 @@
 """fbtodo — watch the Freebuff agent's todo list.
 
-    fbtodo              live pane (default); auto-starts the watcher, exits with freebuff
+    fbtodo              live pane (default); auto-starts the watcher, exits with freebuff.
+                        m quiet until this list finishes · M quiet until you say · u loud
+                        again (the phone/ntfy switch; --no-keys to ignore the keyboard)
     fbtodo snap         one snapshot, plain text
     fbtodo json         one snapshot, clean JSON
     fbtodo bar          "todos 3/5" — for a tmux status bar
@@ -19,12 +21,22 @@
                         normal ask afterwards; --dry-run plans without changing anything)
     fbtodo pane-watch   keep the todo panes open, for as long as freebuff runs
                         (started for you; --once for one pass)
+    fbtodo mute         the pane's phone/ntfy switch, without a keystroke: list (or no
+                        verb) reports it, on mutes until told otherwise, off gives the
+                        notifications back, until-done mutes until this list finishes
+                        (the same switch the pane's m/M/u keys write; --json)
     fbtodo pin          pin the list pane's side or size for one window
-                        (--side v|h|auto, --size N, --role local|nas|both,
-                        --window TARGET, --list, --clear)
+                        (--side v|h|auto, --size N, --window TARGET, --list, --clear)
     fbtodo why          why each list pane is where it is: the side and size in force,
                         the source that supplied them, the pane it sits beside
                         (--window TARGET, --json)
+    fbtodo board        every live session on this machine in one frame: its list, its
+                        heading and its clock, most recently active first (--live keeps
+                        redrawing it; --json for a script; --board-max N, --board-live
+                        MIN, --board-rows N)
+    fbtodo dead         every stretch of code this build's own source proves can never
+                        run — all of them, not the first the reload probe refuses on
+                        (--json); exits nonzero when it finds any
     fbtodo status       instance, watcher, state-file and scratch footprint
                         (--watch reports only keeper changes; --json for a script)
     fbtodo ledger       every step's forecast vector beside the outcome it was scored
@@ -40,8 +52,8 @@ exits, the watcher shuts itself down and removes its lock. A second process, the
 keeper (`pane-watch`), exists because a pane cannot be watched by itself: it puts a
 todo pane back when one is killed mid-session, for every local session, and exits when
 the last freebuff does. Either pane is also put back under the pane its session is drawn
-in — the freebuff pane for a local session, the ssh for a NAS one — since that is where
-a glance looks for it. `--pane-seconds N` sets how often it looks (3s), `--ask-seconds
+in — the freebuff pane itself — since that is where a glance looks for it.
+`--pane-seconds N` sets how often it looks (3s), `--ask-seconds
 N` how often a waiting question is looked for (3s; see `ask-bell.py`), and 0 switches
 either off — as does FBTODO_NO_PANE for the panes, the same switch the shell wrapper
 honours.
@@ -73,20 +85,15 @@ carries it.
 Above that strip is one more row when there is something to say: `PATCH` — the last
 outcome of the CLI-patch step, with the binary's version and how long ago — and `ALERT` —
 the last thing the phone was told. Both are read from the log the producing step already
-writes (`~/.config/freebuff-patch-watch/watch.log` and `~/.config/freebuff-notify/phone.log`,
-or the NAS hook's own two, read at the far end of the ssh the pane already makes), so
-neither has to be fetched with a probe of its own; a state with neither fact renders
+writes (`~/.config/freebuff-patch-watch/watch.log` and `~/.config/freebuff-notify/phone.log`),
+so neither has to be fetched with a probe of its own; a state with neither fact renders
 exactly as before. `fbtodo status` prints the same pair in the same words.
 
-Three stores: the two this machine keeps, and the one a remote host keeps when you run
-freebuff there over ssh (`docker exec -it <container> freebuff`):
+Two stores, both on this machine:
     CLI        ~/.config/manicode/projects/<project>/chats/<ISO>/log.jsonl   live, mid-turn
     Desktop    ~/.config/freebuff-desktop/projects/<slug>/desktop-v2.db      per turn, app only
-    NAS        <host>:<root>/<project>/chats/<ISO>/log.jsonl                 live, over ssh
-`--source auto` prefers a CLI chat for the cwd. `-s nas` reads the remote store
-over ssh (see --nas-*, and set them: there is no built-in host), and follows the remote
-freebuff PROCESS rather than a local pid, so the pane lives as long as the remote
-session does.
+`--source auto` prefers a CLI chat for the cwd. There is no remote source: a list is read
+where it was written, and the pane follows the freebuff PROCESS here that is writing it.
 
 Every new list replaces the old one: state is never merged, and when the session
 changes the previous list is dropped immediately instead of lingering.
@@ -94,8 +101,10 @@ changes the previous list is dropped immediately instead of lingering.
 Each list is headed by its big goal: the agent's own one-line `Goal:` statement, which
 AGENTS.md asks for and the journal keeps in `fullResponse`. The request the list was
 written for is never shown as the goal — a quote is the phrasing, not the objective — so
-a session that skips the line says `big goal · — none stated` in the plain renderer, and
-in the framed pane simply draws no heading row. When a newer
+a session that skips the line is told so loudly: `big goal · no heading`, naming the
+`Goal:` line the agent owes, in the warn yellow and in both renderers — the plain one says
+it where the heading would be, and the framed one draws the same note on that row rather
+than nothing at all. When a newer
 request has arrived since, a `now` line says so: a list can sit unchanged for hours while
 the session works on.
 
@@ -161,9 +170,10 @@ from .locks import *  # noqa: F401,F403 — the package is one namespace
 from .alerts import *  # noqa: F401,F403 — the package is one namespace
 from .scan import *  # noqa: F401,F403 — the package is one namespace
 from .desktop import *  # noqa: F401,F403 — the package is one namespace
-from .nas import *  # noqa: F401,F403 — the package is one namespace
 from .tasks import *  # noqa: F401,F403 — the package is one namespace
+from .board import *  # noqa: F401,F403 — the package is one namespace
 from .fb_init import *  # noqa: F401,F403 — the package is one namespace
+from .mute import *  # noqa: F401,F403 — the package is one namespace
 
 
 def list_fingerprint(state: dict) -> str:
@@ -208,8 +218,17 @@ def finish_state(state: dict, prev: dict | None, claim_first: bool = False) -> d
         # heading arrives with its own list. `now` and `nudge` deliberately stay: they describe
         # the request that replaced the list, not the list, and with nothing on screen they are
         # the only thing left naming what this turn is about.
-        for gone in ("goal", "goal_source"):
+        for gone in ("goal", "goal_source", "goal_stale"):
             state[gone] = None
+        # ...and its CLOCKS go too. `task_times` is per-step and belongs to the list it was
+        # measured on; left standing, a cleared state keeps the dropped steps' timings, and the
+        # pane — which rebuilds them only when they are MISSING (`if not state.get("task_times")`)
+        # — never rebuilt them for the next list written into the same session. Emptying it also
+        # forces that rebuild, so the new list's clocks are measured rather than inherited. The
+        # cross-session memories (`task_history`, `task_shapes`, `task_calls`) deliberately stay:
+        # those are what a NEW list projects from, and the task log keeps the finished records
+        # regardless of what the state carries.
+        state["task_times"] = {}
     fp = list_fingerprint(state)
     version = int((prev or {}).get("list_version") or 0)
     session_changed = bool(prev) and prev.get("session") != state.get("session")
@@ -218,10 +237,13 @@ def finish_state(state: dict, prev: dict | None, claim_first: bool = False) -> d
 
     if session_changed:
         # A new session owns the pane now: its list is not the previous one, and
-        # the old list must not linger while the new one is being written.
+        # the old list must not linger while the new one is being written. With no list of
+        # its own yet, the previous session's clocks have nothing left to describe, so they
+        # go with it — one session's timings must never be read against another's steps.
         version = 0
         if not todos:
             cleared = True
+            state["task_times"] = {}
     if drop_turn:
         # Note that this does NOT touch the counter: the list number identifies a list, and a
         # dropped one is still the list it was. The new turn's list is what increments it.
@@ -454,9 +476,8 @@ def cmd_push(args) -> int:
 def state_matches_request(state: dict | None, args) -> bool:
     """Is the cached watcher state an answer to THIS question?
 
-    `auto` takes whatever is live, but an explicit `-s nas` must not be answered by a
-    state file describing the local CLI session: a status bar asking for the NAS list
-    printed the Mac's own list instead, which looked like the NAS had one. The
+    `auto` takes whatever is live, but an explicit `-s cli` must not be answered by a
+    state file describing the desktop app's session. The
     producer's version is checked for the same reason: a watcher left running across an
     upgrade keeps writing the old layout, and then a pane that trusts it silently loses
     every field the new one added (that is how a goal line would go missing).
@@ -469,20 +490,119 @@ def state_matches_request(state: dict | None, args) -> bool:
     return source == "auto" or (state.get("backend") or "") == source
 
 
+def pane_cached_state(st: dict | None, args, instance_pid, now_ms: int) -> bool:
+    """Is the cached watcher state usable for this pane right now?
+
+    Three things have to hold: the file is fresh, it answers THIS request, and the session it
+    names is still live. The last one is what `state_matches_request` could not ask — `auto`
+    accepts whatever backend the watcher wrote — and a watcher heartbeats the file it owns while
+    the chat behind it has already finished, so a pane kept rendering the ended session until
+    the file aged out or somebody reloaded it by hand. A dead session now sends the pane back to
+    `snapshot`, which is where `auto` re-chooses its source.
+
+    There is deliberately no "already handled" memo here. The file a pane reads is not the file
+    the fresh answer lives in, so remembering that this session was dealt with would only mean
+    trusting the same stale file again on the next poll — the pane dropped a list and would pick
+    it straight back up, which is the freeze this rule exists to end. The pane therefore keeps
+    answering from `snapshot` until the file itself names a live session again (a running
+    watcher rewrites it within a poll; with no watcher at all, one probe per poll is what this
+    pane already does).
+    """
+    if not state_matches_request(st, args):
+        return False
+    if not state_is_fresh(st, max(HEARTBEAT_GRACE, getattr(args, "interval", 1.0) * 3)):
+        return False
+    return not followed_session_over(st, instance_pid, now_ms)
+
+
+def latch_pane_subject(args, state: dict) -> str:
+    """Pin this pane to the subject it first resolved, and never move it again.
+
+    A pane's job is to be ONE window on ONE list. Left to re-choose, it changed its mind
+    under the reader every time the work moved: you type in another tab, the app's own
+    picker answers with that thread instead, and the pane you were reading becomes a pane
+    about something else — with no frame drawn to say so, because both frames were valid.
+    That is "it keeps switching threads", and no amount of drawing fixes it.
+
+    So the first successful poll decides, and the decision is made in the ARGUMENTS every
+    later poll already goes through: one source, one thread or one chat, one list. The
+    existing flags are the mechanism — `--thread`, `--chat`, `--threads 1` — so nothing new
+    has to be remembered between polls, and a pane that reloads itself into a new build comes
+    back locked the same way, because the lock is in its own command line from then on.
+
+    What it does NOT do is decide the FIRST subject: that is still `auto`'s chain, so the
+    rule that a finished chat must not answer a live desktop thread (the 2026-10-04 freeze)
+    still picks the starting list. What stops is the moving afterwards — including when the
+    locked thread's turn ends, because a finished list is still a list somebody is reading,
+    and re-acquiring here is the flapping this is meant to end. An answer with no subject to
+    name (an error, or nothing here yet) latches nothing and the pane keeps asking.
+
+    Returns a one-line description of the lock, or "" once there is one.
+    """
+    backend = str(state.get("backend") or "")
+    session = str(state.get("session") or "")
+    target = str(state.get("target") or "")
+    if getattr(args, "pane_locked", None) or not session or backend not in ("cli", "desktop"):
+        return ""
+    if backend == "cli":
+        if not target:
+            return ""
+        args.chat, args.source = target, "cli"
+        os.environ[PANE_LOCK_ENV] = f"cli:{target}"
+        return f"locked to the cli chat {os.path.basename(target.rstrip('/'))}"
+    # A desktop thread is named by its id, and `others` goes to zero so the frame stops
+    # stacking the threads this pane was not asked about.
+    args.thread, args.source, args.threads = session, "desktop", 1
+    os.environ[PANE_LOCK_ENV] = f"desktop:{session}"
+    return f"locked to the desktop thread {session[:8]}"
+
+
+def pane_poll_state(prev: dict | None, note: str, mode: str | None = None) -> dict:
+    """The state a pane draws when its own next poll RAISED (see `cmd_pane`).
+
+    Not the source's answer but the pane's: the list it was showing is gone, so the error row
+    — which `render` already draws in place of a list, in red — carries the message, and the
+    backend/session are kept so the title still says which source it had been reading when it
+    broke (the *mode*, `-s`, when there was nothing to keep yet: a first poll that fails has no
+    session to name and still has to say what it was trying to read). `todos` is emptied
+    because an error state is not a list: nothing downstream may re-time or re-count rows from
+    an answer that was never received.
+    """
+    base = {key: (prev or {}).get(key) for key in ("backend", "session", "source")}
+    where = f" reading {mode}" if mode else ""
+    base.update({"todos": [], "error": f"poll failed{where} — {note}"})
+    return base
+
+
+def cached_state_ok(st: dict | None, args) -> bool:
+    """May a LOOK-ONLY command answer with the cached watcher state?
+
+    `json` and `bar` are reads: they serve the state file while it is fresh and describes what
+    was asked for, and only scan the stores when it is not. That rule was missing the same half
+    the pane was: a watcher heartbeats the file it owns after the chat behind it has finished,
+    so `fbtodo json -s auto` kept answering with an ended session's list from a directory whose
+    live work had moved into the app — the pane's own freeze, in the command people run to see
+    what the pane is about to draw (found by the self-check that switches a cached CLI chat for
+    a live desktop thread through the real CLI, 2026-10-03). The instance is resolved only once
+    the file is otherwise an answer, so the common case — a session still running — costs no
+    `pgrep`.
+    """
+    if not st or not state_is_fresh(st, max(HEARTBEAT_GRACE, getattr(args, "interval", 1.0) * 3)):
+        return False
+    inst, _ = find_instance(os.path.realpath(os.getcwd()), args.watch_pid, args.instance_of)
+    return pane_cached_state(st, args, inst, int(time.time() * 1000))
+
+
 # =================================================================== commands
 def ensure_daemon(args, quiet: bool = True) -> int | None:
     # The panes are kept by their own process, asked for here because this is the moment
     # a session and its pane appear — and asked for BEFORE the watcher lock is consulted,
-    # so a `-s nas` daemon holding that lock cannot leave a local pane unguarded.
+    # so a second daemon holding that lock cannot leave a local pane unguarded.
     ensure_pane_keeper(args, quiet=quiet)
     running = live_watcher_pid(LOCK_PATH)  # an upgrade's leftover is replaced, not adopted
     if running:
         return running
     cwd = os.path.realpath(os.getcwd())
-    if args.source == "nas":
-        # Nothing local to adopt: the session is a process on the NAS, and the watcher
-        # finds out about it from the probe rather than from this machine's process table.
-        return spawn_daemon(args, cwd, None, quiet=quiet)
     inst, _ = find_instance(
         cwd, getattr(args, "watch_pid", None), getattr(args, "instance_of", None)
     )
@@ -518,7 +638,7 @@ def spawn_daemon(args, cwd: str, instance_pid: int, quiet: bool = True) -> int |
         str(getattr(args, "threads", DESKTOP_MAX_THREADS)),
         "--thread-live",
         str(getattr(args, "thread_live", DESKTOP_LIVE_MS // 60_000)),
-        # Passed on for the same reason as the NAS knobs below: a daemon that inherited
+        # Passed on because a daemon that inherited
         # the module default would keep a killed pane reopened for a caller who asked it
         # not to (or never notice one, for a caller who asked it to be quicker).
         "--pane-seconds",
@@ -534,23 +654,6 @@ def spawn_daemon(args, cwd: str, instance_pid: int, quiet: bool = True) -> int |
         argv += ["--project", args.project]
     if args.chat:
         argv += ["--chat", args.chat]
-    # Only meaningful for -s nas, but passed unconditionally so the daemon never falls back
-    # to the module defaults when the caller overrode them.
-    argv += [
-        "--nas-host",
-        args.nas_host,
-        "--nas-root",
-        args.nas_root,
-        "--nas-project",
-        args.nas_project,
-    ]
-    # Which session the daemon watches. Absent this, a `-s nas` pane that named its own
-    # marker spawned a daemon watching `$HOME/.fb-session` instead, and then read that
-    # daemon's answer about a DIFFERENT session: a pane for a live marker saw "no session"
-    # (and closed early), and one whose marker had ended stayed up because the file the
-    # daemon watched belonged to something else that was still alive.
-    if getattr(args, "fb_marker", None):
-        argv += ["--fb-marker", args.fb_marker]
     # The estimate knobs, forwarded only when the caller actually set them: the watcher is
     # the process that builds the memories, so a flag it never saw would be silently halved.
     if args.label_floor is not None:
@@ -586,10 +689,6 @@ def resolve_instance(args):
     """
     served = os.path.realpath(os.path.expanduser(args.cwd)) if args.cwd else None
     cwd = served or os.path.realpath(os.getcwd())
-    if args.source == "nas":
-        # The session is on the NAS, so there is no local pid to report — the lock carries
-        # None and liveness comes from the probe.
-        return cwd, None
     if args.instance_pid is not None:
         return cwd, args.instance_pid
     inst, inst_cwd = find_instance(cwd, args.watch_pid, args.instance_of)
@@ -640,12 +739,10 @@ def daemon_loop(args) -> int:
         return 0
 
     cwd, instance_pid = resolve_instance(args)
-    remote = args.source == "nas"
-    if not instance_pid and not remote:
+    if not instance_pid:
         if not args.quiet:
             print("no running Freebuff instance", file=sys.stderr)
         return EX_CODES["nofile"]
-    remote_seen = False
 
     prev = read_json(STATE_PATH, None)
     # What the last poll had to say (the clock taken out), and when the heartbeat on disk
@@ -711,7 +808,7 @@ def daemon_loop(args) -> int:
 
     try:
         while True:
-            if not remote and not pid_alive(instance_pid):
+            if not pid_alive(instance_pid):
                 stop_reason = "instance-exited"
                 stop_code = 0
                 break
@@ -788,16 +885,6 @@ def daemon_loop(args) -> int:
                                 held_note = note
                                 append_log(LOG_PATH, f"watcher {note}")
             st = snapshot(args, cwd=cwd, instance_pid=instance_pid)
-            if remote:
-                # There is no local pid to lose, so the session ending is read from the probe:
-                # close only after one has actually been SEEN, because the pane is opened by the
-                # ssh alias and `fb` may not be typed for minutes afterwards.
-                if st.get("instance_alive"):
-                    remote_seen = True
-                elif remote_seen:
-                    stop_reason = "instance-exited"
-                    stop_code = 0
-                    break
             st = finish_state(st, prev, claim_first=True)
             st = track_tasks(st)
             prune_scratch()  # no-op unless an hour has passed
@@ -820,11 +907,11 @@ def daemon_loop(args) -> int:
             if args.ask_seconds > 0 and time.monotonic() >= ask_due:
                 ask_due = time.monotonic() + args.ask_seconds
                 ask_notify_once(args, quiet=args.quiet)
-            if not remote and args.pause_seconds > 0 and time.monotonic() >= pause_due:
+            if args.pause_seconds > 0 and time.monotonic() >= pause_due:
                 pause_due = time.monotonic() + args.pause_seconds
                 pause_notify_once(args, instance_pid, quiet=args.quiet)
-            # Not gated on `remote`: what it reports is this machine's tmux, and a `-s
-            # nas` daemon is often the only thing running here to ask.
+            # What it reports is this machine's tmux, so the watcher asks about it
+            # whatever list it is serving.
             if args.pane_bell_seconds > 0 and time.monotonic() >= bell_due:
                 bell_due = time.monotonic() + args.pane_bell_seconds
                 pane_notify_once(args, quiet=args.quiet)
@@ -1001,7 +1088,7 @@ def cmd_doctor(args) -> int:
     else:
         checks.append(("warn", "watcher", "not running (a pane starts one)"))
 
-    kit = os.path.dirname(NAS_NOTIFY)
+    kit = os.path.dirname(TODO_NOTIFY)
     if not os.path.isdir(kit):
         checks.append(("warn", "notify kit", f"not installed ({kit}) — panes work, bells do not"))
     else:
@@ -1308,7 +1395,7 @@ def claim_files() -> list:
     a claim that was never moved can still hold the old store (`_claim_live`), so the audit
     names it instead of pretending this root is all there is.
     """
-    files = [("watcher", LOCK_PATH), ("keeper", PANE_KEEPER_PATH), ("nas pane", NAS_LOCK_PATH)]
+    files = [("watcher", LOCK_PATH), ("keeper", PANE_KEEPER_PATH)]
     seen = {os.path.realpath(p) for _, p in files}
     for label, name in (("watcher", LEGACY_CLAIMS[0]), ("keeper", LEGACY_CLAIMS[1])):
         path = os.path.join(LEGACY_SCRATCH, name)
@@ -1429,8 +1516,8 @@ def watch_locks(args) -> int:
 def cmd_locks(args) -> int:
     """Audit every claim file: holder, name↔inode tie, stale records, and clearing.
 
-    In plain words: each role that owns a scratch dir — the watcher, the pane keeper, the
-    NAS pane watcher — owns it through one claim file, and this asks those files the
+    In plain words: each role that owns a scratch dir — the watcher and the pane keeper —
+    owns it through one claim file, and this asks those files the
     questions their own readers and writers use, WITHOUT writing anything anywhere (the
     probe `lock_holder` would remove a leftover; an audit exists to say so instead). Who
     holds it (the record's pid, and whether it is alive); whether the lock and the NAME are
@@ -1445,7 +1532,7 @@ def cmd_locks(args) -> int:
     (`claim_processes`): a claim file can only name a holder that still ties to its name,
     so a process whose name was replaced — the leftover cleanup above took it, and it went
     on running invisibly — leaves a file that reads `absent` or `free`. The process table
-    is asked the other end: every watcher/keeper/NAS watcher running with THIS state root,
+    is asked the other end: every watcher or keeper running with THIS state root,
     and which of them no claim names. Those rows print under the claim that cannot see
     them, and `orphans` carries the same facts in `--json`. `--json` is the same rows for
     a script, and no run changes a claim file — `--fix` is the separate path that acts on
@@ -1481,7 +1568,6 @@ def cmd_locks(args) -> int:
     hint = {
         "watcher": " — `fbtodo stop` asks this one to end",
         "keeper": " — it also exits with the last freebuff",
-        "nas pane": " — `fbtodo nas` starts it",
     }
     print(f"fbtodo locks  {SCRATCH}")
     for label, entry in rows:
@@ -1608,8 +1694,8 @@ def locks_fix(args) -> int:
     when it next runs. A repair that would end ANYTHING asks first — on the terminal, or with
     `--yes` — and refuses with 66 when it cannot ask (`--no-input`, no terminal), changing
     nothing at all: a kill is never taken on a guess, and never half-applied.    `--dry-run` prints the same plan and touches nothing. On its own it starts nothing —
-    the claims it frees are what the next ask (the shell's `fbtodo daemon`, a pane, `fbtodo
-    nas`) re-claims; `--restart` is the opt-in that runs that ask now (see `restart_claims`),
+    the claims it frees are what the next ask (the shell's `fbtodo daemon`, or a pane)
+    re-claims; `--restart` is the opt-in that runs that ask now (see `restart_claims`),
     so one command can leave the machine watched again instead of waiting for the next
     session to start.
     """
@@ -1758,11 +1844,7 @@ def cmd_status(args) -> int:
     held, pid = lock_peek(LOCK_PATH)
     pid = pid if held else None
     st = read_json(STATE_PATH, None)
-    # The state file is whatever the LOCAL watcher follows. `-s nas` asks about the NAS, so
-    # ask it (one probe): reporting the local session's list against "nas session: — no
-    # session found" was a lie about a box that was running a freebuff at the time.
-    live = adopt_version(finish_state(snapshot(args), None)) if args.source == "nas" else None
-    view = live or st
+    view = st
     read_theme()  # the palette resolves its refusals here, so both branches can report them
     if args.json:
         json.dump(
@@ -1825,24 +1907,9 @@ def cmd_status(args) -> int:
     print(f"  state file        : {'  '.join(bits)}")
     # The patches' own two facts, in the same words the pane's row uses and from the same
     # reader: what the last patch pass did, and when the phone was last told something.
-    # The NAS answer rides in the probe above; locally it is two tail reads.
-    rep = (
-        {"patch": (view or {}).get("patch"), "alert": (view or {}).get("alert")}
-        if args.source == "nas"
-        else local_patch_alert()
-    )
-    seen = {label: text for label, text, _sev in patch_row(rep)}
+    seen = {label: text for label, text, _sev in patch_row(local_patch_alert())}
     print(f"  cli patches       : {seen.get('PATCH') or '— nothing logged'}")
     print(f"  last alert        : {seen.get('ALERT') or '— nothing logged'}")
-    if args.source == "nas" or (st or {}).get("backend") == "nas":
-        nas = (view or {}).get("nas") or {}
-        print(
-            f"  nas session       : {nas.get('dir') or '— no session found'}"
-            f"  ({'live' if nas.get('live') else 'not running'})"
-        )
-        if nas.get("fb") and nas.get("fb") != "-":
-            marker = "live" if nas.get("fb") == "1" else "stale"
-            print(f"  fb marker         : {marker}  {nas.get('fb_project') or '-'}")
     if view and not view.get("todos"):
         # Said out loud, in the pane's own words. Until this line existed a session with no
         # list had no `todos` row at all, and a missing row reads as a broken command rather
@@ -1991,6 +2058,13 @@ def cmd_status(args) -> int:
             print(f"  pane python       : {_short_python(pane_py)}  ({note})")
         elif pane_py:
             print(f"  pane python       : {_short_python(pane_py)}")
+        # ...and which of those panes was captured BEFORE this build's pin. The keeper's
+        # upgrade would rewrite it on the next pass, so this is the line that names the
+        # pane while it is still what it was — and, once the repair is off for it, the line
+        # that keeps naming it, because nothing else will change it.
+        pin_note = stale_pin_note(stale_pane_ids(inst))
+        if pin_note:
+            print(f"  pane pin          : {pin_note}")
     # The keeper's server, in the same shape as the pane python line above: the name its
     # record actually holds, canonicalised (a record written by an older build spells the
     # socket as the raw `TMUX` value — a spelling, not a different server), and whether
@@ -2410,6 +2484,9 @@ def cmd_ledger(args) -> int:
 # pane's own name again before anyone could read it as state. The file that changed rides the
 # same hand-over for the log rather than the chip.
 PANE_RELOAD_ENV = "FBTODO_PANE_RELOADED"
+# What a pane has latched itself to (`cli:<chat dir>` or `desktop:<thread id>`), carried in
+# the environment so it survives the exec a reload does. See `latch_pane_subject`.
+PANE_LOCK_ENV = "FBTODO_PANE_LOCK"
 RELOAD_NOTE_S = 5.0
 
 
@@ -2465,10 +2542,34 @@ def cmd_pane(args) -> int:
     if not sys.stdout.isatty() and not args.once:
         print("refusing to poll without a TTY (use `fbtodo snap`)", file=sys.stderr)
         return EX_CODES["usage"]
+    # A pane that re-execs itself (the reload probe below) comes back LOCKED. The latch
+    # lives in this process's parsed arguments, and an exec throws those away with
+    # everything else in memory, so a lock that did not ride out would be the one thing a
+    # reloaded pane forgot — which is how a pane would start following tabs again, silently,
+    # the first time you edited the code. It travels in the environment the way the
+    # hand-over note already does, and is applied before the first poll so the new image
+    # never gets a chance to choose.
+    carried = os.environ.get(PANE_LOCK_ENV, "")
+    kind, _, what = carried.partition(":")
+    if what and kind in ("cli", "desktop"):
+        args.source = kind
+        if kind == "cli":
+            args.chat = what
+        else:
+            args.thread = what
+        # ...and marked as already decided, or the first poll would latch onto whatever the
+        # new image happens to resolve and quietly undo the lock it was given.
+        args.pane_locked = True
 
     color = use_color()
+    # A PANE is one window on one list, so it asks for one thread from the first poll —
+    # before there is anything to latch to. The stacked frame (`--threads N`, one heading
+    # per live thread) was the other half of the same problem: a reader asking "how far is
+    # this list" got an answer about three, and which three changed while they read. The
+    # reads keep the flag (`fbtodo json`, `snap`, `board` still stack on request); a pane
+    # does not, because it is the window a person is looking at.
+    args.threads = 1
     hide = False
-    saw_instance = False
     last_sig = None
     last_draw = 0.0
     last_frame = None
@@ -2476,11 +2577,26 @@ def cmd_pane(args) -> int:
     stale_after_s = max(0.0, args.stale_after) * 60.0
     last_act = None
     last_activity = time.time()
-    # Poll and paint run on separate clocks. A poll is expensive — on the NAS it is an
-    # ssh round trip plus a remote probe — while a repaint is free, so the pane wakes
-    # often enough to move its own numbers at 1Hz and only reaches for the store every
-    # `args.interval`. Sleeping the whole gap is what made a NAS pane look stuck: its
-    # clock and its "N ago" could not move until the next ssh had come back.
+    # The pane's own switch over the phone. Nothing else reads this terminal — it IS the
+    # pane's tmux pane — so taking it for single keystrokes costs nobody else anything, and
+    # `PaneKeys` hands the attributes back on every way out of this function (see `restore`
+    # and the `finally`). Off for a pane that is not a pane (`--once`) and for a pane whose
+    # owner said so (`--no-keys`, or FBTODO_PANE_KEYS=off, the flag winning).
+    keys = PaneKeys(enabled=not (args.once or getattr(args, "no_keys", False)
+                                 or str(os.environ.get("FBTODO_PANE_KEYS", "")).strip().casefold()
+                                 in ("off", "0", "no", "false", "disable", "disabled")))
+    keys.open()
+    # ...and the note a keypress leaves on the chip: the switch itself is said for as long
+    # as it is true (`mute_chip`), so this is the transient half — the words of what the key
+    # did, and the only word there is when a key was pressed and NOTHING happened (a switch
+    # that could not be written), which is exactly the case that would otherwise look broken.
+    key_note = None
+    key_note_until = None
+    # Poll and paint run on separate clocks. A poll is a store read and costs something,
+    # while a repaint is free, so the pane wakes often enough to move its own numbers at
+    # 1Hz and only reaches for the store every `args.interval`. Sleeping the whole gap is
+    # what made a pane look stuck: its clock and its "N ago" could not move until the next
+    # poll had come back.
     WAKE = 0.25
     next_poll = 0.0
     # When this pane next asks whether it is still the build on disk — `BUILD_CHECK_S`, the
@@ -2492,7 +2608,7 @@ def cmd_pane(args) -> int:
     # pane's own name again — and the variable is popped whatever it says, so nothing this
     # pane starts inherits a note about a reload that is long over. The clock is armed by the
     # first frame the note can be painted into, not here: a reload can begin with a slow poll
-    # (a NAS pane's is an ssh round trip), and a note that expired while waiting for the state
+    # (a slow store read), and a note that expired while waiting for the state
     # is a note nobody sees.
     reloaded = reload_note(os.environ.pop(PANE_RELOAD_ENV, None))
     # ...and the other note a pane can start with: the keeper reopened this one because its
@@ -2507,11 +2623,16 @@ def cmd_pane(args) -> int:
     # for `kept`: a `reopen` note belongs to the process that will replace this one.
     next_note_check = 0.0
     state = watching = inst = None
+    # The last failure this pane's own tick hit, so a build that breaks every tick logs once
+    # rather than once a second (see the poll's `except`): the frame still shows it.
+    poll_note = None
+    pane_lock_note = ""
 
     def restore(*_a):
         if hide:
             sys.stderr.write("\x1b[?25h")
             sys.stderr.flush()
+        keys.close()
         raise SystemExit(130)
 
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -2584,34 +2705,59 @@ def cmd_pane(args) -> int:
                             os.environ.pop(PANE_RELOAD_ENV, None)
                             pane_log(f"pane reload failed: {exc.__class__.__name__}")
             if state is None or now >= next_poll:
-                remote = args.source == "nas"
-                if remote:
-                    inst = None  # decided from the state below: a live remote session, or nothing
-                else:
+                # A poll that RAISES must not take the pane with it. The pane is the one
+                # process whose whole job is to be on the screen, and it re-execs itself into
+                # whatever is on disk — including a tree that PARSES and IMPORTS and is still
+                # internally inconsistent, which is what a half-finished edit looks like to
+                # `reload_probe_error` (measured 2026-10-03: an edit that changed a signature
+                # and its call site in two steps exec'd the pane into the between-state, and
+                # the TypeError took the pane down where the list was, mid-work). A failed
+                # poll costs one tick; dying costs the pane, and for a kept pane the keeper
+                # reopens it into the same tree. So the exception becomes the FRAME: logged
+                # once per distinct message, drawn on the error row the renderer already has,
+                # and retried on the next tick — which is also how a pane left running a
+                # broken build comes back by itself the moment that build is fixed. Only
+                # `Exception` is caught: Ctrl-C and the exit path must still restore the
+                # cursor and the terminal.
+                try:
                     inst, _ = find_instance(cwd, args.watch_pid, args.instance_of)
-                st = read_json(STATE_PATH, None)
-                if state_is_fresh(st, max(HEARTBEAT_GRACE, args.interval * 3)) and state_matches_request(st, args):
-                    # Only this source's watcher state: a `-s nas` pane must not render the
-                    # local CLI watcher's list just because that one happens to be fresh.
-                    state = st
-                    # The pane ACTS (it tracks tasks and may start a watcher), so the probe
-                    # is allowed here: a leftover record must not be printed as the watcher
-                    # serving this state. Look-only commands use `lock_peek`.
-                    watching = st.get("daemon_pid") or daemon_pid()
-                else:
-                    state = finish_probe(snapshot(args, cwd=cwd, instance_pid=inst))
-                    # No watcher is serving THIS request (that is why we snapshotted), so name
-                    # one only if the cached state actually describes it: a `-s nas` pane was
-                    # crediting the local CLI watcher for a remote session it never watched.
-                    watching = daemon_pid() if (st and state_matches_request(st, args)) else None
-                if remote:
-                    # A live session on the NAS is the "instance" this pane follows; once it is gone
-                    # the pane closes itself (and until one appears, it says it is waiting).
-                    inst = True if state.get("instance_alive") else None
-                if not state.get("error") and not state.get("task_times"):
-                    # either no watcher, or one from before timings existed — track
-                    # here so task clocks are never silently missing
-                    state = track_tasks(state)
+                    st = read_json(STATE_PATH, None)
+                    if pane_cached_state(st, args, inst, int(now * 1000)):
+                        # Only this source's watcher state, so a pane asking for one store
+                        # is not handed another's list because that one is fresher.
+                        state = st
+                        # The pane ACTS (it tracks tasks and may start a watcher), so the probe
+                        # is allowed here: a leftover record must not be printed as the watcher
+                        # serving this state. Look-only commands use `lock_peek`.
+                        watching = st.get("daemon_pid") or daemon_pid()
+                    else:
+                        # ...and this half IS the re-resolve: the cached file was good except that
+                        # its session has ended, so the answer comes from the stores themselves.
+                        state = finish_probe(snapshot(args, cwd=cwd, instance_pid=inst))
+                        # No watcher is serving THIS request (that is why we snapshotted), so name
+                        # one only if the cached state actually describes it: a pane asking for
+                        # another store must not be credited with the watcher's that is not its.
+                        watching = (daemon_pid()
+                                    if (st and state_matches_request(st, args)) else None)
+                    if not state.get("error") and not state.get("task_times"):
+                        # either no watcher, or one from before timings existed — track
+                        # here so task clocks are never silently missing
+                        state = track_tasks(state)
+                    # ...and the pane decides ONCE which list it is about. Every poll after
+                    # this one asks for that subject by name, so a tab change, a finished
+                    # turn or a second thread going live can no longer move the reader's
+                    # window out from under them (see `latch_pane_subject`).
+                    locked_note = latch_pane_subject(args, state)
+                    if locked_note and locked_note != pane_lock_note:
+                        pane_lock_note = locked_note
+                        pane_log(f"pane {locked_note}")
+                except Exception as exc:
+                    note = f"{exc.__class__.__name__}: {exc}"
+                    if note != poll_note:  # once per distinct failure, not once a tick
+                        poll_note = note
+                        pane_log(f"pane poll failed: {note}")
+                    state = pane_poll_state(state, note, args.source)
+                    watching = None
                 next_poll = time.time() + max(0.2, args.interval)
             now = time.time()
             if now >= next_note_check:
@@ -2639,27 +2785,74 @@ def cmd_pane(args) -> int:
             if act != last_act:
                 last_act, last_activity = act, now
             idle_s = now - last_activity
+            # the pane's own switch over the phone (`mute.py`): one keystroke writes the
+            # notify kit's two switch files and the record of what they were, and nothing
+            # else in this loop changes because of it — so it is asked once per wake, which
+            # costs one select() on a terminal nobody else is reading. One key per wake on
+            # purpose: a paste of three switches is three half-seconds, which is no one's
+            # hurry, and a tight loop over a keyboard is how a pane eats its own terminal.
+            while keys.fd is not None:
+                pressed = keys.poll()
+                if not pressed:
+                    break
+                key_chip, key_said = apply_pane_key(pressed, state or {})
+                if key_said:
+                    pane_log(f"pane key '{pressed}': {key_said}")
+                    # The standing chip is the better answer whenever it HAS one: a mute
+                    # names itself and its undo key on every frame from here, and a chip
+                    # that is clipped to make room for a note about itself says less. The
+                    # note is for the cases the chip cannot — a key that did nothing at all.
+                    if not key_chip:
+                        key_note, key_note_until = key_said, now + RELOAD_NOTE_S
+                    last_sig = None       # repaint this tick: the chip may have changed
+            # ...and the default's other half. A mute taken "until this list finishes" ends
+            # itself when the list does — in THIS pane or in the next one, since the record is
+            # on disk (`MUTE_PATH`) and this pane re-execs into every new build it sees.
+            lifted = auto_unmute(state)
+            if lifted:
+                pane_log(f"pane: {lifted}")
+                key_note, key_note_until = lifted, now + RELOAD_NOTE_S
+                last_sig = None
+            # What the chip says about the notifications right now, whatever put them there.
+            quiet_chip = mute_chip()
             # the notes, while they last: the frame's own title chip says which build this
             # pane is now, or what the keeper saw of it and did about it — reopened it, or
             # kept it because repair is off — then goes back to the pane's name (see
-            # `reload_note`, `reopen_note`)
+            # `reload_note`, `reopen_note`). A keypress outranks the keeper's note, being
+            # the newer thing the reader did; the mute itself is not a note at all, it is the
+            # chip's standing text (`quiet_chip`) until the switch is lifted.
             if reloaded and reloaded_until is None:
                 reloaded_until = now + RELOAD_NOTE_S
             if keeper_note and keeper_note_until is None:
                 keeper_note_until = now + RELOAD_NOTE_S
+            if key_note and key_note_until is None:
+                key_note_until = now + RELOAD_NOTE_S
             note = (reloaded if reloaded_until and now < reloaded_until
-                    else keeper_note if keeper_note_until and now < keeper_note_until else None)
-            text = render(
-                state,
-                color,
-                watching=watching,
-                width=width_of_default(),
-                idle_s=idle_s,
-                stale_after_s=stale_after_s,
-                goal_lines=args.goal_lines,
-                height=_shutil.get_terminal_size(fallback=(80, 24)).lines,
-                reloaded=note,
-            )
+                    else key_note if key_note_until and now < key_note_until
+                    else keeper_note if keeper_note_until and now < keeper_note_until
+                    else None)
+            try:
+                text = render(
+                    state,
+                    color,
+                    watching=watching,
+                    width=width_of_default(),
+                    idle_s=idle_s,
+                    stale_after_s=stale_after_s,
+                    goal_lines=args.goal_lines,
+                    height=_shutil.get_terminal_size(fallback=(80, 24)).lines,
+                    reloaded=note,
+                    mute_note=quiet_chip,
+                )
+            except Exception as exc:
+                # ...and the drawing half of the same tick, for the same reason: a frame the
+                # renderer cannot produce (the state is fine, the code is not) must leave a
+                # readable line behind, not an empty pane and a traceback on its way out.
+                note = f"{exc.__class__.__name__}: {exc}"
+                if note != poll_note:
+                    poll_note = note
+                    pane_log(f"pane cannot draw its frame: {note}")
+                text = f"fbtodo: cannot draw this frame — {note}"
             if args.once:
                 print(text)
                 return 0
@@ -2680,6 +2873,10 @@ def cmd_pane(args) -> int:
                 # ...and the note, so the chip goes back to the pane's own name on the tick
                 # it expires rather than whenever the frame next moves
                 note,
+                # ...and the mute chip, for the same reason: a keypress changes no row of the
+                # list, so without this the frame would sit there unchanged and the reader
+                # would not learn that the phone just went quiet.
+                quiet_chip,
             )
             if sig != last_sig or now - last_draw >= (
                 1.0 if has_running_clock(state, int(now * 1000)) else tick
@@ -2690,15 +2887,24 @@ def cmd_pane(args) -> int:
                 draw(text)
                 print(c_stale_notice(color, idle_s, stale_after_s))
                 return 0
-            if inst is not None:
-                saw_instance = True
-            elif saw_instance and not args.wait:
-                # the instance this pane was watching is gone: don't linger.
-                # --wait is for a pane whose real lifetime is the shell that owns
-                # it (an ssh into the remote host: freebuff can be run again in it).
-                draw(text)
-                print(c_notice(color))
-                return 0
+            # Nothing else ends a pane. Not an ended session, not an exited process.
+            #
+            # The pane's lifetime is its WINDOW's: Ctrl-C, the `--stale-after` line above, a
+            # window that goes away, `--once`. Every earlier version asked the SESSION too and
+            # closed on it — first the pid the pane had resolved, then, when that was found to
+            # be wrong for `auto` (a pane drawing the app's thread while the CLI that opened it
+            # had exited), the journal's own turn boundary. That second rule was closer, and
+            # still wrong for the same reason the first was: what the pane draws is a LIST, and
+            # a list whose session is over is a list somebody is still reading, finishing, or
+            # waiting on. A pane that leaves on its own takes the reader's eyes with it at the
+            # moment they are most likely to be looking — which is why "it keeps closing
+            # mid-run" survived both fixes (2026-10-03, then 2026-10-04).
+            #
+            # `--wait` used to be the way to opt OUT of this (a pane whose real owner was the
+            # shell around it). It no longer has to be, and it never said what the pane did
+            # instead — so it is still accepted, as a no-op, because a command line that
+            # already carries it must not start failing over a switch that now says what
+            # every pane already does.
             time.sleep(min(WAKE, max(0.05, next_poll - time.time())))
     except KeyboardInterrupt:
         restore()
@@ -2707,10 +2913,18 @@ def cmd_pane(args) -> int:
         if hide:
             sys.stderr.write("\x1b[?25h")
             sys.stderr.flush()
+        keys.close()
+        # A pane that exits holding a mute leaves a phone that never rings again, and the
+        # only key that fixes it is on the pane that just closed — so the exit gives the
+        # notifications back (a finished list, a dead session, Ctrl-C: all three are the
+        # read being over). `--once` never took a key, so it never hands one back.
+        if not args.once:
+            released = mute_release("the pane closed")
+            if released:
+                pane_log(f"pane: {released}")
 
 
-def c_notice(color: bool) -> str:
-    return paint(color)("2", "freebuff instance exited — fbtodo pane closing")
+
 
 
 def c_stale_notice(color: bool, idle_s: float, limit_s: float) -> str:
@@ -2719,6 +2933,91 @@ def c_stale_notice(color: bool, idle_s: float, limit_s: float) -> str:
         f"todo list idle {short_duration((idle_s or 0) * 1000)} "
         f"(limit {short_duration(limit_s * 1000)}) — fbtodo pane closing",
     )
+
+
+def cmd_mute(args) -> int:
+    """`fbtodo mute` — the pane's notification switch, without a keystroke.
+
+    The pane can mute its phone with `m`/`M`/`u` (`mute.py`), which is the fast way when
+    you are looking at the pane and the wrong way for everything else: a script, a status
+    row, another program's button, or a shell that is not a pane at all. So the same switch
+    is a command here, with the same words and the same files underneath — there is no
+    second implementation to drift.
+
+    Four verbs, and the fourth is the shape of the first three: `list` (or no verb) reports
+    what is in force, `on` mutes until told otherwise, `off` gives the notifications back,
+    and `until-done` mutes until the list this directory is working on is finished. That last
+    one is a PROMISE about a list, so it reads the list rather than assuming one: asked when
+    the list is already finished it says so and leaves the phone alone, because a mute whose
+    condition is already met is a mute nobody would have wanted. `until-done` is lifted by the
+    pane that watches the list (`auto_unmute`), which means by the next pane to run if none
+    is open now — and, unlike a mute a key took, it is NOT lifted by a pane merely closing:
+    `mute_release(only_mine=True)` is the pane's promise to itself, not the person's.
+
+    `--json` prints the same facts as a document (the switches with the word in each file
+    and whether the environment is what holds it, the record, and the chip the pane would be
+    showing). A switch that cannot be written is 73 — the file is the switch, and a switch
+    that could not be written is not a mute.
+    """
+    verb = getattr(args, "mute_verb", None)
+
+    def emit(state: dict, line: str) -> int:
+        if args.json:
+            json.dump(state, sys.stdout, ensure_ascii=False)
+            sys.stdout.write("\n")
+            return EX_CODES["ok"]
+        print(line)
+        return EX_CODES["ok"]
+
+    if verb in (None, "list"):
+        state = describe_mute()
+        if not state["muted"]:
+            return emit(state, "  notifications : on")
+        scope = state["scope"] or "off (set outside this pane)"
+        who = {"key": "a pane key", "command": "`fbtodo mute`"}.get(state["by"], "someone")
+        detail = []
+        for sw in state["switches"]:
+            if sw["off"]:
+                detail.append(f"{sw['what']} off" + (" by env" if sw["held_by_env"] else ""))
+        return emit(state, f"  notifications : off — {scope}, by {who}"
+                           f" ({'; '.join(detail) or 'nothing of ours'})")
+
+    if verb == "off":
+        rec = read_mute_record()
+        if not rec.get("until"):
+            # Nothing of ours to undo. Refusing here (rather than writing `on` over both
+            # files) is the same rule the `u` key follows: a switch this pane never wrote is
+            # not this command's to overwrite.
+            state = describe_mute()
+            if not state["muted"]:
+                return emit(state, "  notifications : on  (nothing of ours to undo)")
+        _chip, said = set_unmuted()
+        if said.startswith("no mute"):
+            return emit(describe_mute(), "  notifications : on  (nothing of ours to undo)")
+        return emit(describe_mute(), f"  notifications : on  ({said})")
+
+    # ...`on` and `until-done`: the switch itself. `until-done` is the one that has to know
+    # which list it is promising about, so it reads the state the pane would be showing —
+    # and only it does, because an ssh round trip is not the price of turning a bell off.
+    state = {}
+    if verb == "until-done":
+        cwd = os.path.realpath(os.getcwd())
+        try:
+            state = finish_probe(snapshot(args, cwd=cwd))
+        except Exception as exc:                      # noqa: BLE001 — a report is not a crash
+            print(f"fbtodo mute until-done: cannot read the list ({exc.__class__.__name__}) — "
+                  "muted until you say otherwise with `fbtodo mute off`", file=sys.stderr)
+            state = {}
+        if state and not state.get("error") and list_is_finished(state):
+            return emit(describe_mute(),
+                        f"  notifications : on  (the list is already finished — nothing to "
+                        f"wait for; `fbtodo mute on` if you meant it anyway)")
+    _chip, said = set_muted("list" if verb == "until-done" else "sticky", state, by="command")
+    if said.startswith("cannot write"):
+        print(f"fbtodo mute: {said}", file=sys.stderr)
+        return EX_CODES["cantcreat"]
+    scope = "until this list finishes" if verb == "until-done" else "until `fbtodo mute off`"
+    return emit(describe_mute(), f"  notifications : off — {scope} ({said})")
 
 
 def cmd_snap(args) -> int:
@@ -2731,11 +3030,7 @@ def cmd_snap(args) -> int:
 
 def cmd_json(args) -> int:
     st = read_json(STATE_PATH, None)
-    state = (
-        st
-        if state_is_fresh(st) and state_matches_request(st, args)
-        else finish_probe(snapshot(args))
-    )
+    state = st if cached_state_ok(st, args) else finish_probe(snapshot(args))
     if not state.get("error") and not state.get("task_times"):
         state = track_tasks(state)
     json.dump(state, sys.stdout, ensure_ascii=False)
@@ -2745,76 +3040,41 @@ def cmd_json(args) -> int:
 
 def cmd_bar(args) -> int:
     st = read_json(STATE_PATH, None)
-    state = (
-        st
-        if state_is_fresh(st) and state_matches_request(st, args)
-        else finish_probe(snapshot(args))
-    )
+    state = st if cached_state_ok(st, args) else finish_probe(snapshot(args))
     print(bar_text(state))
     return 0
-
-
-def nas_anchor_in_window(window: str | None, nas_host: str | None) -> str | None:
-    """The ssh pane a NAS list in THIS window belongs under, when exactly one login is in it.
-
-    Only panes already on this server are looked at — no ssh, no marker: a pin set at the
-    keyboard has to be answered at keyboard speed, and the watcher does the authoritative
-    placement while a session runs anyway. Several logins in one window is ambiguous (which
-    one runs `fb` takes the far side's marker), so the pin is left to the watcher then.
-    """
-    if not window or not nas_host:
-        return None
-    rows, table = pane_rows(), process_table()
-    here = [
-        cand["pane"] for cand in ssh_session_candidates(nas_host, rows, table)
-        if window_of(cand["pane"]) == window
-    ]
-    return here[0] if len(here) == 1 else None
-
-
-def apply_pin(window: str, role: str = "both", nas_host: str | None = None) -> list[str]:
+def apply_pin(window: str) -> list[str]:
     """Put this window's list panes where the pin now says; their ids back.
 
     Run when a pin is set, so the effect is visible at once instead of on the next keeper
-    pass, and with the same two halves the keeper and the NAS watcher enforce: the side the
-    pane sits on, and the size it holds. `role` limits it to one of them — that is what
-    `--role nas` is for, and a window holding both a session and an ssh has two panes.
+    pass, and with the same two halves the keeper enforces: the side the pane sits on, and
+    the size it holds.
     """
     rows, table = pane_rows(), process_table()
     rects = pane_rects()
+    layout = pane_layout(window)
     touched = []
-    for one in (("local", "nas") if role == "both" else (role,)):
-        layout = pane_layout(window, one)
-        anchors = []
-        if one == "local":
-            for inst, win in session_windows(rows, table).items():
-                if win != window:
-                    continue
-                inst_pane = freebuff_pane_id(inst, rows=rows, table=table)
-                if inst_pane:
-                    anchors.append((inst_pane, local_pane_ids(inst, rows, table)))
-        else:
-            anchor = nas_anchor_in_window(window, nas_host or NAS_HOST)
-            if anchor:
-                anchors.append(
-                    (anchor, [pane for pane in nas_pane_ids() if window_of(pane) == window])
-                )
-        for anchor, panes in anchors:
-            for pane in panes:
-                if place_pane_beside(pane, anchor, rects, layout["side"]):
-                    touched.append(pane)
-                    rects = pane_rects()
-                if resize_pane_to(pane, rects, layout["side"], layout["size"]):
-                    touched.append(pane)
-                    rects = pane_rects()
+    for inst, win in session_windows(rows, table).items():
+        if win != window:
+            continue
+        inst_pane = freebuff_pane_id(inst, rows=rows, table=table)
+        if not inst_pane:
+            continue
+        for pane in local_pane_ids(inst, rows, table):
+            if place_pane_beside(pane, inst_pane, rects, layout["side"]):
+                touched.append(pane)
+                rects = pane_rects()
+            if resize_pane_to(pane, rects, layout["side"], layout["size"]):
+                touched.append(pane)
+                rects = pane_rects()
     return touched
 
-def pane_reason(pane, role: str, window: str | None, anchor: str | None, rects: dict,
+def pane_reason(pane, window: str | None, anchor: str | None, rects: dict,
                 layout: dict, anchor_note: str) -> dict:
     """What decided one list pane's place: the rule, the anchor, and the numbers.
 
     Four answers, always the same four, because that is what a person asks about a pane:
-    which pane and role; where it should be (the anchor it is placed against, and the side
+    which pane; where it should be (the anchor it is placed against, and the side
     that decides which edge of it); what side and size are in force and which source
     supplied them; and whether it is actually there.
     """
@@ -2830,7 +3090,6 @@ def pane_reason(pane, role: str, window: str | None, anchor: str | None, rects: 
     placed = bool(pane and anchor) and placed_beside(anchor, pane, rects, kept["side"])
     return {
         "pane": pane,
-        "role": role,
         "elsewhere": elsewhere,
         "window_id": window,
         "window": layout["window"] or (window or ""),
@@ -2860,42 +3119,29 @@ def why_records(pins: dict | None = None, last: dict | None = None) -> list[dict
     last = load_last() if last is None else last
     records = []
     for inst, window in session_windows(rows, table).items():
-        layout = pane_layout(window, "local", pins, last)
+        layout = pane_layout(window, pins, last)
         anchor = freebuff_pane_id(inst, rows=rows, table=table)
+        starts = {row["pane"]: row["start"] for row in rows}
+        # The pin to judge by is the SESSION's, read from its own process — not this shell's.
+        # `why` can be typed in any shell, and a pane the keeper would leave alone must not
+        # read as stale just because that shell spells a value differently (`session_pinned_env`).
+        wanted = session_pinned_env(inst, rows, table)
         panes = local_pane_ids(inst, rows, table) or [None]
         for pane in panes:
-            records.append(
-                pane_reason(pane, "local", window, anchor, rects, layout, f"freebuff pid {inst}")
-            )
-    # The NAS half needs no ssh: the panes are on this server, and the ssh anchor is the
-    # login already sitting here. WHICH login runs `fb` over there takes the marker on the
-    # far side, so with several candidates the record says which rule the watcher applies.
-    cands = ssh_session_candidates(NAS_HOST)
-    nas_window = None
-    nas_panes = nas_pane_ids()
-    for pane in nas_panes:
-        if nas_window is None:
-            nas_window = window_of(pane)
-            layout = pane_layout(nas_window, "nas", pins, last)
-            if len(cands) == 1:
-                anchor, note = cands[0]["pane"], f"the only ssh login to {NAS_HOST}"
-            elif cands:
-                anchor, note = None, (
-                    f"{len(cands)} ssh logins ({', '.join(c['pane'] for c in cands)}) — "
-                    "the watcher picks the newest that began before the session"
-                )
-            else:
-                anchor, note = None, f"no ssh login to {NAS_HOST} on this server"
-        records.append(pane_reason(pane, "nas", nas_window, anchor, rects, layout, note))
+            rec = pane_reason(pane, window, anchor, rects, layout, f"freebuff pid {inst}")
+            # A pane captured before this build's pin: the keeper's upgrade will rewrite its
+            # recorded command on the next pass, so `why` says so rather than leaving the
+            # reader to wonder why a pane it described a moment ago is suddenly different.
+            rec["stale_pin"] = bool(pane and stale_pin(starts.get(pane, ""), wanted))
+            records.append(rec)
     return records
 
 
 def cmd_why(args) -> int:
     """Say why every list pane is where it is — the rule, the anchor, and the numbers.
 
-    The pane keeper moves panes and the NAS watcher opens them, and both answer to the same
-    four things: the window's pin (that role's own, then the window's shared one), what the
-    pane was left at last time, FBTODO_SPLIT / FBTODO_PANE_SIZE, and the built-in default.
+    The pane keeper moves panes and opens them, and both answer to the same
+    four things: the window's pin, what the pane was left at last time, FBTODO_SPLIT / FBTODO_PANE_SIZE, and the built-in default.
     Which one won is invisible in a layout that merely looks right — and the first question
     when one is wrong — so this prints, per pane, the side and size in force WITH the source
     that supplied them, the pane it is placed against, and whether it is actually there.
@@ -2947,15 +3193,20 @@ def cmd_why(args) -> int:
                 ", placed" if rec["placed"] else ", MISPLACED (a pass moves it back)"
             )
             tail += f"  {rec['now']}"
-        print(f"{rec['window']:<12} {rec['role']:<5} {rec['pane'] or '(none)':<6} {rule}")
-        print(f"{'':<12} {'':<5} {'':<6} {tail} — {rec['anchor_note']}")
+        print(f"{rec['window']:<12} {rec['pane'] or '(none)':<6} {rule}")
+        print(f"{'':<12} {'':<6} {tail} — {rec['anchor_note']}")
+        if rec.get("stale_pin"):
+            print(f"{'':<12} {'':<6} on an OLDER PIN than this build writes — the keeper "
+                  "reopens it on the current one (`@fbtodo_repair off` keeps it)")
     bad = [
         rec["pane"] for rec in records
         if rec["pane"] and not rec["placed"] and not rec["elsewhere"]
     ]
+    stale = [rec["pane"] for rec in records if rec.get("stale_pin")]
     print(
         f"{len(records)} list pane(s), {len(bad)} misplaced"
         + (f": {' '.join(bad)} — tell the keeper to move them: fbtodo pane-watch --once" if bad else "")
+        + (f"; {len(stale)} on an older pin: {' '.join(stale)}" if stale else "")
     )
     return 0
 
@@ -2970,13 +3221,8 @@ def cmd_pin(args) -> int:
     `fbtodo-pins.json` in the state directory, and the pane keeper enforces both halves — the side it
     splits on and puts a drifted pane back on, and the size it resizes back to.
 
-    `--role` says which list pane it is for: `local` (a session's), `nas` (the one a NAS
-    ssh pulls in), or `both` (the default) for the window's shared answer. A window holding
-    both needs the distinction — the two panes need not be the same size — so the role's own
-    pin outranks the shared one for that pane, and only that one.
-
-    Bare `fbtodo pin` reports what this window is set to, per role, and where each half came
-    from (a pin, the remembered size, FBTODO_SPLIT/FBTODO_PANE_SIZE, or the default);
+    Bare `fbtodo pin` reports what this window is set to and where each half came from
+    (a pin, the remembered size, FBTODO_SPLIT/FBTODO_PANE_SIZE, or the default);
     `--list` reports every pin; `--clear` drops the window's pin whole; `--side auto` and
     `--size 0` drop one half of it.
     """
@@ -2992,14 +3238,15 @@ def cmd_pin(args) -> int:
         for key in sorted(pins):
             entry = pins[key] if isinstance(pins[key], dict) else {}
             state = "live" if window_key(key) else "no such window"
-            shared = [f"{f}={entry[f]}" for f in ("side", "size") if entry.get(f)]
-            print(f"{key:<16} {'both':<6} {' '.join(shared) or '-':<16} {state}")
-            for one in ("local", "nas"):
-                sub = entry.get(one)
-                sub = sub if isinstance(sub, dict) else {}
-                got = [f"{f}={sub[f]}" for f in ("side", "size") if sub.get(f)]
-                if got:
-                    print(f"{key:<16} {one:<6} {' '.join(got):<16} {state}")
+            # A pin written while there were two list panes per window filed its answer
+            # under the role that owned it; `local` is this window's only pane now, so the
+            # half is reported with the flat one rather than dropped.
+            scoped = entry.get("local")
+            scoped = scoped if isinstance(scoped, dict) else {}
+            flat = {f: entry[f] for f in ("side", "size") if entry.get(f)}
+            flat.update({f: scoped[f] for f in ("side", "size") if scoped.get(f)})
+            got = [f"{f}={flat[f]}" for f in ("side", "size") if flat.get(f)]
+            print(f"{key:<16} {' '.join(got) or '-':<16} {state}")
         return 0
     window = (getattr(args, "window", None) or "").strip()
     if not window:
@@ -3014,19 +3261,16 @@ def cmd_pin(args) -> int:
         )
         return EX_CODES["nofile"]
     entry = dict(pins.get(key)) if isinstance(pins.get(key), dict) else {}
-    role = getattr(args, "role", None) or "both"
     if args.clear:
         had = key in pins
         pins.pop(key, None)
         save_pins(pins)
-        apply_pin(window, nas_host=args.nas_host)
+        apply_pin(window)
         if not args.quiet:
             print(f"{key}: {'pin cleared' if had else 'nothing was pinned'}")
         return 0
     asked = args.side is not None or args.size is not None
-    # `both` writes the window's shared halves — what every pin written before there was a
-    # role is; `local`/`nas` write that role's own, which outranks the shared one for it.
-    target = entry if role == "both" else dict(entry.get(role) or {})
+    target = entry
     if getattr(args, "side", None):
         if args.side == "auto":
             target.pop("side", None)
@@ -3040,26 +3284,19 @@ def cmd_pin(args) -> int:
             target.pop("size", None)
         else:
             target["size"] = args.size
-    if role != "both":
-        if target:
-            entry[role] = target
-        else:
-            entry.pop(role, None)
     if asked:
         if entry:
             pins[key] = entry
         else:
             pins.pop(key, None)
         save_pins(pins)
-    roles = ("local", "nas") if role == "both" else (role,)
-    layouts = {one: pane_layout(window, one, pins) for one in roles}
-    touched = list(dict.fromkeys(apply_pin(window, role, args.nas_host))) if asked else []
-    first = layouts["local" if "local" in layouts else roles[0]]
+    layout = pane_layout(window, pins)
+    touched = list(dict.fromkeys(apply_pin(window))) if asked else []
     if args.json:
         json.dump(
             {
-                "window": key, "role": role, "pin": entry, "layouts": layouts,
-                "side": first["side"], "size": first["size"], "panes": touched,
+                "window": key, "pin": entry, "layout": layout,
+                "side": layout["side"], "size": layout["size"], "panes": touched,
             },
             sys.stdout, ensure_ascii=False,
         )
@@ -3068,13 +3305,10 @@ def cmd_pin(args) -> int:
     if args.quiet:
         return 0
     lines = [f"{key}  ({'pinned' if entry else 'nothing pinned'})"]
-    for one, layout in layouts.items():
-        lines.append(
-            f"  {one:<5} side={layout['side']}"
-            f" ({source_note(layout['side_source'], key)})"
-            f"  size={layout['size']}"
-            f" ({source_note(layout['size_source'], key)})"
-        )
+    lines.append(
+        f"  side={layout['side']} ({source_note(layout['side_source'], key)})"
+        f"  size={layout['size']} ({source_note(layout['size_source'], key)})"
+    )
     if touched:
         lines.append(f"  list pane {', '.join(touched)} re-placed")
     print("\n".join(lines))
@@ -3082,6 +3316,35 @@ def cmd_pin(args) -> int:
 
 
 # ======================================================================== main
+def cmd_dead(args) -> int:
+    """List every stretch of code this build's own source proves can never run.
+
+    In plain words: the reload probe holds a rebuild the moment `unreachable_code` names one
+    dead branch, but it only names the FIRST — enough to refuse the build, not enough to fix
+    it. This is the same two passes over the whole package with every finding kept, so the
+    shape of the problem is visible in one look: a statement stranded after a `return`, a
+    constant-false branch, a comparison of literals that is false, or a branch an earlier
+    guard (or `assert`) already settled. `--json` is the same rows for a script, and the exit
+    is nonzero when anything is found — the same fact the probe acts on.
+    """
+    findings = dead_code()
+    if args.json:
+        json.dump({"version": VERSION, "count": len(findings), "findings": findings},
+                  sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return EX_CODES["ok"] if not findings else EX_CODES["ex_software"]
+    if not findings:
+        if not args.quiet:
+            print(f"fbtodo dead  {VERSION}: nothing unreachable")
+        return EX_CODES["ok"]
+    plural = "" if len(findings) == 1 else "s"
+    print(f"fbtodo dead  {VERSION}  ({len(findings)} finding{plural})")
+    for found in findings:
+        print(f"  {found['path']}:{found['line']}")
+        print(f"      {found['why']}")
+    return EX_CODES["ex_software"]
+
+
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="fbtodo",
@@ -3090,12 +3353,13 @@ def build_parser():
     )
     ap.add_argument("command", nargs="?", default="pane",
                     choices=["pane", "snap", "json", "bar", "daemon", "stop", "status",
-                             "prune", "nas", "pane-watch", "pin", "why", "ledger", "doctor",
-                             "push", "init", "keep", "locks"])
-    ap.add_argument("keep_verb", nargs="?", default=None, metavar="on|off|default",
-                    choices=["on", "off", "default"],
-                    help="keep: on resumes the pane-repair, off keeps a drifted pane as it is, "
-                         "default removes the choice again (omitted: print what is in force)")
+                             "prune", "pane-watch", "pin", "why", "ledger", "doctor",
+                             "push", "init", "keep", "locks", "dead", "board", "mute"])
+    ap.add_argument("verb", nargs="?", default=None, metavar="VERB",
+                    help="the command's own verb (omitted: print what is in force): "
+                         "keep: on resumes the pane-repair, off keeps a drifted pane as it "
+                         "is, default removes the choice again; "
+                         "mute: on/off switch the notifications (see `fbtodo mute --help`)")
     ap.add_argument("--pane", dest="keep_pane", metavar="ID",
                     help="keep: the pane whose knob to read or set (default: the pane you are in)")
     ap.add_argument("--server", dest="keep_server", action="store_true",
@@ -3110,6 +3374,19 @@ def build_parser():
         help="estimates: 0..1, how much a WAITING step's wording counts against the list's "
              "pace (0 = pace only, 1 = wording only; FBTODO_BLEND_WEIGHT)",
     )
+    # --- the board: every live session in one pane. The three knobs are the same questions
+    # the single-session pane answers with `--threads` / `--thread-live`, asked about the
+    # machine instead of one store: how many sessions to draw, how quiet one may be and still
+    # count as live, and how many of its steps to show.
+    ap.add_argument("--board-max", type=int, default=BOARD_MAX, metavar="N",
+                    help=f"board: how many live sessions to draw (default {BOARD_MAX})")
+    ap.add_argument("--board-live", type=int, default=BOARD_LIVE_MS // 60_000, metavar="MIN",
+                    help="board: how quiet a session's store may be and still count as live "
+                         f"(default {BOARD_LIVE_MS // 60_000} minutes; 0 = no window)")
+    ap.add_argument("--board-rows", type=int, default=BOARD_ROWS, metavar="N",
+                    help=f"board: steps drawn per session (default {BOARD_ROWS})")
+    ap.add_argument("--live", action="store_true",
+                    help="board: keep redrawing in place instead of printing once")
     ap.add_argument("--days", type=float, metavar="N",
                     help="ledger: how far back to list (default 60, the retention window)")
     ap.add_argument("--limit", type=int, default=20, metavar="N",
@@ -3121,6 +3398,11 @@ def build_parser():
     ap.add_argument("-h", "--help", action="store_true")
     ap.add_argument("-V", "--version", action="store_true")
     ap.add_argument("--once", action="store_true", help="pane: render once and exit")
+    ap.add_argument(
+        "--no-keys",
+        action="store_true",
+        help="pane: ignore the keyboard, so m/M/u do nothing (FBTODO_PANE_KEYS=off)",
+    )
     ap.add_argument("--tick", type=float, default=5.0,
                     help="pane: repaint at least this often while nothing moves "
                          "(1s while a step's clock is counting up, 1s for a store "
@@ -3129,39 +3411,17 @@ def build_parser():
                     help="pane: close after MIN minutes of no store activity (0 = never)")
     ap.add_argument("-i", "--interval", type=float, default=1.0,
                     help="pane, status --watch, locks --watch: seconds between polls (the "
-                         "clock repaints far more often than this; 5s for -s nas; "
-                         "locks --watch polls every 5s by default)")
+                         "clock repaints far more often than this; locks --watch polls "
+                         "every 5s by default)")
     ap.add_argument(
         "-s", "--source", default="auto", metavar="SOURCE",
-        help="where the list comes from: auto, cli, nas, desktop, or file:PATH (a state "
+        help="where the list comes from: auto, cli, desktop, or file:PATH (a state "
              "JSON on disk, the same shape `fbtodo push` writes)",
     )
     ap.add_argument(
         "--to", dest="push_to", metavar="PATH",
         help="push: write this state file instead of the live state (the list a `-s file:PATH` "
              "then reads back)",
-    )
-    ap.add_argument(
-        "--nas-host", default=NAS_HOST, metavar="USER@HOST",
-        help="nas: ssh target holding the freebuff store (FBTODO_NAS; required for -s nas)",
-    )
-    ap.add_argument(
-        "--nas-root", default=NAS_ROOT, metavar="DIR",
-        help="nas: remote projects directory (FBTODO_NAS_ROOT; required for -s nas)",
-    )
-    ap.add_argument(
-        "--nas-project", default=NAS_PROJECT, metavar="NAME",
-        help="nas: project name inside that directory (FBTODO_NAS_PROJECT; required for -s nas)",
-    )
-    ap.add_argument(
-        "--fb-marker",
-        default=os.environ.get("FBTODO_FB_MARKER") or "$HOME/.fb-session",
-        help="nas: the host `fb` wrapper's session marker (pid, started, dir), read on the NAS",
-    )
-    ap.add_argument(
-        "--wait",
-        action="store_true",
-        help="pane: stay open when the session goes away (a remote pane is closed with its ssh)",
     )
     ap.add_argument(
         "--goal-lines",
@@ -3173,7 +3433,10 @@ def build_parser():
     ap.add_argument("--chat")
     ap.add_argument("--cli-root", default=DEFAULT_CLI_ROOT)
     ap.add_argument("-p", "--project")
-    ap.add_argument("--db", default=DEFAULT_DB_GLOB)
+    ap.add_argument("--db", default=DEFAULT_DB_GLOB,
+                    help="desktop store glob; a path with no `*` names ONE store (and skips "
+                         "the walk below), else auto takes this directory's own project, "
+                         "deepest first, and -s desktop walks up")
     ap.add_argument("--state", default=DEFAULT_WORKSPACE_STATE)
     ap.add_argument("-t", "--thread")
     ap.add_argument("--last", action="store_true")
@@ -3182,7 +3445,7 @@ def build_parser():
     # them running at once: `--threads` is how many the pane stacks (the one it follows
     # included, 0 for that one alone) and `--thread-live` how quiet a thread's own list may
     # be and still be one of them (0 = no window at all). Neither means anything to a
-    # journal, a NAS session or a file, which have exactly one list by construction.
+    # journal or a file, which have exactly one list by construction.
     ap.add_argument("--threads", type=int, default=DESKTOP_MAX_THREADS)
     ap.add_argument("--thread-live", type=int, default=DESKTOP_LIVE_MS // 60_000)
     ap.add_argument("-f", "--foreground", action="store_true", help="daemon: don't detach")
@@ -3206,24 +3469,12 @@ def build_parser():
     ap.add_argument("--no-input", action="store_true",
                     help="never prompt — a confirmation that cannot be asked is refused (66)")
     ap.add_argument("--no-daemon", action="store_true", help="pane: read stores directly")
-    # --- the NAS pane watcher (`nas`): a local daemon because `fb` over there cannot
-    # reach this Mac's tmux, so something here has to notice the session starting.
-    ap.add_argument("--stop", action="store_true", help="nas: stop the pane watcher")
-    ap.add_argument("--status", action="store_true", help="nas: the watcher, the session, and the pane")
-    ap.add_argument("--poll", type=float,
-                    default=float(os.environ.get("FBTODO_NAS_POLL") or 5.0),
-                    help="nas: seconds between polls while you are at the keyboard")
-    ap.add_argument("--poll-idle", type=float,
-                    default=float(os.environ.get("FBTODO_NAS_POLL_IDLE") or 60.0),
-                    help="nas: seconds between polls when no tmux client is attached")
-
-    ap.add_argument("--poll-live", type=float, default=2.5,
-                    help="nas: seconds between polls while a NAS session runs")
+    # `--wait` was the way to opt out of a pane closing itself; nothing closes itself now, so
+    # it says nothing. It is still accepted rather than dropped, because a command line that
+    # already carries it must not start failing over a switch whose meaning became the default.
     ap.add_argument(
-        "--notify-seconds", type=float,
-        default=float(os.environ.get("FBTODO_NOTIFY_SECONDS") or 15.0),
-        help="nas: ask the phone notifier this often while a session runs (0 = never; "
-             "it is skipped when ~/.config/freebuff-notify/todo-bell.py is missing)",
+        "--wait", action="store_true",
+        help="pane: no-op, and the default — a pane does not close itself",
     )
     ap.add_argument(
         "--pause-seconds", type=float,
@@ -3249,7 +3500,7 @@ def build_parser():
         "--ask-seconds", type=float,
         default=float(os.environ.get("FBTODO_ASK_SECONDS") or 3.0),
         help="watcher: look for a freebuff pane waiting on a question this often, "
-             "local and NAS alike (0 = never; it is skipped when "
+             "0 = never; it is skipped when "
              "~/.config/freebuff-notify/ask-bell.py is missing)",
     )
     # --- per-window pins (`pin`): where the list pane goes in THIS window, and how big
@@ -3257,25 +3508,19 @@ def build_parser():
                     help="pin: v puts the list below the session, h beside it, auto unpins the side")
     ap.add_argument("--size", type=int, metavar="N",
                     help="pin: keep the list pane N lines (0 unpins the size)")
-    ap.add_argument("--role", choices=["local", "nas", "both"], default="both",
-                    help="pin: which list pane the pin is for — a session's (`local`), the "
-                         "one a NAS ssh pulls in (`nas`), or the window's shared answer "
-                         "for any of them (`both`, the default)")
     ap.add_argument("--window", metavar="TARGET",
                     help="pin, why, keep: the tmux window to act on (default: the pane "
                          "you are in)")
     ap.add_argument("--list", action="store_true", help="pin: every pin, and whether its window exists")
     ap.add_argument("--clear", action="store_true", help="pin: drop this window's pin")
     ap.add_argument("--dry-run", action="store_true",
-                    help="nas: say what it would do, change nothing; init: show without "
+                    help="init: show without "
                          "writing; locks --fix: plan without changing anything")
     ap.add_argument("--shell", metavar="SHELL", default=None,
                     help="init: shell to configure (bash, zsh, ksh, mksh, dash, sh, fish; "
                          "default: detected from $SHELL, then the parent process)")
     ap.add_argument("--startup-file", metavar="PATH", default=None,
                     help="init: startup file to edit, for a shell not in the table")
-    ap.add_argument("--idle-exit", type=float, default=30.0, metavar="MIN",
-                    help="nas: quit after MIN of no session and no client (0 = run forever)")
     ap.add_argument("--instance-pid", type=int, help="daemon: watch this pid (internal)")
     ap.add_argument("--watch-pid", type=int, help="treat this pid as the instance (internal)")
     ap.add_argument("--instance-of", type=int, metavar="PID",
@@ -3293,9 +3538,12 @@ def probe_answer() -> int:
     would have replaced a running image with that time bomb in the meantime. The probe
     therefore exercises what it safely can and interrogates the rest: it BUILDS THE COMMAND
     PARSER (the entry point every invocation goes through, so its own body and every default
-    it computes are executed), then asks `undefined_global_names` the deep question — does
-    every name the package's functions load as a global still exist? A missing one is printed
-    for the caller's log and the exit is nonzero, so the caller HOLDS.
+    it computes are executed), then asks the two questions the parse can answer about what
+    an import never touches. `undefined_global_names`: does every name the package's
+    functions load as a global still exist? And `unreachable_code`: does its own source
+    prove that some of it can never run — a statement after a `return`, a constant-false
+    branch? Either answer is printed for the caller's log and the exit is nonzero, so the
+    caller HOLDS.
 
     Nothing is claimed, moved or written here: this runs before `init_state_root`, the first
     thing that touches disk, and the parser is built without ever reading the real argv. A
@@ -3305,6 +3553,10 @@ def probe_answer() -> int:
     missing = undefined_global_names()
     if missing:
         print(f"fbtodo: this build uses a name it never defines — {missing}", file=sys.stderr)
+        return EX_CODES["ex_software"]
+    dead = unreachable_code()
+    if dead:
+        print(f"fbtodo: this build has code it can never run — {dead}", file=sys.stderr)
         return EX_CODES["ex_software"]
     return 0
 
@@ -3330,10 +3582,28 @@ def main(argv=None) -> int:
     if extra:
         print(f"unexpected arguments: {' '.join(extra)}", file=sys.stderr)
         return EX_CODES["usage"]
-    if args.keep_verb is not None and args.command != "keep":
-        print(f"unexpected argument: {args.keep_verb!r} — on/off/default belong to `keep`",
-              file=sys.stderr)
-        return EX_CODES["usage"]
+    args.keep_verb = getattr(args, "keep_verb", None)
+    args.mute_verb = None
+    if args.verb is not None:
+        # One positional, several commands' verbs: argparse would hand `mute on` to the
+        # FIRST positional (whose choices are `keep`'s), so the words are routed here
+        # instead, where each command's own list is checked. A verb on a command that has
+        # none, and a word that is not one of its verbs, are both the caller's usage error
+        # (64) — the same answer the choices= used to give, from one place.
+        allowed = {"keep": ("on", "off", "default"),
+                   "mute": ("on", "off", "list", "until-done")}.get(args.command)
+        if not allowed:
+            print(f"unexpected argument: {args.verb!r} — {args.command} takes no verb",
+                  file=sys.stderr)
+            return EX_CODES["usage"]
+        if args.verb not in allowed:
+            print(f"fbtodo {args.command}: {args.verb!r} is not a verb here — "
+                  f"{' / '.join(allowed)}", file=sys.stderr)
+            return EX_CODES["usage"]
+        if args.command == "keep":
+            args.keep_verb = args.verb
+        else:
+            args.mute_verb = args.verb
     if args.watch and args.command not in ("status", "locks"):
         print("unexpected argument: --watch — it belongs to `status` and `locks`",
               file=sys.stderr)
@@ -3348,6 +3618,13 @@ def main(argv=None) -> int:
     if args.restart and not args.fix:
         print("unexpected argument: --restart — it belongs to `locks --fix`", file=sys.stderr)
         return EX_CODES["usage"]
+    if args.live and args.command != "board":
+        print("unexpected argument: --live — it belongs to `board`", file=sys.stderr)
+        return EX_CODES["usage"]
+    if args.live and args.json:
+        print("unexpected arguments: --json with --live — one is a document, the other a pane",
+              file=sys.stderr)
+        return EX_CODES["usage"]
     if args.help:
         print(__doc__)
         return 0
@@ -3361,20 +3638,13 @@ def main(argv=None) -> int:
     # `-s` is a word or a `file:PATH`, so the word set is checked here rather than by
     # argparse's choices: a typo is the caller's usage error (64), and a `file:` prefix
     # must reach `sources_for` instead of being rejected before it.
-    if args.source not in ("auto", "cli", "nas", "desktop") and not source_path(args.source):
-        print(f"fbtodo: unknown source {args.source!r} — expected auto, cli, nas, desktop, "
+    if args.source not in ("auto", "cli", "desktop") and not source_path(args.source):
+        print(f"fbtodo: unknown source {args.source!r} — expected auto, cli, desktop, "
               "or file:PATH", file=sys.stderr)
         return EX_CODES["ex_usage"]
     if args.command == "locks" and args.watch and args.interval <= 1.0:
         # One poll is a full audit — every claim file plus the process table — and a finding
-        # is worth hearing within seconds, not within one: the same floor, and the same
-        # reasoning, as the NAS poll below.
-        args.interval = 5.0
-    if args.source == "nas" and args.interval <= 1.0:
-        # One ssh per poll, and the pane no longer needs a poll to move its own numbers:
-        # the clock and the "N ago" repaint locally (see the pane loop), so the store is
-        # reached every 5s — half the ssh traffic of the old 2.5s — while the pane still
-        # looks alive every second.
+        # is worth hearing within seconds, not within one.
         args.interval = 5.0
     os.makedirs(SCRATCH, mode=0o700, exist_ok=True)
     # A `file:PATH` state is an ingress like push, so the same caps apply and a payload over
@@ -3404,6 +3674,8 @@ def main(argv=None) -> int:
         return cmd_stop(args)
     if args.command == "keep":
         return cmd_keep(args)
+    if args.command == "mute":
+        return cmd_mute(args)
     if args.command == "locks":
         return cmd_locks(args)
     if args.command == "status":
@@ -3414,14 +3686,16 @@ def main(argv=None) -> int:
         return cmd_prune(args)
     if args.command == "ledger":
         return cmd_ledger(args)
-    if args.command == "nas":
-        return cmd_nas(args)
     if args.command == "pane-watch":
         return cmd_pane_watch(args)
     if args.command == "pin":
         return cmd_pin(args)
     if args.command == "why":
         return cmd_why(args)
+    if args.command == "dead":
+        return cmd_dead(args)
+    if args.command == "board":
+        return cmd_board(args)
     return EX_CODES["usage"]
 
 

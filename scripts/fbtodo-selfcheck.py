@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import types
+import unicodedata
 
 HOME = os.path.expanduser("~")
 # This suite lives in `scripts/`; the checkout it drives is the directory above it, so the
@@ -37,7 +38,56 @@ HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 FB = os.path.join(ROOT, "fbtodo")
-TEST_HOME = os.path.join(HOME, ".freebuff", "fbtodo-test")
+# PER RUN, not one shared directory. The suite wipes its state root at the start and removes
+# it at the end, so two runs — a second shell's, or the one this session starts while the
+# first is still going — used to delete each other's claims, state files and logs mid-check,
+# and the loser failed on missing files it had just created (measured: `FileNotFoundError`
+# on `fbtodo-state.json`, and a watcher that "never took its lock" because the other run
+# had just removed the directory under it). A pid in the name makes the runs independent;
+# a crashed run leaves its own directory behind rather than anyone's, and the sweep below
+# takes those only once they are demonstrably stale.
+TEST_HOME = os.path.join(HOME, ".freebuff", f"fbtodo-test-{os.getpid()}")
+
+
+def sock(name: str) -> str:
+    """A tmux socket name this run alone can be holding.
+
+    Every pane check drives its own private tmux server, and the names were fixed strings, so
+    two runs shared them: each killed the other's server on the way in AND on the way out, so
+    a concurrent suite destroyed the panes its sibling was about to inspect (measured: `keep`
+    printing no repair line at all, because the pane it named no longer existed). The pid in
+    the name makes the servers private the same way the state root now is — and the cleanup
+    can then kill only what this run started.
+    """
+    return f"{name}-{os.getpid()}"
+
+
+def sweep_stale_test_homes(older_than_s: float = 24 * 3600.0) -> int:
+    """How many abandoned `fbtodo-test-<pid>` directories this sweep removed.
+
+    A run killed mid-phase cannot clean up after itself, and a directory nobody owns is the
+    one thing a shared root could not have. Only directories whose own mtime is older than the
+    bound go: a run that is merely slow has just written to it, so it is never mistaken for
+    a corpse.
+    """
+    base = os.path.join(HOME, ".freebuff")
+    removed = 0
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return 0
+    for name in names:
+        if not (name.startswith("fbtodo-test-") and name != os.path.basename(TEST_HOME)):
+            continue
+        path = os.path.join(base, name)
+        try:
+            if time.time() - os.stat(path).st_mtime < older_than_s:
+                continue
+            shutil.rmtree(path)
+            removed += 1
+        except OSError:
+            continue
+    return removed
 REAL_HOME = os.path.join(HOME, ".freebuff")
 PANES = os.path.join(ROOT, "fbtodo")
 # The program is the package under `src/`; `FB` above is the launcher beside it, which is
@@ -78,7 +128,7 @@ os.environ["FBTODO_HOME"] = TEST_HOME
 # shell's environment), and a real watcher reading the fixture's dead-looking session
 # pushes "freebuff dropped" to the owner's phone: measured 2026-09-22, three spurious
 # pairs while this suite ran. `/usr/bin/true` answers every notifier contract well enough
-# for phases that only assert a watcher came up; the NAS block below points its own
+# for phases that only assert a watcher came up; the block below points its own
 # commands at logged stubs instead.
 MUTE = shutil.which("true") or "/usr/bin/true"
 for _var in ("FBTODO_NOTIFY", "FBTODO_DROP", "FBTODO_ASK", "FBTODO_PAUSE", "FBTODO_PANE_BELL"):
@@ -94,14 +144,10 @@ PATCH_HOME = os.path.join(TEST_HOME, "patchlogs")
 PATCH_FIXTURE = os.path.join(PATCH_HOME, "watch.log")
 ALERT_FIXTURE = os.path.join(PATCH_HOME, "phone.log")
 META_FIXTURE = os.path.join(PATCH_HOME, "freebuff-metadata.json")
-NAS_PATCH_FIXTURE = os.path.join(PATCH_HOME, "nas-patch.log")
-NAS_ALERT_FIXTURE = os.path.join(PATCH_HOME, "nas-notify.log")
 for _key, _val in (
     ("FBTODO_PATCH_LOG", PATCH_FIXTURE),
     ("FBTODO_ALERT_LOG", ALERT_FIXTURE),
     ("FBTODO_PATCH_META", META_FIXTURE),
-    ("FBTODO_NAS_PATCH_LOG", NAS_PATCH_FIXTURE),
-    ("FBTODO_NAS_ALERT_LOG", NAS_ALERT_FIXTURE),
 ):
     os.environ[_key] = _val
     env[_key] = _val
@@ -190,10 +236,12 @@ ok = []
 START = time.monotonic()  # the suite's clock; `say()` reports each check's cost against it
 
 
-def run(*args, timeout=30, check=False):
+def run(*args, timeout=30, check=False, cwd=CWD):
+    # `cwd` is the directory the command is asked ABOUT (`auto` resolves a source from it);
+    # nearly every check wants the throwaway home, and the few that do not say so.
     p = subprocess.run(
         [sys.executable, FB, *args], capture_output=True, text=True, env=env,
-        cwd=CWD, timeout=timeout,
+        cwd=cwd, timeout=timeout,
     )
     if check and p.returncode != 0:
         raise AssertionError(f"{args} -> {p.returncode}\n{p.stdout}\n{p.stderr}")
@@ -217,7 +265,8 @@ def say(msg):
     """Report a passing check, and — with FBTODO_SELFCHECK_TIME=1 — what it cost.
 
     The suite takes 90-160 s and the reason is not obvious from the outside (real tmux
-    servers, keeper passes, NAS fixtures), so the elapsed seconds since the last check go
+    servers, keeper passes, notifier fixtures), so the elapsed seconds since the last
+    check go
     on the line: `[+12.4s 3m21s]`. That is how the expensive phases are found instead of
     guessed at.
     """
@@ -341,7 +390,7 @@ def kill_tree(proc) -> None:
 #
 #   python3 scripts/fbtodo-selfcheck.py --list
 #   python3 scripts/fbtodo-selfcheck.py --only local-session
-#   python3 scripts/fbtodo-selfcheck.py --only 1 --only "nas pane"
+#   python3 scripts/fbtodo-selfcheck.py --only 1 --only "local session"
 SUBSET_GUARD = "FBTODO_SELFCHECK_SUBSET"  # set for the re-run, so it does not recurse
 PHASE_MARK = "#@phase "
 
@@ -430,22 +479,19 @@ def selector_run() -> None:
 
 selector_run()
 
+sweep_stale_test_homes()
 if os.path.exists(TEST_HOME):
     shutil.rmtree(TEST_HOME)
 os.makedirs(TEST_HOME, mode=0o700)
-# ...but a wiped test home is not a fresh machine: a NAS pane watcher started by an earlier
-# run's fixture ssh is not tied to the directory, and a run that dies before that phase's own
-# cleanup leaves it polling forever against a path this run has just recreated. Found
-# 2026-09-29: an 8-minute-old `fbtodo nas -f` (pid 15961, fixture ssh under the test home) was
-# still rewriting fbtodo-nas-pane.json on every poll, so `nas --stop` said "not running" while
-# `--status` read a live-looking state and the nas-live phase went red on a healthy machine —
-# with four runs spent proving it was not the code under test. Only watchers whose argv names
-# the fixture ssh are touched; the owner's real nas watcher does not mention this path.
+# ...but a wiped test home is not a fresh machine: a watcher started by an earlier
+# run is not tied to the directory, and a run that dies before its own cleanup leaves it
+# polling forever against a path this run has just recreated. Only processes whose argv names
+# this home are touched; the owner's own watchers never mention this path.
 for _line in subprocess.run(
     ["ps", "-Ao", "pid=,args="], capture_output=True, text=True
 ).stdout.splitlines():
     _pid, _, _args = _line.strip().partition(" ")
-    if TEST_HOME in _args and "fbtodo nas" in _args:
+    if TEST_HOME in _args and "fbtodo" in _args:
         try:
             os.kill(int(_pid), signal.SIGTERM)
         except (OSError, ValueError):
@@ -465,12 +511,6 @@ with open(ALERT_FIXTURE, "w") as fh:
     fh.write(f"{PATCH_FIXTURE_STAMP} phone: sent ntfy freebuff done · fixture\n")
 with open(META_FIXTURE, "w") as fh:
     json.dump({"version": "9.9.9-fixture", "target": "darwin-arm64"}, fh)
-with open(NAS_PATCH_FIXTURE, "w") as fh:
-    fh.write("2026-01-01T00:00:00Z converge=ok patch=incomplete binary=9.9.9-nas [1 bytes]\n")
-    fh.write("    freebuff: local CLI patches incomplete (no window for fixture-window);"
-             " the rest were applied\n")
-with open(NAS_ALERT_FIXTURE, "w") as fh:
-    fh.write('2026-01-01 00:00:01 sent ntfy incomplete (2f14bfcf14a4d794) — http 200 {"id":"x"}\n')
 
 try:
     state_path = os.path.join(TEST_HOME, "fbtodo-state.json")
@@ -507,10 +547,18 @@ try:
     time.sleep(0.2)
 
     # ---- daemon starts, watches the victim, refreshes the state file
+    # The desktop glob is NAMED as one that matches nothing, and this is the same reason the
+    # json/bar/snap check below names its own: this daemon follows a session whose `--cwd` is
+    # the home directory, and on the owner's machine the app's store for THAT directory is
+    # live and being written — so `auto` answers from it and this fixture's own journal, which
+    # is what the check is about, is never read (measured 2026-10-04: the watcher answered
+    # `backend: desktop` with the operator's session on screen). A fixture that cannot be
+    # asserted about is not a fixture.
+    no_desk = os.path.join(TEST_HOME, "no-desktop", "*.db")
     daemon = subprocess.Popen(
         [sys.executable, FB, "daemon", "--foreground", "--quiet",
          "--instance-pid", str(victim.pid), "--cwd", CWD, "-i", "0.2",
-         "--cli-root", cli_root],
+         "--cli-root", cli_root, "--db", no_desk],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL, start_new_session=True, env=env, cwd=CWD,
     )
@@ -725,15 +773,22 @@ try:
     finally:
         kill_tree(daemon_g)
         kill_tree(victim_g)
-        shutil.rmtree(gone_root, ignore_errors=True)
-
-    # ---- json/bar/snap contracts, against the same fixture root the watcher read: the
-    # operator's live session is not a fixture and cannot be asserted about.
-    j = json.loads(run("json", "--cli-root", cli_root).stdout)
+        shutil.rmtree(gone_root, ignore_errors=True)# ---- json/bar/snap contracts, against the same fixture root the watcher read: the
+    #      operator's live session is not a fixture and cannot be asserted about.
+    #      ...which is also why the desktop glob is NAMED here, as one that matches nothing:
+    #      `auto` at the home directory prefers a LIVE desktop thread over a CLI journal
+    #      that finished days ago (a pane following this very session is such a thread), so
+    #      with the machine's own default glob this check was answering from the operator's
+    #      store and went red on a healthy machine — measured 2026-10-04, twice, on a live
+    #      session, with the fixture root it was given sitting right there unused. The
+    #      assertion is unchanged; only the question stops depending on what else is running.
+    j = json.loads(run("json", "--cli-root", cli_root, "--db", no_desk).stdout)
     assert j.get("backend") == "cli" and j.get("todos"), j
-    bar_out = run("bar", "--cli-root", cli_root).stdout
+    bar_out = run("bar", "--cli-root", cli_root, "--db", no_desk).stdout
     assert bar_out.strip().startswith("todos "), bar_out
-    assert "no conversation DB found" not in run("snap", "--cli-root", cli_root).stderr
+    assert "no conversation DB found" not in run(
+        "snap", "--cli-root", cli_root, "--db", no_desk
+    ).stderr
     say("json / bar / snap subcommands: ok")
 
     # ---- the golden files: the same three contracts, byte for byte. Their own fixture
@@ -1137,17 +1192,22 @@ try:
         "and what clearing takes — without writing anything, its own claim included: ok")
 
     # ---- and the command over the state root's own files: the watcher's leftover, the
-    #      keeper's claim held by this process, the NAS file absent — text and JSON say the
-    #      same four facts, and the run does not change a byte (flush the rows, then read
-    #      the files back)
+    #      keeper's claim held by this process, and a file that is not there at all —
+    #      text and JSON say the same facts, and the run does not change a byte (flush
+    #      the rows, then read the files back). The absent one is asked FIRST, while the
+    #      keeper has not claimed anything: a role with no file is a real answer, and the
+    #      only way to see one is for there to be one.
     module.atomic_write_json(module.LOCK_PATH, {"pid": dead_pid_audit, "cwd": CWD,
                                                 "started_ms": 0, "instance_pid": None,
                                                 "version": module.VERSION})
+    bare = STRIP(run("locks").stdout)
+    assert "watcher" in bare and "leftover" in bare, bare
+    assert "no file — no claim" in bare, bare
+    assert json.loads(run("locks", "--json").stdout)["claims"][1]["state"] == "absent", \
+        json.loads(run("locks", "--json").stdout)["claims"]
     module.atomic_write_json(module.PANE_KEEPER_PATH, {"pid": os.getpid(), "cwd": CWD,
                                                        "started_ms": 0, "instance_pid": None,
                                                        "version": module.VERSION})
-    if os.path.exists(module.NAS_LOCK_PATH):
-        os.unlink(module.NAS_LOCK_PATH)
     audit_fd = module.lock_open(module.PANE_KEEPER_PATH)
     assert module.lock_take(audit_fd), "the keeper claim could not be locked"
     module._LOCK_FDS[module.PANE_KEEPER_PATH] = audit_fd
@@ -1159,7 +1219,6 @@ try:
         out = STRIP(ran.stdout)
         assert "watcher" in out and "leftover" in out, out
         assert "keeper" in out and f"pid {os.getpid()}" in out and "held by" in out, out
-        assert "nas pane" in out and "no file — no claim" in out, out
         doc = json.loads(run("locks", "--json").stdout)
         by_role = {c["role"]: c for c in doc["claims"]}
         assert by_role["watcher"]["state"] == "free", by_role["watcher"]
@@ -1169,12 +1228,11 @@ try:
         assert by_role["keeper"]["pid"] == os.getpid() and by_role["keeper"]["pid_alive"], \
             by_role["keeper"]
         assert by_role["keeper"]["name_inode"] == "match", by_role["keeper"]
-        assert by_role["nas pane"]["state"] == "absent", by_role["nas pane"]
         after_audit = {p: open(p, "rb").read()
                        for p in (module.LOCK_PATH, module.PANE_KEEPER_PATH)}
         assert after_audit == before_audit, "the audit wrote to a claim file"
-        say("locks: the command audits the watcher's leftover, the held keeper and the "
-            "absent NAS file — text and JSON, and not a byte written: ok")
+        say("locks: the command audits the watcher's leftover, the held keeper and an absent "
+            "file — text and JSON, and not a byte written: ok")
     finally:
         module.clear_lock(path=module.PANE_KEEPER_PATH)
         if os.path.exists(module.LOCK_PATH):
@@ -1221,11 +1279,10 @@ try:
         900: (1, f"{sys.executable} /p/fbtodo daemon --foreground --quiet --cwd /x"),
         901: (1, f"{sys.executable} /p/fbtodo pane-watch --foreground --quiet"),
         902: (1, f"{sys.executable} /p/fbtodo daemon --foreground"),
-        903: (1, f"{sys.executable} /p/fbtodo nas -f --quiet"),
+        903: (1, f"{sys.executable} /p/fbtodo daemon --foreground --quiet --cwd /y"),
         904: (1, "/usr/sbin/distnoted daemon"),
         905: (1, f"{sys.executable} /p/fbtodo/__init__.py pane-watch --quiet"),
         906: (1, f"{sys.executable} /p/fbtodo daemon --quiet"),
-        907: (1, f"{sys.executable} /p/fbtodo nas --quiet"),
         908: (1, f"{sys.executable} /p/fbtodo daemon --foreground --quiet"),
     }
     saved_ages = module.ages_for
@@ -1235,7 +1292,8 @@ try:
         by_pid = {p["pid"]: p for p in procs}
         assert set(by_pid) == {900, 901, 903, 905, 908}, by_pid
         assert by_pid[900]["role"] == "watcher" and by_pid[901]["role"] == "keeper", by_pid
-        assert by_pid[903]["role"] == "nas pane" and by_pid[905]["role"] == "keeper", by_pid
+        assert by_pid[903]["role"] == "watcher" and by_pid[905]["role"] == "keeper", by_pid
+        assert 906 not in by_pid, "a bare spawn that only STARTS a watcher is not one"
         assert by_pid[900]["root"] == TEST_HOME and by_pid[900]["age_s"] == 400, by_pid[900]
         # the launcher-less copy's python is its own line's, read not assumed
         assert by_pid[905]["python"] == sys.executable, by_pid[905]
@@ -1250,7 +1308,7 @@ try:
         assert by_pid[908]["root"] == TEST_HOME and by_pid[908]["env_clipped"] is False, \
             by_pid[908]
         assert by_pid[900]["env_clipped"] is False, by_pid[900]
-        say("locks: the cross-check finds the watcher, keeper and NAS watcher running with "
+        say("locks: the cross-check finds the watcher and keeper running with "
             "this state root — launcher or entry file alike — leaves another root's "
             "processes alone, and ignores the bare spawns that only START a watcher: ok")
         # ---- the environment read itself. `ps -Eww` answers with a command line whether or
@@ -1339,11 +1397,10 @@ try:
         # and a healthy held claim is left entirely alone.
         fix_rows = [
             ("watcher", {"state": "free", "leftover": True, "path": "/p/daemon.pid"}),
-            ("keeper", {"state": "free", "leftover": False, "path": "/p/keeper.pid"}),
-            ("nas pane", {"state": "free", "leftover": True, "path": "/p/nas.pid"}),
+            ("keeper", {"state": "free", "leftover": True, "path": "/p/keeper.pid"}),
         ]
         clears, kills, skipped = module.locks_fix_plan(fix_rows, [by_pid[900], by_pid[903]])
-        assert [label for label, _e in clears] == ["watcher", "nas pane"], clears
+        assert [label for label, _e in clears] == ["watcher", "keeper"], clears
         assert [p["pid"] for _l, p in kills] == [900], kills
         assert [p["pid"] for _l, p in skipped] == [903], skipped
         held_rows = [("watcher", {"state": "held", "leftover": False,
@@ -1362,6 +1419,38 @@ try:
         while time.time() < limit and not pred():
             time.sleep(0.1)
         return pred()
+
+    def poll_bound(interval_s: float, ticks: int = 3, startup_s: float = 10.0) -> float:
+        """How long to wait for something a polling child announces, as ITS clock says.
+
+        A fixed 20 s is a guess that only holds when the machine is idle: a child told to poll
+        every six seconds needs two ticks for `open` then `clear`, and on a loaded machine
+        (this suite beside another one, an agent turn, a watcher reloading) its own ticks come
+        late — so the bound has to be the interval it was given, times the ticks the check
+        waits for, plus enough for the process to start at all. Derived from the same number
+        the child was launched with, a check cannot drift away from it.
+        """
+        return interval_s * ticks + startup_s
+
+    def hold_window(checks: int = 4) -> float:
+        """How long to watch a reloading child prove that it did NOT reload.
+
+        The window is the child's own clocks: a file it must first stop seeing being written
+        (`SOURCE_SETTLE_S`) and then several of its build checks to notice. A fixed `sleep(2.5)`
+        was both too short to catch a late reload on a loaded machine — so the check passed
+        vacuously — and pure dead time in every run. Waiting out the real interval and then
+        requiring the count to be unchanged is both stronger and the same length.
+        """
+        return module.SOURCE_SETTLE_S + checks * module.BUILD_CHECK_S
+
+    def quiet_for(pred, seconds: float) -> bool:
+        """True when `pred` stayed false for the whole window: a NON-event, asserted."""
+        limit = time.time() + seconds
+        while time.time() < limit:
+            if pred():
+                return False
+            time.sleep(0.1)
+        return True
 
     # ---- ...and the safety read that uses the same two-source rule. `keeper_aim` asks every
     #      live `pane-watch` process for its state root and tmux server, and a bare `ps -Eww`
@@ -1457,8 +1546,8 @@ try:
                     "pid_alive": False, "leftover": False, "name_inode": None}),
         ("watcher", {"path": "/p/fbtodo-daemon.pid", "state": "free", "pid": os.getpid(),
                      "pid_alive": True, "leftover": True, "name_inode": "mismatch"}),
-        ("nas pane", {"path": "/p/fbtodo-nas-pane.pid", "state": "free", "pid": 1,
-                      "pid_alive": False, "leftover": True, "name_inode": "mismatch"}),
+        ("keeper", {"path": "/p/fbtodo-pane-keeper.pid", "state": "free", "pid": 1,
+                    "pid_alive": False, "leftover": True, "name_inode": "mismatch"}),
         ("legacy keeper", {"path": "/old/fbtodo-pane-keeper.pid", "state": "held", "pid": 900,
                            "pid_alive": True, "leftover": False, "name_inode": "match"}),
     ]
@@ -1475,7 +1564,8 @@ try:
         module.locks_watch_line("open", found[f"tie:watcher:{os.getpid()}"]), found
     # ...and the two states that are NOT findings: a dead pid in a free record (the next ask
     # clears it, and it is not a live tie), and a held claim that names its own holder.
-    assert not [k for k in found if k.startswith("tie:nas")], "a dead leftover was a tie"
+    # The keeper's own row above is that dead-pid case.
+    assert not [k for k in found if k.startswith("tie:keeper")], "a dead leftover was a tie"
     assert not [k for k in found if k.startswith("tie:legacy")], found
     # ...and a watch does not report itself: this process is a live pid too.
     self_row = module.locks_findings(watch_rows, [dict(by_pid[901], pid=os.getpid(),
@@ -1509,28 +1599,41 @@ try:
         except (OSError, ValueError):
             return []
 
+    # The watch is told to poll every 6 s, and the check below waits for TWO of its events
+    # (`open`, then `clear`), so the bound is its own interval rather than a fixed 20 s that
+    # only holds on an idle machine (measured: this check failing under load, with the events
+    # arriving a tick or two after the bound did).
+    WATCH_I = 6
+    watch_bound = poll_bound(WATCH_I, ticks=3)
     try:
         with open(watch_log, "w") as handle:
             watcher = subprocess.Popen(
-                [sys.executable, FB, "locks", "--watch", "--json", "-i", "6"],
+                [sys.executable, FB, "locks", "--watch", "--json", "-i", str(WATCH_I)],
                 env={**env, "FBTODO_LOCKS_BELL": stub_bell}, stdout=handle,
                 stderr=subprocess.DEVNULL, cwd=CWD,
             )
             try:
                 key = f"tie:watcher:{os.getpid()}"
                 assert soon(lambda: any(e["event"] == "open" and e["key"] == key
-                                        for e in watch_events())), watch_events()
+                                        for e in watch_events()), watch_bound), watch_events()
                 opened = next(e for e in watch_events() if e["key"] == key and
                               e["event"] == "open")
                 assert opened["kind"] == "tie" and opened["pid"] == os.getpid(), opened
                 assert isinstance(opened["at_ms"], int), opened
-                assert soon(lambda: os.path.exists(asked)), "the watch never asked the kit"
+                assert soon(lambda: os.path.exists(asked), watch_bound), \
+                    "the watch never asked the kit"
                 os.unlink(lock_path)  # the tie is whole again: no file, no tie
                 assert soon(lambda: any(e["event"] == "clear" and e["key"] == key
-                                        for e in watch_events())), watch_events()
-                time.sleep(1.0)
-                assert [e["event"] for e in watch_events() if e["key"] == key] == \
-                    ["open", "clear"], watch_events()
+                                        for e in watch_events()), watch_bound), watch_events()
+                # ...and the SEQUENCE, not the tally: the finding is announced once when it
+                # appears and once when it is gone, in that order. Compared as a list of the
+                # events this key ever had, so a re-announcement on a later tick is caught
+                # while an event about some other finding (or an extra tick's silence) is not
+                # mistaken for one.
+                time.sleep(WATCH_I / 2)
+                seq = [e["event"] for e in watch_events() if e["key"] == key]
+                assert seq[0] == "open" and seq[-1] == "clear" and set(seq) <= {"open", "clear"}, (
+                    seq)
                 with open(asked) as fh:
                     asks = fh.read().splitlines()
                 assert asks and len(asks) == 1, asks  # once per new finding, not per tick
@@ -1635,7 +1738,7 @@ try:
         [sys.executable, os.path.join(build, "fbtodo"), "daemon", "--foreground", "--quiet",
          "--cwd", CWD, "--instance-pid", str(victim_rl.pid), "-i", "0.2",
          "--ask-seconds", "0", "--pause-seconds", "0", "--pane-seconds", "0",
-         "--pane-bell-seconds", "0"],
+         "--pane-bell-seconds", "0", "--db", no_desk],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
         start_new_session=True, env=env, cwd=CWD,
     )
@@ -1649,12 +1752,31 @@ try:
             time.sleep(0.1)
         return pred()
 
+    def stale_window_bound(minutes: float = 0.05, startup_s: float = 20.0) -> float:
+        """How long a pane asked to close on a STALE window may be given to do it.
+
+        The window is the subject's own clock and the test sets it: `--stale-after 0.05` is
+        three seconds, and the pane has to start, find its source, notice the store has
+        stopped moving, and exit. A flat `+ 25` cannot say whether it is slack or luck — it
+        was the same number on both sides of a check that waits for the reader's window and
+        one that waits for a process to settle, and only one of them had a window at all.
+        """
+        return minutes * 60.0 + startup_s
+
     def log_text() -> str:
         try:
             with open(module.LOG_PATH) as fh:
                 return fh.read()
         except OSError:
             return ""
+
+    # Every reload below is counted from HERE, not from zero. The log is this run's, so it can
+    # already hold reloads from an earlier phase (or from a watcher this check did not start),
+    # and an absolute `== 2` is then waiting for a number that will never arrive — a check
+    # that fails on the state of the world rather than on the behaviour. Relative, it asserts
+    # what it means to: one more reload happened, and none happened while the tree was broken.
+    reloaded = lambda: log_text().count("watcher reloading:")  # noqa: E731
+    reloads_at_start = reloaded()
 
     try:
         deadline = time.time() + 10
@@ -1668,6 +1790,7 @@ try:
         with open(os.path.join(reload_src, "zz_reload.py"), "w") as fh:
             fh.write("x = 1\n")
         assert wait_for(lambda: "watcher reloading:" in log_text()), log_text()[-400:]
+        assert reloaded() >= reloads_at_start + 1, log_text()[-400:]
         beat = beats()
         assert repl.poll() is None and os.path.exists(lock_path), "the reload took it down"
         assert module.lock_holder(lock_path) == repl.pid, "the claim changed hands across a reload"
@@ -1676,13 +1799,14 @@ try:
         with open(os.path.join(reload_src, "zz_broken.py"), "w") as fh:
             fh.write("def half(\n")
         assert wait_for(lambda: "watcher holding" in log_text()), log_text()[-400:]
-        time.sleep(2.5)
+        assert quiet_for(lambda: reloaded() != reloads_at_start + 1, hold_window()), (
+            "it reloaded into a broken file")
         assert repl.poll() is None, "the watcher died on a source that does not parse"
-        assert log_text().count("watcher reloading:") == 1, "it reloaded into a broken file"
+        assert module.lock_holder(lock_path) == repl.pid, "the claim moved on a held reload"
         os.remove(os.path.join(reload_src, "zz_broken.py"))
         with open(os.path.join(reload_src, "zz_reload2.py"), "w") as fh:
             fh.write("y = 2\n")
-        assert wait_for(lambda: log_text().count("watcher reloading:") == 2), log_text()[-400:]
+        assert wait_for(lambda: reloaded() >= reloads_at_start + 2), log_text()[-400:]
         assert module.lock_holder(lock_path) == repl.pid and repl.poll() is None
         beat = beats()
         assert wait_for(lambda: beats() > beat), "the second reload left nobody serving"
@@ -1691,7 +1815,7 @@ try:
         os.rename(os.path.join(build, "fbtodo"), os.path.join(build, "fbtodo.gone"))
         with open(os.path.join(reload_src, "zz_reload3.py"), "w") as fh:
             fh.write("z = 3\n")
-        assert wait_for(lambda: log_text().count("watcher reloading:") == 3), log_text()[-400:]
+        assert wait_for(lambda: reloaded() >= reloads_at_start + 3), log_text()[-400:]
         assert repl.poll() is None and module.lock_holder(lock_path) == repl.pid
         beat = beats()
         assert wait_for(lambda: beats() > beat), "the launcher-less reload left nobody serving"
@@ -1710,15 +1834,17 @@ try:
         assert wait_for(lambda: "does not load" in log_text()), log_text()[-500:]
         assert module.source_syntax_error(here=render_copy) is None, \
             "the unloadable tree does not parse cleanly, so the probe was not what held it"
-        time.sleep(2.5)
+        held_at = reloaded()
+        assert quiet_for(lambda: reloaded() != held_at, hold_window()), (
+            "it reloaded into an unfit build")
         assert repl.poll() is None, "the watcher exec'd into a build that will not load"
         assert module.lock_holder(lock_path) == repl.pid, "the claim moved on a held reload"
-        assert log_text().count("watcher reloading:") == 3, "it reloaded into an unfit build"
+        assert reloaded() == reloads_at_start + 3, "it reloaded into an unfit build"
         # ...and once the tree is coherent again, the SAME watcher reloads into it — the hold
         # is a wait, not a surrender.
         with open(render_copy, "w") as fh:
             fh.write(render_orig)
-        assert wait_for(lambda: log_text().count("watcher reloading:") == 4), log_text()[-500:]
+        assert wait_for(lambda: reloaded() >= reloads_at_start + 4), log_text()[-500:]
         assert repl.poll() is None and module.lock_holder(lock_path) == repl.pid
         beat = beats()
         assert wait_for(lambda: beats() > beat), "the recovered reload left nobody serving"
@@ -1877,9 +2003,8 @@ try:
     #      the pane and the daemon would then disagree about where the state lives. Only `base`,
     #      which owns them, may hold them.
     state_path_names = {
-        "SCRATCH", "STATE_PATH", "TASKS_PATH", "LOCK_PATH", "LOG_PATH", "NAS_LOCK_PATH",
-        "PANE_KEEPER_PATH", "PANE_LOG_PATH", "PINS_PATH", "LAST_PATH", "NAS_STATE_PATH",
-        "NAS_LOG_PATH",
+        "SCRATCH", "STATE_PATH", "TASKS_PATH", "LOCK_PATH", "LOG_PATH",
+        "PANE_KEEPER_PATH", "PANE_LOG_PATH", "PINS_PATH", "LAST_PATH",
     }
 
     def _import_time_names(node) -> list:
@@ -2041,9 +2166,287 @@ try:
     named = module.reload_probe_error(here=name_base)
     assert named and "FBTODO_PROBE_MISSING_NAME" in named and "_probe_bait" in named, named
     shutil.rmtree(name_build, ignore_errors=True)
-    assert module.undefined_global_names() is None, "the checkout names everything it uses"
+    # Read from a SNAPSHOT of the tree, not from the checkout the suite happens to be run
+    # in: this parses every source file, and anything writing the checkout while the suite
+    # runs — an agent turn in this very repo, an IDE save — can leave a half-written file
+    # under the reader, which then fails a check about the build rather than about the code
+    # (measured 2026-10-04: `the checkout names everything it uses` failing on a tree that
+    # named everything a minute earlier). The names are still resolved against the live
+    # namespaces, so the question is still "does the code we RUN name everything it uses".
+    globals_snap = os.path.join(TEST_HOME, "globals-snap")
+    shutil.rmtree(globals_snap, ignore_errors=True)
+    shutil.copytree(os.path.join(ROOT, "src", "fbtodo"), os.path.join(globals_snap, "fbtodo"))
+    snap_error = module.undefined_global_names(
+        here=os.path.join(globals_snap, "fbtodo", "base.py"))
+    assert snap_error is None, f"the checkout names everything it uses: {snap_error}"
+    assert module.undefined_global_names() is None, (
+        "the build that is running names everything it uses")
     say("the reload probe: a function body's globals are resolved too — a name used only "
         "inside a command that was never called still fails the pre-flight: ok")
+
+    # ---- ...and a tree whose names all resolve can still contain code its own SOURCE proves
+    #      will never run: a statement after a `return`, a whole `if False:` branch, a body
+    #      under `while False:`. That is invisible to an import — it is valid Python and it
+    #      compiles — so nothing else notices that a path the source describes never happens.
+    #      The probe answers it from the parse too, and only from certainties; the controls
+    #      are the LIVE shapes (`while True:` with a `break`, an `if x:`), so the check cannot
+    #      pass by calling live code dead. The bait is chosen so the failure is the dead part,
+    #      not a missing name: `_PROBE_NEVER` is assigned, just never reached.
+    dead_build = os.path.join(TEST_HOME, "probe-dead-build")
+    shutil.rmtree(dead_build, ignore_errors=True)
+    os.makedirs(dead_build)
+    shutil.copytree(os.path.join(ROOT, "src", "fbtodo"),
+                    os.path.join(dead_build, "src", "fbtodo"))
+    shutil.copy(os.path.join(ROOT, "fbtodo"), os.path.join(dead_build, "fbtodo"))
+    dead_base = os.path.join(dead_build, "src", "fbtodo", "base.py")
+    with open(dead_base, "a", encoding="utf-8") as fh:
+        fh.write("\ndef _probe_live(x):\n    while True:\n        if x:\n            return 1\n"
+                 "        break\n    return 2\n")
+    assert module.reload_probe_error(here=dead_base) is None, \
+        "a live loop and a live branch were read as code that can never run"
+    with open(dead_base, "a", encoding="utf-8") as fh:
+        fh.write("\ndef _probe_dead():\n    return 1\n    _PROBE_NEVER = 2\n")
+    assert module.source_syntax_error(here=dead_base) is None, \
+        "the bait tree does not parse, so this would test the parser instead"
+    held = module.reload_probe_error(here=dead_base)
+    assert held and "unreachable" in held and "after the return" in held, held
+    shutil.copy(os.path.join(ROOT, "src", "fbtodo", "base.py"), dead_base)
+    with open(dead_base, "a", encoding="utf-8") as fh:
+        fh.write("\ndef _probe_branch(x):\n    if False:\n        return x\n    return 3\n")
+    assert module.source_syntax_error(here=dead_base) is None, \
+        "the branch bait does not parse, so this would test the parser instead"
+    held = module.reload_probe_error(here=dead_base)
+    assert held and "unreachable" in held and "constant-false" in held, held
+
+    #      ...including a test that is a COMPARISON of literals, which the parse can fold
+    #      (`if 1 > 2:`, `while 0 == 1:`, a chained `0 < 1 < 0`) — and only when every
+    #      operand is a literal. A comparison against a NAME, an `in` that cannot be made
+    #      (`1 in 2`), and `is`/`is not` (identity is not a value question) are left alone;
+    #      the controls must pass, so folding can never call a live branch dead.
+    shutil.copy(os.path.join(ROOT, "src", "fbtodo", "base.py"), dead_base)
+    with open(dead_base, "a", encoding="utf-8") as fh:
+        fh.write("\ndef _probe_cmp_live(x, y):\n    if x > 2:\n        return x\n"
+                 "    if 1 < x:\n        return 1\n    if 1 in y:\n        return 3\n"
+                 "    if 1 in 2:\n        return 4\n    return 0\n")
+    assert module.reload_probe_error(here=dead_base) is None, \
+        "a comparison against a name, or one that cannot be made, was read as a constant"
+    with open(dead_base, "a", encoding="utf-8") as fh:
+        fh.write("\ndef _probe_cmp_dead():\n    if 0 < 1 < 0:\n        return 1\n    return 0\n")
+    held = module.reload_probe_error(here=dead_base)
+    assert held and "unreachable" in held and "constant-false" in held, held
+
+    #      ...and the parse reasons about a GUARD as well as a literal: inside one function
+    #      `if P: <leaves>` means P is false for every line below it, so a later `if P:` can
+    #      never run and a later `if not P:` can never take its `else`; an `assert P` makes
+    #      the same promise by the other route, so P is already true below it. The fact is
+    #      carried into any block the guard DOMINATES (a `with`/`if`/`try` body, a handler,
+    #      and a loop body — but a loop gets only the facts its own assignments leave
+    #      standing) and never across a scope. The promise is only made where it cannot be
+    #      wrong — the guard must leave on every path, the test may read nothing but locals
+    #      this function binds, and nothing between the two may rebind one of them — so the
+    #      controls below are exactly those refusals: a rebinding, a module global, a closure
+    #      cell, an attribute, a call, a guard that does not always leave, and a loop that
+    #      assigns the name (so a later pass through the body could have moved it). A loop the
+    #      body does NOT disturb is the opposite: a place the fact is carried into, and its
+    #      own baits follow.
+    shutil.copy(os.path.join(ROOT, "src", "fbtodo", "base.py"), dead_base)
+    with open(dead_base, "a", encoding="utf-8") as fh:
+        fh.write('''
+_PROBE_MODE = None
+
+
+def _probe_live_rebind(x):
+    if x is None:
+        return None
+    x = 5
+    if x is None:
+        return 1
+    return 0
+
+
+def _probe_live_global():
+    if _PROBE_MODE is None:
+        return 2
+    if _PROBE_MODE is None:
+        return 3
+    return 0
+
+
+def _probe_live_attr(other):
+    if other.h is None:
+        return 4
+    if other.h is None:
+        return 5
+    return 0
+
+
+def _probe_live_call(y):
+    if y.get() is None:
+        return 6
+    if y.get() is None:
+        return 7
+    return 0
+
+
+def _probe_live_partial(x, y):
+    if x is None:
+        if y:
+            return 8
+    if x is None:
+        return 9
+    return 0
+
+
+def _probe_live_closure(y):
+    z = 1
+
+    def _inner():
+        if y is None:
+            return 12
+        if y is None:
+            return 13
+
+    return _inner, z
+
+
+def _probe_live_assert_global():
+    assert _PROBE_MODE is None
+    if _PROBE_MODE is None:
+        return 14
+    return 0
+
+
+def _probe_live_assert_attr(other):
+    assert other.h is None
+    if other.h is None:
+        return 15
+    return 0
+
+
+def _probe_live_assert_call(y):
+    assert y.get() is None
+    if y.get() is None:
+        return 16
+    return 0
+
+
+def _probe_live_assert_rebind(x):
+    assert x is None
+    x = 5
+    if x is None:
+        return 17
+    return 0
+
+
+def _probe_live_for_rebind(x, y):
+    assert x is not None
+    for _i in y:
+        x = 5
+        if x is None:
+            return 18
+    return 0
+
+
+def _probe_live_for_target(x, y):
+    assert x is not None
+    for x in y:
+        if x is None:
+            return 19
+    return 0
+''')
+    assert module.reload_probe_error(here=dead_base) is None, \
+        "a guard's promise outlived a rebinding, a global, a closure, an attribute, a call, " \
+        "or a loop that assigns the name"
+    with open(dead_base, "a", encoding="utf-8") as fh:
+        fh.write("\ndef _probe_guard_dead(x):\n    if x is None:\n        return None\n"
+                 "    if x is None:\n        return 1\n    return 2\n")
+    held = module.reload_probe_error(here=dead_base)
+    assert held and "unreachable" in held and "guard on line" in held, held
+    shutil.copy(os.path.join(ROOT, "src", "fbtodo", "base.py"), dead_base)
+    with open(dead_base, "a", encoding="utf-8") as fh:
+        fh.write("\ndef _probe_guard_neg(x):\n    if x is None:\n        return None\n"
+                 "    if x is not None:\n        return 1\n    else:\n        return 2\n")
+    held = module.reload_probe_error(here=dead_base)
+    assert held and "unreachable" in held and "negated" in held, held
+    #      The same fact is carried into a block the guard DOMINATES, so a third look at the
+    #      test is caught there too — in a `with` body and in a `try` handler. What must NOT
+    #      be caught is unchanged: the controls above already prove a rebinding, a global, an
+    #      attribute, a call and a loop that assigns the name all stay silent.
+    shutil.copy(os.path.join(ROOT, "src", "fbtodo", "base.py"), dead_base)
+    with open(dead_base, "a", encoding="utf-8") as fh:
+        fh.write("\ndef _probe_guard_nested(x):\n    if x is None:\n        return None\n"
+                 "    with open('f') as h:\n        if x is None:\n            return 1\n"
+                 "    return 2\n")
+    held = module.reload_probe_error(here=dead_base)
+    assert held and "unreachable" in held and "guard on line" in held, held
+    shutil.copy(os.path.join(ROOT, "src", "fbtodo", "base.py"), dead_base)
+    with open(dead_base, "a", encoding="utf-8") as fh:
+        fh.write("\ndef _probe_guard_handler(x):\n    if x is None:\n        return None\n"
+                 "    try:\n        pass\n    except ValueError:\n"
+                 "        if x is None:\n            return 1\n    return 2\n")
+    held = module.reload_probe_error(here=dead_base)
+    assert held and "unreachable" in held and "guard on line" in held, held
+    #      An `assert` makes the same promise by the other route: control continues past it
+    #      only when its test held, so the same test is already true and its negation already
+    #      false. Both arrows are proved, and each names the `assert` it came from.
+    shutil.copy(os.path.join(ROOT, "src", "fbtodo", "base.py"), dead_base)
+    with open(dead_base, "a", encoding="utf-8") as fh:
+        fh.write("\ndef _probe_assert_dead(x):\n    assert x is not None\n"
+                 "    if x is None:\n        return 1\n    return 0\n")
+    held = module.reload_probe_error(here=dead_base)
+    assert held and "unreachable" in held and "`assert`" in held \
+        and "already false here" in held, held
+    shutil.copy(os.path.join(ROOT, "src", "fbtodo", "base.py"), dead_base)
+    with open(dead_base, "a", encoding="utf-8") as fh:
+        fh.write("\ndef _probe_assert_same(x):\n    assert x is not None\n"
+                 "    if x is not None:\n        return 1\n    else:\n        return 2\n")
+    held = module.reload_probe_error(here=dead_base)
+    assert held and "unreachable" in held and "`assert`" in held \
+        and "already true here" in held, held
+    #      A LOOP body is entered too, and only with the facts its own assignments leave
+    #      standing: a test settled before the loop and repeated inside the body is caught,
+    #      while one the body could have moved is not (the controls above). Both `for` and
+    #      `while` are proved, and the `else` suite of a loop counts as well.
+    shutil.copy(os.path.join(ROOT, "src", "fbtodo", "base.py"), dead_base)
+    with open(dead_base, "a", encoding="utf-8") as fh:
+        fh.write("\ndef _probe_for_dead(x, y):\n    assert x is not None\n"
+                 "    for _i in y:\n        if x is None:\n            return 1\n    return 0\n")
+    held = module.reload_probe_error(here=dead_base)
+    assert held and "unreachable" in held and "`assert`" in held \
+        and "already false here" in held, held
+    shutil.copy(os.path.join(ROOT, "src", "fbtodo", "base.py"), dead_base)
+    with open(dead_base, "a", encoding="utf-8") as fh:
+        fh.write("\ndef _probe_while_dead(x, y):\n    if x is None:\n        return None\n"
+                 "    while y:\n        if x is None:\n            return 1\n    return 2\n")
+    held = module.reload_probe_error(here=dead_base)
+    assert held and "unreachable" in held and "guard on line" in held, held
+    #      ...and `fbtodo dead` is the SAME two passes with every finding kept, not only the
+    #      first the probe refuses on. The build under test here already carries the `while`
+    #      bait; one more stranded statement makes two, so the subcommand must name BOTH
+    #      (not stop at one), end nonzero, and answer `--json` with the same rows — while
+    #      this checkout itself has nothing to list, exactly as `unreachable_code` says.
+    with open(dead_base, "a", encoding="utf-8") as fh:
+        fh.write("\ndef _probe_dead_extra(x):\n    return 1\n    x = 2\n"
+                 "    if x is None:\n        return 3\n")
+    ran = subprocess.run(
+        [sys.executable, os.path.join(dead_build, "fbtodo"), "dead", "--json"],
+        capture_output=True, text=True, env=env, cwd=dead_build, timeout=30,
+    )
+    assert ran.returncode != 0, (ran.returncode, ran.stdout, ran.stderr)
+    doc = json.loads(ran.stdout)
+    assert doc["count"] >= 2 and len(doc["findings"]) == doc["count"], doc
+    assert all({"path", "line", "why"} <= set(f) for f in doc["findings"]), doc
+    assert sum("guard on line" in f["why"] for f in doc["findings"]) >= 1, doc
+    assert sum("nothing runs after" in f["why"] for f in doc["findings"]) >= 1, doc
+    assert module.dead_code() == [], module.dead_code()
+    assert module.unreachable_code() is None, "the checkout runs everything it says it does"
+    shutil.rmtree(dead_build, ignore_errors=True)
+    say("the reload probe: code the parse proves can never run — a statement after a "
+        "return, a constant-false branch, a comparison of literals, or a branch an earlier "
+        "guard or `assert` rules out (inside a block it dominates, including a loop body it "
+        "does not disturb) — is a reason to HOLD, while a comparison against a name, a "
+        "rebinding, a loop that moves the name, or anything the guard's promise does not "
+        "cover is not: ok")
 
     # ---- the pane's environment, pinned rather than inherited. tmux REBUILDS a pane's PATH,
     #      so a pane command resolved through it can come up on a different Python than the
@@ -2057,9 +2460,6 @@ try:
     assert parts[0] == "/usr/bin/env" and f"PATH={module.pinned_path()}" in parts, cmd
     assert module.self_argv()[0] in parts and module.self_argv()[1] in parts, cmd
     assert module.PANE_WATCH_RE.search(cmd).group(1) == "4242", cmd
-    nas = module.nas_pane_command(types.SimpleNamespace(
-        nas_host="h", nas_root="/r", nas_project="p", fb_marker="/m"))
-    assert "/usr/bin/env PATH=" in nas and "--no-daemon" in shlex.split(nas), nas
     assert module.PANE_INSTANCE_RE.search(
         module.pane_command(["x", "--instance-of", "7"])).group(1) == "7"
     # The PIN's shape: the interpreter's own directory first (so anything the pane starts by
@@ -2094,6 +2494,76 @@ try:
     assert module.pane_python("%2", rows=rows, table=table) is None, "no such pane, no answer"
     say("pane environment: the interpreter is named absolutely under the opener's PATH, the "
         "flags survive it, and the pane's own Python can be read back: ok")
+
+    # ---- ...and the pin covers WHERE the pane works, not only what it runs. tmux starts a
+    #      pane from its SERVER's environment, so the state root (`FBTODO_HOME` /
+    #      `XDG_STATE_HOME`), the tmux server it drives, the session marker it counts live
+    #      sessions by and the six notify-watch paths its bells are sent to are the SERVER's
+    #      answer unless they ride in the command with the PATH — a pane whose server
+    #      predates one of them silently reads another store, follows another set of
+    #      sessions, or rings the DEFAULT bells. `pinned_env` carries only the values this
+    #      process HAS: an empty `FBTODO_HOME=` in the line would read as "names a root" to
+    #      the locks audit, which must keep telling a command line from an environment.
+    #      Every PINNED_ENV_KEYS entry needs a sample here, so a key added without one fails
+    #      loudly rather than going untested.
+    sample = {"FBTODO_HOME": "/p/h", "XDG_STATE_HOME": "/p/x", "FBTODO_TMUX": "tmux -L s",
+              "FBTODO_FB_MARKER": "/p/m", "FBTODO_NOTIFY": "/p/todo.py",
+              "FBTODO_DROP": "/p/drop.py", "FBTODO_ASK": "/p/ask.py",
+              "FBTODO_PAUSE": "/p/pause.py", "FBTODO_PANE_BELL": "/p/pane.py",
+              "FBTODO_LOCKS_BELL": "/p/locks.py"}
+    keep_env = {key: os.environ.get(key) for key in module.PINNED_ENV_KEYS}
+    for key in module.PINNED_ENV_KEYS:
+        os.environ.pop(key, None)
+    assert module.pinned_env() == [], "an unset variable was carried as an empty assignment"
+    for key in module.PINNED_ENV_KEYS:
+        os.environ[key] = sample[key]
+    carried = module.pinned_env()
+    assert carried == [f"{key}={sample[key]}" for key in module.PINNED_ENV_KEYS], carried
+    parts = shlex.split(module.local_pane_command(4242))
+    assert not [c for c in carried if c not in parts], (carried, parts)
+    for key, value in keep_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+    #      The launcher builds the same string in shell, and there are two POSIX bodies to
+    #      prove it with: the one the repository ships and the one `fbtodo init` GENERATES.
+    #      Both are run under a stub tmux (the generated one written out first) with a value
+    #      for every key, and the command each would have split is read back and checked —
+    #      a body that forgot a key, or wrote one unquoted, is a failure and not a comment.
+    #      The fish body is run too where fish exists.
+    launched = dict(os.environ, FREEBUFF_NO_REFRESH="1", TMUX="stub",
+                    PATH=os.path.join(ROOT) + os.pathsep + os.environ.get("PATH", ""),
+                    **sample)
+    fbi = sys.modules.get("fbtodo.fb_init") or module.fb_init
+    generated = os.path.join(TEST_HOME, "fb-probe.sh")
+    with open(generated, "w", encoding="utf-8") as fh:
+        fh.write(fbi.FB_SCRIPT)
+    stub = 'tmux() { printf "%s\\n" "$6"; exit 0; }; . "$1"; fb'
+    for label, source in (("the shipped examples/fb.sh", os.path.join(ROOT, "examples", "fb.sh")),
+                          ("the generated `fbtodo init` body", generated)):
+        out = subprocess.run(["bash", "-c", stub, "bash", source],
+                             env=launched, capture_output=True, text=True, timeout=30)
+        for key in module.PINNED_ENV_KEYS:
+            want = f"{key}='{sample[key]}'"
+            assert want in out.stdout, (label, want, out.stdout, out.stderr)
+    for dialect, body in (("posix", fbi.FB_SCRIPT), ("fish", fbi.FISH_SCRIPT)):
+        for key in module.PINNED_ENV_KEYS:
+            assert key in body, f"the {dialect} launcher never carries {key}"
+    if shutil.which("fish"):
+        fish_file = os.path.join(TEST_HOME, "fb-probe.fish")
+        with open(fish_file, "w", encoding="utf-8") as fh:
+            fh.write(fbi.FISH_SCRIPT)
+        fstub = ("function tmux; printf '%s\\n' $argv[6]; exit 0; end\n"
+                 f"source {fish_file}\nfb\n")
+        fout = subprocess.run(["fish", "-c", fstub], env=launched,
+                              capture_output=True, text=True, timeout=30)
+        for key in module.PINNED_ENV_KEYS:
+            want = f"{key}='{sample[key]}'"
+            assert want in fout.stdout, (want, fout.stdout, fout.stderr)
+    say("pane environment: the state root, the tmux server, the session marker and the "
+        "notify-watch paths ride into the pane with the interpreter and the PATH: ok")
 
     # ---- the keeper's other repair: a pane found on a different interpreter than its
     #      watcher's is reopened with the pinned command IN PLACE, so it puts itself right
@@ -2163,7 +2633,7 @@ try:
     # the server's environment are load-bearing: the pane the respawn starts calls
     # `ensure_daemon`, and a keeper or watcher built for a stand-in pane would outlive it.
     if shutil.which("tmux"):
-        pin_sock = "fbtpinsock"
+        pin_sock = sock("fbtpinsock")
         tmux_pin = ["tmux", "-L", pin_sock]
         subprocess.run(tmux_pin + ["kill-server"], capture_output=True)
         made = subprocess.run(
@@ -2372,6 +2842,221 @@ try:
             "own chip — and `fbtodo keep` flips the knob, pane, window or server, without "
             "the incantation: ok")
 
+    # ---- the keeper's third repair: a pane whose RECORDED command is an older PIN. The
+    #      drift repair next door only asks whether the INTERPRETER agrees; a pane whose
+    #      command names the same Python can still have been started with the wrong state
+    #      root, the wrong tmux server or the old bells, and nothing else in the keeper ever
+    #      looks — the recorded command is re-run only when somebody respawns the pane, and
+    #      nobody has a reason to. `stale_pin` is therefore about the CARRIED VALUES and
+    #      nothing else: every value this build hands on must be in the line, with THIS
+    #      value. The interpreter, the PATH and the arguments after them are deliberately
+    #      not compared, so an `fb` pane on `--instance-of` that carries every value is not
+    #      called stale for differing from a split's `--watch-pid` — and with no values to
+    #      hand on, no command is stale at all (the server's environment IS the answer).
+    sample = {"FBTODO_HOME": "/p/h", "XDG_STATE_HOME": "/p/x", "FBTODO_TMUX": "tmux -L s",
+              "FBTODO_FB_MARKER": "/p/m", "FBTODO_NOTIFY": "/p/todo.py",
+              "FBTODO_DROP": "/p/drop.py", "FBTODO_ASK": "/p/ask.py",
+              "FBTODO_PAUSE": "/p/pause.py", "FBTODO_PANE_BELL": "/p/pane.py",
+              "FBTODO_LOCKS_BELL": "/p/locks.py"}
+    stale_keep = {key: os.environ.get(key) for key in module.PINNED_ENV_KEYS}
+    try:
+        for key in module.PINNED_ENV_KEYS:
+            os.environ.pop(key, None)
+        assert module.stale_pin("fbtodo --watch-pid 1") is False, \
+            "a command was called stale with no values to hand on"
+        for key in module.PINNED_ENV_KEYS:
+            os.environ[key] = sample[key]
+        pin = module.local_pane_command(4242)
+        ours = f"{module.self_argv()[0]} {module.self_argv()[1]} --watch-pid 1"
+        assert module.stale_pin("") is False, "an empty command was called stale"
+        assert module.stale_pin("tmux new-window") is False, \
+            "a pane that is not ours was called stale"
+        assert module.stale_pin(ours) is True, \
+            "a pane of ours carrying no values at all was called fresh"
+        assert module.stale_pin(pin) is False, "the current pin was called stale"
+        fb_like = module.pane_command([*module.self_argv(), "--instance-of", "4242"])
+        assert module.stale_pin(fb_like) is False, \
+            "an fb pane carrying every value was called stale"
+        for key in ("FBTODO_HOME", "XDG_STATE_HOME", "FBTODO_LOCKS_BELL"):
+            gone = [t for t in shlex.split(pin) if not t.startswith(f"{key}=")]
+            assert module.stale_pin(shlex.join(gone)) is True, \
+                f"a pin missing {key} was called fresh"
+        swapped = [f"{t.partition('=')[0]}=/elsewhere"
+                   if t.partition("=")[0].startswith("FBTODO_") else t
+                   for t in shlex.split(pin)]
+        assert module.stale_pin(shlex.join(swapped)) is True, \
+            "a pin carrying a DIFFERENT value was called fresh"
+        #      ...and the reader that is NOT the keeper judges by the SESSION's values, not
+        #      its own: `status`/`why` can be typed in any shell, and a pane the keeper would
+        #      leave alone must not read stale because THAT shell spells a value differently.
+        #      The two environments differ in one key so the choice is visible — judged by the
+        #      client's, the very pane carrying the session's pin reads stale (the bug).
+        sess_values = [f"{k}={sample[k]}" for k in module.PINNED_ENV_KEYS]
+        client_values = [v for v in sess_values if not v.startswith("FBTODO_LOCKS_BELL=")] \
+            + ["FBTODO_LOCKS_BELL=/client-only"]
+        assert module.stale_pin(pin, sess_values) is False, \
+            "a pane on the session's pin was called stale under the session's own values"
+        assert module.stale_pin(pin, client_values) is True, \
+            "the injected client values were not what stale_pin compared against"
+        # the blob reader keeps a value's own spaces and orders by PINNED_ENV_KEYS, and a
+        # process naming none of the keys falls back to this process's own answer
+        blob = "PATH=/bin OTHER=1 " + " ".join(sess_values)
+        assert module.pinned_env_from(blob) == sess_values, module.pinned_env_from(blob)
+        assert module.session_pinned_env(None, blob=blob) == sess_values
+        assert module.session_pinned_env(None, blob="PATH=/bin OTHER=1") == module.pinned_env(), \
+            "a process naming none of the keys did not fall back to this process's own"
+    finally:
+        for key, value in stale_keep.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    #      ...and the repair itself, through a private server: a pane recorded on a command
+    #      with none of the values is reopened on the pin IN PLACE — same pane id, same
+    #      window — and the readback shows the CURRENT pin, which is the whole point, since
+    #      the command is what a later respawn would re-run. One already carrying the pin is
+    #      left alone, and one marked `@fbtodo_repair off` is kept exactly as it is and told
+    #      so on its own chip (the `kept` note the running pane picks up, since nothing is
+    #      restarting to deliver a reopen one). A respawn that never happened takes its note
+    #      back, so nothing unknown claims it.
+    if shutil.which("tmux"):
+        stale_sock = sock("fbstalesock")
+        tmux_stale = ["tmux", "-L", stale_sock]
+        subprocess.run(tmux_stale + ["kill-server"], capture_output=True)
+        made = subprocess.run(
+            tmux_stale + [
+                "new-session", "-d", "-s", "stalesess", "-x", "80", "-y", "24",
+                "-c", TEST_HOME,
+                "-e", f"FBTODO_HOME={TEST_HOME}",
+                "-e", "FBTODO_PANE_SECONDS=0",
+                "-e", "FBTODO_NO_AUTOSTART=1",
+                "sleep 300",
+            ],
+            capture_output=True, text=True,
+        )
+        assert made.returncode == 0, made.stderr
+        saved_tmux = list(module.TMUX_BIN)
+        set_knob(module, "TMUX_BIN", list(tmux_stale))
+        try:
+            listed = subprocess.run(
+                tmux_stale + ["list-panes", "-t", "stalesess", "-F", "#{pane_id} #{pane_pid}"],
+                capture_output=True, text=True,
+            ).stdout.split()
+            stale_pane, stale_pid = listed[0], int(listed[1])
+            stale_table = {stale_pid: (1, "-zsh")}
+            # a command of OURS — the real launcher token, which is what `stale_pin`
+            # recognises us by — but carrying none of the values
+            old_line = " ".join(
+                shlex.quote(t) for t in [*module.self_argv(), "--watch-pid", "4242"]
+            )
+            assert "fbtodo" in old_line, old_line
+            old_rows = [{"pane": stale_pane, "pid": stale_pid, "window": "@1",
+                         "start": old_line}]
+            # the knob, first: a stale pane marked repair-off is left as it is, logged, and
+            # told on its own chip — and said only once, however often the keeper looks
+            subprocess.run(tmux_stale + ["set", "-p", "-t", stale_pane, "@fbtodo_repair", "off"],
+                           capture_output=True)
+            module._STALE_TRIED.clear()
+            module._STALE_HELD.clear()
+            kept_mark = len(pane_log_text())
+            assert module.upgrade_stale_panes({4242: "@1"}, rows=old_rows,
+                                              table=stale_table) == [], \
+                "a stale pane marked repair-off was reopened"
+            assert "older pin" in pane_log_text()[kept_mark:], pane_log_text()[-300:]
+            kept_note = module.pane_note_take(stale_pane, kind="kept")
+            assert kept_note is not None, "the kept stale pane was not told on its chip"
+            held_mark = len(pane_log_text())
+            assert module.upgrade_stale_panes({4242: "@1"}, rows=old_rows,
+                                              table=stale_table) == []
+            assert "older pin" not in pane_log_text()[held_mark:], \
+                "the kept stale pane was logged again on the next pass"
+            assert subprocess.run(
+                tmux_stale + ["list-panes", "-t", "stalesess", "-F", "#{pane_id}"],
+                capture_output=True, text=True,
+            ).stdout.split() == [stale_pane], "the kept pane was replaced anyway"
+            subprocess.run(tmux_stale + ["set", "-p", "-u", "-t", stale_pane, "@fbtodo_repair"],
+                           capture_output=True)
+            assert module.pane_repair_off(stale_pane) is False, "the repair never came back"
+            # now the real respawn: the pane keeps its id and its recorded command becomes
+            # THIS build's pin, so a later reader — and a later respawn — finds it current
+            module._STALE_TRIED.clear()
+            module._STALE_HELD.clear()
+            log_mark = len(pane_log_text())
+            assert module.upgrade_stale_panes({4242: "@1"}, rows=old_rows,
+                                              table=stale_table) == [stale_pane]
+            after = subprocess.run(
+                tmux_stale + ["list-panes", "-t", "stalesess",
+                              "-F", "#{pane_id}|#{pane_start_command}"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            got_pane, got_start = after.split("|", 1)
+            assert got_pane == stale_pane, "the upgrade changed the pane's id"
+            assert module.pane_start_command(got_start) == module.local_pane_command(4242), got_start
+            assert f"reopened {stale_pane}" in pane_log_text()[log_mark:], \
+                pane_log_text()[-300:]
+            # ...and the pass SETTLES: the command the pane now reports is the pin, so the
+            # very next pass is a no-op — no respawn however often the keeper looks
+            module._STALE_TRIED.clear()
+            current_rows = [{"pane": stale_pane, "pid": stale_pid, "window": "@1",
+                             "start": module.pane_start_command(got_start)}]
+            assert module.upgrade_stale_panes({4242: "@1"}, rows=current_rows,
+                                              table=stale_table) == [], \
+                "a pane already on the pin was reopened again"
+            # ---- ...and the DIAGNOSTIC that names a stale pane BEFORE the keeper rewrites
+            #      it: `status`'s `pane pin` line and `why`'s flag both read
+            #      `stale_pane_ids`, the same predicate the upgrade acts on — so a pane
+            #      cannot be named stale one moment and treated as current the next, and one
+            #      marked repair-off keeps being named. The two halves of the sentence mean
+            #      different things (about to change vs will not), so they are split.
+            assert module.stale_pane_ids(4242, rows=current_rows, table=stale_table) == [], \
+                "a pane already on the pin was named stale"
+            assert module.stale_pane_ids(4242, rows=old_rows, table=stale_table) == [stale_pane], \
+                "a stale pane was not named"
+            assert module.stale_pane_ids(9999, rows=old_rows, table=stale_table) == [], \
+                "another instance's pane was named stale"
+            assert module.stale_pane_ids(4242, rows=old_rows, table=stale_table,
+                                         wanted=[]) == [], \
+                "stale_pane_ids ignored an injected pin of no values"
+            assert module.stale_pin_note([]) == "", "an empty pane list said something"
+            subprocess.run(tmux_stale + ["set", "-p", "-u", "-t", stale_pane, "@fbtodo_repair"],
+                           capture_output=True)
+            assert "reopens it on the current one" in module.stale_pin_note([stale_pane]), \
+                module.stale_pin_note([stale_pane])
+            subprocess.run(tmux_stale + ["set", "-p", "-t", stale_pane, "@fbtodo_repair", "off"],
+                           capture_output=True)
+            assert "kept (@fbtodo_repair off)" in module.stale_pin_note([stale_pane]), \
+                module.stale_pin_note([stale_pane])
+            subprocess.run(tmux_stale + ["set", "-p", "-u", "-t", stale_pane, "@fbtodo_repair"],
+                           capture_output=True)
+            # ...and a failed respawn takes its note back, so nothing unknown claims it
+            calls = []
+
+            def fake_tmux(*argv, timeout=10.0):
+                calls.append(argv)
+                return None
+
+            real_tmux = module.tmux_run
+            set_knob(module, "tmux_run", fake_tmux)
+            try:
+                module._STALE_TRIED.clear()
+                module._STALE_HELD.clear()
+                assert module.upgrade_stale_panes({4242: "@1"}, rows=old_rows,
+                                                  table=stale_table) == []
+                assert ("respawn-pane", "-k", "-t") in [tuple(c[:3]) for c in calls], calls
+                left = module.read_json(module.PANE_NOTE_PATH, {}) or {}
+                assert stale_pane not in left, "a note stayed when the respawn was abandoned"
+            finally:
+                set_knob(module, "tmux_run", real_tmux)
+        finally:
+            set_knob(module, "TMUX_BIN", saved_tmux)
+            subprocess.run(tmux_stale + ["kill-server"], capture_output=True)
+        say("pane pin upgrade: a pane whose recorded command is an older pin — the same "
+            "interpreter agreeing, the values behind — is reopened once in place so its "
+            "command becomes this build's, one already on the pin is left alone, and a pane "
+            "marked `@fbtodo_repair off` is kept as it is and told so; `status` names a stale "
+            "pane before the keeper rewrites it, split by whether the repair is off: ok")
+
     # ---- ...and the drift repair reads the pane's whole TREE now, not only its own line:
     #      what a pane starts under itself — a keeper, a bell through its watcher, a tmux
     #      child — is part of the same promise (one interpreter for the session), and a
@@ -2505,7 +3190,7 @@ try:
     # comes back on the pin. `FBTODO_PANE_SECONDS=0` and `FBTODO_HOME` in the server's
     # environment are load-bearing, the same as in the row above.
     if shutil.which("tmux"):
-        tree_sock = "fbtreesock"
+        tree_sock = sock("fbtreesock")
         tmux_tree = ["tmux", "-L", tree_sock]
         subprocess.run(tmux_tree + ["kill-server"], capture_output=True)
         tree_script = os.path.join(TEST_HOME, "fbtodo-tree-pane.py")
@@ -2613,7 +3298,7 @@ try:
     #      record still naming it. A source that does not parse must HOLD — the same promise
     #      the watcher makes — never exec into a save that is still landing.
     if shutil.which("tmux"):
-        keep_sock = "fbtkeepsock"
+        keep_sock = sock("fbtkeepsock")
         tmux_keep = ["tmux", "-L", keep_sock]
         subprocess.run(tmux_keep + ["kill-server"], capture_output=True)
         made = subprocess.run(
@@ -2682,7 +3367,8 @@ try:
             with open(os.path.join(keeper_src, "zz_broken.py"), "w") as fh:
                 fh.write("def half(\n")
             assert wait_for(lambda: "keeper holding" in keeper_since()), keeper_since()[-400:]
-            time.sleep(2.5)
+            assert quiet_for(lambda: keeper_since().count("keeper reloading:") != 1,
+                             hold_window()), "it reloaded into a broken file"
             assert keep.poll() is None, "the keeper died on a source that does not parse"
             assert keeper_since().count("keeper reloading:") == 1, \
                 "it reloaded into a broken file"
@@ -2708,7 +3394,8 @@ try:
             assert wait_for(lambda: "does not load" in keeper_since()), keeper_since()[-500:]
             assert module.source_syntax_error(here=render_keep) is None, \
                 "the unloadable keeper tree parses cleanly, so the probe was what held it"
-            time.sleep(2.5)
+            assert quiet_for(lambda: keeper_since().count("keeper reloading:") != 2,
+                             hold_window()), "it reloaded into an unfit keeper build"
             assert keep.poll() is None, "the keeper exec'd into a build that will not load"
             assert module.lock_holder(module.PANE_KEEPER_PATH) == keep.pid, \
                 "the claim moved on a held keeper reload"
@@ -2747,7 +3434,7 @@ try:
     #      all does not evict a keeper it cannot judge — only one for a genuinely different
     #      server, or from an older build, is replaced.
     if shutil.which("tmux"):
-        ident_sock = "fbtidentsock"
+        ident_sock = sock("fbtidentsock")
         tmux_ident = ["tmux", "-L", ident_sock]
         subprocess.run(tmux_ident + ["kill-server"], capture_output=True)
         made = subprocess.run(
@@ -2765,22 +3452,25 @@ try:
         saved_env_ident = {k: os.environ.get(k) for k in ("TMUX", "FBTODO_TMUX")}
         set_knob(module, "TMUX_BIN", list(tmux_ident))
         try:
-            sock = subprocess.run(
+            #      `ident_path`, not `sock`: this is module level, so a bare `sock` here
+            #      would replace the helper every later line — including the later `sock2 = sock(...)`
+            #      and the teardown that kills these servers — with a string.
+            ident_path = subprocess.run(
                 tmux_ident + ["display-message", "-p", "#{socket_path}"],
                 capture_output=True, text=True,
             ).stdout.strip()
-            assert sock, "the private server did not answer its own socket path"
+            assert ident_path, "the private server did not answer its own socket path"
             os.environ.pop("FBTODO_TMUX", None)
             # a `TMUX` value carries a server pid and a session id besides the socket, and
             # two panes on one server differ in exactly those: neither changes the name
-            os.environ["TMUX"] = f"{sock},4242,7"
-            assert module.tmux_identity() == os.path.realpath(sock), module.tmux_identity()
-            os.environ["TMUX"] = f"{sock},9999,8"
-            assert module.tmux_identity() == os.path.realpath(sock), \
+            os.environ["TMUX"] = f"{ident_path},4242,7"
+            assert module.tmux_identity() == os.path.realpath(ident_path), module.tmux_identity()
+            os.environ["TMUX"] = f"{ident_path},9999,8"
+            assert module.tmux_identity() == os.path.realpath(ident_path), \
                 "a second session on the same server got a name of its own"
             # ...and the desktop integration's context: outside tmux, no `TMUX` at all
             del os.environ["TMUX"]
-            assert module.tmux_identity() == os.path.realpath(sock), \
+            assert module.tmux_identity() == os.path.realpath(ident_path), \
                 "an ask outside tmux named a different server than the one it talks to"
             # a forced server is named deliberately and verbatim, the same string anywhere
             os.environ["FBTODO_TMUX"] = f"tmux -L {ident_sock}"
@@ -2798,13 +3488,13 @@ try:
             del os.environ["TMUX"]
             set_knob(module, "TMUX_BIN", list(tmux_ident))
             # ...and the rule the churn broke, before any process is started
-            same = {"version": module.VERSION, "tmux": sock}
-            assert module.keeper_serves(same, sock) is True
+            same = {"version": module.VERSION, "tmux": ident_path}
+            assert module.keeper_serves(same, ident_path) is True
             assert module.keeper_serves(same, None) is True, \
                 "an ask that cannot name a server evicted one it cannot judge"
             assert module.keeper_serves(same, "/x/other") is False, \
                 "an ask naming another server kept a keeper that cannot serve it"
-            assert module.keeper_serves({"version": "0.0.0", "tmux": sock}, sock) is False, \
+            assert module.keeper_serves({"version": "0.0.0", "tmux": ident_path}, ident_path) is False, \
                 "a keeper from an older build was kept"
             assert module.keeper_serves({}, None) is False, "a lock with no record is no keeper"
             # ...and the comparison is a SERVER comparison, not a string one: the spellings
@@ -2818,15 +3508,15 @@ try:
                 os.symlink(real, link)
             assert module.same_tmux_server(os.path.join(link, "s"), os.path.join(real, "s")), \
                 "two spellings of one path were read as two servers"
-            assert module.same_tmux_server(f"{sock},4242,7", sock), "a raw `TMUX` value"
+            assert module.same_tmux_server(f"{ident_path},4242,7", ident_path), "a raw `TMUX` value"
             default_sock = os.path.realpath(os.path.join(
                 os.environ.get("TMUX_TMPDIR") or "/tmp", f"tmux-{os.getuid()}", "default"))
             assert module.same_tmux_server("-default", default_sock), \
                 "the old placeholder stopped meaning the default server"
-            assert module.same_tmux_server(f"tmux -L {ident_sock}", sock), \
+            assert module.same_tmux_server(f"tmux -L {ident_sock}", ident_path), \
                 "a forced server written as a name and as its socket"
-            assert module.same_tmux_server(f"tmux -S {sock}", sock)
-            assert not module.same_tmux_server("-default", sock), \
+            assert module.same_tmux_server(f"tmux -S {ident_path}", ident_path)
+            assert not module.same_tmux_server("-default", ident_path), \
                 "the default server and a private one were read as one"
             assert not module.same_tmux_server("/x/one", "/x/two"), \
                 "distinct names were read as one"
@@ -2864,7 +3554,7 @@ try:
             # (`TMUX`) with the server forced by name (`FBTODO_TMUX`), so one run reads
             # both asks. `keeper server` names them, and `--json` carries the same facts
             # for a script: the server, both asks, and which ask would replace the keeper.
-            env_status = dict(env, FBTODO_TMUX=f"tmux -L {ident_sock}", TMUX=f"{sock},4242,7")
+            env_status = dict(env, FBTODO_TMUX=f"tmux -L {ident_sock}", TMUX=f"{ident_path},4242,7")
 
             def keeper_status_line() -> str:
                 out = subprocess.run(
@@ -2888,19 +3578,19 @@ try:
             none_yet = keeper_status_json()
             assert none_yet["running"] is False and none_yet["server"] is None, none_yet
             assert none_yet["would_replace"] == [] and none_yet["agree"] is False, none_yet
-            os.environ["TMUX"] = f"{sock},4242,7"
+            os.environ["TMUX"] = f"{ident_path},4242,7"
             first = module.ensure_pane_keeper(ident_args)
             assert first, "the first ask started no keeper"
             assert wait_for(lambda: module.lock_holder(module.PANE_KEEPER_PATH) == first), \
                 "the keeper never claimed"
             assert wait_for(
                 lambda: (module.read_json(module.PANE_KEEPER_PATH, {}) or {}).get("tmux")
-                == os.path.realpath(sock)
+                == os.path.realpath(ident_path)
             ), (module.read_json(module.PANE_KEEPER_PATH, {}) or {})
             del os.environ["TMUX"]
             assert module.ensure_pane_keeper(ident_args) == first, \
                 "the desktop integration replaced the pane's keeper"
-            os.environ["TMUX"] = f"{sock},9999,8"
+            os.environ["TMUX"] = f"{ident_path},9999,8"
             assert module.ensure_pane_keeper(ident_args) == first, \
                 "a second session's ask replaced the keeper"
             assert "replacing keeper" not in ident_log()[base_len:], ident_log()[base_len:][-300:]
@@ -2909,23 +3599,23 @@ try:
             # context (`TMUX`), the watcher's from outside tmux — here both point at the
             # forced private server, the way the desktop integration names one.
             line = keeper_status_line()
-            assert os.path.realpath(sock) in line, line
+            assert os.path.realpath(ident_path) in line, line
             assert "asks name it" in line, line
             # ...and the same facts for a script, from the same reader: the server, both
             # asks reduced to the sockets they name, and no churn due
             view = keeper_status_json()
             assert view["running"] is True and view["pid"] == first, view
-            assert view["server"] == os.path.realpath(sock), view
-            assert view["recorded"] == os.path.realpath(sock), view
-            assert view["asks"] == {"pane": os.path.realpath(sock),
-                                    "watcher": os.path.realpath(sock)}, view
+            assert view["server"] == os.path.realpath(ident_path), view
+            assert view["recorded"] == os.path.realpath(ident_path), view
+            assert view["asks"] == {"pane": os.path.realpath(ident_path),
+                                    "watcher": os.path.realpath(ident_path)}, view
             assert view["agree"] is True and view["would_replace"] == [], view
             assert "asks name it" in view["note"], view
             # ...and a record written by an OLDER build — the raw `TMUX` value, which names
             # this same server with a server pid and a session id on it — is that server
             # too: a different spelling, not a reason to replace the keeper.
             rec = module.read_json(module.PANE_KEEPER_PATH, {}) or {}
-            rec["tmux"] = f"{sock},4242,7"
+            rec["tmux"] = f"{ident_path},4242,7"
             with open(module.PANE_KEEPER_PATH, "w", encoding="utf-8") as fh:
                 json.dump(rec, fh)
             assert module.ensure_pane_keeper(ident_args) == first, \
@@ -2934,11 +3624,11 @@ try:
             # the record's spelling is old, the server is not: `status` prints the name it
             # denotes and says where the spelling came from, without calling it a difference
             line = keeper_status_line()
-            assert os.path.realpath(sock) in line and "recorded as" in line, line
+            assert os.path.realpath(ident_path) in line and "recorded as" in line, line
             assert "asks name it" in line, line
             view = keeper_status_json()
-            assert view["server"] == os.path.realpath(sock), view
-            assert view["recorded"] == f"{sock},4242,7", view
+            assert view["server"] == os.path.realpath(ident_path), view
+            assert view["recorded"] == f"{ident_path},4242,7", view
             assert view["agree"] is True and view["would_replace"] == [], view
             say("status: the keeper's server is named canonically, and the asks that could "
                 "replace it are compared: ok")
@@ -3050,7 +3740,7 @@ try:
             assert churn["would_replace"] == ["pane", "watcher"], churn
             assert churn["agree"] is False, churn
             assert "replaces this keeper" in churn["note"], churn
-            os.environ["TMUX"] = f"{sock},4242,7"
+            os.environ["TMUX"] = f"{ident_path},4242,7"
             replaced = module.ensure_pane_keeper(ident_args)
             assert replaced and replaced != first, "a keeper for another server was kept"
             assert "replacing keeper" in ident_log()[base_len:], "the replacement was not logged"
@@ -3183,7 +3873,11 @@ try:
                 stdin=subprocess.DEVNULL, start_new_session=True,
             )
             orphan_keeper = orphan.pid
-            time.sleep(2.5)  # past the cross-check's grace: it is a settled process now
+            # Long enough for the stand-in keeper to have finished its first pass and written
+            # (or, here, failed to write) its claim, taken from the keeper's OWN claim-check
+            # interval rather than typed in: a fixed 2.5 s is a number that silently stops
+            # meaning "one pass" the moment that interval changes.
+            time.sleep(module.KEEPER_CLAIM_CHECK_S * 2.5)
             blind = module.claim_audit(module.PANE_KEEPER_PATH)
             assert blind["state"] == "absent" and blind["pid"] is None, blind
             seen_orphan = run("locks")
@@ -3362,7 +4056,7 @@ try:
     #      `fbtodo-daemon.pid`, the record `_claim_live` decides the state root from and `one
     #      python` reads the watcher's pid from. The row now reads through `lock_peek` (open,
     #      try the lock; no unlink, no write), and this pins the whole contract: records for
-    #      the daemon, the keeper and the NAS pane seeded with a DEAD pid — free, the exact
+    #      the daemon and the keeper seeded with a DEAD pid — free, the exact
     #      case a cleanup would have removed — must survive a run byte-identical, and so must
     #      the same record while a claim is HELD, with the row naming its holder.
     doctor_victim = spawn_quiet("sleep", "600")
@@ -3371,7 +4065,7 @@ try:
     deadline = time.time() + 5
     while time.time() < deadline and module.pid_alive(dead_pid):
         time.sleep(0.05)
-    claim_paths = [module.LOCK_PATH, module.PANE_KEEPER_PATH, module.NAS_LOCK_PATH]
+    claim_paths = [module.LOCK_PATH, module.PANE_KEEPER_PATH]
 
     def watcher_row(text: str) -> str:
         rows = [ln for ln in STRIP(text).splitlines() if re.match(r"\s*\S+\s+watcher\s", ln)]
@@ -3404,7 +4098,7 @@ try:
             "keeper records, dead pids and a held claim alike: ok")
     finally:
         module.clear_lock(path=module.LOCK_PATH)
-        for p in (module.PANE_KEEPER_PATH, module.NAS_LOCK_PATH):
+        for p in (module.PANE_KEEPER_PATH,):
             try:
                 os.unlink(p)
             except OSError:
@@ -3412,17 +4106,17 @@ try:
 
     # ---- ...and not just `doctor`: EVERY command that only looks keeps the same promise.
     #      `status` was the last one left on `daemon_pid()` — the destructive probe whose
-    #      free-claim answer removes the record it then reports on — and `nas --status` read
-    #      its claim through `nas_pane_daemon_pid` (`lock_holder` again, which for a watcher
+    #      free-claim answer removes the record it then reports on — a status read
+    #      its claim through `lock_holder` again (which for a watcher
     #      from another build even KILLS it and clears the claim). Both now read through
     #      `lock_peek` like the doctor's row. This pins the family: with the daemon, keeper
-    #      and NAS records seeded with a DEAD pid (free — the exact case a cleanup would
+    #      records seeded with a DEAD pid (free — the exact case a cleanup would
     #      have removed), each look-only command must leave every claim record byte-identical
     #      and still present, and the state root otherwise untouched. The task log is
     #      deliberately outside the pin: `snap` and `json` record tracking events in it by
     #      design (`track_tasks`), so they are held to the claims half of the contract only,
     #      and the whole-root comparison starts after their write.
-    look_paths = [module.LOCK_PATH, module.PANE_KEEPER_PATH, module.NAS_LOCK_PATH]
+    look_paths = [module.LOCK_PATH, module.PANE_KEEPER_PATH]
 
     def scratch_bytes() -> dict:
         """Every file under the test state root, by path — what a look may not move."""
@@ -3466,8 +4160,6 @@ try:
         # behind to say it next time.
         assert "— not running" in watcher_claim_row(run("status").stdout), "status row"
         assert json.loads(run("status", "--json").stdout)["watcher_pid"] is None, "status json"
-        assert json.loads(run("nas", "--status", "--json").stdout)["watcher_pid"] is None, \
-            "nas status json"
         scratch_before = scratch_bytes()
         for argv in (
             ["status"], ["status", "--json"],
@@ -3475,7 +4167,6 @@ try:
             ["ledger"], ["ledger", "--json"],
             ["locks"], ["locks", "--json"],
             ["doctor"], ["doctor", "--json"],
-            ["nas", "--status"], ["nas", "--status", "--json"],
             ["bar"], ["pin", "--list"],
         ):
             seen = run(*argv)
@@ -3507,13 +4198,13 @@ try:
                                                     "version": module.VERSION})
         assert module.daemon_pid() is None and not os.path.exists(module.LOCK_PATH), \
             "the acting probe stopped clearing a dead record"
-        say("looks: every command that only looks — status, why, ledger, locks, doctor, nas "
+        say("looks: every command that only looks — status, why, ledger, locks, doctor, "
             "--status, bar and pin --list, plus the tracking snap/json — leaves every claim "
             "record byte-identical, reports a dead pid as not running, and a held claim by "
             "its holder, while the acting probe still clears a dead record: ok")
     finally:
         module.clear_lock(path=module.LOCK_PATH)
-        for p in (module.PANE_KEEPER_PATH, module.NAS_LOCK_PATH):
+        for p in (module.PANE_KEEPER_PATH,):
             try:
                 os.unlink(p)
             except OSError:
@@ -3525,7 +4216,7 @@ try:
     #      see it before anything moves. A fix with no untied process to end asks nothing —
     #      there is no kill in it — and a second run finds nothing to clear, which is what
     #      makes it safe on a schedule. The flag belongs to its command, like `--watch`.
-    fix_paths = [module.LOCK_PATH, module.PANE_KEEPER_PATH, module.NAS_LOCK_PATH]
+    fix_paths = [module.LOCK_PATH, module.PANE_KEEPER_PATH]
     fix_victim = spawn_quiet("sleep", "600")
     fix_dead = fix_victim.pid
     kill_tree(fix_victim)
@@ -3539,11 +4230,11 @@ try:
         dry_fix = json.loads(run("locks", "--fix", "--dry-run", "--json").stdout)
         assert dry_fix["dry_run"] is True and dry_fix["applied"] is False, dry_fix
         assert [c["role"] for c in dry_fix["planned"]["clears"]] == \
-            ["watcher", "keeper", "nas pane"], dry_fix["planned"]
+            ["watcher", "keeper"], dry_fix["planned"]
         assert all(os.path.exists(p) for p in fix_paths), "--dry-run removed a claim record"
         fixed = json.loads(run("locks", "--fix", "--json", "--yes").stdout)
         assert fixed["applied"] is True and fixed["reason"] is None, fixed
-        assert [c["role"] for c in fixed["cleared"]] == ["watcher", "keeper", "nas pane"] \
+        assert [c["role"] for c in fixed["cleared"]] == ["watcher", "keeper"] \
             and all(c["removed"] for c in fixed["cleared"]), fixed["cleared"]
         assert all(not os.path.exists(p) for p in fix_paths), "the fix left a leftover record"
         again = json.loads(run("locks", "--fix", "--json", "--yes").stdout)
@@ -3744,9 +4435,9 @@ try:
     def asked(mode: str) -> list:
         return [src.name for src in module.sources_for(_Ask(mode))]
 
-    assert sorted(module.SOURCES) == ["cli", "desktop", "nas"], sorted(module.SOURCES)
+    assert sorted(module.SOURCES) == ["cli", "desktop"], sorted(module.SOURCES)
     for name, cls in (("cli", "CliSource"), ("desktop", "DesktopSource"),
-                      ("nas", "NasSource")):
+                      ):
         src = module.SOURCES[name]
         assert isinstance(src, getattr(module, cls)), (name, type(src))
         assert (src.name, src.backend) == (name, name), (src.name, src.backend)
@@ -3754,18 +4445,144 @@ try:
             assert getattr(type(src), method) is not getattr(module.Source, method), (name, method)
         assert src.miss().get("error"), (name, src.miss())
     assert asked("auto") == ["cli", "desktop"], asked("auto")
-    assert asked("cli") == ["cli"] and asked("desktop") == ["desktop"] and asked("nas") == ["nas"]
+    assert asked("cli") == ["cli"] and asked("desktop") == ["desktop"]
     # `-s cli` asks ONE source: with no journal in this directory the answer is an error,
     # not the desktop store — which is what the whole seam has to keep true
     assert module.SOURCES["cli"].miss()["error"] == "no CLI chat for this directory"
     assert module.SOURCES["desktop"].miss()["error"] == "no conversation DB found"
     say("sources: one protocol, three readers, and the order `-s` asks them in: ok")
 
+    # ---- a cached state that is FRESH and answers the request can still name a session that
+    #      has ENDED: a watcher heartbeats the file it owns after the chat behind it finished,
+    #      and `auto` accepts whatever backend the watcher wrote. The pane used to hold that
+    #      until the file aged out or somebody reloaded it by hand; now it re-resolves once,
+    #      as soon as the session is over.
+    now_ms = int(time.time() * 1000)
+
+    class _PaneArgs:
+        source = "auto"
+        interval = 1.0
+
+    live_cli = {"backend": "cli", "session": "LIVE", "tool_version": module.VERSION,
+                "status": "watching", "heartbeat_ms": now_ms,
+                "store_mtime_ms": now_ms - 1_000}
+    dead_cli = dict(live_cli, session="DEAD",
+                    store_mtime_ms=now_ms - module.SOURCE_LIVE_MS - 60_000)
+    assert not module.followed_session_over(live_cli, None, now_ms), "a moving journal is live"
+    assert module.followed_session_over(dead_cli, None, now_ms), "a silent one with no process is over"
+    assert not module.followed_session_over(dead_cli, 1234, now_ms), (
+        "a Freebuff process behind the chat keeps it live"
+    )
+    assert not module.followed_session_over({"backend": "desktop", "store_mtime_ms": 1}, None,
+                                             now_ms), "only the CLI answers from a journal clock"
+    assert not module.followed_session_over({"backend": "cli", "store_mtime_ms": None}, None,
+                                             now_ms), "no clock to judge by is not 'over'"
+    # the pane keeps a fresh, live state and drops a fresh one whose session has ended — that
+    # drop IS the re-resolve — and it stays dropped: the file still names the ended session, so
+    # there is no "already handled" that could hand the same list back on the next poll
+    assert module.pane_cached_state(live_cli, _PaneArgs(), None, now_ms)
+    assert not module.pane_cached_state(dead_cli, _PaneArgs(), None, now_ms)
+    assert not module.pane_cached_state(dead_cli, _PaneArgs(), None, now_ms + 60_000), (
+        "a dropped session must not come back just because a poll went by"
+    )
+    # a stale file is unusable whatever it says, and a state that is not an answer to THIS
+    # request is never used (`-s cli` is not answered by the desktop store's state)
+    stale = dict(live_cli, heartbeat_ms=now_ms - 60_000)
+    assert not module.pane_cached_state(stale, _PaneArgs(), None, now_ms)
+
+    class _CliArgs:
+        source = "cli"
+        interval = 1.0
+
+    assert not module.pane_cached_state(
+        dict(live_cli, backend="desktop", session="D"), _CliArgs(), None, now_ms
+    ), "an explicit source is never answered by another backend's cached state"
+    say("the pane: a cached list is dropped the moment its session ends: ok")
+
+    # ---- ...and the PANE does it, not just the helper: the real loop, in a pty, started from
+    #      a cached state that is fresh and answers the request but names a finished session.
+    #      It must come up on the LIVE chat — and do it on its own poll, with no reload.
+    import fcntl
+    import pty
+    import select
+    import struct
+    import termios
+
+    proj = "liveproj"
+    cli_root = os.path.join(TEST_HOME, "paneroot")
+    chat = os.path.join(cli_root, proj, "chats", "2026-01-01T00-00-00.000Z")
+    os.makedirs(chat, exist_ok=True)
+    live_step = "the live session's only step"
+    with open(os.path.join(chat, "log.jsonl"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "level": "DEBUG", "timestamp": "2026-01-01T00:00:01.000Z",
+            "data": {"toolCalls": [{"toolName": "write_todos",
+                                    "input": {"todos": [{"task": live_step,
+                                                        "completed": False}]}}]},
+        }) + "\n")
+    pane_cwd = os.path.join(TEST_HOME, "panecwd", proj)
+    os.makedirs(pane_cwd, exist_ok=True)
+    # the cached state the pane starts from: fresh, matching, and a FINISHED session
+    dead_now = int(time.time() * 1000)
+    with open(module.STATE_PATH, "w", encoding="utf-8") as fh:
+        json.dump({
+            "schema": 1, "backend": "cli", "session": "DEAD", "status": "watching",
+            "tool_version": module.VERSION, "heartbeat_ms": dead_now,
+            "store_mtime_ms": dead_now - module.SOURCE_LIVE_MS - 60_000,
+            "todos": [{"task": "a finished session's step", "completed": True}],
+        }, fh)
+    master, slave = pty.openpty()
+    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+    # `--watch-pid` names a pid that cannot be alive, so `find_instance` answers None on ANY
+    # machine: the check must not pass or fail on whether this one happens to run freebuff.
+    pane_proc = subprocess.Popen(
+        [sys.executable, FB, "pane", "--no-daemon", "--interval", "0.2",
+         "--stale-after", "0", "--cli-root", cli_root, "--watch-pid", "999999"],
+        cwd=pane_cwd, stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True,
+    )
+    os.close(slave)
+    os.set_blocking(master, False)
+    seen = bytearray()
+    ended = time.time() + 6.0
+    try:
+        while time.time() < ended:
+            ready, _, _ = select.select([master], [], [], 0.2)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            seen += chunk
+            if live_step.encode() in seen:
+                break
+    finally:
+        pane_proc.send_signal(signal.SIGINT)
+        try:
+            pane_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pane_proc.kill()
+        os.close(master)
+    painted = STRIP(seen.decode("utf-8", "replace"))
+    assert live_step in painted, painted[-800:]
+    assert "a finished session's step" not in painted, (
+        "the pane painted the finished session's list instead of re-resolving\n" + painted[-800:]
+    )
+    say("the pane: it re-resolves away from an ended session without a reload: ok")
+
+
     old = module.finish_state(
         {"session": "S1", "todos": [{"task": "a", "completed": True}]}, None
     )
-    new_session_empty = module.finish_state({"session": "S2", "todos": []}, old)
+    new_session_empty = module.finish_state(
+        {"session": "S2", "todos": [], "task_times": {"a": {"started_ms": 1, "done_ms": 2}}},
+        old,
+    )
     assert new_session_empty["cleared"] is True, new_session_empty
+    # the previous session's clocks have nothing left to describe, so they go with its list
+    assert new_session_empty["task_times"] == {}, new_session_empty
     assert new_session_empty["list_version"] == 0, new_session_empty
     assert new_session_empty["todos"] == [], new_session_empty
     new_list = module.finish_state(
@@ -3786,12 +4603,14 @@ try:
     # ---- a FINISHED list does not belong to the turn after it: it is dropped, not carried
     done = {"session": "S", "todos": [{"task": "a", "completed": True}], "ts": 1000,
             "source_updated_ms": 1000, "probed_ms": 3000, "goal": "the old project",
+            "task_times": {"a": {"started_ms": 10, "done_ms": 70, "elapsed_ms": 60}},
             "now": None, "nudge": None}
     was = dict(done, list_version=4, list_id="x")
     after = module.finish_state(dict(done, turn={"start_ms": 2000}), was)
     assert after["todos"] == [] and after["total"] == 0 and after["done"] == 0, after
     assert after["cleared"] is True and after["cleared_turn"] is True, after
     assert after["goal"] is None, after          # the heading described the dropped list
+    assert after["task_times"] == {}, after      # ...and so did the dropped list's clocks
     assert after["list_version"] == 4, after     # a drop is not a new list
     assert "last turn's list is done" in module.no_list_reason(after), after
     # work LEFT on it is the agent's standing plan, so it stays — heading and all
@@ -3802,13 +4621,15 @@ try:
     held = module.finish_state(left, was)
     assert len(held["todos"]) == 2 and not held["cleared_turn"], held
     assert held["goal"] == "the old project", held
+    assert held["task_times"] == done["task_times"], held   # a standing plan keeps its clocks
     # a list written INSIDE this turn is this turn's own, however finished it looks
     inside = dict(done, ts=3000, source_updated_ms=3000, turn={"start_ms": 2000})
     kept = module.finish_state(inside, was)
     assert len(kept["todos"]) == 1 and not kept["cleared_turn"], kept
-    # the NAS and desktop paths carry no turn clock; a newer request is enough there
-    nas_ish = module.finish_state(dict(done, now="something new"), was)
-    assert nas_ish["todos"] == [] and nas_ish["cleared_turn"] is True, nas_ish
+    assert kept["task_times"] == done["task_times"], kept  # this turn's own list keeps its clocks
+    # the desktop path carries no turn clock; a newer request is enough there
+    desktop_ish = module.finish_state(dict(done, now="something new"), was)
+    assert desktop_ish["todos"] == [] and desktop_ish["cleared_turn"] is True, desktop_ish
     say("a finished list is dropped when the next turn starts, and only then: ok")
 
     # ---- the desktop app runs SEVERAL threads per project (each tab is one, and a thread
@@ -3910,6 +4731,1333 @@ try:
     assert not off.get("threads"), "--threads 0 is the one-list answer"
     say("desktop: --threads and --thread-live reach the state through the CLI: ok")
 
+    # ---- a turn writes its list MORE THAN ONCE — that is what updating a todo list IS — and
+    #      the app commits the whole turn as ONE message whose parts carry every call in order.
+    #      So one `messages` row holds several `write_todos` lists and only the LAST of them is
+    #      the turn's list. A reader that took the first (SQLite is free to hand `json_each`'s
+    #      rows over in any order) drew a finished turn as `0/6` with a live clock beside it —
+    #      measured 2026-10-03 on the pane following this very session, its own turn's OPENING
+    #      list, after the turn had closed with every step ticked. The row is added here rather
+    #      than to `desk_rows` above so the live-thread assertions already made cannot change.
+    multi_parts = json.dumps([
+        {"toolName": "write_todos",
+         "input": {"todos": [{"task": "first step", "completed": False},
+                             {"task": "second step", "completed": False}]}},
+        {"toolName": "read_file"},
+        {"toolName": "write_todos",
+         "input": {"todos": [{"task": "first step", "completed": True},
+                             {"task": "second step", "completed": True}]}},
+    ])
+    con = sqlite3.connect(desk_db)
+    con.execute("INSERT INTO threads VALUES ('T6', 'Rewritten list', 'open', NULL)")
+    con.execute("INSERT INTO messages VALUES (99, 'T6', ?, ?)",
+                (multi_parts, DESK_NOW - 210 * 60_000))
+    con.commit()
+    con.close()
+    multi = module.read_desktop(desk_db, thread_id="T6", source="pinned", now_ms=DESK_NOW)
+    assert [t["completed"] for t in multi["todos"]] == [True, True], multi["todos"]
+    wide = module.read_desktop(desk_db, thread_id="T0", source="pinned", others=9,
+                               now_ms=DESK_NOW, window_ms=0)
+    six = next(t for t in wide["threads"] if t["id"] == "T6")
+    assert all(t["completed"] for t in six["todos"]), six["todos"]
+    rewritten = json.loads(run(
+        "json", "-s", "desktop", "--db", desk_db, "--state", desk_state, "-t", "T6"
+    ).stdout)
+    assert (rewritten["done"], rewritten["total"]) == (2, 2), (rewritten["done"], rewritten["total"])
+    say("desktop: a turn's list is its LAST write_todos, not its first: ok")
+
+    # ---- ...and the row's PROSE, which nothing read at all: the live history has a running
+    #      turn's heading and requests, the committed rows have every finished turn's — so a
+    #      pane following the app whose agent state carries no history drew a heading-less list
+    #      beside `no heading — the agent owes a Goal: line` while the row it was reading held
+    #      the line (measured 2026-10-03 on the pane following this session). The committed row
+    #      is read by the same rules, anchored to ITS list — and its positions are `(seq, key)`
+    #      pairs for the same reason the list read orders by `part.key`: one row is a whole
+    #      turn, so two headings in it would otherwise share a position.
+    prose_dir = os.path.join(TEST_HOME, "prosestore")
+    os.makedirs(prose_dir, exist_ok=True)
+    prose_db = os.path.join(prose_dir, "desktop-v2.db")
+    if os.path.exists(prose_db):
+        os.remove(prose_db)
+    prose_first = [{"task": "the older step", "completed": True},
+                   {"task": "the newer step", "completed": False}]
+    prose_last = [{"task": "the older step", "completed": True},
+                  {"task": "the newer step", "completed": True}]
+    prose_opened, prose_list = DESK_NOW - 90_000, DESK_NOW - 60_000
+    prose_parts = [
+        {"kind": "text", "text": "Goal: the heading of the FIRST list"},
+        {"kind": "tool", "toolName": "write_todos", "input": {"todos": prose_first}},
+        {"kind": "text", "text": "Goal: the heading that belongs to the shown list"},
+        {"kind": "tool", "toolName": "write_todos", "input": {"todos": prose_last}},
+    ]
+
+    def write_prose(requests=(), harness=None, turn_state="idle", beat=0, opened=0, parts=None,
+                    rows=None):
+        con = sqlite3.connect(prose_db)
+        con.execute("CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, title TEXT,"
+                    " status TEXT, turn_state TEXT, turn_alive_at INTEGER,"
+                    " last_prompt_at INTEGER, sidebar_archived_at INTEGER, harness_state TEXT)")
+        con.execute("CREATE TABLE IF NOT EXISTS messages (seq INTEGER, thread_id TEXT,"
+                    " role TEXT, parts_json TEXT, ts INTEGER)")
+        con.execute("DELETE FROM threads")
+        con.execute("DELETE FROM messages")
+        con.execute("INSERT INTO threads VALUES ('P0', 'Prose thread', 'open', ?, ?, ?, NULL, ?)",
+                    (turn_state, beat, opened, json.dumps(harness) if harness else None))
+        if rows is None:
+            rows = [
+                (200, "user", [{"kind": "text", "text": "tidy the footer"}], prose_opened),
+                (201, "assistant", prose_parts if parts is None else parts, prose_list),
+            ]
+        for seq, role, body, ts in rows:
+            con.execute("INSERT INTO messages VALUES (?, 'P0', ?, ?, ?)",
+                        (seq, role, json.dumps(body), ts))
+        for seq, text, ts in requests:
+            con.execute("INSERT INTO messages VALUES (?, 'P0', 'user', ?, ?)",
+                        (seq, json.dumps([{"kind": "text", "text": text}]), ts))
+        con.commit()
+        con.close()
+
+    def read_prose():
+        return module.read_desktop(prose_db, thread_id="P0", source="pinned", now_ms=DESK_NOW)
+
+    write_prose(requests=[(202, "add a colour palette", DESK_NOW - 10_000)])
+    st = read_prose()
+    assert [t["completed"] for t in st["todos"]] == [True, True], st["todos"]
+    assert st.get("goal") == "the heading that belongs to the shown list", st.get("goal")
+    assert not st.get("goal_stale"), st
+    assert st["now"] == "add a colour palette" and st["nudge"] is None, st
+    # a bare continuation after the list is a nudge, exactly as in the live history
+    write_prose(requests=[(203, "continue", DESK_NOW - 10_000)])
+    st = read_prose()
+    assert st["nudge"] == "continue" and st["now"] is None, st
+    # nothing after the list: no request the shown list does not already describe
+    write_prose()
+    st = read_prose()
+    assert st["now"] is None and st["nudge"] is None, st
+    assert st.get("goal") == "the heading that belongs to the shown list", st.get("goal")
+    # ...and it reaches the command people run to see what the pane is about to draw
+    drawn = json.loads(run(
+        "json", "-s", "desktop", "--db", prose_db, "-t", "P0",
+        "--state", os.path.join(prose_dir, "workspace.json"),
+    ).stdout)
+    assert drawn["goal"] == "the heading that belongs to the shown list", drawn.get("goal")
+    assert (drawn["done"], drawn["total"]) == (2, 2), (drawn["done"], drawn["total"])
+    say("desktop: a committed row's own heading, now and nudge are read — the last part and "
+        "the newest request: ok")
+
+    # ---- ...and the heading is not always in the list's own row: an agent that states its goal
+    #      once and then re-publishes the same list in later turns leaves it one row back — its
+    #      own words are kept and the shared rule decides whether they still belong to this list
+    #      (`_goal_choice`) and whether the reader should be told the list moved on
+    #      (`goal_stale_at`). Both sides below are the shapes a real thread has.
+    back_one = [{"kind": "text", "text": "Goal: stated once, one turn back"}]
+    two_lists = [prose_parts[1], prose_parts[3]]
+    write_prose(rows=[(300, "user", [{"kind": "text", "text": "tidy the footer"}],
+                       prose_opened),
+                      (301, "assistant", back_one, prose_list - 20_000),
+                      (302, "assistant", two_lists, prose_list)])
+    st = read_prose()
+    assert st.get("goal") == "stated once, one turn back", st.get("goal")
+    assert not st.get("goal_stale"), st
+    write_prose(rows=[(300, "user", [{"kind": "text", "text": "the older ask"}],
+                       prose_opened),
+                      (301, "assistant", back_one, prose_list - 20_000),
+                      (302, "user", [{"kind": "text", "text": "a newer ask"}],
+                       prose_list - 10_000),
+                      (303, "assistant", two_lists, prose_list)])
+    st = read_prose()
+    assert st.get("goal") == "stated once, one turn back", st.get("goal")
+    assert st.get("goal_stale") is True, st
+    say("desktop: a heading written one row back still heads the list — and is marked when "
+        "the list's own turn opened after it: ok")
+
+    # ---- ...and the LIVE history's prose must not be carried over a list it does not head: a
+    #      heading from `harness_state` belongs to the harness's list, so when the committed row
+    #      is what the pane is showing, its own prose answers — and when that row states no
+    #      heading, the answer is NO heading (the honest `the agent owes a Goal: line`), never
+    #      the live history's. The harness's list here predates the turn (`last_prompt_at` is
+    #      newer), which is exactly when this happened; the committed row is the same lists
+    #      with the headings taken out, so what the state carries IS the harness's leak.
+    stale_history = {"sessionState": {"mainAgentState": {"messageHistory": [
+        {"role": "assistant", "sentAt": prose_list - 40_000,
+         "content": [{"type": "tool-call", "toolName": "write_todos",
+                      "input": {"todos": prose_first}}]},
+        {"role": "assistant", "sentAt": prose_list - 39_000,
+         "content": [{"type": "text", "text": "Goal: the live history's own heading"}]},
+    ]}}}
+    write_prose(harness=stale_history, turn_state="running", beat=DESK_NOW - 1_000,
+                opened=DESK_NOW - 5_000, parts=[prose_parts[1], prose_parts[3]])
+    st = read_prose()
+    assert st["turn_running"] is True and st["todos"] == prose_last, st
+    assert st.get("goal") is None, st.get("goal")
+    say("desktop: the live history's heading never heads a committed row's list: ok")
+
+    # ---- ...and the committed rows say WHO asked, in a receipt rather than a tag: every user
+    #      message the app writes carries the `input_id` of a `queue_items` row, whose `source`
+    #      is the app's own word for the asker (`user` for the person, `assistant` for a prompt
+    #      it wrote for itself, `mission-*`, `skill`) and whose `kind` says whether the row is a
+    #      request at all. The harness calls the same distinction `USER_PROMPT`; skipping it
+    #      let the app's own prompt stand as the newest ask (measured 2026-10-04 on the live
+    #      store: the pane offered `Find how the desktop app marks a real user request` — an
+    #      auto-run step — as `now`). One receipt the app cannot write for itself: its Continue
+    #      button posts its fixed resume line through the ORDINARY send path, so only the words
+    #      give it away.
+    receipt_dir = os.path.join(TEST_HOME, "receiptstore")
+    os.makedirs(receipt_dir, exist_ok=True)
+    receipt_db = os.path.join(receipt_dir, "desktop-v2.db")
+    if os.path.exists(receipt_db):
+        os.remove(receipt_db)
+    resume = "Continue the interrupted request from where you left off."
+
+    def write_receipts(requests=(), harness=None, turn_state="idle", beat=0, opened=0):
+        """The prose store again, with receipts: `requests` are (seq, text, source, kind, ts)."""
+        con = sqlite3.connect(receipt_db)
+        con.execute("CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, title TEXT,"
+                    " status TEXT, turn_state TEXT, turn_alive_at INTEGER,"
+                    " last_prompt_at INTEGER, sidebar_archived_at INTEGER, harness_state TEXT)")
+        con.execute("CREATE TABLE IF NOT EXISTS messages (seq INTEGER, thread_id TEXT,"
+                    " role TEXT, parts_json TEXT, ts INTEGER, input_id TEXT)")
+        con.execute("CREATE TABLE IF NOT EXISTS queue_items (id TEXT PRIMARY KEY,"
+                    " source TEXT, kind TEXT)")
+        for table in ("threads", "messages", "queue_items"):
+            con.execute(f"DELETE FROM {table}")
+        con.execute("INSERT INTO threads VALUES ('R0', 'Receipt thread', 'open', ?, ?, ?, NULL, ?)",
+                    (turn_state, beat, opened, json.dumps(harness) if harness else None))
+        con.execute("INSERT INTO messages VALUES (200, 'R0', 'user', ?, ?, 'r-200')",
+                    (json.dumps([{"kind": "text", "text": "tidy the footer"}]), prose_opened))
+        con.execute("INSERT INTO queue_items VALUES ('r-200', 'user', 'prompt')")
+        con.execute("INSERT INTO messages VALUES (201, 'R0', 'assistant', ?, ?, NULL)",
+                    (json.dumps(prose_parts), prose_list))
+        for seq, text, source, kind, ts in requests:
+            con.execute("INSERT INTO messages VALUES (?, 'R0', 'user', ?, ?, ?)",
+                        (seq, json.dumps([{"kind": "text", "text": text}]), ts, f"r-{seq}"))
+            con.execute("INSERT INTO queue_items VALUES (?, ?, ?)", (f"r-{seq}", source, kind))
+        con.commit()
+        con.close()
+
+    def read_receipts():
+        return module.read_desktop(receipt_db, thread_id="R0", source="pinned", now_ms=DESK_NOW)
+
+    # The newest row here is the app's OWN prompt; the pane must still show the user's ask.
+    write_receipts(requests=[(202, "add a colour palette", "user", "prompt", DESK_NOW - 20_000),
+                             (203, "audit every committed-row read", "assistant", "prompt",
+                              DESK_NOW - 10_000)])
+    st = read_receipts()
+    assert st["now"] == "add a colour palette" and st["nudge"] is None, st
+    # A row that is not a request at all — a skill activation, say — is not one either.
+    write_receipts(requests=[(202, "/merge-local", "user", "skill-context", DESK_NOW - 10_000)])
+    st = read_receipts()
+    assert st["now"] is None and st["nudge"] is None, st
+    # ...and the app's own resume line, which rides the ordinary send path (receipt `user`),
+    # is not an ask: the request before it stands, and when it is the only thing there the
+    # pane says nothing rather than reporting the app's button as the newest request.
+    write_receipts(requests=[(202, "add a colour palette", "user", "prompt", DESK_NOW - 20_000),
+                             (203, resume, "user", "prompt", DESK_NOW - 10_000)])
+    st = read_receipts()
+    assert st["now"] == "add a colour palette" and st["nudge"] is None, st
+    write_receipts(requests=[(203, resume, "user", "prompt", DESK_NOW - 10_000)])
+    st = read_receipts()
+    assert st["now"] is None and st["nudge"] is None, st
+    # The LIVE history gets the same treatment: the button's line is tagged `USER_PROMPT`
+    # exactly like the user's words, so the tag alone cannot tell them apart — and here the
+    # live list is the one the pane shows, which is the state the app is in right after the
+    # button is pressed.
+    resume_history = {"sessionState": {"mainAgentState": {"messageHistory": [
+        {"role": "assistant", "sentAt": prose_list + 4_000,
+         "content": [{"type": "tool-call", "toolName": "write_todos",
+                      "input": {"todos": prose_last}}]},
+        {"role": "user", "sentAt": prose_list + 5_000, "tags": ["USER_PROMPT"],
+         "content": [{"type": "text", "text": resume}]},
+    ]}}}
+    write_receipts(harness=resume_history, turn_state="running", beat=DESK_NOW - 1_000,
+                   opened=DESK_NOW - 120_000)
+    st = read_receipts()
+    assert st.get("live_list") is True and st["todos"] == prose_last, st
+    assert st["now"] is None and st["nudge"] is None, st
+    say("desktop: only a row the app's own receipt attributes to the user is a request — the "
+        "app's prompts and its resume line are not: ok")
+
+    # ---- `auto` asks the session WORKING in this directory, and a chat directory keeps its
+    #      last chat forever: a finished CLI journal used to answer for a directory whose live
+    #      session was in the desktop store, so the pane rendered a two-day-old list, frozen,
+    #      while the app's own thread moved (the `09-30 07:12 · ALL DONE` pane of 2026-10-03).
+    #      A finished journal is HELD now, and only answers when nothing fresher is here.
+    dead = os.path.join(TEST_HOME, "deadchat")
+    os.makedirs(dead, exist_ok=True)
+    dead_log = os.path.join(dead, "log.jsonl")
+    with open(dead_log, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"data": {"toolCalls": []}}) + "\n")
+    stale_at = time.time() - (module.SOURCE_LIVE_MS / 1000.0) - 3600
+    os.utime(dead_log, (stale_at, stale_at))
+
+    def auto_pick(*extra, instance_pid=0):
+        args = module.build_parser().parse_args(
+            ["json", "-s", "auto", "--chat", dead, "--db", desk_db, "--state", desk_state,
+             *extra]
+        )
+        return module._snapshot(args, cwd=TEST_HOME, instance_pid=instance_pid)
+
+    assert not module._chat_is_live({"chat": dead}, None), (
+        "a journal quiet past the live window is a finished session"
+    )
+    picked = auto_pick()
+    assert picked["backend"] == "desktop", picked          # the live store answers instead
+    # ...and the chain says so on the state, in its own words: this is what the pane's title
+    # draws, so a list that looks wrong names the choice behind it
+    assert picked["source_why"].startswith("cli finished "), picked
+    assert picked["source_why"].endswith("→ desktop"), picked
+    running = auto_pick(instance_pid=1234)
+    assert running["backend"] == "cli", "a running Freebuff process keeps its chat"
+    assert "source_why" not in running, (
+        "nothing was passed over, so there is nothing to explain"
+    )
+    os.utime(dead_log, None)                               # the journal is alive again
+    assert module._chat_is_live({"chat": dead}, None)
+    assert auto_pick()["backend"] == "cli", "a working CLI session still answers"
+    os.utime(dead_log, (stale_at, stale_at))
+    cli_args = module.build_parser().parse_args(["json", "-s", "cli", "--chat", dead])
+    single = module._snapshot(cli_args, cwd=TEST_HOME, instance_pid=0)
+    assert single["backend"] == "cli", (
+        "`-s cli` never falls through: asking for one source means exactly that"
+    )
+    assert "source_why" not in single, (
+        "a chain of ONE source has no other source to explain away"
+    )
+    say("sources: `auto` follows the live store, not a finished chat's last list: ok")
+
+    # ---- the three source paths nothing else in this suite reaches, each one a way a pane
+    #      can end up answering from the wrong place. Found by reading the branches of
+    #      `sources.py` against this suite (2026-10-04): `--project` never appears in it, the
+    #      file source's own miss string appears nowhere, and the held-chat fallback — the one
+    #      branch where `auto` deliberately answers a FINISHED chat — had no check at all.
+    gap_root = os.path.join(TEST_HOME, "gaproot")
+    proj_a = os.path.join(TEST_HOME, "gapprojA")
+    proj_b = os.path.join(TEST_HOME, "gapprojB")
+    for d in (proj_a, proj_b):
+        os.makedirs(d, exist_ok=True)
+    chat_b = os.path.join(gap_root, "gapprojB", "chats", "2026-01-01T00-00-00.000Z")
+    os.makedirs(chat_b, exist_ok=True)
+    b_step = "project B's own step"
+    with open(os.path.join(chat_b, "log.jsonl"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"timestamp": "2026-01-01T00:00:00.000Z",
+                             "data": {"prompt": "work on B", "shouldEndTurn": False}}) + "\n")
+        fh.write(json.dumps({"data": {"toolCalls": [
+            {"toolName": "write_todos",
+             "input": {"todos": [{"task": b_step, "completed": False}]}}]}}) + "\n")
+
+    # (1) `--project`: the chat a DIRECTORY answers with is named by the directory's own
+    # name, so a pane opened in a directory that has no chat of its own has nothing — and
+    # `-p` is how a reader points a pane at a sibling project instead. It reaches
+    # `cli_chat_dir` as the basename it is given, so this is a path of its own and not a
+    # spelling of `--chat`: the cwd below is a project with NO chat, and the answer must come
+    # from the one that was named.
+    proj_args = module.build_parser().parse_args(
+        ["json", "-s", "cli", "--cli-root", gap_root, "--project", "gapprojB"])
+    by_project = module._snapshot(proj_args, cwd=proj_a, instance_pid=0)
+    assert by_project["backend"] == "cli", by_project
+    assert by_project["target"] == chat_b, (by_project["target"], chat_b)
+    assert [t["task"] for t in by_project["todos"]] == [b_step], by_project
+    # ...and the same directory with no project named is the miss it has always been, which
+    # is what makes the flag worth having rather than a second spelling of the cwd.
+    here_args = module.build_parser().parse_args(
+        ["json", "-s", "cli", "--cli-root", gap_root])
+    assert module._snapshot(here_args, cwd=proj_a, instance_pid=0)["backend"] is None, (
+        "a directory with no chat of its own must not borrow a sibling project's"
+    )
+    say("sources: `--project` answers for the project it names, not this directory's: ok")
+
+    # (2) the file source's own miss. `-s file:PATH` is the one backend a reader can point at
+    # a path that does not exist, and its answer must say WHICH path rather than inherit the
+    # last source's wording — a wrong-path typo is the whole failure a reader is chasing when
+    # they read it.
+    missing_path = os.path.join(TEST_HOME, "no-such-state.json")
+    missing = module._snapshot(
+        module.build_parser().parse_args(["json", "-s", f"file:{missing_path}"]),
+        cwd=TEST_HOME, instance_pid=0)
+    assert missing["backend"] == "file", missing
+    assert missing["error"] == f"no state file at {missing_path}", missing
+    assert missing["todos"] == [], missing
+    say("sources: a file source with no file names the path it looked for: ok")
+
+    # (3) the held-chat fallback: when the finished chat is all `auto` has, it answers with it
+    # and SAYS SO. This is the branch the freeze fix pushed the work onto, and it is what keeps
+    # `auto` from being a source that sometimes says nothing — an old list is a better answer
+    # than an empty one, and `-s cli` would have said the same thing.
+    chat_c = os.path.join(gap_root, "gapprojB", "chats", "2026-02-02T00-00-00.000Z")
+    os.makedirs(chat_c, exist_ok=True)
+    with open(os.path.join(chat_c, "log.jsonl"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"data": {"prompt": "an earlier request",
+                                      "shouldEndTurn": False}}) + "\n")
+        fh.write(json.dumps({"data": {"toolCalls": [
+            {"toolName": "write_todos",
+             "input": {"todos": [{"task": "the finished chat's step",
+                                 "completed": True}]}}]}}) + "\n")
+        fh.write(json.dumps({"data": {"shouldEndTurn": True}}) + "\n")
+    held_at = time.time() - 60_000
+    os.utime(os.path.join(chat_c, "log.jsonl"), (held_at, held_at))
+    held_args = module.build_parser().parse_args(
+        ["json", "-s", "auto", "--cli-root", gap_root,
+         "--db", os.path.join(TEST_HOME, "gapstores", "*", "desktop-v2.db"),
+         "--state", os.path.join(TEST_HOME, "gapworkspace.json")])
+    held = module._snapshot(held_args, cwd=proj_b, instance_pid=0)
+    assert held["backend"] == "cli", held
+    assert held["target"] == chat_c, (held["target"], chat_c)
+    assert held["source_why"].startswith("cli finished "), held.get("source_why")
+    assert held["source_why"].endswith("→ cli"), held.get("source_why")
+    say("sources: a finished chat is still the answer when nothing fresher is: ok")
+
+    # ---- ...and the clock it judges that by is the AGENT's, not the file's. The desktop app
+    #      appends its own records to the same journal (`cli.feedback_button_hovered`, a note
+    #      saved, a tab closed), so a chat whose turn ENDED an hour ago still had a fresh
+    #      mtime, `auto` kept answering a live desktop thread with that finished list, and the
+    #      pane sat frozen on one session's `ALL DONE` while the app worked (measured
+    #      2026-10-04: unchanged across two tabs). The turn boundary decides instead.
+    def agent_journal(name, *records):
+        """A chat directory whose journal holds `records` newest-last, and is fresh."""
+        chat = os.path.join(TEST_HOME, name)
+        os.makedirs(chat, exist_ok=True)
+        with open(os.path.join(chat, "log.jsonl"), "w", encoding="utf-8") as fh:
+            for rec in records:
+                fh.write(json.dumps(rec) + "\n")
+        os.utime(os.path.join(chat, "log.jsonl"), None)
+        return chat
+
+    def at(seconds_ago, **data):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(
+            time.time() - seconds_ago)) + ".000Z"
+        return {"timestamp": stamp, "data": data}
+
+    ended_chat = agent_journal("endedchat",
+                               at(3600, prompt="a request an hour ago", shouldEndTurn=False),
+                               at(3500, fullResponse="the answer", iteration=9,
+                                  shouldEndTurn=True),
+                               # ...and then the APP touched the file, minutes later
+                               at(120, eventId="cli.feedback_button_hovered",
+                                  messageId="m1", source="cli"))
+    assert module.journal_liveness(ended_chat)[1] is True, (
+        "a journal whose newest turn boundary ended is a session waiting for you"
+    )
+    assert not module._chat_is_live({"chat": ended_chat}, None), (
+        "an app append must not make a finished session the session WORKING here"
+    )
+    # ...and the pid has to BE one. `--watch-pid` is taken as given whenever that pid is
+    # alive, and the shell wrapper passes one on every session, so in a directory the app
+    # also works in a live pid with no Freebuff behind it is not evidence about the chat
+    # whose finished journal is sitting there — measured 2026-10-04, the same freeze this
+    # whole rule exists to prevent, reachable whenever a pid resolves. So the exception
+    # says Freebuff and the pid's identity is asked. (The stand-in is a script, because
+    # macOS SIGKILLs a copied /bin/sleep: AMFI takes the copy's signature, and `ps` then
+    # shows no command line to recognise.)
+    lbin = os.path.join(TEST_HOME, "livebin")
+    os.makedirs(lbin, exist_ok=True)
+    lfake = os.path.join(lbin, "freebuff")
+    with open(lfake, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\nsleep 600 & wait\n")
+    os.chmod(lfake, 0o755)
+    live_fb = spawn_quiet(lfake)
+    assert wait_for(lambda: live_fb.poll() is None
+                    and live_fb.pid in module.freebuff_pids()), (
+        "the stand-in freebuff never reached the process table"
+    )
+    try:
+        assert module._chat_is_live({"chat": ended_chat}, live_fb.pid), (
+            "a real Freebuff process behind an ended chat is still working it"
+        )
+    finally:
+        kill_tree(live_fb)
+    assert not module._chat_is_live({"chat": ended_chat}, os.getpid()), (
+        "a live pid that is not Freebuff must not resurrect a finished session"
+    )
+    # ...and it is the journal's own turn, not a quiet window: this one ended a minute ago,
+    # well inside `SOURCE_LIVE_MS`, and is still not a session working here.
+    just_ended = agent_journal("justended", at(30, shouldEndTurn=True))
+    assert not module._chat_is_live({"chat": just_ended}, None), (
+        "a turn that ended inside the live window is finished all the same"
+    )
+    # ...while the two shapes that ARE working answer true, and the pane's other half — the
+    # cached state it keeps drawing — drops the finished session the same way.
+    working = agent_journal("workingchat",
+                            at(30, prompt="keep going", shouldEndTurn=False),
+                            at(20, toolCalls=[{"toolName": "write_todos"}],
+                               shouldEndTurn=False))
+    assert module._chat_is_live({"chat": working}, None), "a turn in flight is live"
+    assert not module.journal_liveness(working)[1], "a turn in flight has not ended"
+    waiting = agent_journal("waitingchat", at(30, shouldEndTurn=True),
+                            at(20, prompt="and now the other half"))
+    assert not module.journal_liveness(waiting)[1], (
+        "a request after the turn ended puts the session back to work"
+    )
+    assert module._chat_is_live({"chat": waiting}, None), (
+        "a fresh request is a working session whatever the previous turn ended"
+    )
+    fresh = int(time.time() * 1000)
+    assert module.followed_session_over({"backend": "cli", "session": "E", "target": ended_chat,
+                                         "store_mtime_ms": fresh}, None, fresh), (
+        "a fresh heartbeat over an ended journal must not keep the pane on it"
+    )
+    assert not module.followed_session_over({"backend": "cli", "session": "W", "target": working,
+                                             "store_mtime_ms": fresh}, None, fresh), (
+        "a journal still being written keeps the pane"
+    )
+    assert module.followed_session_over(dict(live_cli, target=ended_chat), None, now_ms), (
+        "a state written before `turn_ended` existed is still asked directly"
+    )
+    say("the clock `auto` follows: the agent's last record, not the app's mtime: ok")
+
+    # ---- the two states a pane's close used to be DECIDED by, pinned against the code that
+    #      owns them now. `session_still_live` — the helper that answered "is this session
+    #      still live?" for the close rule — was deleted with the rule itself (2026-10-04,
+    #      CHANGELOG: the pane's lifetime is its window's), so there is nothing left to pin
+    #      BY NAME. What is pinned here is the behaviour those two states still have, because
+    #      both were once the input to a close and neither may ever be one again.
+    #
+    #      An ERROR state is not a finished session. Nothing was read, nothing was watched,
+    #      and there is no journal behind it that could have ended — so every reader of the
+    #      question has to say so. The one that matters is the cached-state drop: answering
+    #      True would send a pane back to `snapshot`, which would resolve the same error and
+    #      cost a re-read to learn nothing.
+    error_state = {"backend": None, "todos": [], "error": "no conversation DB found"}
+    assert not module.followed_session_over(error_state, None, fresh), (
+        "an error state is not a session that ended"
+    )
+    assert not module.followed_session_over(error_state, 4321, fresh), (
+        "an error state is not a session that ended, instance or not"
+    )
+    # ...and the pane shows the error INSTEAD of a list, which is the half a reader sees: an
+    # error says "no source here", where an empty list would say "a source with nothing
+    # written yet" — two different situations that used to look alike.
+    error_frame = STRIP(module.render(error_state, True, watching=None, width=68,
+                                      now_ms=fresh, height=14, theme={}, truecolor=False))
+    assert "no conversation DB found" in error_frame, error_frame
+    assert "0%" not in error_frame and "todos" not in error_frame, error_frame
+
+    #      An ENDED JOURNAL is the other one, and it is the opposite answer: the session it
+    #      names IS over. Every reader of that fact must agree — `auto` will not choose the
+    #      chat again, and the pane drops a cached list for it rather than freezing it at
+    #      whatever the heartbeat last said.
+    ended_state = {"backend": "cli", "session": "E", "target": ended_chat,
+                   "turn_ended": True, "store_mtime_ms": fresh}
+    assert module.followed_session_over(ended_state, None, fresh), (
+        "an ended journal is a session that ended, however fresh the heartbeat is"
+    )
+    assert not module._chat_is_live({"chat": ended_chat}, None), (
+        "an ended journal is not the session working in this directory"
+    )
+    # ...and the pane KEEPS drawing it, because a finished session is not a finished pane.
+    # This is the pair the deleted helper used to collapse into one question, so it is worth
+    # having both answers next to each other: ended at the SOURCE, alive at the window.
+    ended_frame = STRIP(module.render(
+        dict(ended_state, todos=[{"task": "the step the reader is reading", "completed": True}]),
+        True, watching=None, width=68, now_ms=fresh, height=14, theme={}, truecolor=False))
+    assert "the step the reader is reading" in ended_frame, ended_frame
+    say("the two states a close used to be decided by: an error is not a finished session, "
+        "and a finished session is not a finished pane: ok")
+
+    # ---- ...and the tab the pane FOLLOWS is live where the app's own file is behind. The app
+    #      persists `workspace.activeId` on a debounce, and it reached the disk minutes after
+    #      a tab switch, so a pane reading only that file drew the tab you had already left.
+    #      No live focus signal exists to read instead — the orchestrator API and the CDP
+    #      bridge answer 401 to anything outside the app's own process (their tokens are
+    #      minted in its bootstrap), the store has no focus column, and `turn_alive_at` is
+    #      written ONE VALUE FOR ALL THREADS, so it cannot say which tab is yours. What IS
+    #      per-thread is the ask, so `focused_thread` corrects the persisted tab with the
+    #      thread being worked in — and only when the file is behind, so the app's own answer
+    #      still wins whenever the two agree.
+    focus_home = os.path.join(TEST_HOME, "focusproj")
+    focus_dir = os.path.join(focus_home, "store")
+    os.makedirs(focus_dir, exist_ok=True)
+    focus_db = os.path.join(focus_dir, "desktop-v2.db")
+    if os.path.exists(focus_db):
+        os.remove(focus_db)
+    with open(os.path.join(focus_dir, "project.json"), "w", encoding="utf-8") as fh:
+        json.dump({"projectPath": focus_home}, fh)
+    focus_con = sqlite3.connect(focus_db)
+    focus_con.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, status TEXT,"
+        " sidebar_archived_at INTEGER, turn_state TEXT, last_prompt_at INTEGER)"
+    )
+    focus_con.execute(
+        "CREATE TABLE messages (seq INTEGER, thread_id TEXT, parts_json TEXT, ts INTEGER)"
+    )
+    FOCUS_NOW = int(time.time() * 1000)
+
+    def focus_thread(tid, title, asked_ms, state, task):
+        focus_con.execute("INSERT INTO threads VALUES (?, ?, 'open', NULL, ?, ?)",
+                          (tid, title, state, asked_ms))
+        focus_con.execute(
+            "INSERT INTO messages VALUES (?, ?, ?, ?)",
+            (len(task), tid, desk_parts(desk_todos(task)), asked_ms or FOCUS_NOW),
+        )
+
+    focus_thread("A", "the tab the app still names", FOCUS_NOW - 3 * 3600_000, "idle",
+                 ("the tab you left", False))
+    focus_thread("B", "the tab you are working in", FOCUS_NOW - 30_000, "running",
+                 ("the step you just sent", False))
+    focus_con.commit()
+    focus_state = os.path.join(focus_home, "state.json")
+    with open(focus_state, "w", encoding="utf-8") as fh:
+        json.dump({"workspace": {"activeId": "A", "tabs": [{"id": "A"}],
+                                 "spaces": [{"projectPath": focus_home, "activeId": "A"}]}}, fh)
+
+    behind = module.read_desktop(focus_db, source="active", state_path=focus_state, now_ms=FOCUS_NOW)
+    assert behind["session"] == "B", behind
+    assert behind["source"] == "live-tab" and behind["todos"][0]["task"] == "the step you just sent", behind
+    assert behind["source_why"] == "A behind → B asked 0m ago", behind.get("source_why")
+    # ...and when the app's file is RIGHT, the app's answer stands and nothing says otherwise:
+    # a correction that fires on every poll would move the pane under the reader.
+    with sqlite3.connect(focus_db) as fix:
+        fix.execute("UPDATE threads SET turn_state = 'running', last_prompt_at = ? WHERE id = 'A'",
+                    (FOCUS_NOW - 5_000,))
+    agree = module.read_desktop(focus_db, source="active", state_path=focus_state, now_ms=FOCUS_NOW)
+    assert agree["session"] == "A" and agree["source"] == "active-tab", agree
+    assert not agree.get("source_why"), agree.get("source_why")
+    # ...the persisted tab is answered whatever it is, and a thread asked outside the window
+    # is not "where you are": the correction waits for the app's own write rather than guessing.
+    # The window is the one a pane already uses to decide a thread is worth showing, because it
+    # is sized by the lag it covers and not by how long a turn runs.
+    with sqlite3.connect(focus_db) as fix:
+        fix.execute("UPDATE threads SET last_prompt_at = ? WHERE id = 'A'",
+                    (FOCUS_NOW - module.DESKTOP_FOCUS_MS - 60_000,))
+        fix.execute("UPDATE threads SET last_prompt_at = ? WHERE id = 'B'",
+                    (FOCUS_NOW - module.DESKTOP_FOCUS_MS - 60_000,))
+        fix.execute("UPDATE threads SET turn_state = 'idle' WHERE id = 'A'")
+    stale = module.read_desktop(focus_db, source="active", state_path=focus_state, now_ms=FOCUS_NOW)
+    assert stale["session"] == "A", stale
+    # ...and the newest ask wins when two threads are live and neither is the persisted tab.
+    focus_thread("C", "the other one you are working in", FOCUS_NOW - 5_000, "running",
+                 ("a newer step", False))
+    focus_con.commit()
+    focus_con.close()
+    with sqlite3.connect(focus_db) as fix:
+        fix.execute("UPDATE threads SET last_prompt_at = ? WHERE id = 'B'",
+                    (FOCUS_NOW - 120_000,))
+    two_live = module.read_desktop(focus_db, source="active", state_path=focus_state,
+                                   now_ms=FOCUS_NOW)
+    assert two_live["session"] == "C", two_live
+    # A store from an app that writes neither column answers nothing, and `activeId` is then
+    # the whole answer — the correction is additive, never a replacement.
+    old_db = os.path.join(focus_dir, "old-v2.db")
+    if os.path.exists(old_db):
+        os.remove(old_db)
+    old_con = sqlite3.connect(old_db)
+    old_con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, status TEXT,"
+                    " sidebar_archived_at INTEGER)")
+    old_con.execute("CREATE TABLE messages (seq INTEGER, thread_id TEXT, parts_json TEXT, ts INTEGER)")
+    old_con.execute("INSERT INTO threads VALUES ('A', 'old tab', 'open', NULL)")
+    old_con.execute("INSERT INTO threads VALUES ('B', 'old other', 'open', NULL)")
+    old_con.execute("INSERT INTO messages VALUES (0, 'B', ?, ?)",
+                    (desk_parts(desk_todos(("an old step", False))), FOCUS_NOW))
+    old_con.commit()
+    old_con.close()
+    old = module.read_desktop(old_db, source="active", state_path=focus_state, now_ms=FOCUS_NOW)
+    assert old["session"] == "A" and old["source"] == "active-tab", old
+    say("the tab followed: the app's file first, its live work correcting it while it lags: ok")
+
+    # ---- and `auto` asks that store for THIS directory's project, the way it already asks
+    #      the CLI journal for this directory's chat (`cli_chat_dir` reads `basename(cwd)` and
+    #      never walks up). The store's own answer used to be "the first project that contains
+    #      this directory, newest store first" — and the home directory contains every path
+    #      there is, so a pane in a repo under it was answered by the home project's session
+    #      (measured 2026-10-03: a repo's pane drawing the home thread's list, over a
+    #      repository the app had never opened). DEPTH now decides, and `auto` narrows it to
+    #      the project whose path IS this directory; an explicit `-s desktop` was not told a
+    #      directory, so it keeps the wider walk.
+    pk = os.path.join(TEST_HOME, "pickdb")
+    root = os.path.join(pk, "home")
+    child = os.path.join(root, "repo")
+    deep = os.path.join(child, "pkg")
+    os.makedirs(deep, exist_ok=True)
+    pick_pat = os.path.join(pk, "*", "desktop-v2.db")
+
+    def make_store(name, project_path, age_s, task):
+        """A one-thread store whose `project.json` names `project_path`."""
+        d = os.path.join(pk, name)
+        os.makedirs(d, exist_ok=True)
+        db = os.path.join(d, "desktop-v2.db")
+        if os.path.exists(db):
+            os.remove(db)
+        with open(os.path.join(d, "project.json"), "w", encoding="utf-8") as fh:
+            json.dump({"projectPath": project_path}, fh)
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, status TEXT,"
+                    " sidebar_archived_at INTEGER)")
+        con.execute("CREATE TABLE messages (seq INTEGER, thread_id TEXT, parts_json TEXT,"
+                    " ts INTEGER)")
+        con.execute("INSERT INTO threads VALUES (?, ?, 'open', NULL)", (name, name + " thread"))
+        con.execute("INSERT INTO messages VALUES (0, ?, ?, ?)",
+                    (name, desk_parts(desk_todos((task, False))), DESK_NOW))
+        con.commit()
+        con.close()
+        at = time.time() - age_s
+        os.utime(db, (at, at))                       # the parent store is the NEWER one
+        return db
+
+    home_db = make_store("home", root, 0, "the home project's step")
+    child_db = make_store("repo", child, 3600, "the repo project's step")
+    assert module.pick_db(pick_pat, None, cwd=deep) == child_db, (
+        "the deepest project that contains the cwd wins, whatever moved last"
+    )
+    assert module.pick_db(pick_pat, None, cwd=root) == home_db, (
+        "a directory with no project of its own still belongs to the one that contains it"
+    )
+    assert module.pick_db(pick_pat, None, cwd=child, own_only=True) == child_db
+    assert module.pick_db(pick_pat, None, cwd=deep, own_only=True) is None, (
+        "a directory UNDER a project is not that project's own session"
+    )
+    assert module.pick_db(pick_pat, None, cwd=os.path.join(pk, "nowhere"),
+                          own_only=True) is None
+    assert module.pick_db(pick_pat, None, cwd=os.path.join(pk, "nowhere")) == home_db, (
+        "nothing here at all: the fallback is still the newest store"
+    )
+    assert module.pick_db(pick_pat, child) == child_db, "a named project answers by its path"
+    # two stores naming the SAME path: nothing to rank by depth, so the newest still wins
+    newer_db = make_store("home2", root, -60, "the newer home project's step")
+    assert module.pick_db(pick_pat, None, cwd=root, own_only=True) == newer_db, (
+        "two stores for one path: the one that moved last answers"
+    )
+    say("desktop: the store for a directory is its OWN project, deepest first: ok")
+
+    # ---- ...and `auto` is what narrows it, so it is checked at the seam `-s` is read at:
+    #      a cwd inside a project gets no desktop answer, one that IS the project gets it.
+    empty_root = os.path.join(TEST_HOME, "emptyroot")
+    os.makedirs(empty_root, exist_ok=True)
+
+    def auto_here(cwd, source="auto"):
+        args = module.build_parser().parse_args(
+            ["json", "-s", source, "--cli-root", empty_root, "--db", pick_pat,
+             "--state", desk_state]
+        )
+        return module._snapshot(args, cwd=cwd, instance_pid=0)
+
+    own = auto_here(child)
+    assert own["backend"] == "desktop" and own["target"] == child_db, own
+    assert own["session"] == "repo" and own["todos"][0]["task"] == "the repo project's step", own
+    under = auto_here(deep)
+    assert under.get("backend") != "desktop", (
+        "`auto` in a directory under a project must not inherit that project's session"
+    )
+    assert auto_here(deep, "desktop")["target"] == child_db, (
+        "`-s desktop` was told the store, not a directory, and still walks up"
+    )
+    say("sources: `auto` answers a directory's own project, never a parent's: ok")
+
+    # ---- ...and the same switch when the live half is the APP, not another CLI chat: the
+    #      pane's cached state names a finished CLI chat for this directory, and the session
+    #      actually working here is a desktop thread. Everything below runs through the REAL
+    #      CLI — `-s auto` resolving from the arguments a user types, `cli_chat_dir` naming the
+    #      chat by the directory and `pick_db` naming the store by its `project.json` — and
+    #      then watches the pane's own frames across several polls. The CLI→CLI check above
+    #      proves the drop; this one proves WHERE it lands and that it does not slide back.
+    #      (That last half is not decoration: an earlier build memoised the dropped session and
+    #      trusted the still-unchanged cached file again on the next poll, so the pane painted
+    #      the live thread for one frame and then went back to the finished one.)
+    switch_root = os.path.join(TEST_HOME, "switchroot")
+    proj_dir = os.path.join(TEST_HOME, "switchproj")
+    os.makedirs(proj_dir, exist_ok=True)
+    dead_chat = os.path.join(switch_root, os.path.basename(proj_dir), "chats",
+                             "2026-02-02T00-00-00.000Z")
+    os.makedirs(dead_chat, exist_ok=True)
+    dead_step = "the finished CLI session's step"
+    with open(os.path.join(dead_chat, "log.jsonl"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "data": {"toolCalls": [{"toolName": "write_todos",
+                                    "input": {"todos": [{"task": dead_step,
+                                                        "completed": True}]}}]},
+        }) + "\n")
+    dead_at = time.time() - (module.SOURCE_LIVE_MS / 1000.0) - 1800
+    os.utime(os.path.join(dead_chat, "log.jsonl"), (dead_at, dead_at))
+    # the store for THIS directory and no other: its `projectPath` IS the directory
+    switch_stores = os.path.join(TEST_HOME, "switchstores")
+    store_dir = os.path.join(switch_stores, "proj")
+    os.makedirs(store_dir, exist_ok=True)
+    with open(os.path.join(store_dir, "project.json"), "w", encoding="utf-8") as fh:
+        json.dump({"projectPath": proj_dir}, fh)
+    switch_db = os.path.join(store_dir, "desktop-v2.db")
+    if os.path.exists(switch_db):
+        os.remove(switch_db)
+    switch_step = "the desktop thread's live step"
+    con = sqlite3.connect(switch_db)
+    con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, status TEXT,"
+                " sidebar_archived_at INTEGER)")
+    con.execute("CREATE TABLE messages (seq INTEGER, thread_id TEXT, parts_json TEXT, ts INTEGER)")
+    con.execute("INSERT INTO threads VALUES ('SW', 'Switch thread', 'open', NULL)")
+    con.execute("INSERT INTO messages VALUES (0, 'SW', ?, ?)",
+                (desk_parts(desk_todos(("an earlier step", True), (switch_step, False))),
+                 DESK_NOW))
+    con.commit()
+    con.close()
+    switch_pat = os.path.join(switch_stores, "*", "desktop-v2.db")
+    switch_state = os.path.join(TEST_HOME, "switchworkspace.json")
+
+    # the cached state a watcher would have left behind for that finished chat: fresh,
+    # matching, and an ended session
+    switch_now = int(time.time() * 1000)
+    with open(module.STATE_PATH, "w", encoding="utf-8") as fh:
+        json.dump({
+            "schema": 1, "backend": "cli", "session": "2026-02-02T00-00-00.000Z",
+            "status": "watching", "tool_version": module.VERSION,
+            "heartbeat_ms": switch_now,
+            "store_mtime_ms": switch_now - module.SOURCE_LIVE_MS - 1_800_000,
+            "todos": [{"task": dead_step, "completed": True}],
+        }, fh)
+    # the resolution the pane runs, through the real CLI, from the directory's own cwd, with
+    # that cached file sitting there: `json` and `bar` are reads and may serve it, but only
+    # while it names a live session. `--watch-pid` names a pid that cannot be alive, so a
+    # machine that happens to be running Freebuff in a parent directory resolves as this one
+    # does; `-s cli` is asked the same question afterwards to prove the switch is `auto`'s
+    # doing (`hold the finished journal, answer the live store`) and not the chat vanishing.
+    seen_json = run("json", "-s", "auto", "--cli-root", switch_root, "--db", switch_pat,
+                    "--state", switch_state, "--watch-pid", "999999", cwd=proj_dir).stdout
+    assert dead_step not in seen_json, (
+        "`fbtodo json` answered with the ended session's cached list\n" + seen_json
+    )
+    assert switch_step in seen_json, seen_json
+    # `bar` carries no step text, only the count: the ended chat's list is 1/1 and the live
+    # thread's is 1/2, so the count alone says which one was answered
+    seen_bar = run("bar", "-s", "auto", "--cli-root", switch_root, "--db", switch_pat,
+                   "--state", switch_state, "--watch-pid", "999999", cwd=proj_dir).stdout
+    assert "todos 1/2" in seen_bar, (
+        "`fbtodo bar` answered with the ended session's cached list\n" + seen_bar
+    )
+    doc = json.loads(run("json", "-s", "auto", "--cli-root", switch_root, "--db", switch_pat,
+                         "--state", switch_state, "--watch-pid", "999999", cwd=proj_dir).stdout)
+    assert doc["backend"] == "desktop" and doc["session"] == "SW", doc
+    assert [t["task"] for t in doc["todos"]] == ["an earlier step", switch_step], doc
+    cli_doc = json.loads(run("json", "-s", "cli", "--cli-root", switch_root,
+                             cwd=proj_dir).stdout)
+    assert cli_doc["backend"] == "cli" and [t["task"] for t in cli_doc["todos"]] == [dead_step], (
+        cli_doc
+    )
+    master, slave = pty.openpty()
+    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+    switch_proc = subprocess.Popen(
+        [sys.executable, FB, "pane", "--no-daemon", "--interval", "0.2", "--stale-after", "0",
+         "--cli-root", switch_root, "--db", switch_pat, "--state", switch_state,
+         "--watch-pid", "999999"],
+        cwd=proj_dir, stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True,
+    )
+    os.close(slave)
+    os.set_blocking(master, False)
+    seen = bytearray()
+    settled_at = None
+    ended = time.time() + 8.0
+    try:
+        while time.time() < ended:
+            if settled_at is not None and time.time() - settled_at > 3.0:
+                break  # the pane has drawn the same subject for several polls now
+            ready, _, _ = select.select([master], [], [], 0.2)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            seen += chunk
+            if settled_at is None and switch_step.encode() in seen:
+                settled_at = time.time()
+    finally:
+        switch_proc.send_signal(signal.SIGINT)
+        try:
+            switch_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            switch_proc.kill()
+        os.close(master)
+    painted = STRIP(seen.decode("utf-8", "replace"))
+    # The pane reaches the live thread, because the CACHED state is dropped before anything
+    # else: `pane_cached_state` refuses a state whose session has ended, so the first poll the
+    # pane accepts already answers the stores. That is the 2026-10-04 freeze fix and it is
+    # untouched by the lock — which is why the pane never draws the finished chat here, and why
+    # this half of the check is the same claim it was before.
+    assert settled_at is not None, (
+        "the pane never reached the live desktop thread\n" + painted[-800:]
+    )
+    assert dead_step not in painted, (
+        "the pane painted the finished CLI session's list instead of the live thread\n"
+        + painted[-800:]
+    )
+    # ...and then it STAYS: the lock is what makes this true by construction rather than by
+    # luck, and a pane that flapped back would draw both subjects' rows into one window.
+    tail = painted[-1200:]
+    assert switch_step in tail and dead_step not in tail, tail
+    # ...and the READ still says WHY this list is the app's, on its own title: the finished
+    # chat is the whole reason a fresh resolve lands on the thread, and a reader running
+    # `fbtodo why` should not have to guess. This is the read's note, not the pane's: a pane
+    # that latched carries the session it latched to in its own title, which is the thing the
+    # reader is being held on.
+    assert doc["source_why"].startswith("cli finished "), doc["source_why"]
+    assert doc["source_why"].endswith("→ desktop"), doc["source_why"]
+    # ...and the `cli` half of the chain reaches the same note through `-s cli`'s own state:
+    # a chain of one has nothing to explain, which is what keeps `-s cli` byte-identical
+    assert "source_why" not in cli_doc, cli_doc.get("source_why")
+    say("the pane: dropped a finished cached list, reached the live thread, and stayed there: ok")
+
+    # ---- ...and the case the lock exists for: the reader types in ANOTHER tab, that thread
+    #      starts running, and the app's own picker would answer with it. The pane must not.
+    #      Two threads, both with a list, both live; the pane starts while only the FIRST is
+    #      running, and the check then makes the SECOND the newest ask — the exact input the
+    #      store's thread picker takes, and the one a following pane used to obey.
+    lock_proj = os.path.join(TEST_HOME, "lockproj")
+    os.makedirs(lock_proj, exist_ok=True)
+    lock_store = os.path.join(TEST_HOME, "lockstores", "proj")
+    os.makedirs(lock_store, exist_ok=True)
+    with open(os.path.join(lock_store, "project.json"), "w", encoding="utf-8") as fh:
+        json.dump({"projectPath": lock_proj}, fh)
+    lock_db = os.path.join(lock_store, "desktop-v2.db")
+    if os.path.exists(lock_db):
+        os.remove(lock_db)
+    first_step, second_step = "the first tab's step", "the second tab's step"
+    con = sqlite3.connect(lock_db)
+    con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, status TEXT,"
+                " turn_state TEXT, last_prompt_at INTEGER, sidebar_archived_at INTEGER)")
+    con.execute("CREATE TABLE messages (seq INTEGER, thread_id TEXT, parts_json TEXT, ts INTEGER)")
+    con.execute("INSERT INTO threads VALUES ('ONE', 'First tab', 'open', 'running', ?, NULL)",
+                (DESK_NOW - 5_000,))
+    con.execute("INSERT INTO threads VALUES ('TWO', 'Second tab', 'open', 'idle', ?, NULL)",
+                (DESK_NOW - 9_000,))
+    for tid, step in (("ONE", first_step), ("TWO", second_step)):
+        con.execute("INSERT INTO messages VALUES (0, ?, ?, ?)",
+                    (tid, desk_parts(desk_todos((step, False))), DESK_NOW))
+    con.commit()
+    con.close()
+    lock_pat = os.path.join(TEST_HOME, "lockstores", "*", "desktop-v2.db")
+    lock_state = os.path.join(TEST_HOME, "lockworkspace.json")
+    lock_pane = spawn_quiet("sleep", "600")
+    pid_l, fd_l = pty.fork()
+    if pid_l == 0:
+        os.environ["FBTODO_HOME"] = TEST_HOME
+        os.chdir(lock_proj)
+        os.execv(sys.executable, [sys.executable, FB, "pane", "--no-daemon", "-i", "0.3",
+                                 "-s", "desktop", "--db", lock_pat, "--state", lock_state,
+                                 "--watch-pid", str(lock_pane.pid)])
+
+    def lock_drain(seconds):
+        got = b""
+        stop_at = time.time() + seconds
+        while time.time() < stop_at:
+            if not select.select([fd_l], [], [], 0.2)[0]:
+                continue
+            try:
+                chunk = os.read(fd_l, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            got += chunk
+        return got.decode("utf-8", "replace")
+
+    try:
+        before = lock_drain(2.5)
+        assert first_step in before, before[-600:]
+        assert second_step not in before, (
+            "a pane must draw one list, not every live thread's\n" + before[-600:]
+        )
+        # the reader types in the other tab: it starts running and becomes the newest ask,
+        # which is what a fresh resolve would follow
+        con2 = sqlite3.connect(lock_db)
+        con2.execute("UPDATE threads SET turn_state = 'running', last_prompt_at = ?"
+                     " WHERE id = 'TWO'", (DESK_NOW + 60_000,))
+        con2.commit()
+        con2.close()
+        after = lock_drain(4.0)
+        assert first_step in after, after[-600:]
+        assert second_step not in after, (
+            "the pane moved to another thread while the reader was on this one\n"
+            + after[-600:]
+        )
+    finally:
+        try:
+            os.kill(pid_l, signal.SIGTERM)
+            os.waitpid(pid_l, 0)
+        except (ProcessLookupError, ChildProcessError):
+            pass
+        os.close(fd_l)
+        kill_tree(lock_pane)
+    say("a pane stays on its thread when another tab starts working: ok")
+
+    # ---- ...and a poll that RAISES — the other half of the same hazard. The pane re-execs
+    #      itself into whatever is on disk, and the reload probe can prove a tree PARSES and
+    #      IMPORTS without proving its call sites still agree: measured 2026-10-03, an edit
+    #      that changed a signature in one step and its call site in the next exec'd a live
+    #      pane into the between-state, and the TypeError took the pane down mid-work with a
+    #      traceback where the list was. A failed poll must cost one tick, not the pane: the
+    #      frame shows the failure, the log records it ONCE rather than once a second, and the
+    #      next tick can still answer — which is how a pane left running a broken build comes
+    #      back on its own the moment that build is fixed.
+    surv = os.path.join(TEST_HOME, "panesurvives")
+    surv_proj = os.path.join(surv, "proj")
+    surv_store_dir = os.path.join(surv, "stores", "p")
+    os.makedirs(surv_proj, exist_ok=True)
+    os.makedirs(surv_store_dir, exist_ok=True)
+    with open(os.path.join(surv_store_dir, "project.json"), "w", encoding="utf-8") as fh:
+        json.dump({"projectPath": surv_proj}, fh)
+    surv_db = os.path.join(surv_store_dir, "desktop-v2.db")
+    if os.path.exists(surv_db):
+        os.remove(surv_db)
+    os.makedirs(surv_db)          # a DIRECTORY where the store belongs: opening it raises
+    surv_pat = os.path.join(surv, "stores", "*", "desktop-v2.db")
+    surv_step = "the step after a failed poll"
+
+    def surv_store():
+        """Replace the directory with a real store: the next poll has an answer again.
+
+        Built BESIDE it and moved into place. The check counts the logged failures, and a heal
+        that spent its time between `os.rmdir` and `sqlite3.connect` left the store MISSING for
+        a poll or two — a second, genuinely distinct error logged as the distinct failure it
+        was, which failed the count on a race in this fixture (met 2026-10-04). Two syscalls
+        back to back leave no window a 0.2 s poll can land in.
+        """
+        os.rmdir(surv_db)
+        healed_db = surv_db + ".heal"
+        if os.path.exists(healed_db):
+            os.remove(healed_db)
+        con = sqlite3.connect(healed_db)
+        con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, status TEXT,"
+                    " sidebar_archived_at INTEGER)")
+        con.execute("CREATE TABLE messages (seq INTEGER, thread_id TEXT, parts_json TEXT,"
+                    " ts INTEGER)")
+        con.execute("INSERT INTO threads VALUES ('SV', 'survivor', 'open', NULL)")
+        con.execute("INSERT INTO messages VALUES (0, 'SV', ?, ?)",
+                    (desk_parts(desk_todos((surv_step, False))), DESK_NOW))
+        con.commit()
+        con.close()
+        os.rename(healed_db, surv_db)
+
+    def pane_bytes(fd, seconds, stop_when=None):
+        """What the pane painted in the next `seconds` — or until `stop_when` shows up."""
+        out = bytearray()
+        end = time.time() + seconds
+        while time.time() < end:
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+            if stop_when is not None and stop_when.encode() in out:
+                break
+        return out
+
+    master, slave = pty.openpty()
+    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+    surv_proc = subprocess.Popen(
+        [sys.executable, FB, "pane", "--no-daemon", "--interval", "0.2", "--stale-after", "0",
+         "-s", "desktop", "--db", surv_pat, "--watch-pid", "999999"],
+        cwd=surv_proj, stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True,
+    )
+    os.close(slave)
+    os.set_blocking(master, False)
+    try:
+        broke = STRIP(pane_bytes(master, 3.0).decode("utf-8", "replace"))
+        assert surv_proc.poll() is None, (
+            "a poll that raised took the pane down\n" + broke[-600:]
+        )
+        assert "poll failed reading desktop" in broke, broke[-600:]
+        surv_store()
+        healed = STRIP(pane_bytes(master, 4.0, stop_when=surv_step).decode("utf-8", "replace"))
+        assert surv_step in healed, (
+            "the pane never polled again after its failure\n" + broke[-400:] + healed[-400:]
+        )
+        assert surv_proc.poll() is None, "the pane died after recovering"
+    finally:
+        surv_proc.send_signal(signal.SIGINT)
+        try:
+            survived = surv_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            surv_proc.kill()
+            survived = "killed"
+        os.close(master)
+    assert survived == 130, (
+        "a pane that has survived a bad poll must still leave cleanly on Ctrl-C: "
+        f"{survived}"
+    )
+    # ...and the failure is in the log ONCE: ~15 polls failed in that window, and a pane that
+    # logged each one would fill its own log with the same line
+    try:
+        with open(module.PANE_LOG_PATH, encoding="utf-8") as fh:
+            pane_log_text = fh.read()
+    except OSError:
+        pane_log_text = ""
+    assert pane_log_text.count("pane poll failed") == 1, (
+        "the poll failure was logged more than once (or not at all):\n" + pane_log_text[-400:]
+    )
+    say("the pane: a poll that raises becomes the frame, and the next tick still answers: ok")
+
+    # ---- the pane's own switch over the phone. A key inside the pane writes the notify
+    #      kit's two state files — the very words `phone.sh` and `bell.sh` already read — so
+    #      "quiet while I read this" is one keystroke instead of a file's name and a
+    #      variable's name, and the pane has to be able to say it is quiet and undo it.
+    #      Three halves, because each fails on its own: the decision (`apply_pane_key`), the
+    #      chip that tells the reader the switch is in force, and the keyboard itself.
+    mute_dir = os.path.join(TEST_HOME, "notify")
+    shutil.rmtree(mute_dir, ignore_errors=True)
+    os.makedirs(mute_dir, mode=0o700, exist_ok=True)
+    with open(os.path.join(mute_dir, "state"), "w", encoding="utf-8") as fh:
+        fh.write("on\n")            # the chime is loud; `phone-state` is not there at all
+    set_knob(module, "NOTIFY_DIR", mute_dir)
+
+    def mute_switches():
+        out = {}
+        for name, _env, _script, _what in module.MUTE_SWITCHES:
+            try:
+                with open(os.path.join(mute_dir, name), encoding="utf-8") as fh:
+                    out[name] = fh.read().strip()
+            except FileNotFoundError:
+                out[name] = None
+        return out
+
+    quiet = {"done": 1, "total": 2, "session": "QUIET", "list_id": "q1",
+             "todos": [{"task": "step one", "completed": True}, {"task": "step two"}]}
+    finished = dict(quiet, done=2, todos=[{"task": "step one", "completed": True}])
+
+    # A key that is not a switch key must change NOTHING: a stray byte in a pane's input
+    # cannot silence a phone.
+    assert module.apply_pane_key("q", quiet) == (None, ""), module.apply_pane_key("q", quiet)
+    assert not module.muted_now() and mute_switches() == {"phone-state": None, "state": "on"}, (
+        mute_switches()
+    )
+    chip, said = module.apply_pane_key("m", quiet)
+    assert chip == "quiet until done · u", chip
+    assert "phone.sh" in said and "bell.sh" in said, said
+    assert mute_switches() == {"phone-state": "off", "state": "off"}, mute_switches()
+    record = module.read_mute_record()
+    assert record["until"] == "list" and record["was"] == {"phone-state": "", "state": "on"}, (
+        record
+    )
+    # ...and the promise it made is kept while there is something left to read. A list that
+    # is not there is not a finished list either: a pane muted before its agent planned
+    # anything must stay quiet, or the mute lasts less than the keypress that set it.
+    assert module.list_is_finished(quiet) is False, quiet
+    assert module.list_is_finished({}) is False and module.list_is_finished(None) is False
+    assert module.auto_unmute(quiet) is None, "a list with work left must stay quiet"
+    assert mute_switches() == {"phone-state": "off", "state": "off"}, mute_switches()
+    assert module.auto_unmute(finished), "a finished list must end the mute on its own"
+    # ...and restoring RESTORES: the file that was never there is gone again, and the word
+    # that was there is the word that is there now — `on`, not a guess at it.
+    assert mute_switches() == {"phone-state": None, "state": "on"}, mute_switches()
+    assert module.read_mute_record() == {}, module.read_mute_record()
+    # `M` is the same switch with no automatic end, for a read that outlasts its list.
+    chip, said = module.apply_pane_key("M", finished)
+    assert chip == "muted · u" and module.read_mute_record()["until"] == "sticky", (chip, said)
+    assert module.auto_unmute(finished) is None, "a sticky mute must not end itself"
+    assert module.apply_pane_key("u", finished)[1] == "notifications back"
+    assert mute_switches() == {"phone-state": None, "state": "on"}, mute_switches()
+    # Someone else's mute is not this pane's to lift — and the chip has to say whose it is,
+    # because a reader who pressed `u` and saw nothing happen needs to know that the pane is
+    # not broken, the switch is simply not this pane's.
+    with open(os.path.join(mute_dir, "phone-state"), "w", encoding="utf-8") as fh:
+        fh.write("off\n")
+    chip, said = module.apply_pane_key("u", finished)
+    assert mute_switches()["phone-state"] == "off", (
+        "an undo removed a switch this pane never wrote"
+    )
+    assert chip == "notifications off · m", chip
+    os.unlink(os.path.join(mute_dir, "phone-state"))
+    say("the pane's mute key: m writes the notify kit's own switch files, holds them off "
+        "until this list finishes and puts back exactly what was there: ok")
+
+    # ---- the chip: the one slot on a frame that belongs to the PROCESS rather than to the
+    #      list, and the only place a reader can learn that the phone is off and which key
+    #      undoes it. Drawn here by hand rather than read off a pane, so this half fails on
+    #      its own if the title ever stops carrying the switch.
+    chip_state = {"session": "QUIET", "backend": "cli", "goal": "a list to read",
+                  "list_id": "q1", "list_version": 4,
+                  "todos": [{"task": "step one", "completed": True}, {"task": "step two"}],
+                  "done": 1, "total": 2}
+    chip_title = STRIP(module.render(chip_state, True, width=100, height=24,
+                                    mute_note="quiet until done · u")).splitlines()[0]
+    assert "quiet until done · u" in chip_title, chip_title
+    # ...it is the STANDING half of the title, so it survives a transient note taking the
+    # chip for a few seconds: both are the process's own facts and both are said at once.
+    both_title = STRIP(module.render(chip_state, True, width=100, height=24,
+                                     reloaded="reloaded: build 4.30.2",
+                                     mute_note="quiet until done · u")).splitlines()[0]
+    assert "reloaded: build 4.30.2" in both_title and "quiet until done" in both_title, both_title
+    assert "quiet until done" not in STRIP(
+        module.render(chip_state, True, width=100, height=24)), "the chip is on with no switch"
+    say("the pane's chip: the title says the notifications are off, and names the key that "
+        "turns them back on: ok")
+
+    # ---- and the keyboard, through the pane itself. A byte typed into a pane's own terminal
+    #      must write the switch, say so, and come back on `u` — and the pane must hand its
+    #      terminal attributes back on the way out, which is the half a pane that wedged in
+    #      its own signal handler would never notice about itself.
+    mute_state = os.path.join(TEST_HOME, "mute-state.json")
+    module.atomic_write_json(mute_state, dict(chip_state, schema=1))
+    # A colour TERM, because the chip is the FRAMED pane's chrome and the plain renderer has
+    # none: a pane under a dumb terminal still writes the switch, it just has nowhere to say
+    # so. (`penv` also names the notify kit: the pane is a separate process, and it has to be
+    # pointed at this test's switches rather than at this machine's.)
+    penv = dict(env, FBTODO_NOTIFY_DIR=mute_dir, TERM="xterm-256color", COLORTERM="truecolor")
+    penv.pop("NO_COLOR", None)
+
+    def pty_pane(extra=()):
+        master, slave = pty.openpty()
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        before = termios.tcgetattr(master)
+        proc = subprocess.Popen(
+            [sys.executable, FB, "pane", "--no-daemon", "--interval", "0.2", "--tick", "1",
+             "--stale-after", "0", "--watch-pid", "999999", "-s", f"file:{mute_state}",
+             *extra],
+            cwd=CWD, stdin=slave, stdout=slave, stderr=slave, env=penv, close_fds=True,
+        )
+        os.close(slave)
+        os.set_blocking(master, False)
+        return master, proc, before
+
+    def pane_read(fd, seconds, stop_when=None):
+        """What the pane painted in the next `seconds` — or until `stop_when` shows up."""
+        out = bytearray()
+        end = time.time() + seconds
+        while time.time() < end:
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+            if stop_when is not None and stop_when.encode() in out:
+                break
+        return out
+
+    def pane_stop(master, proc):
+        """Ctrl-C a pane and report how it left: its exit code and its terminal."""
+        proc.send_signal(signal.SIGINT)
+        try:
+            code = proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            code = "hung"
+        after = termios.tcgetattr(master)
+        os.close(master)
+        return code, after
+
+    master, key_proc, before_attrs = pty_pane()
+    seen = bytearray()
+    try:
+        seen += pane_read(master, 4.0, stop_when="a list to read")
+        os.write(master, b"m")
+        # The keypress's own words are a NOTE and expire after `RELOAD_NOTE_S`; the standing
+        # chip — the one naming the undo key, shown on every frame while the switch is in
+        # force — is what the pane must still be painting a few seconds later.
+        seen += pane_read(master, module.RELOAD_NOTE_S + 4.0, stop_when="quiet until done")
+        assert mute_switches() == {"phone-state": "off", "state": "off"}, (
+            "a keypress in the pane did not write the notify kit's switch files"
+        )
+        painted = STRIP(seen.decode("utf-8", "replace"))
+        assert "quiet until done · u" in painted, (
+            "the pane never said on its own title that the notifications are off\n"
+            + painted[-600:]
+        )
+        os.write(master, b"u")
+        pane_read(master, 4.0, stop_when="notifications back")
+        assert mute_switches() == {"phone-state": None, "state": "on"}, (
+            "u in the pane did not put the notifications back"
+        )
+    finally:
+        key_code, key_after = pane_stop(master, key_proc)
+    assert key_code == 130, f"a pane with the key reader must still leave on Ctrl-C, not {key_code}"
+    assert key_after[:4] == before_attrs[:4], (
+        "the pane left its terminal in key-reading mode for whatever runs after it"
+    )
+
+    # `--no-keys` is a claim about the KEYBOARD and nothing else: the pane still paints, and a
+    # byte typed into it changes no switch — the opt-out for a pane whose terminal is not
+    # its own to read.
+    master, quiet_proc, _ = pty_pane(extra=("--no-keys",))
+    try:
+        pane_read(master, 3.0, stop_when="a list to read")
+        os.write(master, b"m")
+        pane_read(master, 2.0)
+        assert mute_switches() == {"phone-state": None, "state": "on"}, (
+            "a pane told to ignore the keyboard acted on a keypress anyway"
+        )
+    finally:
+        quiet_code, _ = pane_stop(master, quiet_proc)
+    assert quiet_code == 130, quiet_code
+    say("the pane's keys: m writes the switch from inside the pane and says so on its own "
+        "title, u gives the notifications back, --no-keys ignores both, and the terminal is "
+        "handed back on exit: ok")
+
+    # ---- the same switch without a keystroke: `fbtodo mute`, for a script, a status row,
+    #      or a shell that is not a pane at all. It must be the SAME switch — the same two
+    #      files, the same record, the same undo — and it carries one thing the keys cannot:
+    #      a promise about a list that outlives the pane watching it, because nobody asked
+    #      that pane for anything.
+    mute_env = dict(env, FBTODO_NOTIFY_DIR=mute_dir)
+
+    def mute_run(*args, timeout=30):
+        return subprocess.run([sys.executable, FB, *args], capture_output=True, text=True,
+                              env=mute_env, cwd=CWD, timeout=timeout)
+
+    assert mute_switches() == {"phone-state": None, "state": "on"}, mute_switches()
+    loud = mute_run("mute")
+    # the row's own indent is part of what a `status`-shaped report promises, so compare the
+    # line as written — `.strip()` would eat the leading indent and match a bare label.
+    assert loud.returncode == 0 and loud.stdout.rstrip("\n") == "  notifications : on", loud
+    # ...and no verb is `list`, because a report with no way to ask for one is half a command
+    assert mute_run("mute", "list").stdout == loud.stdout, "no verb and `list` must agree"
+    bad = mute_run("mute", "bogus")
+    assert bad.returncode == 2 and "is not a verb here" in bad.stderr, bad
+    assert mute_run("snap", "bogus").returncode == 2, "a verb on a command with none"
+
+    quieted = mute_run("mute", "on")
+    assert quieted.returncode == 0, quieted
+    assert mute_switches() == {"phone-state": "off", "state": "off"}, mute_switches()
+    record = module.read_mute_record()
+    assert record["until"] == "sticky" and record["by"] == "command", record
+    reported = mute_run("mute", "list")
+    assert "off — sticky, by `fbtodo mute`" in reported.stdout, reported
+    # ...and the document form, which has to be clean JSON (a script parses it) and to name
+    # the switch that is actually off rather than only that something is.
+    doc = json.loads(mute_run("mute", "--json").stdout)
+    assert doc["muted"] is True and doc["scope"] == "sticky" and doc["by"] == "command", doc
+    assert [s["script"] for s in doc["switches"]] == ["phone.sh", "bell.sh"], doc
+    assert all(s["off"] and s["value"] == "off" for s in doc["switches"]), doc
+    assert doc["chip"] == "muted · u", doc
+    assert mute_run("mute", "off").returncode == 0, "off"
+    assert mute_switches() == {"phone-state": None, "state": "on"}, mute_switches()
+    assert json.loads(mute_run("mute", "--json").stdout)["muted"] is False
+    # `off` twice is not an error and does not touch a switch of somebody else's making.
+    assert mute_run("mute", "off").returncode == 0
+
+    # `until-done` is a promise about a LIST, so it reads one rather than assuming it: asked
+    # when the list is already finished it says so and leaves the phone alone, because a mute
+    # whose condition is already met is a mute nobody would have wanted.
+    finished_state = os.path.join(TEST_HOME, "mute-state-done.json")
+    module.atomic_write_json(finished_state, dict(chip_state, schema=1, done=2,
+                                                  todos=[{"task": "step one", "completed": True}]))
+    already = mute_run("mute", "until-done", "-s", f"file:{finished_state}")
+    assert already.returncode == 0 and "already finished" in already.stdout, already
+    assert mute_switches() == {"phone-state": None, "state": "on"}, (
+        "until-done muted a list that was already finished"
+    )
+    promised = mute_run("mute", "until-done", "-s", f"file:{mute_state}")
+    assert promised.returncode == 0 and "until this list finishes" in promised.stdout, promised
+    assert module.read_mute_record()["until"] == "list", module.read_mute_record()
+    assert module.muted_now() is True, mute_switches()
+    # ...and the two promises are told apart: the LIST lifts it (whoever asked), while a
+    # pane merely CLOSING does not (nobody asked that pane).
+    assert module.mute_release("the pane closed") == "", (
+        "a closing pane lifted a mute `fbtodo mute` took"
+    )
+    assert module.muted_now(), "the closing pane lifted it anyway"
+    assert module.auto_unmute({"done": 2, "total": 2}), (
+        "a finished list must lift a mute made with `fbtodo mute until-done`"
+    )
+    assert not module.muted_now(), mute_switches()
+    say("fbtodo mute: on, off, list and until-done drive the same switch as the pane's keys, "
+        "and only the list lifts the promise a command made: ok")
+
     # ---- and the frame stacks them: a heading row per thread (its title, its own
     #      done/total, and whether it is the one being worked in), that thread's steps under
     #      it, and the frame still inside the height it was asked for.
@@ -3955,6 +6103,16 @@ try:
     after_frame = module.render(finished, False, width=68, now_ms=DESK_NOW)
     assert "the finished step" not in after_frame, after_frame
     assert "Other live thread" in after_frame and "other three" in after_frame, after_frame
+    # ...and the bar counts the lists the frame is DRAWING once the followed thread has none:
+    # `0% (0/0)` sitting under a heading that says `2/3` is the frame contradicting itself,
+    # which is what a reader sees as a bar stuck at zero on a list that is all ticked.
+    assert module.drawn_counts(stacked) == (1, 2), module.drawn_counts(stacked)
+    assert module.drawn_counts(finished) == (2, 3), module.drawn_counts(finished)
+    after_rich = module.render(finished, True, watching=None, width=68, now_ms=DESK_NOW,
+                               height=18, theme={}, truecolor=False)
+    assert "67% (2/3)" in after_rich, after_rich
+    assert "2/3 done" in after_frame, after_frame
+    assert "0/0" not in after_rich and "0/0" not in after_frame, (after_rich, after_frame)
     say("desktop: a pane stacks the live threads, each under its own heading: ok")
 
     # ---- the app's own live signal: the store commits a row only when a turn CLOSES, so
@@ -3993,6 +6151,387 @@ try:
     st, why = reason_with("idle", 2_000)
     assert st["turn_running"] is False, st
     say("desktop: a running turn says so instead of blaming the agent: ok")
+
+    # ---- ...and a running turn SHOWS ITS LIST, the way a CLI pane does mid-turn: the app
+    #      keeps the agent's own state in `threads.harness_state`, whose
+    #      `mainAgentState.messageHistory` carries the tool calls as they are made — so the
+    #      newest `write_todos` there is the in-flight list, read with SQLite's own JSON
+    #      walk (the blob grows with the whole session; a pane ticks once a second). Three
+    #      rules make it the CURRENT list and not the last turn's: only while the turn is
+    #      running, only when the list was written at or after the turn's own start
+    #      (`last_prompt_at`), and only when it is not older than what is committed. The
+    #      turn's start also lets `finish_state` drop a FINISHED previous list rather than
+    #      read it as this turn's progress.
+    live_dir = os.path.join(TEST_HOME, "livestore")
+    os.makedirs(live_dir, exist_ok=True)
+    live_db = os.path.join(live_dir, "desktop-v2.db")
+    if os.path.exists(live_db):
+        os.remove(live_db)
+    live_todos = [{"task": "the in-flight step", "completed": False},
+                  {"task": "a step still to come", "completed": False}]
+    done_todos = [{"task": "the previous turn's step", "completed": True}]
+    committed_ts = DESK_NOW - 60_000
+    prompt_at = DESK_NOW - 30_000
+
+    def harness_history(*messages) -> str:
+        hist = []
+        for kind, at, payload in messages:
+            if kind == "todos":
+                hist.append({"role": "assistant", "sentAt": at,
+                             "content": [{"type": "tool-call", "toolName": "write_todos",
+                                          "input": {"todos": payload}}]})
+            elif kind == "prompt":
+                hist.append({"role": "user", "sentAt": at, "tags": ["USER_PROMPT"],
+                             "content": [{"type": "text", "text": payload}]})
+            elif kind == "goal":
+                hist.append({"role": "assistant", "sentAt": at,
+                             "content": [{"type": "text", "text": payload}]})
+            elif kind == "noise":        # a compaction summary or a tool-error injection
+                hist.append({"role": "user", "sentAt": at, "tags": [payload[0]],
+                             "content": [{"type": "text", "text": payload[1]}]})
+        return json.dumps({"sessionState": {"mainAgentState": {"messageHistory": hist}}})
+
+    def write_live(harness, prompt=prompt_at):
+        con = sqlite3.connect(live_db)
+        con.execute("CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, title TEXT,"
+                    " status TEXT, turn_state TEXT, turn_alive_at INTEGER,"
+                    " last_prompt_at INTEGER, sidebar_archived_at INTEGER, harness_state TEXT)")
+        con.execute("CREATE TABLE IF NOT EXISTS messages (seq INTEGER, thread_id TEXT,"
+                    " parts_json TEXT, ts INTEGER)")
+        con.execute("DELETE FROM threads")
+        con.execute("DELETE FROM messages")
+        con.execute(
+            "INSERT INTO threads VALUES ('R0', 'Working thread', 'open', 'running', ?, ?, NULL, ?)",
+            (DESK_NOW - 2_000, prompt, harness),
+        )
+        con.execute(
+            "INSERT INTO messages VALUES (1, 'R0', ?, ?)",
+            (json.dumps([{"toolName": "write_todos", "input": {"todos": done_todos}}]),
+             committed_ts),
+        )
+        con.commit()
+        con.close()
+
+    # a list written THIS turn: the pane reads it, and the turn's start rides with it
+    write_live(harness_history(("todos", committed_ts, done_todos),
+                               ("todos", DESK_NOW - 5_000, live_todos)))
+    st = module.read_desktop(live_db, thread_id="R0", source="pinned", now_ms=DESK_NOW)
+    assert st["turn_running"] is True and st["todos"] == live_todos, st
+    assert st["ts"] == DESK_NOW - 5_000, st
+    assert st["turn"] == {"start_ms": prompt_at}, st
+    # ...and it is THIS turn's list, so the finished previous one is not what stands
+    module.finish_state(st, None)
+    assert st["todos"] == live_todos, st          # not dropped as last turn's progress
+    assert st["cleared_turn"] is False, st
+    # a list that PREDATES the turn is the previous turn's: the committed row must stand,
+    # and (being finished and older than the new request) it is dropped as the CLI drops it
+    write_live(harness_history(("todos", DESK_NOW - 40_000, done_todos)))
+    st = module.read_desktop(live_db, thread_id="R0", source="pinned", now_ms=DESK_NOW)
+    assert st["todos"] == done_todos and st["turn_running"] is True, st
+    assert st["ts"] == committed_ts, st
+    module.finish_state(st, None)
+    assert module.no_list_reason(st) == "last turn's list is done — waiting for this turn's list", \
+        module.no_list_reason(st)
+    # the newest call may be a shape this build does not know: it is skipped, and the newest
+    # list it CAN read stands rather than a half-read one
+    write_live(harness_history(("todos", DESK_NOW - 5_000, live_todos),
+                               ("todos", "bad", {"task": "not a list"})))
+    assert module.read_desktop(live_db, thread_id="R0", source="pinned",
+                               now_ms=DESK_NOW)["todos"] == live_todos
+    # ---- ...and the same live history carries the REQUESTS, so a running desktop turn can
+    #      say `now` (or `nudge` for a bare continuation) exactly as a CLI pane does. The
+    #      rules are the CLI's, REUSED rather than re-written (`is_nudge` / `pick_prompt` /
+    #      `_newest`, `desktop._now_and_nudge`): a request after the list is newer work the
+    #      list does not describe; a `Goal:` heading written for it wins the line; a bare
+    #      `continue` is a nudge that wins the slot; and a request the current list already
+    #      answers is not drift. Only a USER_PROMPT message counts — the app tags compaction
+    #      summaries and tool-error injections, and those are not something a person asked.
+    args = types.SimpleNamespace(threads=1, thread_live=90,
+                                 state=module.DEFAULT_WORKSPACE_STATE)
+
+    def requests(history, prompt=prompt_at):
+        write_live(history, prompt=prompt)
+        return module.read_desktop(live_db, thread_id="R0", source="pinned", now_ms=DESK_NOW)
+
+    # a request after the list: `now` names it
+    st = requests(harness_history(("todos", DESK_NOW - 5_000, live_todos),
+                                  ("prompt", DESK_NOW - 1_000, "add a colour palette")))
+    assert st["todos"] == live_todos and st["now"] == "add a colour palette", st
+    assert st["nudge"] is None, st
+    # ...and when the agent has written a heading FOR that request, the heading is the line
+    st = requests(harness_history(("todos", DESK_NOW - 5_000, live_todos),
+                                  ("prompt", DESK_NOW - 1_000, "add a colour palette"),
+                                  ("goal", DESK_NOW - 900, "Goal: a colour palette in the pane")))
+    assert st["now"] == "a colour palette in the pane", st
+    # a bare continuation is a NUDGE, and it wins the slot over `now`
+    st = requests(harness_history(("todos", DESK_NOW - 5_000, live_todos),
+                                  ("prompt", DESK_NOW - 1_000, "continue")))
+    assert st["nudge"] == "continue" and st["now"] is None, st
+    # the same words again is not drift: the list already answers that request
+    st = requests(harness_history(("prompt", DESK_NOW - 9_000, "tidy the footer"),
+                                  ("todos", DESK_NOW - 5_000, live_todos),
+                                  ("prompt", DESK_NOW - 1_000, "tidy the footer")))
+    assert st["now"] is None and st["nudge"] is None, st
+    # a compaction summary or a tool-error injection is not a request, however it reads
+    st = requests(harness_history(("todos", DESK_NOW - 5_000, live_todos),
+                                  ("noise", DESK_NOW - 1_000,
+                                   ("MODEL_COMPACTION", "Goal: continue from the summary"))))
+    assert st["now"] is None and st["nudge"] is None, st
+    # with no list to anchor on there is no `now`, but a nudge can still be said
+    st = requests(harness_history(("prompt", DESK_NOW - 1_000, "continue")))
+    assert st["nudge"] == "continue" and st["now"] is None, st
+    # ...and the source forwards them, so a renderer can draw NOW / NUDGE
+    write_live(harness_history(("todos", DESK_NOW - 5_000, live_todos),
+                               ("prompt", DESK_NOW - 1_000, "add a colour palette")))
+    now_obs = module.DesktopSource().describe(
+        args, HOME, {"db": live_db, "thread": "R0", "mode": "pinned"})
+    assert now_obs["now"] == "add a colour palette" and "nudge" not in now_obs, now_obs
+    # ...and the same history carries the AGENT's `Goal:` heading for the list, read from the
+    # same text parts and chosen by the CLI's own rule (`pick_goal`): a heading at or before
+    # the list belongs to it, and the source forwards it so a renderer can head the list.
+    st = requests(harness_history(("prompt", DESK_NOW - 9_000, "tidy the footer"),
+                                  ("goal", DESK_NOW - 8_000, "Goal: a tidier footer"),
+                                  ("todos", DESK_NOW - 5_000, live_todos)))
+    assert st["goal"] == "a tidier footer" and st["goal_source"] == "agent", st
+    assert st["now"] is None, st
+    goal_obs = module.DesktopSource().describe(
+        args, HOME, {"db": live_db, "thread": "R0", "mode": "pinned"})
+    assert goal_obs["goal"] == "a tidier footer", goal_obs
+    assert goal_obs["goal_source"] == "agent", goal_obs
+    # with no list at all the newest heading is the statement of what is going on
+    st = requests(harness_history(("goal", DESK_NOW - 9_000, "Goal: only a heading")))
+    assert st["goal"] == "only a heading", st
+
+    # ---- THE REPLAY: one list of cases through BOTH readers. `pick_goal` and
+    #      `_now_and_nudge` are shared code, but the two stores are not, and a rule that is
+    #      right in the CLI journal and wrong in the app's live history would only ever be
+    #      caught by reading the SAME turn twice and comparing the answer. Each case below
+    #      is written to a journal AND to a harness history, and the two states must carry
+    #      the same `goal`, `now` and `nudge` — the fields a pane actually draws.
+    replay_dir = os.path.join(TEST_HOME, "replaystore")
+    os.makedirs(replay_dir, exist_ok=True)
+    replay_db = os.path.join(replay_dir, "desktop-v2.db")
+    if os.path.exists(replay_db):
+        os.remove(replay_db)
+    replay_chat = os.path.join(replay_dir, "chat")
+    os.makedirs(replay_chat, exist_ok=True)
+    REPLAY_TS = 1_700_000_000_000
+
+    def _rep_rec(kind, at, payload):
+        """One history entry, shaped for whichever reader this case is being replayed for.
+
+        The harness history uses the app's own message shape (a role, `sentAt`, tags); the
+        CLI journal uses one DEBUG record per event (the prompt in `data.prompt`, the prose
+        in `data.fullResponse`, the list in a `write_todos` toolCall). Both are keyed by the
+        same `at`, so the two positions line up and the two readers are comparing the same
+        turn and not merely the same words.
+        """
+        return {"kind": kind, "at": at, "payload": payload}
+
+    def _replay_harness(events) -> str:
+        hist = []
+        for ev in events:
+            at, payload = ev["at"], ev["payload"]
+            if ev["kind"] == "todos":
+                hist.append({"role": "assistant", "sentAt": at,
+                             "content": [{"type": "tool-call", "toolName": "write_todos",
+                                          "input": {"todos": payload}}]})
+            elif ev["kind"] == "prompt":
+                hist.append({"role": "user", "sentAt": at, "tags": ["USER_PROMPT"],
+                             "content": [{"type": "text", "text": payload}]})
+            elif ev["kind"] == "goal":
+                hist.append({"role": "assistant", "sentAt": at,
+                             "content": [{"type": "text", "text": payload}]})
+            elif ev["kind"] == "noise":
+                hist.append({"role": "user", "sentAt": at, "tags": [payload[0]],
+                             "content": [{"type": "text", "text": payload[1]}]})
+        return json.dumps({"sessionState": {"mainAgentState": {"messageHistory": hist}}})
+
+    def _replay_journal(events) -> None:
+        # Removed first, so each case is a NEW inode: the scanner's cache is keyed on
+        # (device, inode, size, mtime), and a rewrite of the same file that happened to land
+        # on the same byte count could otherwise be answered from the previous case's walk.
+        log_path = os.path.join(replay_chat, "log.jsonl")
+        if os.path.exists(log_path):
+            os.unlink(log_path)
+        with open(log_path, "w", encoding="utf-8") as fh:
+            for ev in events:
+                at, payload = ev["at"], ev["payload"]
+                data: dict = {"iteration": 1}
+                if ev["kind"] == "todos":
+                    data["toolCalls"] = [{"toolName": "write_todos",
+                                          "input": {"todos": payload}}]
+                elif ev["kind"] == "prompt":
+                    data["prompt"] = payload
+                elif ev["kind"] == "goal":
+                    data["fullResponse"] = payload
+                elif ev["kind"] == "noise":
+                    data["toolResults"] = [payload[1]]
+                fh.write(json.dumps({
+                    "level": "DEBUG",
+                    "timestamp": _ms_to_iso(at),
+                    "data": data,
+                }) + "\n")
+
+    def _ms_to_iso(ms: int) -> str:
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(ms / 1000, _dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+    def _replay_desktop(events, prompt_at) -> dict:
+        con = sqlite3.connect(replay_db)
+        con.execute("CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, title TEXT,"
+                    " status TEXT, turn_state TEXT, turn_alive_at INTEGER,"
+                    " last_prompt_at INTEGER, sidebar_archived_at INTEGER, harness_state TEXT)")
+        con.execute("CREATE TABLE IF NOT EXISTS messages (seq INTEGER, thread_id TEXT,"
+                    " parts_json TEXT, ts INTEGER)")
+        con.execute("DELETE FROM threads")
+        con.execute("DELETE FROM messages")
+        # A list this turn: `last_prompt_at` opens the turn and the beat is fresh, so the
+        # newest list in the history is the live one — the anchor both readers measure
+        # requests against (`_replay_both` checks the two readers landed on the same one).
+        con.execute(
+            "INSERT INTO threads VALUES ('Q0', 'Replay thread', 'open', 'running', ?, ?, NULL, ?)",
+            (REPLAY_TS - 2_000, prompt_at, _replay_harness(events)),
+        )
+        con.commit()
+        con.close()
+        return module.read_desktop(replay_db, thread_id="Q0", source="pinned",
+                                   now_ms=REPLAY_TS)
+
+    def _replay_both(events, hit_at, prompt_at):
+        _replay_journal(events)
+        st_cli = module.read_cli(replay_chat)
+        st_desk = _replay_desktop(events, prompt_at)
+        if hit_at is not None:
+            # Both readers must have anchored on the SAME list, or the fields below would be
+            # compared across different turns and agree for the wrong reason. This is the
+            # fixture checking itself: the list's own timestamp, read back from each store.
+            assert st_cli.get("ts") == hit_at, ("cli anchored elsewhere", hit_at, st_cli.get("ts"))
+            assert st_desk.get("ts") == hit_at, ("desktop anchored elsewhere", hit_at,
+                                                st_desk.get("ts"))
+        return st_cli, st_desk
+
+    # (name, events, hit_at, prompt_at): the list's position and the turn's start are fixed
+    # per case, exactly as they would be in a real store — only the goal/now/nudge fields
+    # are compared, so every other field of the two states is free to differ.
+    list_at, ask_at = REPLAY_TS - 30_000, REPLAY_TS - 60_000
+    replay_cases = [
+        ("heading before the list",
+         [_rep_rec("prompt", ask_at, "tidy the footer"),
+          _rep_rec("goal", ask_at + 1_000, "Goal: a tidier footer"),
+          _rep_rec("todos", list_at, [{"task": "t", "completed": False}])],
+         list_at, ask_at),
+        ("request after the list is now",
+         [_rep_rec("todos", list_at, [{"task": "t", "completed": False}]),
+          _rep_rec("prompt", list_at + 1_000, "add a colour palette")],
+         list_at, ask_at),
+        ("heading written for the newer request",
+         [_rep_rec("todos", list_at, [{"task": "t", "completed": False}]),
+          _rep_rec("prompt", list_at + 1_000, "add a colour palette"),
+          _rep_rec("goal", list_at + 2_000, "Goal: a colour palette in the pane")],
+         list_at, ask_at),
+        ("bare continuation is a nudge",
+         [_rep_rec("todos", list_at, [{"task": "t", "completed": False}]),
+          _rep_rec("prompt", list_at + 1_000, "continue")],
+         list_at, ask_at),
+        ("the same words again is not drift",
+         [_rep_rec("prompt", ask_at, "tidy the footer"),
+          _rep_rec("todos", list_at, [{"task": "t", "completed": False}]),
+          _rep_rec("prompt", list_at + 1_000, "tidy the footer")],
+         list_at, ask_at),
+        ("a heading, no list",
+         [_rep_rec("goal", ask_at, "Goal: only a heading")],
+         None, ask_at),
+        ("a nudge with no list to anchor on",
+         [_rep_rec("prompt", ask_at, "continue")],
+         None, ask_at),
+        ("noise is not a request",
+         [_rep_rec("todos", list_at, [{"task": "t", "completed": False}]),
+          _rep_rec("noise", list_at + 1_000,
+                   ("MODEL_COMPACTION", "Goal: continue from the summary"))],
+         list_at, ask_at),
+        # ...and a heading left over from an EARLIER turn than the list it heads: the new
+        # request opened a new turn, a new list arrived, and no new heading did — so the old
+        # one is STALE, and both readers must say so as well as agreeing on its words.
+        ("stale heading from the previous turn",
+         [_rep_rec("prompt", ask_at, "tidy the footer"),
+          _rep_rec("goal", ask_at + 1_000, "Goal: a tidier footer"),
+          _rep_rec("todos", list_at, [{"task": "t", "completed": False}]),
+          _rep_rec("prompt", list_at + 1_000, "add a colour palette"),
+          _rep_rec("todos", list_at + 2_000, [{"task": "u", "completed": False}])],
+         list_at + 2_000, ask_at),
+    ]
+    for case_name, case_events, case_hit, case_prompt in replay_cases:
+        st_cli, st_desk = _replay_both(case_events, case_hit, case_prompt)
+        for field in ("goal", "now", "nudge", "goal_stale"):
+            assert st_cli.get(field) == st_desk.get(field), (
+                case_name, field, st_cli.get(field), st_desk.get(field))
+        assert st_desk.get("goal_source") == ("agent" if st_cli.get("goal") else None), case_name
+    # the stale case above is checked for its ANSWER, not only its two-way agreement
+    st_cli, st_desk = _replay_both(replay_cases[-1][1], replay_cases[-1][2], replay_cases[-1][3])
+    assert st_cli.get("goal") == "a tidier footer" and st_cli.get("goal_stale") is True, st_cli
+    assert st_desk.get("goal_stale") is True, st_desk
+    # ...and the SHARED rules are exercised too, so the two readers cannot agree by both
+    # ignoring a rule: each case's expected field is checked as well as the two-way match.
+    assert module.is_nudge("continue") and module.is_nudge("go on") and module.is_nudge("yes")
+    assert not module.is_nudge("continue the other work") and not module.is_nudge("")
+    goals_p = [(1, "g1"), (3, "g3")]
+    prompts_p = [(2, "p2"), (4, "p4")]
+    assert module.pick_goal(goals_p, prompts_p, 3) == "g3"
+    assert module.pick_goal([], prompts_p, 3) is None
+    assert module.pick_goal(goals_p, prompts_p, None) == "g3"
+    # `goal_stale_at` itself: a heading before the request that opened the list's turn is a
+    # leftover; one at or after it belongs to the list; with no request to bracket the turn
+    # there is nothing to prove, so it is False rather than a guess.
+    assert module.goal_stale_at([(1, "old")], [(2, "ask")], 3) is True
+    assert module.goal_stale_at([(3, "new")], [(2, "ask")], 3) is False
+    assert module.goal_stale_at([(1, "old")], [], 3) is False
+    assert module.goal_stale_at([(1, "old")], [(2, "ask")], None) is False
+    say("replay: the CLI journal and the desktop harness history answer `goal`, `now` and "
+        "`nudge` identically for the same turn, across every case: ok")
+
+    # an older store with no such column answers empty rather than failing
+    bare = sqlite3.connect(turn_db)
+    try:
+        assert module.harness_turn(bare.cursor(), "R0") == {"todos": None, "at_ms": 0}
+    finally:
+        bare.close()
+    # ...and the source FORWARDS all of it: the running flag and the turn reach the state
+    # the renderers read, which is what `no_list_reason` and the pane's turn line want
+    write_live(harness_history(("todos", DESK_NOW - 5_000, live_todos)))
+    obs = module.DesktopSource().describe(args, HOME,
+                                          {"db": live_db, "thread": "R0", "mode": "pinned"})
+    assert obs["turn_running"] is True, obs
+    assert obs["turn"] == {"start_ms": prompt_at}, obs
+    assert obs["todos"] == live_todos, obs
+    write_live(harness_history(("todos", DESK_NOW - 5_000, live_todos)), prompt=0)
+    idle_obs = module.DesktopSource().describe(
+        args, HOME, {"db": live_db, "thread": "R0", "mode": "pinned"})
+    assert "turn" not in idle_obs, idle_obs          # no prompt, no turn to name
+    say("desktop: a running turn shows the app's OWN in-flight list — the newest "
+        "`write_todos` in `harness_state`, taken only for this turn's window — and the "
+        "turn's start rides with it, so a finished previous list is dropped the way the "
+        "CLI drops it; the same history says `now`/`nudge` for a request newer than the "
+        "list, by the CLI's own rules, and carries the agent's own `Goal:` heading for it, "
+        "read from the same prose: ok")
+
+    # ---- one history MESSAGE holds a whole turn's parts, so two headings — or two lists —
+    #      inside it share the message and are told apart by their PART: the walk is ordered by
+    #      `msg.key, part.key` and a position names both, because a position that named only the
+    #      message would tie and hand `_newest` the FIRST heading — the same first-vs-last trap
+    #      the committed read was just fixed for, one store over.
+    two_in_one = [{"role": "assistant", "sentAt": DESK_NOW - 5_000, "content": [
+        {"type": "text", "text": "Goal: the first statement"},
+        {"type": "tool-call", "toolName": "write_todos", "input": {"todos": done_todos}},
+        {"type": "text", "text": "Goal: the statement that stands"},
+        {"type": "tool-call", "toolName": "write_todos", "input": {"todos": live_todos}},
+    ]}]
+    write_live(json.dumps({"sessionState": {"mainAgentState": {"messageHistory": two_in_one}}}))
+    st = module.read_desktop(live_db, thread_id="R0", source="pinned", now_ms=DESK_NOW)
+    assert st["todos"] == live_todos, st["todos"]
+    assert st["goal"] == "the statement that stands", st.get("goal")
+    say("desktop: several calls in ONE history message — the last list and the last heading: ok")
 
     # ---- the big goal heading a list: the AGENT's own line, and drift since
     goals = os.path.join(TEST_HOME, "goalstore")
@@ -4035,8 +6574,21 @@ try:
     assert st_g["goal"] is None and st_g["goal_source"] is None, st_g
     assert st_g["now"] == "and check why the list looks frozen", st_g
     text_none = STRIP(module.render(dict(st_g, done=0, total=1), False, width=50))
-    assert "big goal · — none stated" in text_none, text_none
-    say("big goal: with no agent line the heading says so instead of quoting you: ok")
+    # the note wraps, so it is read flat: the words are what matter, not the line break
+    assert "big goal · " + module.GOAL_MISSING_NOTE in " ".join(text_none.split()), text_none
+    # ...and it is drawn in the warn yellow, not the muted grey: a note that only dims reads
+    # as if there were nothing to report, which is how a skipped rule stayed invisible
+    coloured = module.render(dict(st_g, done=0, total=1), True, width=50)
+    note_row = next(ln for ln in coloured.splitlines() if "no heading" in ln)
+    assert "\x1b[33m" in note_row, repr(note_row)
+    # ...and the warning fires for exactly the shown list: a heading silences it, and a
+    # cleared list (no todos) has nothing to head, so `finish_state` dropping a list does
+    # not leave a warning pointing at nothing
+    assert module.goal_missing_note({"goal": None, "todos": [{"task": "t"}]}) == \
+        module.GOAL_MISSING_NOTE
+    assert module.goal_missing_note({"goal": "a heading", "todos": [{"task": "t"}]}) == ""
+    assert module.goal_missing_note({"goal": None, "todos": []}) == ""
+    say("big goal: with no agent line the pane says so loudly instead of quoting you: ok")
 
     # a repeated request is not drift (the list already answers it)
     write_journal(
@@ -4216,7 +6768,7 @@ try:
         ("keep going with it", True),
         ("go on", True),
         ("proceed", True),
-        ("continue with the NAS work", False),
+        ("continue with the other work", False),
         ("keep going and fix the bell", False),
         ("pick up where the compaction left off", False),
     ):
@@ -4492,22 +7044,29 @@ try:
     say("the list rule: and for a re-written list before continuing from a nudge: ok")
     say("the list rule: and for the checks themselves to be steps of it: ok")
 
-    # the NAS program carries its own copy of the heading rule (it runs standalone out
-    # there), so both patterns are compared on the forms that matter
-    # Only the regex line is executed: the program itself wants argv and a store.
-    nas_ns = {}
-    exec(
-        "import re\n"
-        + "\n".join(
-            line for line in module.NAS_EXTRACT.splitlines() if line.startswith("GOAL_RE = ")
-        ),
-        nas_ns,
-    )
-    for sample in ("Goal: x", "**Goal:** y", "- Goal: z", "we discussed the goal: no"):
-        assert bool(module.GOAL_LINE_RE.match(sample)) == bool(
-            nas_ns["GOAL_RE"].match(sample)
-        ), sample
-    say("big goal: the NAS extractor's rule matches the local one: ok")
+    # ...and the skill that CARRIES the rule has to be OFFERED for the task in the first
+    # place: Freebuff shows the model each skill's name and DESCRIPTION — nothing else —
+    # until it loads one, so the trigger has to live in the description, and a skill marked
+    # `disable-model-invocation` is never offered at all. The operator's skills sit outside
+    # this repository; a runner has none, so this is checked where it is installed and named
+    # as absent where it is not.
+    skill_md = os.path.join(HOME, ".agents", "skills", "freebuff-todo-pane", "SKILL.md")
+    if os.path.isfile(skill_md):
+        skill_text = open(skill_md, encoding="utf-8").read()
+        front = skill_text.split("---", 2)[1] if skill_text.startswith("---") else ""
+        assert "name: freebuff-todo-pane" in front, f"{skill_md} lost its name"
+        assert "disable-model-invocation" not in front, (
+            f"{skill_md} is marked non-invocable, so the model is never offered it"
+        )
+        for phrase in ("whenever", "fbtodo", "Goal:"):
+            assert phrase in front, (
+                f"{skill_md}'s description no longer triggers on {phrase!r} — a task that "
+                "touches fbtodo would not be offered the rule"
+            )
+        say("the list rule: the todo-pane skill asks to load on any fbtodo task: ok")
+    else:
+        say("the list rule: no todo-pane skill is installed here to check: ok")
+
 
     # a sentence where a heading belongs is reported, not silently clipped. Its own
     # FBTODO_HOME: the shared one holds the watcher's state, and doctoring that would
@@ -4728,7 +7287,7 @@ try:
     #      only ever a half of the answer.
     assert module.label_class("Run the tests") == "run"
     assert module.label_class("Update the README") == "docs"
-    assert module.label_class("Deploy to the NAS") == "deploy"
+    assert module.label_class("Deploy to the cluster") == "deploy"
     assert module.label_class("frobnicate the widget") == "other"
     cm = {"classes": {"run": 4, "edit": 8}, "calls": 5, "rate_ms": 30_000}
     # 4 calls x 30s = 2m, blended with an 8m pace = sqrt(120_000 * 480_000) = 4m
@@ -4862,42 +7421,220 @@ try:
     )
     say("a state file from another build is ignored rather than trusted: ok")
 
-    # ---- the pane exits when its instance disappears
-    victim2 = spawn_quiet("sleep", "600")
-    time.sleep(0.2)
+    # ---- what a pane closes on, stated once. An instance dying used to be enough on its
+    #      own, which is what "it keeps closing mid-run" was (2026-10-03), and the fix that
+    #      came after it — the journal's turn boundary — was closer and still wrong for the
+    #      same reason: what a pane draws is a LIST, and a list whose session is over is a
+    #      list somebody is reading, finishing or waiting on. So the rule is the window's,
+    #      and only these end a pane: `--stale-after` (the reader's OWN window, measured on
+    #      the store the pane is following — `0`, the default, never fires), Ctrl-C,
+    #      `--once`, and the window going away. Never: an instance exiting, a session or a
+    #      turn ending, a journal going quiet on its own, or the store under the pane changing
+    #      (`finish_state` dropping a finished list is a frame change, not an ending).
+    #
+    #      An `auto` pane has no session to close on at all: its subject is re-picked every
+    #      poll, so "the session this was following ended" is not an event it can be closed
+    #      by — it is a hand-over, to whatever `auto` answers with next. That is why the
+    #      rule above is the only one, and why the last two cases below are `-s auto`: the
+    #      chat ends (a real turn boundary in the fixture, not just an old mtime), the
+    #      instance it was opened beside is killed, and the pane must still be drawing —
+    #      now from the app's thread — until the reader's own window says otherwise.
     import pty
     import select
 
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.environ["FBTODO_HOME"] = TEST_HOME
-        os.execv(sys.executable, [sys.executable, PANES, "pane", "--watch-pid",
-                                 str(victim2.pid), "--no-daemon", "-i", "0.2"])
-    time.sleep(1.5)
-    kill_tree(victim2)
-    # Drain the pane's pty while waiting. The pane paints into this pty and a terminal
-    # always reads it; nobody here did, so once the 64 KB buffer filled the pane sat in
-    # write() and could not reach the top-of-loop liveness check — measured 2026-09-23:
-    # the same pane, pty drained, exits 0.20 s after its instance dies (that is the
-    # behaviour under test); undrained, this check spent 11.8 s and looked like a slow
-    # pane. The test, not the tool, was the slow part.
-    deadline = time.time() + 10
-    status = None
-    while time.time() < deadline:
-        while select.select([fd], [], [], 0)[0]:
-            try:
-                if not os.read(fd, 65536):
+    pane_root = os.path.join(TEST_HOME, "paneclose")
+
+    def pane_chat(name, age_s, ended=False):
+        """A CLI chat whose journal is `age_s` old, and whose turn `ended` when asked.
+
+        Two separate facts, and the fixture has to be able to state each on its own. A turn
+        BOUNDARY in the tail (`shouldEndTurn`) is what a finished session looks like to
+        `journal_liveness` — the agent saying it has stopped and is waiting for you. The
+        mtime is a different clock: it is how long the STORE has stopped moving, which is
+        the one `--stale-after` reads. A finished session written with a fresh mtime is the
+        case the old mtime rule got wrong, so the fixture can now ask for it.
+        """
+        chat = os.path.join(pane_root, name)
+        os.makedirs(chat, exist_ok=True)
+        log = os.path.join(chat, "log.jsonl")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"data": {"toolCalls": [
+                {"toolName": "write_todos",
+                 "input": {"todos": [{"task": f"{name} step", "completed": False}]}}]}}) + "\n")
+            if ended:
+                fh.write(json.dumps({"data": {"shouldEndTurn": True}}) + "\n")
+        old = time.time() - age_s
+        os.utime(log, (old, old))
+        return chat
+
+    finished_chat = pane_chat("finished", module.SOURCE_LIVE_MS / 1000.0 + 600, ended=True)
+    working_chat = pane_chat("working", 5)
+    # A pane answers from the cached watcher state while it is fresh and names a live session,
+    # and another block of this suite leaves one behind: removed, so every case below is
+    # answered by the fixture it names (a stale file that happened to match would hide the
+    # rule). The file lives in the throwaway home.
+    if os.path.exists(module.STATE_PATH):
+        os.remove(module.STATE_PATH)
+
+    
+
+    def kill_instance_pane(*extra, cwd=None, settle=1.0, wait=2.0):
+        """One real pane whose instance dies under it: (exit code, or None while it lives).
+
+        `cwd` is the DIRECTORY `auto` resolves against — `auto` answers for the project the
+        pane stands in, not for whatever the fixtures happen to be named, so an `auto` case
+        has to stand where its own fixture's project does. `settle` is how long the pane gets
+        to find its source and paint before the instance dies, and `wait` how long it is then
+        given to close itself: an `auto` pane resolves a chain of two sources per poll, so it
+        is given longer than a pane that was told which one to read.
+        """
+        victim = spawn_quiet("sleep", "600")
+        time.sleep(0.2)
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.environ["FBTODO_HOME"] = TEST_HOME
+            if cwd:
+                os.chdir(cwd)
+            os.execv(sys.executable, [sys.executable, PANES, "pane", "--watch-pid",
+                                     str(victim.pid), "--no-daemon", "-i", "0.2", *extra])
+        time.sleep(settle)   # long enough for the pane to have seen its instance once
+        kill_tree(victim)
+        # Drain the pane's pty while waiting. The pane paints into this pty and a terminal
+        # always reads it; nobody here did, so once the 64 KB buffer filled the pane sat in
+        # write() and could not reach the top-of-loop liveness check — measured 2026-09-23:
+        # the same pane, pty drained, exits 0.20 s after its instance dies (that is the
+        # behaviour under test); undrained, this check spent 11.8 s and looked like a slow
+        # pane. The test, not the tool, was the slow part.
+        drawn, code = [], None
+        deadline = time.time() + wait     # several polls past the instance's death
+        while time.time() < deadline:
+            while select.select([fd], [], [], 0)[0]:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:          # the child closed its side
+                    chunk = b""
+                if not chunk:
                     break
-            except OSError:  # the child closed its side
+                drawn.append(chunk)
+            wpid, status = os.waitpid(pid, os.WNOHANG)
+            if wpid:
+                code = os.waitstatus_to_exitcode(status)
                 break
-        wpid, status = os.waitpid(pid, os.WNOHANG)
+            time.sleep(0.05)
+        text = b"".join(drawn).decode("utf-8", "replace")
+        if code is None:                 # still on screen — that IS the answer
+            os.kill(pid, signal.SIGTERM)
+            os.waitpid(pid, 0)
+        os.close(fd)
+        return code, text
+
+    # The one rule this whole block exists for: an ended session does not end a PANE. The pane
+    # is the reader's window on a list; a list whose session is finished is a list somebody is
+    # still working through, and closing under them is the "it keeps closing mid-run" report.
+    # So the fixture here is a chat whose turn really ended — the boundary is in the tail —
+    # watched by a pane whose instance is then killed: the exact shape that used to print
+    # `freebuff instance exited` and leave. It must stay, drawing the finished list, until the
+    # reader's own window does.
+    code, text = kill_instance_pane("-s", "cli", "--chat", finished_chat)
+    assert code is None, "a pane closed itself because the session it was showing had ended"
+    assert "finished step" in text, text[-600:]
+    assert "instance exited" not in text, text[-600:]
+    say("pane holds a finished session when its instance dies — only the window ends it: ok")
+
+    code, text = kill_instance_pane("-s", "cli", "--chat", working_chat)
+    assert code is None, "a pane must not close while the journal it follows is still moving"
+    assert "working step" in text, text[-600:]
+    say("pane holds while its journal is still being written, instance or not: ok")
+
+    code, text = kill_instance_pane("-s", "desktop", "--db", desk_db, "--state", desk_state,
+                                    "--thread", "T0")
+    assert code is None, "a pane following the app's store must not close with a CLI pid"
+    assert "its second step" in text, text[-600:]
+    assert "instance exited" not in text, text[-600:]
+    say("pane holds while it follows the app's thread, instance or not: ok")
+
+    # ---- ...and the two cases that decide the rule: what an `auto` pane closes on, which is
+    #      nothing it did not ask for. `auto` re-picks its source every poll, so a session
+    #      ending is not an ending at all — it is a hand-over, and the pane's subject after it
+    #      is whatever the directory is working on NOW. The fixture is a directory with both
+    #      halves: a CLI chat that has ended (a real boundary, an old store) and a desktop
+    #      store with one live thread in it. The pane stands in that directory, its instance
+    #      is killed, and it must go on drawing — from the thread, because that is the list
+    #      this directory is working on now.
+    auto_dir = os.path.join(TEST_HOME, "paneclose-auto-proj")
+    os.makedirs(auto_dir, exist_ok=True)
+    auto_root = os.path.join(TEST_HOME, "paneclose-auto-root")
+    auto_chat = os.path.join(auto_root, os.path.basename(auto_dir), "chats",
+                             "2026-02-02T00-00-00.000Z")
+    os.makedirs(auto_chat, exist_ok=True)
+    ended_step = "the ended CLI session's step"
+    with open(os.path.join(auto_chat, "log.jsonl"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"data": {"toolCalls": [
+            {"toolName": "write_todos",
+             "input": {"todos": [{"task": ended_step, "completed": False}]}}]}}) + "\n")
+        fh.write(json.dumps({"data": {"shouldEndTurn": True}}) + "\n")
+    ended_at = time.time() - (module.SOURCE_LIVE_MS / 1000.0) - 1800
+    os.utime(os.path.join(auto_chat, "log.jsonl"), (ended_at, ended_at))
+    auto_store = os.path.join(TEST_HOME, "paneclose-auto-stores", "proj")
+    os.makedirs(auto_store, exist_ok=True)
+    with open(os.path.join(auto_store, "project.json"), "w", encoding="utf-8") as fh:
+        json.dump({"projectPath": auto_dir}, fh)
+    auto_db = os.path.join(auto_store, "desktop-v2.db")
+    if os.path.exists(auto_db):
+        os.remove(auto_db)
+    auto_step = "the live thread this directory is working on"
+    con = sqlite3.connect(auto_db)
+    con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, status TEXT,"
+                " sidebar_archived_at INTEGER)")
+    con.execute("CREATE TABLE messages (seq INTEGER, thread_id TEXT, parts_json TEXT, ts INTEGER)")
+    con.execute("INSERT INTO threads VALUES ('AU', 'Auto thread', 'open', NULL)")
+    con.execute("INSERT INTO messages VALUES (0, 'AU', ?, ?)",
+                (desk_parts(desk_todos((auto_step, False))), DESK_NOW))
+    con.commit()
+    con.close()
+    auto_pat = os.path.join(TEST_HOME, "paneclose-auto-stores", "*", "desktop-v2.db")
+    auto_state = os.path.join(TEST_HOME, "paneclose-auto-state.json")
+
+    code, text = kill_instance_pane(
+        "-s", "auto", "--cli-root", auto_root, "--db", auto_pat, "--state", auto_state,
+        cwd=auto_dir, settle=2.0, wait=6.0,
+    )
+    assert code is None, f"an auto pane closed itself when a session ended: {code}"
+    assert auto_step in text, text[-800:]
+    assert ended_step not in text, text[-800:]
+    assert "instance exited" not in text, text[-800:]
+    say("an auto pane follows the session on: an ended chat is a hand-over, not an ending: ok")
+
+    # ...and the other half, which is what makes the first half a RULE rather than a shrug:
+    # asked for, the one window left does close it. `--stale-after` is measured on the store
+    # the pane is following, so an auto pane whose sources have all stopped moving goes at
+    # the end of that window — the same exit and the same words as any other source, which is
+    # the whole of what an auto pane can be closed by.
+    pid_w, fd_w = pty.fork()
+    if pid_w == 0:
+        os.environ["FBTODO_HOME"] = TEST_HOME
+        os.chdir(auto_dir)
+        os.execv(sys.executable, [sys.executable, PANES, "pane", "--no-daemon", "-i", "0.2",
+                                 "-s", "auto", "--cli-root", auto_root, "--db", auto_pat,
+                                 "--state", auto_state, "--stale-after", "0.05"])
+    out_w, deadline_w = b"", time.time() + stale_window_bound()
+    os.set_blocking(fd_w, False)
+    status_w = None
+    while time.time() < deadline_w:
+        try:
+            out_w += os.read(fd_w, 65536)
+        except (BlockingIOError, OSError):
+            pass
+        wpid, st_w = os.waitpid(pid_w, os.WNOHANG)
         if wpid:
+            status_w = st_w
             break
-        time.sleep(0.05)
-    os.close(fd)
-    assert status is not None, "pane did not exit after its instance died"
-    assert os.waitstatus_to_exitcode(status) == 0, os.waitstatus_to_exitcode(status)
-    say("pane closes itself when the instance dies: ok (exit 0)")
+        time.sleep(0.1)
+    assert status_w is not None, "an auto pane ignored the window its reader asked for"
+    text_w = STRIP(out_w.decode("utf-8", "replace"))
+    assert "idle" in text_w and "closing" in text_w, text_w[-800:]
+    assert os.waitstatus_to_exitcode(status_w) == 0, os.waitstatus_to_exitcode(status_w)
+    say("an auto pane closes on the window, and on nothing else: ok")
 
     # ---- rendering: narrow panes must not wrap mid-word, and the footer clock
     # must move so a still pane still proves it is alive
@@ -4933,6 +7670,26 @@ try:
         nudge=None,
         patch=None,
         alert=None,
+        # ...and the SOURCE the live `json` answered from is machine state of the same kind.
+        # With `auto` following the live store (see `_snapshot`), a runner in a directory whose
+        # CLI chat has finished inherits the DESKTOP answer — a long thread id on the title and
+        # `threads` stacking heading rows, which is a different frame from the single CLI list
+        # these checks are written for. Measured 2026-10-03: the live desktop answer took the
+        # 12-line `short_patch` frame to the point where its PATCH row was dropped. The shape
+        # still comes from the live `json`; the source is pinned so the frame under test does
+        # not move with whichever session this machine happens to be running.
+        backend="cli",
+        session="S",
+        source="cli-journal",
+        threads=None,
+        goal_stale=None,
+        # ...and `source_why` is source state of exactly that kind: the chain's own note about
+        # which source it passed over, which the live `json` carries whenever THIS machine's
+        # directory had a finished chat to walk past. It is drawn on the title, so inheriting
+        # it would move every frame below with the moment the suite ran; cleared, the shape is
+        # the single-source frame these checks are written for, and the note is checked on its
+        # own (see "the pane's title names the source that answered").
+        source_why=None,
     )
     steps = [
         {"task": "Diagnose the frozen-looking pane and prove it is alive", "completed": True},
@@ -4996,7 +7753,9 @@ try:
     # `╭ ╮ ╰ ╯` only, which the corner assertions above and this one pin
     assert not any(ch in rich for ch in "┌┐└┘"), rich
     assert "FREEBUFF TODOS" in rich and "watcher: pid 999" in rich, rich
-    assert "🎯 Goal:" in rich and "✔" in rich and "➔" in rich, rich
+    # the marker is `▸` and not an emoji: a frame is a grid, and a glyph the code
+    # and the terminal measure differently is enough to step its border sideways
+    assert "▸ Goal:" in rich and "✔" in rich and "➔" in rich, rich
     assert BAR_CELLS.search(rich) and "LIVE:" in rich, rich
     assert "PROGRESS" not in rich, "the bar row still carries its old label"
     assert len(rich.splitlines()) <= 20, rich
@@ -5062,42 +7821,32 @@ try:
         fh.write(f"{PATCH_FIXTURE_STAMP} patched — the collapse and the session-end reason"
                  " are in place (1:2:4)\n")
     say("patch row: a failure is reported, and a `reanchor:` note is not read as one: ok")
-    # the NAS formats: the hook's own line with its complaint under it, and the notifier's,
-    # whose ` — http 200 {…}` transport reply is not the row's business
-    nas_p = module.nas_patch_from_tail("\x1c".join([
-        "2026-01-01T00:00:00Z converge=ok patch=incomplete binary=9.9.9-nas [1 bytes]",
-        "    freebuff: local CLI patches incomplete (no window for fixture-window);"
-        " the rest were applied",
-    ]))
-    assert nas_p["outcome"] == "incomplete" and nas_p["severity"] == "bad", nas_p
-    assert "no window for fixture-window" in nas_p["reason"], nas_p
-    assert module.nas_patch_from_tail("") is None
-    nas_p = module.nas_patch_from_tail(
-        "2026-01-01T00:00:00Z converge=ok patch=ok binary=9.9.9-nas [1 bytes]"
-    )
-    assert nas_p["outcome"] == "ok" and nas_p["reason"] == "", nas_p
-    nas_a = module.alert_from_lines([
+    # the notifier's own line, whose ` — http 200 {…}` transport reply is not the row's
+    # business
+    alert = module.alert_from_lines([
         '2026-01-01 00:00:01 sent ntfy incomplete (2f14bfcf14a4d794) — http 200 {"id":"x"}',
     ], "fixture")
-    assert nas_a["kind"] == "sent" and nas_a["text"] == "sent ntfy incomplete", nas_a
-    nas_a = module.alert_from_lines([
+    assert alert["kind"] == "sent" and alert["text"] == "sent ntfy incomplete", alert
+    alert = module.alert_from_lines([
         "2026-01-01 00:00:02 resolved — the patches are in place again",
     ], "fixture")
-    assert nas_a["kind"] == "resolved" and nas_a["severity"] == "ok", nas_a
-    nas_a = module.alert_from_lines([
+    assert alert["kind"] == "resolved" and alert["severity"] == "ok", alert
+    alert = module.alert_from_lines([
         "2026-01-01 00:00:03 muted — failed (7be3655000448c52) not sent",
     ], "fixture")
-    assert nas_a["kind"] == "muted" and nas_a["severity"] == "warn", nas_a
+    assert alert["kind"] == "muted" and alert["severity"] == "warn", alert
     assert module.alert_from_lines([], "fixture") is None
-    # The NAS container logs UTC while this Mac's kit logs LOCAL time, and both use the
-    # space-separated form — so the source has to say which. Guessing made a 28-minute-old
-    # NAS alert read as `0s ago`: its UTC stamp is a future time on a PDT clock.
-    utc_stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 1800))
-    utc_alert = module.alert_from_lines(
-        [f"{utc_stamp} sent ntfy incomplete"], "fixture", utc=True
-    )
-    assert 1740 < utc_alert["age_s"] < 1890, utc_alert
-    say("patch row: the NAS notifier's clock is UTC, and its ages are read as such: ok")
+    # Two clocks can write a stamp, so the SEPARATOR decides: a local one after a
+    # space, a UTC one after a `T`. Guessing made a 28-minute-old alert read as `0s
+    # ago`: a UTC stamp was a future time on a PDT clock, and the age clamped to zero.
+    local_stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 1800))
+    utc_stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 1800))
+    for stamp, label in ((local_stamp, "local"), (utc_stamp, "utc")):
+        age = (module.entry_ms(f"{stamp} sent ntfy x") or 0) / 1000.0
+        assert 1740 < time.time() - age < 1890, (label, stamp)
+    alert = module.alert_from_lines([f"{local_stamp} sent ntfy incomplete"], "fixture")
+    assert alert and 1740 < alert["age_s"] < 1890, alert
+    say("patch row: a UTC stamp is read as UTC and a local one as local: ok")
     # the row, laddered by width: both facts stay on it, the detail goes
     dirty = {
         "patch": {"outcome": "incomplete", "severity": "bad", "version": "9.9.9",
@@ -5231,13 +7980,19 @@ try:
     ))
     zero_bar = bar_row_of(zero)
     assert set(zero_bar.split("[", 1)[1].split("]", 1)[0]) == {"░"}, zero_bar
-    # no heading written means no heading row at all — the old `— none stated` spent one
-    # of a fixed-height strip's rows saying nothing
-    bare = ansi.sub("", module.render(
+    # a list with no heading is NAMED, not hidden: the framed pane draws the same warning the
+    # plain renderer does, in the warn yellow, on the row the heading would have taken — the
+    # skipped rule is surfaced loudly instead of drawing nothing
+    bare_col = module.render(
         dict(rich_state, goal=None), True, watching=999, width=46, height=20,
         now_ms=SWEEP_NOW,
-    ))
-    assert "🎯" not in bare and "none stated" not in bare, bare
+    )
+    bare = ansi.sub("", bare_col)
+    assert "▸" not in bare, bare                          # no invented heading
+    assert module.GOAL_MISSING_NOTE in bare, bare        # ...but the gap is named
+    assert "none stated" not in bare, bare
+    note_row = next(ln for ln in bare_col.splitlines() if "no heading" in ln)
+    assert "\x1b[33m" in note_row, repr(note_row)         # and in the warn yellow
     # one state word, with the age in the parentheses the idle counter used to spend —
     # and the three states a list can be in, at the width the real pane gets
     def footer_of(state_dict, width=66):
@@ -5523,12 +8278,41 @@ try:
     # zero here would read as a list that took no time at all
     assert module.elapsed_total_ms({}, est_state["todos"], SWEEP_NOW) is None
     assert module.total_estimate_ms({}, est_state["todos"], SWEEP_NOW, 120_000) is None
+    # a list whose clocks have all STOPPED freezes: the span is first start to last stop,
+    # not to `now` — a finished list left up for two days used to read `65h59m spent`,
+    # climbing with nobody working. The two clocks here run 1s->61s and 20s->200s.
+    done_times = {
+        "one": {"started_ms": 1_000, "done_ms": 61_000, "elapsed_ms": 60_000},
+        "two": {"started_ms": 20_000, "done_ms": 200_000, "elapsed_ms": 180_000},
+    }
+    done_todos = [
+        {"task": "one", "completed": True},
+        {"task": "two", "completed": True},
+    ]
+    assert module.elapsed_total_ms(done_times, done_todos, 999_999_999) == 199_000
+    # ...while a list with one clock still counting still measures to `now`, so it keeps
+    # moving between the watcher's writes
+    open_times = dict(done_times, two={"started_ms": 20_000, "done_ms": None})
+    assert module.elapsed_total_ms(open_times, done_todos, 999_999_999) == 999_998_999
     goal_row = next(line for line in est_lines if "GOAL" in line)
     # Two numbers, not three: what this row has and nowhere else has is how much is behind
     # the owner and how much the whole thing is. The third it used to print — the time
     # left — is the `EST REM` on the bar row above, and saying it twice was the repetition
     # the footer was carrying.
     assert "30s spent" in goal_row and "4m00s total" in goal_row, goal_row
+    # ...and a FINISHED list's row is the same two numbers whenever it is drawn: the pane
+    # left open for ten more hours must not show a `spent` that grew by ten hours
+    done_state = dict(est_state, todos=done_todos, done=2, total=2,
+                      task_times=done_times, turn_ended=True)
+    frozen_row = next(ln for ln in ansi.sub("", module.render(
+        done_state, True, watching=999, width=80, height=20, now_ms=SWEEP_NOW,
+    )).splitlines() if "GOAL" in ln)
+    later_row = next(ln for ln in ansi.sub("", module.render(
+        done_state, True, watching=999, width=80, height=20,
+        now_ms=SWEEP_NOW + 10 * 3_600_000,
+    )).splitlines() if "GOAL" in ln)
+    assert frozen_row == later_row, (frozen_row, later_row)
+    assert "3m19s spent" in frozen_row and "3m19s total" in frozen_row, frozen_row
     assert "left" not in goal_row, goal_row
     # the row is bought with height the owner gave the pane, never with a step off the
     # list: a pane too short for one drops the row, and the number moves onto the bar's
@@ -5657,7 +8441,7 @@ try:
         assert "\x1b[32m" not in painted and "\x1b[1;32m" not in painted, repr(painted)
         # ...the goal is the `active` ink rather than a second bold white, and the one row
         # being worked on is the only text in the frame carrying weight
-        goal_row = next(line for line in painted.splitlines() if "🎯" in line)
+        goal_row = next(line for line in painted.splitlines() if "▸ Goal:" in line)
         assert "\x1b[38;2;230;237;243m" in goal_row, repr(goal_row)
         active_row = next(line for line in painted.splitlines() if "➔" in line)
         assert "\x1b[1;38;2;230;237;243m" in active_row, repr(active_row)
@@ -5665,7 +8449,7 @@ try:
         # `○ ~2m` on the steps that have not started
         assert "\x1b[1;36m" in active_row and "[" in active_row, repr(active_row)
         assert "\x1b[2;38;2;255;136;0mDiagnose" in grey_row, repr(grey_row)
-        assert "\x1b[38;2;255;136;0m🎯 Goal:" in painted, repr(painted)
+        assert "\x1b[38;2;255;136;0m▸ Goal:" in painted, repr(painted)
         painted_bar = bar_row_of(painted)
         assert "\x1b[38;2;0;0;255m░" in painted_bar, repr(painted_bar)
     finally:
@@ -5906,9 +8690,9 @@ try:
 
         # ---- and the STRUCTURAL half: not a list of remembered prose keys, but a walk of
         #      every string in the state. The allow-list this replaced cleaned the fields
-        #      someone had thought of, so a thread's title, a NAS `fb_dir`, a tool name in
+        #      someone had thought of, so a thread's title, a session's `fb_dir`, a tool name in
         #      `tool_calls` and every `turn` field were printed as written. A fully populated
-        #      state (stacked threads, a patch, an alert, the action feed, a NAS observation, a
+        #      state (stacked threads, a patch, an alert, the action feed, a store observation,
         #      turn) is copied once per string leaf, that one string replaced by a payload, and
         #      rendered plain and rich: nothing but SGR may come out. No key is exempt, not even
         #      the enum fields the tool owns (backend/source/status/goal_source/schema): they are
@@ -5926,9 +8710,6 @@ try:
                  "todos": [{"task": "two", "completed": False}]},
             ],
             tool_calls={"read_files": 12, "code_search": 5, "write_todos": 2},
-            nas={"dir": "/volume1/proj", "live": True, "fb": "1", "fb_dir": "/volume1/proj",
-                 "fb_project": "proj", "alive": True, "size": 10, "mtime_ms": SWEEP_NOW,
-                 "has_transcript": True, "unchanged": False},
             turn={"start_ms": SWEEP_NOW - 60_000, "iterations": 9, "files": ["a.py", "b.py"],
                   "verbs": {"read_files": 3}, "truncated": False},
             observed=[{"verb": "edit", "what": "the renderer",
@@ -6179,6 +8960,51 @@ try:
     assert module._session_label({"backend": "cli"}) == "cli"
     assert module._session_label({"session": "manual-run"}) == "manual-run"
     assert module._session_label({}) == "no session"
+
+    # ---- ...and when the resolution had to pass a source over, the title says which list
+    #      this is AND why it is not the other one. `_snapshot` writes the note (`source_why`,
+    #      and only for `auto`), the border and the plain heading both carry it, and a state
+    #      without one is the frame it always was — every hand-built fixture here has no note,
+    #      which is exactly why the assertions above still describe the same border.
+    assert module._resolution_note([], "desktop") == "", "nothing skipped, nothing to say"
+    assert module._resolution_note(["cli finished 31h"], "desktop") == (
+        "cli finished 31h → desktop"
+    ), module._resolution_note(["cli finished 31h"], "desktop")
+    assert module._resolution_note(["cli none here", "desktop none here"], None) == (
+        "cli none here · desktop none here"
+    ), "with nothing answered the reasons stand alone"
+    note = {"source_why": "cli finished 31h → desktop"}
+    assert module._source_title(note, 100, "cli · 09-30 07:12") == (
+        "FREEBUFF TODOS · cli finished 31h → desktop"
+    ), module._source_title(note, 100, "cli · 09-30 07:12")
+    assert module._source_title({}, 100, "cli · 09-30 07:12") == "FREEBUFF TODOS"
+
+    def border_of(state_dict, width):
+        return module._plain(module.render(
+            state_dict, True, watching=None, width=width, height=20, now_ms=SWEEP_NOW,
+        ).splitlines()[0])
+
+    noted = border_of(dict(border_state, **note), 100)
+    assert module._cell_width(noted) == 100, (100, noted)
+    assert "cli finished 31h → desktop" in noted, noted
+    assert module._session_label(border_state) in noted, (
+        "the note costs the right slot no session: both fit at this width"
+    )
+    # ...and a title it cannot say usefully is not said: at 44 columns the session keeps its
+    # columns and the pane keeps its name, rather than the note shoving the stamp off the rim
+    capped = border_of(dict(border_state, **note), 44)
+    assert capped.startswith("╭──  FREEBUFF TODOS  "), capped
+    assert "cli finished" not in capped, capped
+    assert "cli · 09-24" in capped, (
+        "...and the session it is showing is still the thing in the slot\n" + capped
+    )
+    # the plain renderer says it in the same place: the line naming what is being shown
+    listed = module._plain(module.render(dict(border_state, **note), False, width=100))
+    assert "cli finished 31h → desktop" in listed.splitlines()[0], listed
+    assert module._plain(module.render(border_state, False, width=100)).splitlines()[0] == (
+        listed.splitlines()[0].replace(" · cli finished 31h → desktop", "")
+    ), "the note is the only difference"
+    say("the pane's title names the source that answered and what it passed over: ok")
     longer = top_of(dict(border_state, session="a-session-name-that-will-never-fit"), 46)
     assert "…" in longer, longer
     assert module._cell_width(longer) == 46, longer
@@ -7021,9 +9847,16 @@ try:
                               + [{"task": "s%d" % i} for i in range(mod.PUSH_MAX_STEPS - 1)]},
                     "--to", okfile)
     assert boundary.returncode == 0, (boundary.returncode, boundary.stderr[-200:])
-    assert json.loads(boundary.stdout)["total"] == mod.PUSH_MAX_STEPS, boundary.stdout[:200]
-    # ...and the failure leaves the state it refused to replace alone
-    assert run("bar").stdout.strip() == "todos 1/1", run("bar").stdout
+    assert json.loads(boundary.stdout)["total"] == mod.PUSH_MAX_STEPS, boundary.stdout[:200]# ...and the failure leaves the state it refused to replace alone. BOTH of the sources are
+    #      named here, for the reason given above this block's first read: with the machine's
+    #      own store in the question, `bar` at the home directory answers from the operator's
+    #      LIVE session (measured 2026-10-04: `todos 3/8`) instead of the state this block
+    #      just pushed, and the check is then about the wrong list. Naming only the desktop
+    #      glob was not enough — the CLI half globs `~/.config/manicode/projects` the same
+    #      way, so the operator's running chats answered too, and this check went red with
+    #      `todos 1/6` as the very thread doing the work added todos under it.
+    assert run("bar", "--cli-root", cli_root, "--db", no_desk).stdout.strip() == "todos 1/1", \
+        run("bar", "--cli-root", cli_root, "--db", no_desk).stdout
     say("push: a state JSON on stdin becomes the live state, and a bad one does not: ok")
 
     # ---- `-s file:PATH`: the same state, read back off disk. A directory means the state
@@ -7088,6 +9921,313 @@ try:
         os.unlink(live_state)
     except OSError:
         pass
+
+    # ---- `fbtodo board`: every live session in one frame. Three questions, and each is
+    #      checked where it is decided rather than through the frame it lands in: which
+    #      sessions count as live, whether the board tells a CLI session from a desktop one,
+    #      and whether a session that has gone quiet drops off by itself.
+    bdir = os.path.join(TEST_HOME, "boardstore")
+    shutil.rmtree(bdir, ignore_errors=True)
+    broot = os.path.join(bdir, "cliprojects")
+    now_s = time.time()
+
+    def board_chat(project: str, age_s: float, tasks: list, goal=None, prompts=(),
+                    ended: bool = False) -> str:
+        """A CLI chat whose journal is `age_s` seconds old, with the given list in it.
+
+        `ended` closes the turn the way the agent does — a `shouldEndTurn` record — without
+        making the FILE old, which is the shape the desktop app leaves behind when it touches
+        a chat nobody is working in any more.
+        """
+        chat = os.path.join(broot, project, "chats", "2026-10-03T10-00-00.000Z")
+        os.makedirs(chat, exist_ok=True)
+        rows = [{"level": "DEBUG", "timestamp": "2026-10-03T10:00:00.000Z",
+                 "data": {"prompt": "do the thing"}}]
+        if goal:
+            rows.append({"level": "DEBUG", "timestamp": "2026-10-03T10:00:01.000Z",
+                         "data": {"fullResponse": f"Goal: {goal}"}})
+        rows.append({"level": "DEBUG", "timestamp": "2026-10-03T10:00:03.000Z",
+                     "data": {"toolCalls": [{"toolName": "write_todos",
+                                              "input": {"todos": tasks}}]}})
+        # ...and only THEN the newer requests, in the order a journal writes them: a request
+        # that came after the list is what makes it `now` (or a `nudge`, when it is a
+        # continuation), and one written before the list would be that list's own ask.
+        for at, text in prompts:
+            rows.append({"level": "DEBUG", "timestamp": at, "data": {"prompt": text}})
+        if ended:
+            rows.append({"level": "DEBUG", "timestamp": "2026-10-03T10:00:09.000Z",
+                         "data": {"fullResponse": "that is all of it", "shouldEndTurn": True}})
+        log = os.path.join(chat, "log.jsonl")
+        with open(log, "w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+        os.utime(log, (now_s - age_s, now_s - age_s))
+        return chat
+
+    board_chat("alpha", 30, [{"task": "one", "completed": True},
+                              {"task": "two", "completed": False}], goal="board it")
+    board_chat("beta", 600, [{"task": "x", "completed": False}],
+               prompts=[("2026-10-03T10:00:04.000Z", "keep going")])
+    # ...and one that stopped two days ago: its store has not moved, so it is not live
+    board_chat("gone", 2 * 86400, [{"task": "z", "completed": False}], goal="long over")
+    # ...and one that STOPPED ten minutes ago: the file is fresh (the app has touched it since),
+    # but the agent's last word was `shouldEndTurn`, so it is a finished session and not a live
+    # one. This is the same question the single-session pane asks, through the same code
+    # (`journal_liveness`) — the board used to answer it from the file's mtime alone and so
+    # counted every chat the app had touched, running or not (measured 2026-10-04, the reason
+    # `journal_liveness` exists: a chat that ended at 11:20 read as "just written" at 12:04).
+    board_chat("stopped", 600, [{"task": "s", "completed": False}], goal="finished",
+               ended=True)
+    bargs = ["--cli-root", broot, "--db", os.path.join(bdir, "none", "*.db")]
+    # the parsed flags, for the checks that ask the renderer rather than the command line
+    bns = module.build_parser().parse_args(["board", *bargs])
+    rows = json.loads(run("board", "--json", *bargs).stdout)
+    assert rows["count"] == 2, rows
+    assert [s["label"] for s in rows["sessions"]] == ["alpha", "beta"], rows["sessions"]
+    # the newest store first, and the two clocks are the board's own fields
+    assert rows["sessions"][0]["store_mtime_ms"] > rows["sessions"][1]["store_mtime_ms"]
+    assert rows["sessions"][0]["running"] and not rows["sessions"][1]["running"], rows
+    assert rows["sessions"][0]["goal"] == "board it", rows["sessions"][0]
+    assert rows["sessions"][1]["nudge"] == "keep going", rows["sessions"][1]
+    # a finished turn is not a live session, however recently the file moved — and no window
+    # brings it back, because this is not a window question
+    assert "stopped" not in [s["label"] for s in rows["sessions"]], rows["sessions"]
+    still_gone = json.loads(run("board", "--json", "--board-live", "4320", *bargs).stdout)
+    assert "stopped" not in [s["label"] for s in still_gone["sessions"]], still_gone
+    # a row is the SAME list the single-session pane draws, read through the same reader
+    one = json.loads(run("json", "--chat", os.path.join(broot, "alpha", "chats",
+                                                         "2026-10-03T10-00-00.000Z")).stdout)
+    assert [t["task"] for t in rows["sessions"][0]["todos"]] == [t["task"] for t in one["todos"]]
+    assert rows["sessions"][0]["goal"] == one["goal"], (rows["sessions"][0], one)
+    say("board: a live session is one whose store moved AND whose agent has not stopped, newest "
+        "first, and the row is the same list the pane draws: ok")
+
+    # ...and the window is the whole of "live": the quiet chat comes back when it is widened,
+    # so nothing was dropped for being unreadable — only for being old.
+    wide = json.loads(run("board", "--json", "--board-live", "4320", *bargs).stdout)
+    assert wide["count"] == 3 and "gone" in [s["label"] for s in wide["sessions"]], wide
+    assert wide["window_ms"] == 4320 * 60_000, wide
+    # ...and `--board-max` is a real cap, not a hint: the two newest are what fit
+    capped = json.loads(run("board", "--json", "--board-live", "4320",
+                            "--board-max", "2", *bargs).stdout)
+    assert capped["count"] == 2, capped
+    assert [s["label"] for s in capped["sessions"]] == ["alpha", "beta"], capped["sessions"]
+    # ...and `--board-rows` decides how many of a session's steps the frame draws
+    tall = STRIP(run("board", "--board-rows", "1", *bargs).stdout)
+    assert "[ ] two" not in tall and "… 1 more step" in tall, tall
+    say("board: the window, the cap and the row count are the caller's, and a widened window "
+        "brings the quiet session back: ok")
+
+    # ...and a DESKTOP store is a board row too, with the app's own live threads: the same
+    # store the single-session pane reads, asked for every thread it holds rather than one.
+    bdb = os.path.join(bdir, "desktop", "proj-abc", "desktop-v2.db")
+    os.makedirs(os.path.dirname(bdb), exist_ok=True)
+    with open(os.path.join(os.path.dirname(bdb), "project.json"), "w") as fh:
+        json.dump({"projectPath": os.path.join(TEST_HOME, "Proj")}, fh)
+    con = sqlite3.connect(bdb)
+    con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, status TEXT,"
+                " sidebar_archived_at INTEGER, turn_state TEXT, turn_alive_at INTEGER,"
+                " last_prompt_at INTEGER, harness_state TEXT)")
+    con.execute("CREATE TABLE messages (seq INTEGER, thread_id TEXT, role TEXT,"
+                " parts_json TEXT, ts INTEGER)")
+    bnow = int(now_s * 1000)
+    for tid, title in (("T1", "first tab"), ("T2", "second tab")):
+        con.execute("INSERT INTO threads VALUES (?, ?, 'open', NULL, 'idle', NULL, NULL, NULL)",
+                    (tid, title))
+    # The rows a real thread holds: the request that opened its turn, the agent's prose and
+    # its `write_todos` (T1's row carries TWO lists — the turn's list is the last of them),
+    # and, for T2, a heading left one row back with a newer ask after it (the stale shape).
+    # `role` is here because the prose read asks for it: a fixture without it made the read
+    # fail softly and the invariant below pass VACUOUSLY — nothing to disagree about.
+    for seq, tid, role, parts, ts in (
+        (0, "T1", "user", [{"kind": "text", "text": "the request that opened this list"}],
+         bnow - 16_000),
+        (1, "T1", "assistant",
+         [{"toolName": "write_todos",
+           "input": {"todos": [{"task": "step T1 opening", "completed": False}]}},
+          {"kind": "text", "text": "Goal: first tab's list"},
+          {"toolName": "write_todos",
+           "input": {"todos": [{"task": "step T1", "completed": True},
+                                {"task": "step T1 second", "completed": False}]}}],
+         bnow - 10_000),
+        (2, "T1", "user", [{"kind": "text", "text": "a newer ask for tab one"}],
+         bnow - 5_000),
+        (3, "T2", "assistant", [{"kind": "text", "text": "Goal: stated once, one turn back"}],
+         bnow - 25_000),
+        (4, "T2", "user", [{"kind": "text", "text": "the older ask"}], bnow - 24_000),
+        (5, "T2", "user", [{"kind": "text", "text": "a newer ask for tab two"}], bnow - 23_000),
+        (6, "T2", "assistant",
+         [{"toolName": "write_todos",
+           "input": {"todos": [{"task": "step T2", "completed": False},
+                                {"task": "step T2 second", "completed": False}]}}],
+         bnow - 20_000),
+        # T3 is RUNNING: the store holds the previous turn's list, and the in-flight one
+        # lives in `harness_state`. A reader that stops at the committed rows answers the
+        # wrong list (the old one), which is the divergence the invariant below is for —
+        # the live list and its own heading are what all three must show.
+        (8, "T3", "assistant",
+         [{"toolName": "write_todos",
+           "input": {"todos": [{"task": "committed step T3", "completed": False}]}}],
+         bnow - 30_000),
+    ):
+        con.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
+                    (seq, tid, role, json.dumps(parts), ts))
+    live_history = {"sessionState": {"mainAgentState": {"messageHistory": [
+        {"role": "user", "sentAt": bnow - 35_000, "tags": ["USER_PROMPT"],
+         "content": [{"type": "text", "text": "the request that opened tab three"}]},
+        {"role": "assistant", "sentAt": bnow - 8_000,
+         "content": [{"type": "text", "text": "Goal: tab three's live list"}]},
+        {"role": "assistant", "sentAt": bnow - 6_000,
+         "content": [{"type": "tool-call", "toolName": "write_todos",
+                      "input": {"todos": [{"task": "live step one", "completed": True},
+                                           {"task": "live step two", "completed": False}]}}]},
+    ]}}}
+    con.execute("INSERT INTO threads VALUES ('T3', 'running tab', 'open', NULL, 'running', ?, ?, ?)",
+                (bnow - 1_000, bnow - 40_000, json.dumps(live_history)))
+    con.commit()
+    con.close()
+    both = json.loads(run("board", "--json", "--cli-root", broot,
+                          "--db", os.path.join(bdir, "desktop", "*", "desktop-v2.db")).stdout)
+    kinds = {s["backend"] for s in both["sessions"]}
+    assert kinds == {"cli", "desktop"}, both["sessions"]
+    desk = [s for s in both["sessions"] if s["backend"] == "desktop"]
+    assert {s["session"] for s in desk} == {"T1", "T2", "T3"}, desk
+    assert desk[0]["label"] == "Proj", desk[0]
+    # the desktop row is a THREAD, so its own list is the thread's — read by `live_threads`,
+    # the same answer the single-session pane stacks under a heading. T3 is running, so its
+    # row is the LIVE list, not the committed one the store has closed.
+    assert {s["todos"][0]["task"] for s in desk} == {"step T1", "step T2", "live step one"}, desk
+    say("board: the desktop store contributes every live thread it holds, labelled by project: ok")
+
+    # ---- ...and the three readers of ONE store — the pane's own read (which `json` prints),
+    #      the pane's STACKED rows and the board's desktop rows — must agree about every
+    #      thread: its `done/total`, its heading, and whether that heading is stale. They are
+    #      three separate walks today (the followed-thread query, `live_threads`, and the
+    #      board's own call into it), and the bug class this pane has already had once — a
+    #      list drawn as `0/6` because one walk took the turn's FIRST `write_todos` instead of
+    #      its last — is exactly a disagreement between walks. The fixture holds a fresh
+    #      heading, a stale one and a heading-less neighbour, so a reader that loses
+    #      staleness, or a heading, cannot pass by reporting nothing for everybody.
+    inv_now = int(now_s * 1000)
+    bpattern = os.path.join(bdir, "desktop", "*", "desktop-v2.db")
+    bstate = os.path.join(bdir, "desktop", "workspace.json")
+
+    def inv_facts(todos, goal, stale):
+        """(done, total, heading, stale) — the four facts every reader answers."""
+        todos = todos or []
+        return (sum(1 for t in todos if isinstance(t, dict) and t.get("completed")),
+                len(todos), goal, bool(stale))
+
+    pinned = {tid: module.read_desktop(bdb, thread_id=tid, source="pinned", now_ms=inv_now)
+              for tid in ("T1", "T2", "T3")}
+    stacked = module.read_desktop(bdb, thread_id="T1", source="pinned", others=9,
+                                 now_ms=inv_now)
+    stacked_rows = {row["id"]: row for row in stacked["threads"]}
+    for tid, st in pinned.items():
+        want = inv_facts(st.get("todos"), st.get("goal"), st.get("goal_stale"))
+        row = stacked_rows.get(tid)
+        assert row is not None, stacked_rows
+        assert inv_facts(row.get("todos"), row.get("goal"), row.get("goal_stale")) == want, \
+            (tid, "stacked row", row, want)
+        drawn = json.loads(run("json", "-s", "desktop", "--db", bdb, "-t", tid,
+                               "--state", bstate).stdout)
+        assert inv_facts(drawn.get("todos"), drawn.get("goal"), drawn.get("goal_stale")) \
+            == want, (tid, "json", drawn, want)
+        # ...the declared totals too, not only the list they are counted from
+        assert (drawn.get("done"), drawn.get("total")) == want[:2], (tid, "json totals", drawn)
+    board_rows = json.loads(run("board", "--json", "--cli-root", broot,
+                                "--db", bpattern).stdout)["sessions"]
+    by_session = {r["session"]: r for r in board_rows if r["backend"] == "desktop"}
+    for tid, st in pinned.items():
+        want = inv_facts(st.get("todos"), st.get("goal"), st.get("goal_stale"))
+        row = by_session.get(tid)
+        assert row is not None, sorted(by_session)
+        assert inv_facts(row.get("todos"), row.get("goal"), row.get("goal_stale")) == want, \
+            (tid, "board row", row, want)
+    assert pinned["T1"].get("goal") and not pinned["T1"].get("goal_stale"), pinned["T1"]
+    assert pinned["T2"].get("goal_stale") is True, pinned["T2"]
+    # ...and the running thread reads its LIVE list in all three, heading included: a reader
+    # that stopped at the committed rows would answer `0/1` about a thread that is at `1/2`.
+    assert pinned["T3"].get("live_list") and len(pinned["T3"]["todos"]) == 2, pinned["T3"]
+    assert pinned["T3"].get("goal") == "tab three's live list", pinned["T3"]
+    say("three readers of one store — json, the pane's stacked rows and the board — agree "
+        "on done/total, heading and staleness for every thread: ok")
+
+    # ...and the frame is a frame: one box, a heading row per session, the last divider
+    # closing the last session rather than opening one that never comes
+    # (drawn with colour asked FOR, since a piped run is the plain renderer by design — the
+    # same split `render` makes, and the reason a script gets the stable text)
+    framed = STRIP(module.render_board(module.board_sessions(bns, int(now_s * 1000)), True,
+                                       width=80, now_ms=int(now_s * 1000), height=24))
+    assert framed.splitlines()[0].startswith("╭── ") and "FREEBUFF BOARD" in framed, framed
+    assert framed.splitlines()[-1].startswith("╰"), framed
+    assert "├" not in framed.splitlines()[-2], framed.splitlines()[-3:]
+    assert framed.count("╭") == 1 and framed.count("╰") == 1, framed
+    # ...and no row of it is wider than the pane it was drawn for — asked of the renderer
+    # directly, at a width the frame's own budgets have to give way to
+    wide_frame = module.render_board(module.board_sessions(bns, int(now_s * 1000)), True,
+                                     width=44, now_ms=int(now_s * 1000), height=24)
+    assert max(module._cell_width(line) for line in wide_frame.split("\n")) <= 44, wide_frame
+    say("board: one box, a heading per session, and no row wider than the pane: ok")
+
+    # ...and the two things that are refusals rather than output: a document and a pane are
+    # not the same request, and the flag set is still checked by the parser's own rules
+    assert run("board", "--live", "--json", *bargs).returncode == 2, "--live with --json"
+    assert run("snap", "--live").returncode == 2, "--live outside the board"
+    say("board: --json with --live is a usage error, and --live belongs to `board`: ok")
+
+    # ---- the frame's grid, which is the one thing a reader sees without reading: every row
+    #      is the same width, so the right border is a straight line. A single glyph whose
+    #      width the code and the terminal disagree about breaks that ON SCREEN while every
+    #      width check here still passes — measured 2026-10-04, `🎯` in the goal heading is two
+    #      cells to `wcwidth` and one in the terminal the pane was read in, so every goal row
+    #      sat a column short of its neighbours and the border stepped sideways under it.
+    assert module.frame_chrome_is_single_cell() == [], module.frame_chrome_is_single_cell()
+    grid_now = int(time.time())
+    for probe_w in (32, 40, 48, 56, 72, 96):
+        probe = STRIP(module.render(
+            {"backend": "cli", "session": "S", "goal": "pane inherits host colors, UI-only "
+             "rendering, and the overflow menu as one vertical labelled menu",
+             "todos": [{"task": "a step long enough to wrap at the narrowest probe width here",
+                        "completed": False}], "done": 0, "total": 1},
+            True, watching=None, width=probe_w, now_ms=grid_now, height=24,
+            theme={}, truecolor=False)).split("\n")
+        for line in probe:
+            assert module._cell_width(line) == probe_w, (probe_w, module._cell_width(line), line)
+            assert line[:1] in "╭│├╰" and line[-1:] in "╮│┤╯", (probe_w, line)
+    say("the frame is a grid: every row the width it was asked for, both edges kept, and "
+        "every glyph one cell wide: ok")
+
+    # ---- ...and the width assertion above CANNOT catch that class of bug on its own, which is
+    #      why the pane was still a column short after it was written. `_cell_width` decides a
+    #      glyph is two cells because `unicodedata.east_asian_width` says `W`, and the terminal
+    #      that drew the frame said one: the ruler and the thing it measures disagree, so
+    #      asserting the ruler's answer is asserting the bug. The check that can fail is the one
+    #      that does not consult the ruler — it reads the rendered frame's own glyphs and asks
+    #      Unicode directly, which is the same table the terminal's font metrics come from. A
+    #      frame may only ever draw characters that table calls one cell wide: `Ambiguous` and
+    #      `Wide` are exactly the two answers a terminal is free to disagree with, and `🎯`
+    #      (U+1F3AF) is `Wide` here and one cell there.
+    grid_frame = STRIP(module.render(
+        {"backend": "cli", "session": "S",
+         "goal": "pane inherits host colors, UI-only",
+         "todos": [{"task": "a step that wraps at the narrowest probe width", "completed": False},
+                   {"task": "a finished step", "completed": True}],
+         "done": 1, "total": 2, "now": "measure the real widths"},
+        True, watching=True, width=32, now_ms=grid_now, height=24,
+        theme={}, truecolor=False))
+    # `frame_chrome_is_single_cell` is the inventory's own claim about the declared chrome; this
+    # is the claim about what a real render actually emitted, which is the one a reader sees.
+    emitted_wide = sorted({
+        ch for ch in grid_frame if not unicodedata.combining(ch)
+        and unicodedata.east_asian_width(ch) in ("W", "F")
+    })
+    assert emitted_wide == [], (
+        "the frame draws glyphs a terminal may draw at a different width than the code "
+        f"pads for: {emitted_wide!r} — every one of these steps the right border sideways "
+        "on screen while `_cell_width` still agrees with itself"
+    )
+    say("the frame's own glyphs are one cell to Unicode, not just to the code's ruler: ok")
 
     # ---- and how far the log is from re-choosing its own constants: the clip is consulted
     #      only on a young list, and moves the number only sometimes, so the count that
@@ -7189,52 +10329,6 @@ try:
     assert mod.parse_etime("2-03:34:49") == 185_689
     say("instance detection matches argv tokens and parses ps etime: ok")
 
-    # ---- the NAS session's pane: an ssh, told apart from the things that look like one.
-    #      A tunnel, a control master and a `docker exec` over ssh all name the same host
-    #      and all sit in a pane; none of them is a login shell with a freebuff prompt in it.
-    for good in (
-        "ssh -t remote@nas.local cd / && exec $SHELL -l",
-        "/usr/bin/ssh remote@nas.local",
-        "/bin/sh /tmp/fixture/bin/ssh -t remote@nas.local x",
-    ):
-        assert mod.is_ssh_cmd(good), good
-    for bad in ("/usr/bin/ssh-agent -l", "python3 -c 'x ssh y'", "scp a b"):
-        assert not mod.is_ssh_cmd(bad), bad
-    assert mod.nas_host_tokens("remote@nas.local") == {
-        "remote@nas.local", "nas.local"
-    }
-    assert mod.nas_host_tokens("/tmp/fixture/fake-ssh") == set(), "a path is not a host"
-
-    table = {
-        500: (1, "-zsh"),
-        501: (500, "ssh -t remote@nas.local cd / && exec $SHELL -l"),
-        900: (1, "-zsh"),
-        901: (900, "ssh -N -L 8080:localhost:8080 remote@nas.local"),
-        902: (900, "ssh -t remote@nas.local cd / && docker exec -w / -it dsh x"),
-    }
-    rows = [
-        {"pane": "%7", "window": "@1", "pid": 500, "start": ""},
-        {"pane": "%9", "window": "@1", "pid": 900, "start": ""},
-    ]
-    cands = mod.ssh_session_candidates("remote@nas.local", rows, table)
-    assert [c["pane"] for c in cands] == ["%7"], cands
-    # a fingerprint of another box is nobody's NAS session
-    foreign = {1: (0, "-zsh"), 2: (1, "ssh other@example.com")}
-    one_row = [{"pane": "%9", "window": "@1", "pid": 1, "start": ""}]
-    assert mod.ssh_session_candidates("remote@nas.local", one_row, foreign) == []
-    # ...while a stand-in that names a *program* (a fixture's fake transport) leaves no
-    # host to match, and then a session-like ssh is accepted instead of refusing to place
-    assert len(mod.ssh_session_candidates("/tmp/fixture/fake-ssh", one_row, foreign)) == 1
-
-    # several logins open: the session's own start time decides (an ssh cannot host a
-    # session that was already running when it logged in)
-    began = {"%7": 0.0, "%8": 6000.0}
-    assert mod.pick_ssh_pane(began, 6500.0) == "%8", "the newest login before the session"
-    assert mod.pick_ssh_pane(began, 900.0) == "%7", "only the older one was open in time"
-    assert mod.pick_ssh_pane(began, -9000.0) == "%7", "every login is after it: the earliest"
-    assert mod.pick_ssh_pane(began, None) == "%8", "no timestamp at all: the newest"
-    assert mod.pick_ssh_pane({}, 6500.0) is None
-    say("nas: the ssh a session runs in is found by ancestry, flags and start time: ok")
 
     # ---- --instance-of finds the CLI launched by a given shell
     # A copy of /bin/sleep is SIGKILLed on macOS (AMFI: the copy loses its
@@ -7247,8 +10341,14 @@ try:
         fh.write("#!/bin/sh\nsleep 600 & wait\n")
     os.chmod(fake, 0o755)
     fake_proc = spawn_quiet(fake)
-    time.sleep(0.4)
-    assert fake_proc.poll() is None, "stand-in freebuff exited immediately"
+    # Waited for, not slept through: what this check needs from the stand-in is that the
+    # PROCESS TABLE can see it (`instance_of_parent` reads `ps`), and a fixed 0.4 s is a
+    # guess that only holds on an idle machine — the same assumption that made a start-up
+    # race read as a flaky check.
+    assert wait_for(lambda: fake_proc.poll() is None
+                    and fake_proc.pid in mod.freebuff_pids()), (
+        "the stand-in freebuff never reached the process table"
+    )
     resolved = mod.instance_of_parent(os.getpid())
     assert resolved == fake_proc.pid, (resolved, fake_proc.pid)
     snap_of = json.loads(run("json", "--instance-of", str(os.getpid())).stdout)
@@ -7286,7 +10386,7 @@ try:
             [sys.executable, FB, "pane", "--no-daemon", "--chat", frozen,
              "--stale-after", "0.05", "-i", "0.2"],
         )
-    out_s, deadline = b"", time.time() + 25
+    out_s, deadline = b"", time.time() + stale_window_bound()
     os.set_blocking(fd_s, False)
     status_s = None
     while time.time() < deadline:
@@ -7313,7 +10413,12 @@ try:
     # session at all, and without a stand-in the hook correctly starts nothing. The stand-in
     # is reaped with the check.
     autostart_fake = spawn_quiet(fake)
-    time.sleep(0.4)
+    # waited for, not slept through: the hook adopts a Freebuff it can see in `ps`, so the
+    # stand-in has to be THERE before the count that measures what it adopts is taken
+    assert wait_for(lambda: autostart_fake.poll() is None
+                    and autostart_fake.pid in mod.freebuff_pids()), (
+        "the stand-in freebuff never reached the process table"
+    )
     keepers_before = keeper_aim()
     ptypid, ptyfd = pty.fork()
     if ptypid == 0:
@@ -7539,650 +10644,6 @@ try:
         else:
             os.environ["FBTODO_HOME"] = saved_home
 
-    # ---- NAS backend: the remote protocol, against a fixture store
-    # FBTODO_NAS may hold a whole command, so the stand-in runs the very script the
-    # `--source nas` path would ssh. Only the transport is faked — the header protocol,
-    # the quoting of the extractor program, its argv contract and the mtime skip all
-    # execute for real.
-    stub = os.path.join(TEST_HOME, "fake-ssh")
-    with open(stub, "w") as fh:
-        fh.write('#!/bin/sh\nexec /bin/sh -c "$1"\n')
-    os.chmod(stub, 0o755)
-    # A second name for it: `stub` is reused further down for the stand-in freebuff
-    # binary, and pointing FBTODO_NAS at THAT made every probe a six-second sleep.
-    fake_ssh = stub
-    store = os.path.join(TEST_HOME, "nasstore")
-    chats = os.path.join(store, "demo", "chats")
-    nas_args = ["--nas-root", store, "--nas-project", "demo"]
-    # `env` (the copy run() hands to the child), not os.environ: mutating os.environ
-    # alone left the real ssh target in place and the checks quietly tested the NAS.
-    saved_nas = env.get("FBTODO_NAS")
-    env["FBTODO_NAS"] = stub
-    try:
-        def nas_snapshot(*extra):
-            # the `json` subcommand, not `snap --json` (that flag only means anything
-            # to `status`), and NOT the state file: `-s nas` must never be answered
-            # from a cached local-CLI state, which is exactly what it used to do.
-            p = run("-s", "nas", *nas_args, *extra, "json", check=True)
-            return json.loads(p.stdout)
-
-        def write_session(name, blocks, age_s):
-            """A session directory whose mtime decides whether it is 'the newest'.
-
-            Content writes bump the directory's own mtime, so the age is stamped last:
-            relying on creation order made these checks depend on how fast the loop ran.
-            """
-            d = os.path.join(chats, name)
-            os.makedirs(d, exist_ok=True)
-            open(os.path.join(d, "log.jsonl"), "w").write("{}\n")
-            if blocks is not None:
-                with open(os.path.join(d, "chat-messages.json"), "w") as fh:
-                    if isinstance(blocks, str):
-                        fh.write(blocks)
-                    else:
-                        json.dump([{"id": "m1", "variant": "ai", "content": "", "blocks": blocks}], fh)
-            stamp = time.time() - age_s
-            os.utime(d, (stamp, stamp))
-            return d
-
-        def tool(name, todos=None):
-            return {
-                "type": "tool", "toolCallId": "t", "toolName": name,
-                "input": {"todos": todos} if todos is not None else {"pattern": "x"},
-                "agentId": "main-agent", "includeToolCall": True, "output": "...",
-            }
-
-        # an older session that DID write a list...
-        write_session(
-            "2026-01-01T00-00-01.000Z",
-            [tool("code_search"), tool("write_todos", [{"task": "old", "completed": True}])],
-            300,
-        )
-        # ...and a newer one with no transcript yet (it appears per completed turn).
-        # The newer session is what gets described: showing the old list as if it were
-        # current would be worse than showing nothing.
-        write_session("2026-01-01T00-00-02.000Z", None, 60)
-        st = nas_snapshot()
-        assert st["backend"] == "nas", st
-        assert st["nas"]["has_transcript"] is False, st
-        assert st["todos"] == [] and not st.get("error"), st
-        assert st["target"].endswith("2026-01-01T00-00-02.000Z/"), st["target"]
-        say("nas: the newest session wins; one with no transcript is named, not missing: ok")
-
-        # a real list arrives, in the shape the NAS store actually uses
-        write_session(
-            "2026-01-01T00-00-02.000Z",
-            [
-                tool("run_terminal_command"),
-                tool("write_todos", [{"task": "do a", "completed": True}, {"task": "do b", "completed": False}]),
-                tool("write_todos", [{"task": "do a", "completed": True}, {"task": "do b", "completed": True}]),
-            ],
-            60,
-        )
-        st = nas_snapshot()
-        assert [t["task"] for t in st["todos"]] == ["do a", "do b"], st["todos"]
-        assert st["todos"][1]["completed"] is True, st["todos"]
-        assert st["source_updated_ms"], st
-        say("nas: the newest write_todos wins, extracted from the store: ok")
-
-        # `-s nas status` has to describe the NAS. It read the local watcher's state file
-        # and printed the Mac's own list beside "nas session: — no session found" — about a
-        # box that was running a freebuff at the time.
-        # The state file the local half of this check reads is written HERE rather than left
-        # to whatever the last local watcher recorded. On the owner's machine that watcher
-        # finds the operator's own journal and fills in their live session; on a runner there
-        # is no journal, so the file held no session at all and the check had nothing to
-        # compare against — it failed with `local_sess = None` on every runner while passing
-        # on the machine it was written on. The session set here is this suite's own local
-        # fixture, and it is deliberately distinct from the NAS one asserted just above.
-        local_state = {}
-        if os.path.exists(state_path):
-            try:
-                local_state = json.load(open(state_path))
-            except ValueError:
-                local_state = {}
-        local_state["session"] = os.path.basename(chat_dir)
-        module.atomic_write_json(state_path, local_state)
-        status_nas = STRIP(run("-s", "nas", *nas_args, "status").stdout)
-        assert "nas session       : 2026-01-01T00-00-02.000Z/" in status_nas, status_nas
-        assert "todos             : 2/2 done" in status_nas, status_nas
-        # the state-file line still describes the local file (that is honest); the NAS
-        # lines must not borrow its session or its list
-        local_sess = (json.load(open(state_path)) if os.path.exists(state_path) else {}).get("session")
-        nas_line = next(
-            line for line in status_nas.splitlines() if line.strip().startswith("nas session")
-        )
-        assert local_sess and local_sess not in nas_line, (local_sess, nas_line)
-        say("nas: `-s nas status` reports the NAS session, not the local list: ok")
-
-        # unchanged transcript => the remote parse is skipped (the pane's idle poll is a stat)
-        st2 = nas_snapshot()
-        assert st2["nas"]["unchanged"] is True, st2["nas"]
-        assert [t["task"] for t in st2["todos"]] == ["do a", "do b"], st2["todos"]
-        say("nas: an unmoved transcript skips the parse instead of re-reading it: ok")
-
-        # The patch row's two facts come back in the SAME poll: the hook's patch log and
-        # its notifier's, gathered at the far end of the ssh the pane already makes. The
-        # real paths are the NAS's own, so both are pointed at fixtures — and asserted
-        # through the `-s nas` path a pane uses rather than by calling the readers here.
-        env["FBTODO_NAS_PATCH_LOG"] = NAS_PATCH_FIXTURE
-        env["FBTODO_NAS_ALERT_LOG"] = NAS_ALERT_FIXTURE
-        st3 = nas_snapshot()
-        assert st3["patch"]["outcome"] == "incomplete", st3.get("patch")
-        assert st3["patch"]["version"] == "9.9.9-nas", st3.get("patch")
-        assert "no window for fixture-window" in st3["patch"]["reason"], st3.get("patch")
-        assert st3["patch"]["severity"] == "bad", st3.get("patch")
-        assert st3["alert"]["kind"] == "sent", st3.get("alert")
-        assert st3["alert"]["text"] == "sent ntfy incomplete", st3.get("alert")
-        say("nas: the patch log and the alert log ride the poll the pane already makes: ok")
-        # ...and a NAS pane that has no session yet still answers the question, because the
-        # strip is drawn from the state and the state carries the two facts either way
-        nas_status = STRIP(run("-s", "nas", *nas_args, "status").stdout)
-        assert "cli patches       : incomplete · 9.9.9-nas" in nas_status, nas_status
-        assert "last alert        : sent ntfy incomplete" in nas_status, nas_status
-        say("nas: `-s nas status` answers for the NAS's patches, not this Mac's: ok")
-
-        # the goal of a NAS list comes from the AGENT's line too — the transcript keeps
-        # user requests, and those are never the heading. Two fixtures: one where the ai
-        # message carries prose (the rule followed), one like the real store, where it
-        # carries none at all (measured: content length 0, tool blocks only).
-        dg = os.path.join(store, "goalproj", "chats", "2026-04-04T00-00-00.000Z")
-        os.makedirs(dg, exist_ok=True)
-        open(os.path.join(dg, "log.jsonl"), "w").write("{}\n")
-        with open(os.path.join(dg, "chat-messages.json"), "w") as fh:
-            json.dump(
-                [
-                    {"id": "m0", "variant": "user", "content": "wire voicevox to wake on demand"},
-                    # Work LEFT on the list, deliberately: a FINISHED list with a newer request
-                    # is dropped (see finish_state), and this check is about the heading, so it
-                    # needs a list that is still the standing plan.
-                    {"id": "m1", "variant": "ai", "content": "Goal: wake voicevox on demand",
-                     "blocks": [tool("write_todos", [{"task": "deploy", "completed": False}])]},
-                    {"id": "m2", "variant": "user", "content": "and also fix the pane timeout"},
-                    {"id": "m3", "variant": "ai", "content": "Goal: fix the pane timeout",
-                     "blocks": []},
-                ],
-                fh,
-            )
-        stg = nas_snapshot("--nas-project", "goalproj")
-        assert [t["task"] for t in stg["todos"]] == ["deploy"], stg["todos"]
-        assert stg["goal"] == "wake voicevox on demand", stg
-        assert stg["now"] == "fix the pane timeout", stg
-        say("nas: an agent Goal: line heads the list, and a newer one is `now`: ok")
-
-        with open(os.path.join(dg, "chat-messages.json"), "w") as fh:
-            json.dump(
-                [
-                    {"id": "m0", "variant": "user", "content": "wire voicevox to wake on demand"},
-                    {"id": "m1", "variant": "ai", "content": "",
-                     "blocks": [tool("write_todos", [{"task": "deploy", "completed": True}])]},
-                ],
-                fh,
-            )
-        # The far side skips its parse while the transcript's mtime is unchanged, and that
-        # mtime has one-second resolution — so a rewrite in the same second needs a nudge
-        # for the new content to be read at all.
-        path_g = os.path.join(dg, "chat-messages.json")
-        os.utime(path_g, (time.time() + 2, time.time() + 2))
-        stg = nas_snapshot("--nas-project", "goalproj")
-        assert stg["goal"] is None, stg
-        assert stg["now"] is None, stg
-        say("nas: a transcript with no agent prose yields no heading, as measured: ok")
-
-        # ...and the `fb` marker, which is the sharper "which session is live" answer
-        shim = os.path.join(TEST_HOME, "shim")
-        os.makedirs(shim, exist_ok=True)
-        with open(os.path.join(shim, "pgrep"), "w") as fh:
-            fh.write("#!/bin/sh\nexit 1\n")  # no freebuff process, so only the marker can say live
-        os.chmod(os.path.join(shim, "pgrep"), 0o755)
-        saved_path = env.get("PATH", "")
-        env["PATH"] = shim + os.pathsep + saved_path
-        marker = os.path.join(TEST_HOME, "fb-session")
-        # a second project, as `fb` run from another directory would have: the marker's
-        # dir must select THAT store, or the pane shows a different project's list
-        other = "otherproj"
-        d2 = os.path.join(store, other, "chats", "2026-02-02T00-00-00.000Z")
-        os.makedirs(d2, exist_ok=True)
-        with open(os.path.join(d2, "chat-messages.json"), "w") as fh:
-            json.dump(
-                [{"id": "m", "variant": "ai", "content": "", "blocks": [
-                    tool("write_todos", [{"task": "from otherproj", "completed": False}])]}],
-                fh,
-            )
-
-        live_pid = subprocess.Popen(["sleep", "30"]).pid
-        with open(marker, "w") as fh:
-            fh.write(f"{live_pid} 2026-01-01T00:00:00Z {store}/{other}\n")
-        st4 = nas_snapshot("--fb-marker", marker)
-        assert st4["nas"]["fb"] == "1" and st4["instance_alive"], st4["nas"]
-        assert st4["nas"]["fb_project"] == other, st4["nas"]
-        assert st4["target"].endswith("2026-02-02T00-00-00.000Z/"), st4["target"]
-        assert [t["task"] for t in st4["todos"]] == ["from otherproj"], st4["todos"]
-        say("nas: a live fb marker names the session, and reads ITS project's store: ok")
-
-        # ...but the marker's dir is where the session STARTED, which is not always where
-        # its store lands (measured: `fb` maps a cwd the container cannot see, and a
-        # container cwd of `/` makes the project nameless — `projects/chats/<thread>`, not
-        # `projects/host`). Trusting the marker then read a two-day-old session and the
-        # pane could never show the live one, however often it was re-listed. A live
-        # session is followed by the store it writes.
-        host_store = os.path.join(store, "host", "chats", "2026-09-19T09-01-35.987Z")
-        os.makedirs(host_store, exist_ok=True)
-        with open(os.path.join(host_store, "chat-messages.json"), "w") as fh:
-            json.dump(
-                [{"id": "m", "variant": "ai", "content": "", "blocks": [
-                    tool("write_todos", [{"task": "two days old", "completed": True}])]}],
-                fh,
-            )
-        stale = time.time() - 3600 * 48
-        os.utime(host_store, (stale, stale))
-        live_store = os.path.join(store, "chats", "2026-09-21T19-40-05.908Z")
-        os.makedirs(live_store, exist_ok=True)
-        with open(os.path.join(live_store, "chat-messages.json"), "w") as fh:
-            json.dump(
-                [{"id": "m", "variant": "ai", "content": "", "blocks": [
-                    tool("write_todos", [{"task": "the session you are in", "completed": False}])]}],
-                fh,
-            )
-        with open(marker, "w") as fh:
-            fh.write(f"{live_pid} 2026-09-21T19:40:01Z {store}/host/\n")
-        st5 = nas_snapshot("--nas-project", "host", "--fb-marker", marker)
-        assert st5["target"].endswith("2026-09-21T19-40-05.908Z/"), st5["target"]
-        assert st5["nas"]["fb_project"] == "", st5["nas"]
-        assert [t["task"] for t in st5["todos"]] == ["the session you are in"], st5["todos"]
-        say("nas: a live session is followed by the store it writes, not the marker's guess: ok")
-
-        # ---- a `continue` on the NAS: the transcript carries user messages, so the same
-        #      continuation rule applies there — 
-        nudge_proj = os.path.join(store, "nudgeproj", "chats", "2026-03-03T00-00-00.000Z")
-        os.makedirs(nudge_proj, exist_ok=True)
-        open(os.path.join(nudge_proj, "log.jsonl"), "w").write("{}\n")
-
-        def write_transcript(prompt):
-            with open(os.path.join(nudge_proj, "chat-messages.json"), "w") as fh:
-                json.dump(
-                    [
-                        {"id": "m0", "variant": "user", "content": "track the deploy"},
-                        {"id": "m1", "variant": "ai", "content": "", "blocks": [
-                            tool("write_todos", [{"task": "deploy", "completed": True}])]},
-                        {"id": "m2", "variant": "user", "content": prompt},
-                    ],
-                    fh,
-                )
-
-        for i, (phrase, is_cont) in enumerate((
-            ("continue", True),
-            ("ok, keep going with it", True),
-            ("continue with the NAS work", False),
-        )):
-            write_transcript(phrase)
-            # One-second mtime resolution: the far side skips its parse while the
-            # transcript has not moved, so each rewrite needs a DISTINCT second — a
-            # shared `+2` made the loop read the first phrase three times.
-            path_n = os.path.join(nudge_proj, "chat-messages.json")
-            stamp = time.time() + 3 + 2 * i
-            os.utime(path_n, (stamp, stamp))
-            stn = nas_snapshot("--nas-project", "nudgeproj")
-            assert bool(stn["nudge"]) == is_cont, (phrase, stn.get("nudge"), stn.get("now"))
-            if is_cont:
-                assert stn["nudge"] == phrase and stn["now"] is None, stn
-                rendered_n = STRIP(module.render(dict(stn, done=1, total=1), False, width=60))
-                assert "nudge · " in rendered_n and "rewrite the list" in rendered_n, rendered_n
-            else:
-                assert stn["now"] == phrase, stn
-        say("nas: a `continue` in the transcript is a nudge, and real work is still `now`: ok")
-
-        # the far side has no fbtodo to import, so the word list is injected into its
-        # source — this is the check that the injection happened and carries the same words
-        injected = repr(tuple(sorted(module.NUDGE_WORDS)))
-        assert injected in module.NAS_EXTRACT, "the NAS extractor did not get the nudge words"
-        assert str(module.NUDGE_MAX_CHARS) in module.NAS_EXTRACT, module.NUDGE_MAX_CHARS
-        say("nas: the extractor carries the same continuation rule, injected not guessed: ok")
-
-        # ---- why a NAS list looks plainer than the local one, said out loud.
-        # Measured 2026-09-26: a NAS session that called write_todos ONCE, at the end, with
-        # every todo already completed. The pane could show the list and nothing else — no row
-        # clock, no pace, no EST REM — because a clock is only ever started for a step seen
-        # unfinished. A silent gap reads as a broken pane; the pane now names the reason, and a
-        # list-less one names the tools the session did call.
-        def tool2(name, todos=None, pattern="x"):
-            return {
-                "type": "tool", "toolCallId": "t", "toolName": name,
-                "input": {"todos": todos} if todos is not None else {"pattern": pattern},
-                "agentId": "main-agent", "includeToolCall": True, "output": "...",
-            }
-
-        # its OWN project, not `demo`: a fixture left in the project every later
-        # check probes becomes "the newest session" for them, and the unreadable-store
-        # check then reads this list instead of the broken file it means to read
-        census = os.path.join(store, "censusproj", "chats", "2026-09-21T20-00-04.000Z")
-        os.makedirs(census, exist_ok=True)
-        open(os.path.join(census, "log.jsonl"), "w").write("{}\n")
-        with open(os.path.join(census, "chat-messages.json"), "w") as fh:
-            json.dump([{"id": "m", "variant": "ai", "content": "", "blocks": [
-                tool2("run_terminal_command"), tool2("run_terminal_command"),
-                tool2("code_search"),
-                tool2("write_todos", [
-                    {"task": "one", "completed": True},
-                    {"task": "two", "completed": True}])]}], fh)
-        # the census survives the round trip: it is the only thing there is to say about a
-        # session that has written no list at all
-        # an explicit marker path that does not exist: a live marker left by an earlier check
-        # would send the probe to THAT project, and this fixture is not in it
-        st6 = nas_snapshot(
-            "--nas-project", "censusproj",
-            "--fb-marker", os.path.join(TEST_HOME, "no-marker-for-census"),
-        )
-        assert st6["tool_calls"].get("run_terminal_command") == 2, json.dumps(
-            {k: v for k, v in st6.items() if k not in ("todos",)}, default=str)[:500]
-        assert st6["tool_calls"].get("code_search") == 1, st6["tool_calls"]
-        say("nas: the transcript's tool census reaches the state, counts and all: ok")
-
-        ticked_state = dict(st6, task_times={})
-        frame = ansi.sub("", module.render(
-            ticked_state, True, watching=999, width=68, height=12, now_ms=SWEEP_NOW,
-        ))
-        assert "no per-step times" in frame, frame
-        # the reason is longer than a 68-column frame, so assert the part that fits
-        assert "arrived with every step" in frame, frame
-        # ...and a list that DID get a clock is not told it has none
-        timed = dict(ticked_state, task_times={
-            "one": {"started_ms": SWEEP_NOW - 60_000, "done_ms": SWEEP_NOW - 30_000,
-                    "elapsed_ms": 30_000}})
-        assert "no per-step times" not in ansi.sub("", module.render(
-            timed, True, watching=999, width=68, height=12, now_ms=SWEEP_NOW)), timed
-        say("nas: a list with no clocks says why, and one with clocks is left alone: ok")
-
-        empty_proj = os.path.join(store, "censusproj", "chats", "2026-09-21T20-00-05.000Z")
-        os.makedirs(empty_proj, exist_ok=True)
-        open(os.path.join(empty_proj, "log.jsonl"), "w").write("{}\n")
-        with open(os.path.join(empty_proj, "chat-messages.json"), "w") as fh:
-            json.dump(
-                [{"id": "m", "variant": "ai", "content": "", "blocks": [
-                    tool2("run_terminal_command"), tool2("read_url", pattern="y"),
-                    tool2("run_terminal_command")]}],
-                fh,
-            )
-        # The census reached the state over the wire (the check above); this one is about
-        # the pane's sentence, so it renders a state directly rather than negotiating the
-        # probe's liveness a second time.
-        st7 = {"backend": "nas", "instance_alive": True, "todos": [], "task_times": {},
-               "tool_calls": {"run_terminal_command": 2, "read_url": 1, "skill": 1},
-               "source": "nas-journal", "session": "x"}
-        frame7 = ansi.sub("", module.render(
-            st7, True, watching=999, width=68, height=12, now_ms=SWEEP_NOW))
-        assert "no write_todos call yet" in frame7, frame7
-        assert "called so far: run_terminal_command 2, read_url 1, skill 1" in frame7, frame7
-        # and with nothing called, there is nothing to add: the pane keeps its old shape
-        st7["tool_calls"] = {}
-        frame7b = ansi.sub("", module.render(
-            st7, True, watching=999, width=68, height=12, now_ms=SWEEP_NOW))
-        assert "called so far" not in frame7b, frame7b
-        say("nas: a session with no list is told which tools it has called: ok")
-
-        # The SECOND basket: with no list, the pane names what the session has actually
-        # DONE. The feed REPLACES the tool counts rather than joining them — both answer
-        # "and what has it been doing instead?", and rows are the answer that fits.
-        st8 = dict(st7, tool_calls={"run_terminal_command": 2, "skill": 1}, observed=[
-            {"verb": "edited", "what": "fbtodo", "ts_ms": SWEEP_NOW - 120_000},
-            {"verb": "ran", "what": "python3 scripts/fbtodo-selfcheck.py", "ts_ms": SWEEP_NOW - 60_000},
-        ])
-        feed = ansi.sub("", module.render(
-            st8, True, watching=999, width=68, height=14, now_ms=SWEEP_NOW))
-        assert "edited fbtodo  ·  2m ago" in feed, feed
-        assert "ran python3 scripts/fbtodo-selfcheck.py  ·  1m ago" in feed, feed
-        assert "called so far" not in feed, feed
-        # ...and a state carrying no calls keeps the line it had: the feed is an addition,
-        # never a blank where the old answer used to be.
-        nofeed = ansi.sub("", module.render(
-            dict(st7, tool_calls={"run_terminal_command": 2}), True,
-            watching=999, width=68, height=12, now_ms=SWEEP_NOW))
-        assert "called so far: run_terminal_command 2" in nofeed, nofeed
-        say("nas: with no list the pane names what the session has done: ok")
-
-
-
-        # the same marker with a dead pid: a stale marker must not pin a phantom session,
-        # and a pane with nothing to show says it is waiting for `fb`
-        os.kill(live_pid, signal.SIGKILL)
-        time.sleep(0.2)
-        waitproj = "waitproj"
-        write_session_at_project = os.path.join(store, waitproj, "chats", "2026-03-03T00-00-00.000Z")
-        os.makedirs(write_session_at_project, exist_ok=True)
-        open(os.path.join(write_session_at_project, "log.jsonl"), "w").write("{}\n")
-        with open(marker, "w") as fh:
-            fh.write(f"{live_pid} 2026-01-01T00:00:00Z {store}/{waitproj}\n")
-        st5 = nas_snapshot("--fb-marker", marker)
-        assert st5["nas"]["fb"] == "0", st5["nas"]
-        assert not st5["instance_alive"], st5["nas"]
-        assert st5["nas"]["fb_project"] == waitproj, st5["nas"]
-        assert st5["todos"] == [], st5["todos"]
-        text = STRIP(run("-s", "nas", *nas_args, "--fb-marker", marker, "snap").stdout)
-        assert "waiting for a NAS freebuff session" in text, text
-        say("nas: a stale marker is not a live session, and the pane says it is waiting: ok")
-        os.unlink(marker)
-
-        # a store the far side cannot read is an error, not an empty list
-        write_session("2026-01-01T00-00-03.000Z", "not json", 10)
-        st3 = nas_snapshot()
-        assert st3["todos"] == [] and st3["nas"].get("error"), st3
-        assert "JSONDecodeError" in st3["nas"]["error"], st3
-        say("nas: an unreadable store reports an error instead of a zero: ok")
-    finally:
-        if saved_nas is None:
-            env.pop("FBTODO_NAS", None)
-        else:
-            env["FBTODO_NAS"] = saved_nas
-
-        # ---- a NAS pane's lifetime: --wait keeps it for the shell that owns it, so a
-    #      remote pane can outlive one freebuff run (and is killed when the ssh returns)
-    #@phase nas-pane-wait
-    if shutil.which("tmux"):
-        sess2 = "fbtwait"
-        sock2 = "fbtchecksockwait"
-        tmux2 = ["tmux", "-L", sock2]
-        # the NAS block restored FBTODO_NAS on its way out; this pane needs it again
-        env["FBTODO_NAS"] = fake_ssh
-        # A watcher left behind by an earlier phase is ADOPTED by these panes: its state
-        # answers `-s nas` because `state_matches_request` compares the source and not the
-        # session it watched, so the panes would read a live-looking list that this fixture
-        # has no handle on and never updates. Stop it — the panes below have to be reading
-        # a state this fixture produced. Its state FILE outlives it and answers `-s nas` on
-        # its own while it is still fresh, so drop that too.
-        run("stop")
-        if os.path.exists(state_path):
-            os.unlink(state_path)
-        # The stand-in session ends when THIS suite says so, not on a clock of its own. A
-        # `sleep 2` marker put the two panes in a race with the pane's own start-up: on a
-        # loaded runner the plain pane's first poll landed after the sleep had already
-        # exited, so it never saw a live session and never had a reason to close — while on
-        # a fast machine the same fixture passed. It is killed explicitly below instead.
-        short = subprocess.Popen(["sleep", "60"])
-        marker2 = os.path.join(TEST_HOME, "fb-session-2")
-        # The marker's dir selects the store the pane reads, and this fixture is about pane
-        # LIFETIME — so it points at a project of its OWN, with no list in it. Sharing the
-        # NAS phase's `otherproj` made the state carry that phase's list, and a NAS state
-        # that is no longer alive still draws the last list it has: the pane could not be
-        # told apart from one that had never seen a session, and the `--wait` pane below
-        # rendered a list instead of the "waiting" line it is checked for.
-        wait_dir = os.path.join(store, "panelifetime")
-        # A session with a journal and no `chat-messages.json`: the store must hold a session
-        # (or the probe answers "no session on the NAS") but no list, so the list-less pane
-        # reaches the one line this fixture is about.
-        wait_chat = os.path.join(wait_dir, "chats", "2026-01-01T00-00-00.000Z")
-        os.makedirs(wait_chat, exist_ok=True)
-        with open(os.path.join(wait_chat, "log.jsonl"), "w") as fh:
-            fh.write("{}\n")
-        with open(marker2, "w") as fh:
-            fh.write(f"{short.pid} 2026-01-01T00:00:00Z {wait_dir}\n")
-        base = (
-            f"FBTODO_HOME={TEST_HOME} FBTODO_NAS={env['FBTODO_NAS']} "
-            f"PATH={shim}:{saved_path} "
-            f"{sys.executable} {FB} -s nas --nas-root {store} --nas-project demo "
-            f"--fb-marker {marker2} -i 2.5 --stale-after 0 --tick 2"
-        )
-        for name, extra in (("wait", " --wait"), ("nowait", "")):
-            subprocess.run(
-                tmux2 + ["new-session", "-d", "-s", name, "-x", "70", "-y", "12", f"{base}{extra}"],
-                capture_output=True,
-            )
-        def alive(sess) -> bool:
-            p = subprocess.run(tmux2 + ["list-panes", "-t", sess], capture_output=True)
-            return p.returncode == 0
-
-        # Long enough for both panes to have polled at least once (`-i 2.5`) with the
-        # session alive — that first sighting is what a plain pane closes AFTER.
-        deadline = time.time() + 20
-        while time.time() < deadline and not (alive("wait") and alive("nowait")):
-            time.sleep(0.3)
-        assert alive("wait") and alive("nowait"), "a NAS pane never came up"
-        # ...and a sighting has to be SEEN, not merely started: `alive` only says tmux made
-        # the pane, and a plain pane closes only after a poll in which it saw a live
-        # instance. Both panes read the same state file, so wait for that file to name THIS
-        # marker's directory as live and then let both panes poll it again — a pane's first
-        # poll is immediate, but it can land before the watcher's first write (the cached
-        # file was just dropped) and a pane that polls only a not-yet-live state never has
-        # anything to close on. The pane's own text is NOT the test here: a NAS state that
-        # is not alive still draws the last list, so "not waiting" is true either way.
-        def pane_text(sess) -> str:
-            shot = subprocess.run(
-                tmux2 + ["capture-pane", "-p", "-t", sess], capture_output=True, text=True
-            )
-            return STRIP(shot.stdout) if shot.returncode == 0 else "<no pane>"
-
-        def state_read() -> dict:
-            try:
-                return json.load(open(state_path))
-            except (OSError, ValueError):
-                return {}
-
-        this_dir = os.path.join(store, "panelifetime")
-
-        def live_here() -> bool:
-            st = state_read()
-            return bool(st.get("instance_alive")) and (st.get("nas") or {}).get("fb_dir") == this_dir
-
-        deadline = time.time() + 40
-        while time.time() < deadline and not live_here():
-            time.sleep(0.3)
-        assert live_here(), (
-            "the NAS panes never saw this fixture's session as live:"
-            f" {state_read()!r}"
-        )
-        time.sleep(6)  # more than two poll intervals (`-i 2.5`), so both panes have polled
-        assert alive("wait") and alive("nowait"), "a NAS pane closed while its session was live"
-        short.kill()
-        # Reap it, then take its marker away. A killed child stays a ZOMBIE until its parent
-        # waits, and `kill -0` on a zombie still answers — worse, a freed pid can be handed
-        # to another process on a busy runner, so the same probe would call the session alive
-        # again at random. A wrapper whose session has ended removes its marker; that is what
-        # makes every later poll say "not live" here without depending on a pid's afterlife.
-        short.wait(timeout=10)
-        os.unlink(marker2)
-        # A poll is an ssh round trip plus a probe, and the close happens at the END of the
-        # poll that notices: on a loaded runner one poll can outlast a short deadline, so
-        # this waits several of them (`-i 2.5`) rather than two.
-        deadline = time.time() + 30
-        while time.time() < deadline and alive("nowait"):
-            time.sleep(0.3)
-        assert alive("wait"), "--wait pane closed when its session ended"
-        mine = {}
-        if os.path.exists(state_path):
-            try:
-                mine = json.load(open(state_path))
-            except ValueError:
-                mine = {}
-        marker_seen = open(marker2).read().strip() if os.path.exists(marker2) else "<gone>"
-        assert not alive("nowait"), (
-            "a plain nas pane lingered after its session ended:"
-            f" text={pane_text('nowait')!r} marker={marker_seen!r}"
-            f" watcher={module.live_watcher_pid(lock_path)} state={mine!r}"
-        )
-        shot = subprocess.run(tmux2 + ["capture-pane", "-p", "-t", "wait"], capture_output=True, text=True)
-        assert "waiting for a NAS freebuff session" in STRIP(shot.stdout), shot.stdout
-        subprocess.run(tmux2 + ["kill-server"], capture_output=True)
-        short.kill()
-        if os.path.exists(marker2):
-            os.unlink(marker2)
-        env.pop("FBTODO_NAS", None)
-        say("nas pane: --wait outlives one fb run, a plain pane closes with it: ok")
-        env["PATH"] = saved_path
-
-    # ---- painting is not tied to polling: the clock moves every second while the
-    #      store is only reached once per `-i` (on the NAS every poll is an ssh)
-    #@phase nas-pane-repaint
-    if shutil.which("tmux"):
-        sock3, sess3 = "fbtchecksockcad", "fbtcad"
-        tmux3 = ["tmux", "-L", sock3]
-        subprocess.run(tmux3 + ["kill-server"], capture_output=True)
-        # a list that is MID-flight: step 1 ticked off, step 2 running
-        write_session(
-            "2026-01-01T00-00-09.000Z",
-            [
-                tool(
-                    "write_todos",
-                    [
-                        {"task": "tick me", "completed": True},
-                        {"task": "still running", "completed": False},
-                        {"task": "later", "completed": False},
-                    ],
-                )
-            ],
-            # a FUTURE directory mtime: the earlier blocks leave sessions age-0 seconds
-            # old, and `ls -1dt` would otherwise make one of those the newest
-            -5,
-        )
-        alive = subprocess.Popen(["sleep", "60"])
-        marker3 = os.path.join(TEST_HOME, "fb-session-3")
-        with open(marker3, "w") as fh:
-            fh.write(f"{alive.pid} 2026-01-01T00:00:00Z {store}/demo\n")
-        # the transport, wrapped so every poll is counted: one ssh per poll is the
-        # cost the slow interval exists to pay for
-        calls = os.path.join(TEST_HOME, "nas-calls.log")
-        spliced = os.path.join(TEST_HOME, "counting-ssh")
-        with open(spliced, "w") as fh:
-            fh.write(f'#!/bin/sh\necho x >> {calls}\nexec /bin/sh -c "$1"\n')
-        os.chmod(spliced, 0o755)
-        env["FBTODO_NAS"] = spliced
-        # `--no-daemon` because that is what the watcher opens, and a scratch home of its
-        # own because a nas daemon left running by an earlier block writes a state file
-        # this pane would be right to trust — and that state describes the dead marker.
-        cad_home = os.path.join(TEST_HOME, "cad-home")
-        os.makedirs(cad_home, exist_ok=True)
-        cmd = (
-            f"FBTODO_HOME={cad_home} FBTODO_NAS={spliced} PATH={shim}:{saved_path} "
-            f"{sys.executable} {FB} -s nas --no-daemon --nas-root {store} "
-            f"--nas-project demo --fb-marker {marker3} -i 5 --stale-after 0 --tick 5"
-        )
-        subprocess.run(
-            tmux3 + ["new-session", "-d", "-s", sess3, "-x", "60", "-y", "12", cmd],
-            capture_output=True,
-        )
-        time.sleep(2.5)  # the first poll lands immediately; the next is 5s out
-
-        def cad_shot() -> str:
-            return STRIP(
-                subprocess.run(
-                    tmux3 + ["capture-pane", "-p", "-t", sess3], capture_output=True, text=True
-                ).stdout
-            )
-
-        shots = [cad_shot()]
-        for _ in range(4):  # ~2.4s of watching, well inside one poll
-            time.sleep(0.6)
-            shots.append(cad_shot())
-        polls = len(open(calls).read().split()) if os.path.exists(calls) else 0
-        assert "still running" in shots[0], shots[0]
-        # One poll costs one ssh (the extractor's mtime skip needs no second), and the
-        # window is shorter than the interval — so a pane that painted only when it
-        # polled would have exactly one shot here, not three.
-        assert len(set(shots)) >= 3, f"the pane did not repaint between polls: {shots}"
-        assert polls <= 2, f"the pane polled {polls} times in ~2.4s at -i 5: {shots}"
-        say("nas pane: 1Hz repaint while polling the store once per -i: ok")
-        subprocess.run(tmux3 + ["kill-server"], capture_output=True)
-        alive.kill()
-        os.unlink(marker3)
-        env["FBTODO_NAS"] = fake_ssh
 
     # ---- the freebuff() wrapper opens a todo pane with the session and closes it
     #@phase local-session
@@ -8191,9 +10652,13 @@ try:
         # PATH (a shared server would overwrite PATH from the attaching client via
         # update-environment, and the stub freebuff would never be found), and the
         # user's real server is never touched.
-        sock = "fbtchecksock"
+        #      Named `check_sock`, not `sock`: this is module level, and rebinding the NAME
+        #      would turn the helper into a string for every later line — including the
+        #      teardown that kills this server, which then died of `TypeError` instead and
+        #      left the server (and its error) behind.
+        check_sock = sock("fbtchecksock")
         sess = "fbtcheck"
-        tmux = ["tmux", "-L", sock]
+        tmux = ["tmux", "-L", check_sock]
         subprocess.run(tmux + ["kill-server"], capture_output=True)
         stub_bin = os.path.join(TEST_HOME, "session", "bin")
         os.makedirs(stub_bin, exist_ok=True)
@@ -8214,9 +10679,8 @@ try:
             fh.write(f"#!/bin/sh\nwhile [ ! -e {release} ]; do sleep 0.2; done\n")
         os.chmod(stub, 0o755)
         path = stub_bin + os.pathsep + os.environ.get("PATH", "")
-        # The stall watch is asked about a LOCAL session (the NAS build writes no
-        # end-of-turn record), so its stub — and the check for it below — live here
-        # rather than in the NAS block. A stub, not the real notifier: this run must
+        # The stall watch is asked about a LOCAL session, so its stub — and the check for
+        # it below — live here. A stub, not the real notifier: this run must
         # not push the fixture's lists to the owner's phone.
         pause_log = os.path.join(TEST_HOME, "pause-calls.log")
         pause_stub = os.path.join(TEST_HOME, "pause-stub.sh")
@@ -8280,9 +10744,14 @@ try:
             + [
                 "new-session", "-d", "-s", sess, "-x", "100", "-y", "30",
                 "-e", f"FBTODO_HOME={TEST_HOME}",
+                # The same named server the `why`/`status` below talk to (`FBTODO_TMUX`).
+                # Without it the session's pane and the CLI disagree about a pinned key
+                # neither should, and `stale_pin` reports the false positive its own
+                # uniform-environment promise rules out.
+                "-e", f"FBTODO_TMUX=tmux -L {check_sock}",
                 "-e", f"PATH={path}",
                 "-e", f"ZDOTDIR={zdot_sess}",
-                # ...and no autostart daemon left behind either (see the NAS block)
+                # ...and no autostart daemon left behind either
                 "-e", "FBTODO_NO_AUTOSTART=1",
                 # notice a killed pane quickly: the shipped default is deliberately calm
                 "-e", "FBTODO_PANE_SECONDS=1",
@@ -8488,7 +10957,7 @@ try:
 
         # ...and it comes back in the right PLACE, directly under the pane its own session
         # is drawn in. Asked for 2026-09-22, after a live window showed the list a column
-        # over and three rows down, under a NAS pane: the wrapper had split a WINDOW, and
+        # over and three rows down, under another pane: the wrapper had split a WINDOW, and
         # tmux answered that with the window's active pane, which is not necessarily the
         # one running freebuff.
         panes_mod = load_fbtodo()
@@ -8585,7 +11054,11 @@ try:
         #      filed by session:index and enforced by the keeper like placement is.
         #      FBTODO_TMUX is set for these: run() is a child of THIS shell, whose $TMUX is
         #      the owner's server, and the pin has to land on the private one.
-        env["FBTODO_TMUX"] = f"tmux -L {sock}"
+        env["FBTODO_TMUX"] = f"tmux -L {check_sock}"
+        # Deliberately NOT aligned with the session here: this CLI's own environment may
+        # spell the pin however it likes, because `why`/`status` judge a pane by the
+        # SESSION's values (`session_pinned_env`), not the shell they were typed in. The
+        # `why` assertions below hold the pane current despite the client's placeholders.
         # The window's own name, asked of tmux rather than assumed: `base-index` is a user
         # setting, and the pin is filed under what the window actually is.
         window_target = subprocess.run(
@@ -8670,16 +11143,15 @@ try:
         assert kept_left(), f"tmux did not put the pane left of its session: {placement()}"
 
         def filed_local() -> dict:
-            """This fixture window's `local` half of the remembered layout, or {}."""
+            """This fixture window's entry in the remembered layout, or {}."""
             try:
                 with open(os.path.join(TEST_HOME, "fbtodo-last.json")) as handle:
                     doc = json.load(handle)
             except (OSError, ValueError):
                 return {}
             for key, entry in (doc if isinstance(doc, dict) else {}).items():
-                local = entry.get("local") if isinstance(entry, dict) else None
-                if key.startswith(f"{sess}:") and isinstance(local, dict):
-                    return local
+                if key.startswith(f"{sess}:") and isinstance(entry, dict):
+                    return entry
             return {}
 
         deadline = time.time() + 15
@@ -8801,38 +11273,41 @@ try:
         assert run("pin", "--side", "sideways").returncode != 0, "a bad --side was accepted"
         say("pin --list shows the pin, --clear drops it, a bad side is refused: ok")
 
-        # ---- one pin, two roles. A pin written without `--role` is the window's SHARED
-        #      answer; a role's own half outranks it for that role only, which is what lets
-        #      a window holding a session AND a NAS ssh size its two lists differently.
-        #      Asserted against the module's own lookup, not through tmux: it is a rule.
+        # ---- one pin, one window. The flat halves are the window's answer; a pin file
+        #      written while a window held two list panes may carry its answer under the
+        #      `local` role instead, and that half is read as the window's own — the role
+        #      it was filed for is the only role there is now, so nothing is lost and an
+        #      existing pins file keeps working. Asserted against the module's own lookup,
+        #      not through tmux: it is a rule.
         set_knob(panes_mod, "PINS_PATH", os.path.join(TEST_HOME, "pins-unit.json"))
         set_knob(panes_mod, "LAST_PATH", os.path.join(TEST_HOME, "last-unit.json"))
         with open(panes_mod.PINS_PATH, "w") as fh:
-            json.dump({window_target: {"side": "h", "size": 10, "nas": {"size": 6}}}, fh)
-        shared = panes_mod.pane_layout(window_target, "local")
-        assert (shared["side"], shared["side_source"]) == ("h", "pin"), shared
-        assert (shared["size"], shared["size_source"]) == (10, "pin"), shared
-        theirs = panes_mod.pane_layout(window_target, "nas")
-        assert (theirs["side"], theirs["side_source"]) == ("h", "pin"), theirs
-        assert (theirs["size"], theirs["size_source"]) == (6, "pin:nas"), theirs
-        say("a pin without a role is shared; a role's own half outranks it for that role: ok")
+            json.dump({window_target: {"side": "h", "size": 10}}, fh)
+        flat = panes_mod.pane_layout(window_target)
+        assert (flat["side"], flat["side_source"]) == ("h", "pin"), flat
+        assert (flat["size"], flat["size_source"]) == (10, "pin"), flat
+        with open(panes_mod.PINS_PATH, "w") as fh:
+            json.dump({window_target: {"side": "h", "size": 10, "local": {"size": 6}}}, fh)
+        legacy = panes_mod.pane_layout(window_target)
+        assert (legacy["side"], legacy["side_source"]) == ("h", "pin"), legacy
+        assert (legacy["size"], legacy["size_source"]) == (6, "pin:local"), legacy
+        say("a pin's flat halves answer for the window; a legacy role half still applies: ok")
 
-        # ---- and that role half works through the live path: filed under the role, applied
-        #      to the pane, which has to be moved AND resized by it.
-        scoped = run("pin", "--window", window_target, "--role", "local", "--side", "v",
-                     "--size", "8", "--json")
+        # ---- and a pin works through the live path: filed for the window, applied to the
+        #      pane, which has to be moved AND resized by it.
+        scoped = run("pin", "--window", window_target, "--side", "v", "--size", "8", "--json")
         assert scoped.returncode == 0, (scoped.returncode, scoped.stderr)
         doc = json.loads(scoped.stdout)
-        assert doc["pin"] == {"local": {"side": "v", "size": 8}}, doc
-        assert doc["layouts"]["local"]["side_source"] == "pin:local", doc
+        assert doc["pin"] == {"side": "v", "size": 8}, doc
+        assert doc["layout"]["side_source"] == "pin", doc
         deadline = time.time() + 12
         while time.time() < deadline and not pinned_ok("v", 8):
             time.sleep(0.3)
         assert pinned_ok("v", 8), (
-            f"a pin filed for one role did not move/resize the pane: {pane_geometry()}"
+            f"a pin did not move/resize the pane: {pane_geometry()}"
             f" pin={scoped.stdout.strip()!r}"
         )
-        say("a pin for one role is filed under it and moves that pane only: ok")
+        say("a pin is filed for the window and moves that pane: ok")
 
         # ---- `fbtodo why`: the side and size in force WITH the source that supplied them,
         #      the pane it is placed against, and whether it is actually there.
@@ -8840,479 +11315,55 @@ try:
         mine = [rec for rec in why["panes"] if rec["pane"] == pane]
         assert mine, why
         mine = mine[0]
-        assert mine["role"] == "local" and mine["window"] == window_target, mine
-        assert mine["side_source"] == "pin:local" and mine["size_source"] == "pin:local", mine
+        assert mine["window"] == window_target, mine
+        assert mine["stale_pin"] is False, mine      # a pane the keeper just opened is on the pin
+        # ...and it stays current even when the shell running `why` carries values the
+        # session never had: the judgment is the SESSION's (`session_pinned_env`), not the
+        # client's, so two keys this shell invents cannot make the keeper's own pane stale.
+        odd_env = dict(env, FBTODO_LOCKS_BELL="/client-only", FBTODO_ASK="/client-only")
+        why_odd = json.loads(subprocess.run(
+            [sys.executable, FB, "why", "--json", "--window", window_target],
+            capture_output=True, text=True, env=odd_env, cwd=CWD, timeout=30,
+        ).stdout)
+        odd_mine = [rec for rec in why_odd["panes"] if rec["pane"] == pane][0]
+        assert odd_mine["stale_pin"] is False, odd_mine
+        assert mine["side_source"] == "pin" and mine["size_source"] == "pin", mine
         assert mine["anchor"] == inst_pane and mine["placed"] is True, mine
         why_text = run("why", "--window", window_target).stdout
-        assert f"pin ({window_target} local)" in why_text, why_text
+        assert f"pin ({window_target})" in why_text, why_text
         assert "placed" in why_text and str(mine["size"]) in why_text, why_text
-        say("why names the source that decided each half, and whether the pane is placed: ok")
+        say("why names the source that decided each half, whether the pane is placed, and "
+            "whether it predates the pin: ok")
         assert run("why", "--window", "nosuch:99").returncode != 0, "a bad --window was accepted"
         run("pin", "--window", window_target, "--clear")
         assert json.loads(run("pin", "--list", "--json").stdout) == {}, (
-            "a role's half survived --clear"
+            "the window's pin survived --clear"
         )
-        say("why refuses a window that does not exist; --clear drops a role's half too: ok")
+        say("why refuses a window that does not exist; --clear drops the window's pin too: ok")
         env.pop("FBTODO_TMUX", None)
 
-        # ...and now the session may end (see the release file at `stub`): the keeper has
-        # to notice and take the pane away on its own, FBTODO_PANE_SECONDS=1 apart.
+        # ...and now the session may end (see the release file at `stub`). The pane must NOT
+        # go with it: a pane is the reader's window on a list, and this is the rule the whole
+        # pane-lifetime change rests on — no process exit and no ended session takes it away.
+        # What does end it is named elsewhere in this suite and checked there: `--stale-after`
+        # (the `a stale list closes the pane` check), Ctrl-C, and the window itself. So the
+        # pane here is waited out — it has to still be there when the session's process is
+        # gone — and the tmux server is taken down after, which is the one thing that does
+        # close it.
         with open(release, "w"):
             pass
+        gone = None
         deadline = time.time() + 20
-        while time.time() < deadline and pane_cmds() and any(
-            is_todo_pane(c) for c in pane_cmds()
-        ):
+        while time.time() < deadline:
+            cmds = pane_cmds()
+            if not any(is_todo_pane(c) for c in cmds):
+                gone = cmds
+                break
             time.sleep(0.3)
-        assert not any(is_todo_pane(c) for c in pane_cmds()), (
-            f"todo pane outlived the session: {pane_cmds()}"
-        )
-        say("the pane closes when the session ends: ok")
+        assert gone is None, f"todo pane closed itself when the session ended: {gone}"
+        say("the pane outlives the session that opened it: ok")
         subprocess.run(tmux + ["kill-server"], capture_output=True)
 
-    # ---- the `nas` subcommand itself: reachable, and honest when nothing runs
-    #@phase nas-live
-    if shutil.which("tmux"):
-        sock3, sess3 = "fbtchecksockremote", "fbtremote"
-        tmux3 = ["tmux", "-L", sock3]
-        subprocess.run(tmux3 + ["kill-server"], capture_output=True)
-        # ...and this process looks at THAT server too, so the answer cannot depend on
-        # whatever the owner happens to have open (a live NAS pane would break it)
-        env["FBTODO_TMUX"] = f"tmux -L {sock3}"
-        run("nas", "--stop")
-        p = run("nas", "--status", "--json")
-        st = json.loads(p.stdout)
-        assert p.returncode == 0 and st["watcher_pid"] is None, (p.returncode, st)
-        assert st["panes"] == [] and st["state"] == {}, st
-        assert "not running" in run("nas", "--stop").stderr
-        say("nas: the subcommand answers (status / stop / json) instead of a usage error: ok")
-        nas_bin = os.path.join(TEST_HOME, "nas", "bin")
-        os.makedirs(nas_bin, exist_ok=True)
-        with open(os.path.join(nas_bin, "ssh"), "w") as fh:
-            # stands in for the login: long enough to type freebuff inside
-            fh.write("#!/bin/sh\nsleep 60 & wait\n")
-        os.chmod(os.path.join(nas_bin, "ssh"), 0o755)
-        # The fake ssh runs the probe HERE, so its `pgrep` looks at this Mac's process
-        # table — where a stray argv could make a session out of nothing. A shim keeps
-        # liveness a fact about the marker, which is what these checks are about.
-        with open(os.path.join(nas_bin, "pgrep"), "w") as fh:
-            fh.write("#!/bin/sh\nexit 1\n")
-        os.chmod(os.path.join(nas_bin, "pgrep"), 0o755)
-        # The checkout first, so the `remote` function below finds `fbtodo` even on a
-        # machine where the launcher is not installed on PATH — a runner has it only in
-        # the working copy, and without it `fbtodo nas --quiet` failed silently into the
-        # redirect and no watcher was ever started.
-        path3 = os.pathsep.join([ROOT, nas_bin, shim, saved_path])
-        marker3 = os.path.join(TEST_HOME, "fb-session-3")
-        # The phone notifier this build asks about, as a stub: what is under test here is
-        # that the watcher asks it while a session runs and stops when it goes.
-        notify_log = os.path.join(TEST_HOME, "notify-calls.log")
-        notify_dir = os.path.join(TEST_HOME, ".config", "freebuff-notify")
-        os.makedirs(notify_dir, exist_ok=True)
-        with open(os.path.join(notify_dir, "todo-bell.py"), "w") as fh:
-            fh.write(
-                "#!/bin/sh\n"
-                f'printf "%s\\n" "$*" >> "{notify_log}"\n'
-                "exit 0\n"
-            )
-        os.chmod(os.path.join(notify_dir, "todo-bell.py"), 0o755)
-        # ...and the drop watch it asks when a session STOPS instead of ending. Also a
-        # stub: a real one would push the fixture's death to the owner's phone.
-        drop_log = os.path.join(TEST_HOME, "drop-calls.log")
-        with open(os.path.join(notify_dir, "drop-bell.py"), "w") as fh:
-            fh.write(
-                "#!/bin/sh\n"
-                f'printf "%s\\n" "$*" >> "{drop_log}"\n'
-                "exit 10\n"
-            )
-        os.chmod(os.path.join(notify_dir, "drop-bell.py"), 0o755)
-        # ...and the ask watch, which reads this Mac's PANES — asked on its own clock
-        # while a session runs. A stub for the same reason as the two above, and one that
-        # says "nobody is asking", because a real one here would be scanning the owner's
-        # own tmux server.
-        ask_log = os.path.join(TEST_HOME, "ask-calls.log")
-        with open(os.path.join(notify_dir, "ask-bell.py"), "w") as fh:
-            fh.write(
-                "#!/bin/sh\n"
-                f'printf "%s\\n" "$*" >> "{ask_log}"\n'
-                "echo silent: nobody is asking\n"
-                "exit 0\n"
-            )
-        os.chmod(os.path.join(notify_dir, "ask-bell.py"), 0o755)
-        # ...and the stall watch, which asks the real fbtodo about this session's own
-        # store: also a stub, and one that stays silent.
-        pause_log = os.path.join(TEST_HOME, "pause-calls.log")
-        with open(os.path.join(notify_dir, "pause-bell.py"), "w") as fh:
-            fh.write(
-                "#!/bin/sh\n"
-                f'printf "%s\\n" "$*" >> "{pause_log}"\n'
-                "echo silent: nothing to report\n"
-                "exit 0\n"
-            )
-        os.chmod(os.path.join(notify_dir, "pause-bell.py"), 0o755)
-        # HOME is the real one even here (only the scratch dir is redirected), so the
-        # notifier path has to be pointed at the stub explicitly — otherwise this run
-        # would push the fixture's lists to the owner's phone.
-        env["FBTODO_NOTIFY"] = os.path.join(notify_dir, "todo-bell.py")
-        env["FBTODO_DROP"] = os.path.join(notify_dir, "drop-bell.py")
-        env["FBTODO_ASK"] = os.path.join(notify_dir, "ask-bell.py")
-        env["FBTODO_PAUSE"] = os.path.join(notify_dir, "pause-bell.py")
-        env["FBTODO_NAS"] = fake_ssh
-        env["FBTODO_FB_MARKER"] = marker3
-        # The session's own command is written to a file and sourced by path. The fixture's
-        # stand-in for whatever function a user wraps a remote login in asks fbtodo for the
-        # pane watcher and then execs an ssh whose argv LOOKS like one, because that is what
-        # placement anchors on. It is a file rather than one quoted string because the
-        # nested quotes did not survive tmux's own `/bin/sh -c` on a runner: the shell came
-        # up with nothing to run and sat at a prompt, so the watcher never started.
-        remote_sh = os.path.join(TEST_HOME, "remote-session.zsh")
-        with open(remote_sh, "w", encoding="utf-8") as fh:
-            fh.write(
-                f"export PATH={path3}:$PATH\n"
-                "remote() {\n"
-                "  fbtodo nas --quiet >/dev/null 2>&1 &!\n"
-                '  exec ssh -t remote@nas.local "cd / && exec $SHELL -l"\n'
-                "}\n"
-                "remote\n"
-            )
-        # ...and a throwaway `ZDOTDIR`, because an interactive zsh that finds NO startup
-        # files at all runs `zsh-newuser-install` and BLOCKS on its prompt: every runner
-        # pane sat at "--- Type one of the keys in parentheses ---" and the watcher this
-        # session was supposed to start never appeared. A runner's HOME has no `~/.zshrc`;
-        # the autostart and local-session phases sidestep it the same way. The file's only
-        # job is to exist — what the session RUNS is `remote_session.zsh`, below.
-        zdot_nas = os.path.join(TEST_HOME, "zdot-nas")
-        os.makedirs(zdot_nas, exist_ok=True)
-        with open(os.path.join(zdot_nas, ".zshrc"), "w", encoding="utf-8") as fh:
-            fh.write("# present so zsh does not offer its first-run install prompt\n")
-        created3 = subprocess.run(
-            tmux3
-            + [
-                "new-session", "-d", "-s", sess3, "-x", "100", "-y", "30",
-                "-e", f"FBTODO_HOME={TEST_HOME}",
-                "-e", f"ZDOTDIR={zdot_nas}",
-                # FBTODO_NAS* point the watcher and its pane at the fixture store, so this
-                # asserts what the pane RENDERS, not what the real NAS happens to hold.
-                "-e", f"FBTODO_NAS={fake_ssh}",
-                "-e", f"FBTODO_NAS_ROOT={store}",
-                "-e", "FBTODO_NAS_PROJECT=demo",
-                "-e", f"FBTODO_FB_MARKER={marker3}",
-                # the private server, or the watcher would split a pane in the owner's
-                "-e", f"FBTODO_TMUX=tmux -L {sock3}",
-                # no .zshrc autostart daemon: it is detached, survives the server being
-                # killed below, and then writes stale lists into the NEXT run's home
-                "-e", "FBTODO_NO_AUTOSTART=1",
-                # poll fast — the shipped default is deliberately gentle
-                "-e", "FBTODO_NAS_POLL=1",
-                "-e", "FBTODO_NAS_POLL_IDLE=1",
-                "-e", "FBTODO_NAS_POLL_LIVE=1",
-                "-e", "FBTODO_NOTIFY_SECONDS=1",
-                "-e", f"FBTODO_NOTIFY={os.path.join(notify_dir, 'todo-bell.py')}",
-                "-e", f"FBTODO_DROP={os.path.join(notify_dir, 'drop-bell.py')}",
-                "-e", f"FBTODO_ASK={os.path.join(notify_dir, 'ask-bell.py')}",
-                "-e", "FBTODO_ASK_SECONDS=1",
-                "-e", f"FBTODO_PAUSE={os.path.join(notify_dir, 'pause-bell.py')}",
-                "-e", "FBTODO_PAUSE_SECONDS=1",
-                # PATH is set by the script, not by `-e`: tmux's own env handling and
-                # .zshrc's prepends both fight it, and the real ssh would then be used.
-                # `-d` keeps the distribution's `/etc/zsh` out of it: Ubuntu's runs
-                # `compinit`, which prompts on a runner and blocks the shell before the
-                # script is read. ONE layer of quoting — the path is the only argument.
-                f"zsh -d -i -c 'source {remote_sh}'",
-            ],
-            capture_output=True,
-        )
-        nas_state = os.path.join(TEST_HOME, "fbtodo-nas-pane.json")
-        NAS_LOG = os.path.join(TEST_HOME, "fbtodo-nas-pane.log")
-
-        def nas_listing() -> str:
-            p = subprocess.run(
-                tmux3 + ["list-panes", "-a", "-F", "#{pane_id} #{pane_start_command}"],
-                capture_output=True, text=True,
-            )
-            return p.stdout if p.returncode == 0 else ""
-
-        def nas_panes() -> list[str]:
-            return [ln.split()[0] for ln in nas_listing().splitlines() if "-s nas" in ln]
-
-        # the wrapper on its own must NOT open one: the pane belongs to the session over there
-        nas_lock = os.path.join(TEST_HOME, "fbtodo-nas-pane.pid")
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            assert not nas_panes(), f"the remote shell opened a pane with no NAS session: {nas_listing()}"
-            if os.path.exists(nas_lock):
-                break
-            time.sleep(0.3)
-        if not json.loads(run("nas", "--status", "--json").stdout)["watcher_pid"]:
-            # Only built for the failure: the watcher's own log and state, its claim, and the
-            # process table it would be in. A `--quiet` start writes nothing anywhere but its
-            # log, so this is the only place it can say what happened.
-            tail = ""
-            for name in ("fbtodo-nas-pane.log", "fbtodo-nas-pane.json"):
-                try:
-                    with open(os.path.join(TEST_HOME, name)) as fh:
-                        tail += f" {name}={fh.read()[-800:]!r}"
-                except OSError as exc:
-                    tail += f" {name}={exc.__class__.__name__}"
-            table = subprocess.run(
-                ["ps", "-eo", "pid=,args="], capture_output=True, text=True,
-            ).stdout or ""
-            watchers = [ln.strip() for ln in table.splitlines()
-                        if "fbtodo" in ln and " nas" in ln]
-            first_pane = (nas_listing().split() or ["%0"])[0]
-            seen = subprocess.run(
-                tmux3 + ["capture-pane", "-p", "-t", first_pane],
-                capture_output=True, text=True,
-            ).stdout.strip()
-            raise AssertionError(
-                f"the remote shell did not start the NAS watcher: rc={created3.returncode}"
-                f" err={created3.stderr.strip()!r} lock_file={os.path.exists(nas_lock)}"
-                f" panes={nas_listing()!r} pane_text={seen!r} watchers={watchers}{tail}"
-            )
-        say("a remote shell carries you over and starts the watcher, without opening a pane: ok")
-
-        # the liveness probe asked about the NAS and counted ITSELF as a match, so a NAS
-        # with no session read as live forever. This is the lie that decided the pane.
-        stt = {}
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            try:
-                stt = json.load(open(nas_state))
-            except (OSError, ValueError):
-                stt = {}
-            if stt.get("polls"):
-                break
-            time.sleep(0.3)
-        assert stt.get("alive") is False, stt
-        say("nas: no session, no marker reads idle — the probe cannot match itself: ok")
-
-        def nas_diag() -> str:
-            st = json.load(open(nas_state)) if os.path.exists(nas_state) else {}
-            try:
-                os.kill(st.get("watcher_pid") or 0, 0)
-                alive = True
-            except Exception:
-                alive = False
-            log = open(NAS_LOG).read()[-400:] if os.path.exists(NAS_LOG) else ""
-            return f"watcher_alive={alive} state={st} panes={nas_listing()!r} log={log!r}"
-
-        # `fb` starts over there -> the pane appears here, showing THAT session's list.
-        # A fresh fixture session, because the newest one is what the pane must surface
-        # (and the earlier checks deliberately left a readable-and-newest one behind).
-        write_session(
-            "2026-01-01T00-00-09.000Z",
-            [tool("write_todos", [{"task": "pane check", "completed": False}])],
-            1,
-        )
-        # Where the list belongs: the pane the session's ssh runs in. The fixture's ssh
-        # is in the session's own pane, and a DECOY pane is split into it and made active
-        # first — which is exactly the shape that used to misplace a pane, because a window
-        # target makes tmux split whichever pane is active in it.
-        def pane_geometry() -> dict:
-            return tmux_geometry(tmux3)
-
-        def directly_below(upper: str, lower: str) -> bool:
-            """The rule fbtodo places by, restated from raw tmux geometry."""
-            rects = pane_geometry()
-            a, b = rects.get(upper), rects.get(lower)
-            if not a or not b:
-                return False
-            return b[0] == a[0] and b[2] == a[2] and b[1] == a[1] + a[3] + 1
-
-        ssh_pane = subprocess.run(
-            tmux3 + ["list-panes", "-t", sess3, "-F", "#{pane_id}"],
-            capture_output=True, text=True,
-        ).stdout.split()
-        assert ssh_pane, nas_diag()
-        ssh_pane = ssh_pane[0]
-        decoy = subprocess.run(
-            tmux3 + ["split-window", "-v", "-l", "4", "-d", "-P", "-F", "#{pane_id}",
-                     "-t", ssh_pane, "sleep 120"],
-            capture_output=True, text=True,
-        ).stdout.strip()
-        assert decoy, nas_diag()
-        subprocess.run(tmux3 + ["select-pane", "-t", decoy], capture_output=True)
-
-        fb_proc = spawn_quiet("sleep", "60")
-        with open(marker3, "w") as fh:
-            fh.write(f"{fb_proc.pid} 2026-01-01T00:00:00Z {store}/demo\n")
-        shot, shots = None, []
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            opened = nas_panes()
-            if opened:
-                frame = subprocess.run(
-                    tmux3 + ["capture-pane", "-p", "-t", opened[0]], capture_output=True, text=True
-                )
-                shots.append((opened[0], frame.returncode, len(frame.stdout),
-                              frame.stderr.strip()[:60], STRIP(frame.stdout)[:60]))
-                if "pane check" in STRIP(frame.stdout):
-                    shot = frame
-                    break
-            time.sleep(0.3)
-        assert shot, (
-            "a NAS session starting did not open a pane with its list: " + nas_diag()
-            + f" frames={shots[-4:]!r}"
-        )
-        say("nas: `fb` starting opens the pane, showing that session's own list: ok")
-
-        # ...and it opens UNDER the pane that session runs in, not under the pane that
-        # happened to be active (the decoy), which is what a window target would have done.
-        assert directly_below(ssh_pane, opened[0]), (
-            f"the NAS pane did not open under the pane its ssh runs in: {pane_geometry()}"
-            f"  ssh={ssh_pane} decoy={decoy}"
-        )
-        say("nas: the pane opens under the session's own pane, not the active one: ok")
-
-        # ...and it is put back there when it drifts: a third pane split into the ssh
-        # pushes the list a row down, the shape the placement pass has to notice.
-        subprocess.run(
-            tmux3 + ["split-window", "-v", "-l", "3", "-d", "-t", ssh_pane, "sleep 60"],
-            capture_output=True,
-        )
-        deadline = time.time() + 15
-        while time.time() < deadline and not directly_below(ssh_pane, opened[0]):
-            time.sleep(0.3)
-        assert directly_below(ssh_pane, opened[0]), (
-            f"the drifted NAS pane was not moved back under its ssh: {pane_geometry()}"
-        )
-        say("nas: a NAS pane that drifted is moved back under its ssh: ok")
-
-        # `nas --status` names the pane it placed against, so a wrong one is visible
-        status_text = run("nas", "--status").stdout
-        assert "ssh pane" in status_text and ssh_pane in status_text.split("ssh pane", 1)[1], (
-            status_text
-        )
-        say("nas: --status names the ssh pane the list is placed against: ok")
-
-        # ---- the NAS pane gets the same pin support, filed per window AND per role: this
-        #      window holds the ssh, and a pin for `nas` is that pane's own answer.
-        nas_window = subprocess.run(
-            tmux3 + ["display-message", "-t", sess3, "-p", "#{session_name}:#{window_index}"],
-            capture_output=True, text=True,
-        ).stdout.strip()
-        assert nas_window, nas_diag()
-        nas_pin = run("pin", "--window", nas_window, "--role", "nas", "--size", "7", "--json")
-        assert nas_pin.returncode == 0, (nas_pin.returncode, nas_pin.stderr)
-        assert json.loads(nas_pin.stdout)["pin"] == {"nas": {"size": 7}}, nas_pin.stdout
-        deadline = time.time() + 15
-        while time.time() < deadline and pane_geometry().get(opened[0], [0, 0, 0, 0])[3] != 7:
-            time.sleep(0.3)
-        assert pane_geometry().get(opened[0], [0, 0, 0, 0])[3] == 7, (
-            f"a pin for the nas role did not hold the NAS pane at that size: {pane_geometry()}"
-            + nas_diag()
-        )
-        assert directly_below(ssh_pane, opened[0]), (
-            f"resizing the NAS pane to its pinned size moved it off the ssh: {pane_geometry()}"
-        )
-        say("nas: a pin for the nas role holds the NAS pane at that size, still under its ssh: ok")
-
-        nas_why = json.loads(run("why", "--json", "--window", nas_window).stdout)["panes"]
-        mine = [rec for rec in nas_why if rec["pane"] == opened[0]]
-        assert mine, nas_why
-        mine = mine[0]
-        assert mine["role"] == "nas" and mine["size_source"] == "pin:nas", mine
-        assert mine["size"] == 7 and mine["anchor"] == ssh_pane, mine
-        assert mine["placed"] is True, mine
-        assert mine["anchor_note"], mine
-        say("nas: why says which ssh the NAS pane is placed against, and its pinned size: ok")
-        run("pin", "--window", nas_window, "--clear")
-        assert json.loads(run("pin", "--list", "--json").stdout) == {}, "the NAS pin survived --clear"
-        say("nas: the NAS pin clears like the local one: ok")
-
-        # the phone notifier is asked on its own clock while a session is live: the push
-        # must not depend on the pane being open, which is the whole point of it.
-        def notify_calls() -> int:
-            try:
-                with open(notify_log) as handle:
-                    return len([ln for ln in handle if ln.strip()])
-            except OSError:
-                return 0
-
-        deadline = time.time() + 15
-        while time.time() < deadline and notify_calls() < 1:
-            time.sleep(0.3)
-        assert notify_calls() >= 1, (
-            "the watcher never asked the phone notifier while a session was live: " + nas_diag()
-        )
-        say("nas: the phone notifier is asked while the session runs: ok")
-
-        # The ask watch is asked on its own clock too, and for a different question: a
-        # question on screen stops the session, wherever the pane is being drawn.
-        def ask_calls() -> int:
-            try:
-                with open(ask_log) as handle:
-                    return len([ln for ln in handle if ln.strip()])
-            except OSError:
-                return 0
-
-        deadline = time.time() + 15
-        while time.time() < deadline and ask_calls() < 1:
-            time.sleep(0.3)
-        assert ask_calls() >= 1, (
-            "the watcher never asked the ask watch while a session was live: " + nas_diag()
-        )
-        say("nas: the ask watch is asked while the session runs: ok")
-
-        kill_tree(fb_proc)
-        deadline = time.time() + 30
-        while time.time() < deadline and nas_panes():
-            time.sleep(0.3)
-        assert not nas_panes(), f"the pane outlived the NAS session: {nas_listing()}"
-        say("nas: the pane goes when the session goes (and no ssh close was involved): ok")
-
-        # A session that STOPS is not a session that ended: the fixture's pid was killed, so
-        # nothing removed the marker and it is still there with a dead pid — the witness the
-        # drop watch is asked about, ONCE, after a second pass agrees the death is real.
-        def drop_calls() -> list[str]:
-            try:
-                with open(drop_log) as handle:
-                    return [ln.strip() for ln in handle if ln.strip()]
-            except OSError:
-                return []
-
-        deadline = time.time() + 15
-        while time.time() < deadline and not drop_calls():
-            time.sleep(0.3)
-        assert drop_calls(), (
-            "the watcher never asked the drop watch after the session stopped: " + nas_diag()
-        )
-        assert "--fb 0" in drop_calls()[0] and "--live 0" in drop_calls()[0], (
-            f"the drop was described with the wrong witness: {drop_calls()}"
-        )
-        time.sleep(2)
-        assert len(drop_calls()) == 1, f"one death was asked about more than once: {drop_calls()}"
-        say("nas: a session that stops (not ends) is asked about once, with its marker: ok")
-
-        # ...and it stops being asked once the session goes: a finished session must not
-        # keep paying an ssh every interval for a list nobody is producing.
-        quiet_at, ask_at = notify_calls(), ask_calls()
-        time.sleep(4)
-        assert notify_calls() == quiet_at, (
-            f"the notifier was still asked after the session went: "
-            f"{notify_calls()} calls vs {quiet_at}"
-        )
-        assert ask_calls() == ask_at, (
-            f"the ask watch was still asked after the session went: "
-            f"{ask_calls()} calls vs {ask_at}"
-        )
-        say("nas: and not after it — a gone session stops asking: ok")
-
-        run("nas", "--stop")
-        assert json.loads(run("nas", "--status", "--json").stdout)["watcher_pid"] is None
-        say("nas: the watcher stops on request and leaves no lock behind: ok")
-        subprocess.run(tmux3 + ["kill-server"], capture_output=True)
-        for k in ("FBTODO_NAS", "FBTODO_FB_MARKER", "FBTODO_TMUX", "FBTODO_NOTIFY", "FBTODO_DROP", "FBTODO_ASK", "FBTODO_PAUSE", "FBTODO_PANE_BELL", "FBTODO_PANE_BELL_SECONDS"):
-            env.pop(k, None)
-
-    # ---- the liveness pattern: it must match a real session and never its own probe.
-    #      `pgrep -f` saw the probe's own script line, which carried the pattern, so a NAS
-    #      with no session at all read as live — and the pane never closed.
-    _mod = load_fbtodo()
-    pat = _mod.nas_pgrep("manicode/freebuff")
-    assert not re.search(pat, f"sh -c \"pgrep -f {pat} >/dev/null && echo 1\""), pat
-    assert re.search(pat, "node /root/.config/manicode/freebuff/index.js"), pat
-    say("nas: the liveness pattern matches a real session and never its own probe: ok")
 
 
 
@@ -9327,15 +11378,10 @@ finally:
         )
     except Exception:
         pass
-    subprocess.run(["tmux", "-L", "fbtchecksock", "kill-server"], capture_output=True)
-    subprocess.run(["tmux", "-L", "fbtchecksockremote", "kill-server"], capture_output=True)
-    subprocess.run(["tmux", "-L", "fbtchecksockwait", "kill-server"], capture_output=True)
-    # the NAS watcher is detached and outlives this script's tmux panes: it is killed by
-    # its own lock, which is also the only handle on it
-    try:
-        with open(os.path.join(TEST_HOME, "fbtodo-nas-pane.pid")) as fh:
-            os.kill(int(json.load(fh)["pid"]), signal.SIGTERM)
-    except Exception:
-        pass
+    # ...and only the servers THIS run started: the names used to be fixed strings, so this
+    # cleanup reached into a concurrent run's tmux and killed the panes it was inspecting.
+    subprocess.run(["tmux", "-L", sock("fbtchecksock"), "kill-server"], capture_output=True)
+    subprocess.run(["tmux", "-L", sock("fbtchecksockremote"), "kill-server"], capture_output=True)
+    subprocess.run(["tmux", "-L", sock("fbtchecksockwait"), "kill-server"], capture_output=True)
     if os.path.realpath(TEST_HOME).startswith(os.path.realpath(REAL_HOME) + os.sep):
         shutil.rmtree(TEST_HOME, ignore_errors=True)

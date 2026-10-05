@@ -41,10 +41,6 @@ tomorrow.
 
 ## Seeing everything at once
 
-**`fbtodo board` — all live sessions in one pane.** People run two or three agents at once.
-One pane showing every session with its list and its clock beats switching windows between
-them.
-
 **`fbtodo serve` — a read-only web mirror.** Watch from your phone or another machine without
 ssh. It pairs naturally with the notify kit that already exists.
 

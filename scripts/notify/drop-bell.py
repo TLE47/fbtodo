@@ -14,8 +14,9 @@ and the push cannot drift apart:
     --watch PID           the same question asked after the wrapper is gone — a terminal
                           that dies takes the shell with it, so a watchdog that survives
                           it has "no report arrived" as its witness
-    --nas --fb F          a NAS session whose marker outlived it (`F`=0, a killed ssh or
-                          window) or whose CLI vanished while its `fb` was still up (`F`=1)
+    --fb F, --live BOOL   REMOVED with the remote store: they were the marker-based
+                          witness for a session on another host over ssh, and nothing
+                          local asks for them.
 
 A DROP is:
   * an unclean exit — anything but 0 and 130, i.e. killed by a signal or an error exit;
@@ -64,7 +65,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 TIMEOUT = 6.0             # a decision never waits longer than this on a local store
-NAS_TIMEOUT = 25.0        # ...but the NAS store is one ssh round trip away
+
 POLL = _env_float("FREEBUFF_DROP_POLL", 2.0)   # --watch: how often the pid is asked
 GRACE = 6.0               # --watch: how long a report may still arrive after the shell
 MAX_WAIT = 12 * 3600.0    # --watch: never outlive a marathon session
@@ -117,22 +118,18 @@ def fbtodo_binary():
     return None
 
 
-def store_snapshot(cwd: str | None, nas: bool = False) -> dict | None:
+def store_snapshot(cwd: str | None) -> dict | None:
     """What the store says about the session that just ended.
 
     `fbtodo` answers from the journal on disk, so this still works with the CLI gone —
     which is the whole point: "the agent had not finished" is only knowable from there.
-    For `--nas` it is the far side's store (`fbtodo -s nas json`), one ssh away.
     """
     binary = fbtodo_binary()
     if not binary:
         return None
-    if nas:
-        argv, timeout, where = [binary, "-s", "nas", "json"], NAS_TIMEOUT, None
-    else:
-        # --cwd is a daemon flag: the CLI store is chosen from the directory the process
-        # runs in, so the caller's directory has to be the subprocess's.
-        argv, timeout, where = [binary, "-s", "cli", "json"], TIMEOUT, cwd or None
+    # --cwd is a daemon flag: the CLI store is chosen from the directory the process
+    # runs in, so the caller's directory has to be the subprocess's.
+    argv, timeout, where = [binary, "-s", "cli", "json"], TIMEOUT, cwd or None
     try:
         proc = subprocess.run(argv, cwd=where, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
@@ -151,8 +148,7 @@ def mid_turn(state: dict | None) -> bool:
 
     `turn_ended` is the journal's own end-of-turn record, so a five-minute command in
     flight cannot look like an ending — and a session that quit at its prompt cannot look
-    like a death. Only the local CLI store records it; a NAS store says `False` because
-    that build writes none, which is why NAS drops are decided from the marker instead.
+    like a death.
     """
     return bool(state) and state.get("backend") == "cli" and not state.get("turn_ended")
 
@@ -235,21 +231,6 @@ def decide_vanished(state: dict | None) -> tuple[bool, str, str]:
     return True, "the session vanished with nothing left to read", "high"
 
 
-def decide_nas(fb: str, live: bool, _state: dict | None) -> tuple[bool, str, str]:
-    """(drop?, why, priority) for a NAS session the Mac-side watcher saw go.
-
-    `fb` is the host wrapper's marker: `1` alive, `0` stale (its pid is gone, i.e. the ssh
-    or the window was killed under it), `-` no marker at all — which is also what a clean
-    exit looks like, and what a NAS without the hook looks like, so it cannot be called a
-    drop without inventing one.
-    """
-    if fb == "0":
-        return True, "the session was killed — its marker outlived it", "high"
-    if fb == "1" and not live:
-        return True, "the freebuff process disappeared while the session was still up", "high"
-    return False, "the session closed normally", "default"
-
-
 # --------------------------------------------------------------- report and claim
 def sweep_records(max_age: float = 24 * 3600.0) -> None:
     """Drop report files older than a day: one is written per session, and sessions end.
@@ -302,9 +283,9 @@ def write_state(doc: dict) -> None:
 class claim_lock:
     """Serialize decide+claim, so two passes cannot both push for one death.
 
-    The local path is a single post-mortem, but a NAS watcher can be doubled by a stale
-    lock or an upgrade race and every pass would ask at its own phase — the same window
-    `todo-bell.py` guards. Best effort: no lock is not a reason to skip the report.
+    One session is one post-mortem, but a stale lock or an upgrade race can double a
+    pass and each would ask at its own phase — the same window `todo-bell.py` guards.
+    Best effort: no lock is not a reason to skip the report.
     """
 
     def __enter__(self):
@@ -325,10 +306,10 @@ class claim_lock:
         return False
 
 
-def title_of(state: dict | None, where: str, nas: bool) -> str:
-    """`where` is a directory (the session's cwd, or the NAS marker's): name it, not it."""
+def title_of(state: dict | None, where: str) -> str:
+    """`where` is a directory — the session's cwd: name it, not it."""
     project = os.path.basename(str(where or (state or {}).get("cwd") or "").rstrip("/"))
-    kind = "NAS freebuff dropped" if nas else "freebuff dropped"
+    kind = "freebuff dropped"
     return f"{kind} · {project}" if project else kind
 
 
@@ -397,8 +378,8 @@ def log_drop(kind: str, why: str, state: dict | None, err: str) -> None:
 
 
 def report(kind: str, why: str, state: dict | None, err: str, where: str,
-           nas: bool, priority: str, tty: str, print_only: bool) -> None:
-    title = title_of(state, where, nas)
+           priority: str, tty: str, print_only: bool) -> None:
+    title = title_of(state, where)
     body = body_of(why, state, err)
     if print_only:
         print(f"DROP: {why}  [{kind} session {(state or {}).get('session') or '-'}]")
@@ -429,14 +410,14 @@ def local_mode(argv: dict, print_only: bool) -> int:
                 print(f"no drop: already reported this session ({session})")
             return 0
         if print_only:
-            report("local", why, state, argv.get("err"), argv.get("where", ""), False,
+            report("local", why, state, argv.get("err"), argv.get("where", ""),
                    priority, tty, True)
             return EX_DROP
         if key:
             doc = read_state()
             doc.setdefault("claimed", {})[key] = int(time.time() * 1000)
             write_state(doc)
-    report("local", why, state, argv.get("err"), argv.get("where", ""), False,
+    report("local", why, state, argv.get("err"), argv.get("where", ""),
            priority, tty, False)
     return EX_DROP
 
@@ -453,13 +434,13 @@ def vanished_report(argv: dict, print_only: bool, tty: str) -> int:
         if key in (read_state().get("claimed") or {}):
             return 0
         if print_only:
-            report("vanished", why, state, argv.get("err"), argv.get("where", ""), False,
+            report("vanished", why, state, argv.get("err"), argv.get("where", ""),
                    priority, tty, True)
             return EX_DROP
         doc = read_state()
         doc.setdefault("claimed", {})[key] = int(time.time() * 1000)
         write_state(doc)
-    report("vanished", why, state, argv.get("err"), argv.get("where", ""), False,
+    report("vanished", why, state, argv.get("err"), argv.get("where", ""),
            priority, tty, False)
     return EX_DROP
 
@@ -508,11 +489,6 @@ def consume(record: str | None) -> None:
         pass
 
 
-def truthy(value) -> bool:
-    """`--live 0` is a real answer, and `bool("0")` is True — parse it as text."""
-    return str(value).strip().lower() in {"1", "yes", "true", "on"}
-
-
 def pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -523,42 +499,13 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
-def nas_mode(argv: dict, print_only: bool) -> int:
-    state = argv.get("state") or store_snapshot(None, nas=True)
-    tty = argv.get("tty") or "/dev/tty"
-    drop, why, priority = decide_nas(argv.get("fb") or "-", truthy(argv.get("live")), state)
-    if not drop:
-        if print_only:
-            print(f"no drop: {why}")
-        return 0
-    session = (state or {}).get("session") or ""
-    key = f"nas:{session}" if session else None
-    with claim_lock():
-        if key and key in (read_state().get("claimed") or {}):
-            if print_only:
-                print(f"no drop: already reported this session ({session})")
-            return 0
-        if print_only:
-            report("nas", why, state, argv.get("err"), argv.get("where", ""), True,
-                   priority, tty, True)
-            return EX_DROP
-        if key:
-            doc = read_state()
-            doc.setdefault("claimed", {})[key] = int(time.time() * 1000)
-            write_state(doc)
-    report("nas", why, state, argv.get("err"), argv.get("where", ""), True,
-           priority, tty, False)
-    return EX_DROP
-
-
 # -------------------------------------------------------------------- interface
 def parse(argv: list[str]) -> dict:
     out: dict = {"exit": None, "print": False, "tty": "/dev/tty", "grace": GRACE}
-    flags = {"--local": "local", "--nas": "nas"}
+    flags = {"--local": "local"}
     takes_value = {
         "--exit": "exit", "--cwd": "cwd", "--stderr-log": "errlog", "--shell-pid": "shell_pid",
-        "--tty": "tty", "--record": "record", "--grace": "grace", "--fb": "fb",
-        "--live": "live",
+        "--tty": "tty", "--record": "record", "--grace": "grace",
     }
     i = 0
     while i < len(argv):
@@ -599,7 +546,7 @@ def main() -> int:
         return 0
     mode = argv.get("mode")
     if not mode:
-        print("usage: drop-bell.py --local|--watch|--nas [...]", file=sys.stderr)
+        print("usage: drop-bell.py --local|--watch [...]", file=sys.stderr)
         return 2
 
     sweep_records()
@@ -620,7 +567,8 @@ def main() -> int:
         argv["state"] = store_snapshot(where or None)
         return local_mode(argv, bool(argv["print"]))
 
-    return nas_mode(argv, bool(argv["print"]))
+    print(f"drop-bell.py: unknown mode {mode!r} — --local or --watch", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

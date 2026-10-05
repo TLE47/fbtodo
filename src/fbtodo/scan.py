@@ -133,6 +133,24 @@ def _record_actions(rec: dict, key) -> list:
     return list(reversed(out))
 
 
+def goal_line(text: str):
+    """The first `Goal:` line in a block of the agent's prose, cleaned — or None.
+
+    AGENTS.md asks every task to open with `Goal: …`, and the agent's own words are the one
+    place a goal the *agent* chose can come from; a request next to it is the user's
+    wording, typos and all. Shared by the CLI journal (`_record_goal`, reading
+    `fullResponse`) and the desktop app's live history (`harness_state`), which keep the
+    same prose in different shapes.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    for line in text.splitlines():
+        match = GOAL_LINE_RE.match(line)
+        if match:
+            return " ".join(match.group(1).split()).strip(" *_`") or None
+    return None
+
+
 def _record_goal(rec: dict):
     """The agent's own one-line objective, if this record states one.
 
@@ -144,14 +162,7 @@ def _record_goal(rec: dict):
     data = rec.get("data")
     if not isinstance(data, dict):
         return None
-    text = data.get("fullResponse")
-    if not isinstance(text, str) or not text:
-        return None
-    for line in text.splitlines():
-        match = GOAL_LINE_RE.match(line)
-        if match:
-            return " ".join(match.group(1).split()).strip(" *_`") or None
-    return None
+    return goal_line(data.get("fullResponse"))
 
 
 def prose_text(line: str) -> str:
@@ -271,6 +282,60 @@ def _newest(entries):
         if best is None or key > best[0]:
             best = (key, text)
     return best
+
+
+def _goal_choice(goals, prompts, hit_key):
+    """The `(position, text)` of the heading that belongs to the list at `hit_key`, or None.
+
+    In plain words: which heading goes with which list is a question about TURNS, and a turn
+    is bracketed by its prompt — prose and tool calls are separate iterations, so a turn's
+    heading can be written AFTER the list it belongs to. Hence three positions, tried in
+    order: a heading at or before the list (the ordinary same-turn case), a heading before
+    the newest request when the list has no heading of its own (the agent stated it as the
+    turn opened), and — only when no request came after the list — a heading after it. No
+    list at all means the newest heading is the statement of what is going on. Split out of
+    `pick_goal` so the staleness rule below can read the heading's POSITION as well as its
+    words.
+    """
+    if hit_key is None:
+        return _newest(goals)
+    newer = [(k, t) for k, t in prompts if k > hit_key]
+    asked = _newest(prompts)
+    return (
+        _newest((k, t) for k, t in goals if k <= hit_key)
+        or _newest((k, t) for k, t in goals if asked and k < asked[0])
+        or (_newest((k, t) for k, t in goals if k > hit_key) if not newer else None)
+    )
+
+
+def pick_goal(goals, prompts, hit_key) -> str | None:
+    """The agent's `Goal:` heading that belongs to the list at `hit_key` — or None.
+
+    `goals` and `prompts` are `(position, text)` pairs in history order; the positions order
+    the same way in the journal and in the app's live history, so this reads identically for
+    both, which is the whole reason it is here rather than written twice.
+    """
+    stated = _goal_choice(goals, prompts, hit_key)
+    return stated[1] if stated else None
+
+
+def goal_stale_at(goals, prompts, hit_key) -> bool:
+    """Is the heading in hand left over from an EARLIER turn than the list it heads?
+
+    In plain words: a heading belongs to the turn that wrote it, and a turn is bracketed by
+    its request — so the heading is the shown list's own only when it is not older than the
+    request that opened that list's turn. A heading written before that request belongs to an
+    earlier turn, and a pane drawing it over this list would be heading the work with the last
+    turn's objective. The request that opened the shown list's turn is the newest one at or
+    before `hit_key`; with no such request (or no list) there is nothing to prove, so this is
+    False rather than a guess. Shared by the CLI journal and the app's live history so a stale
+    heading is reported the same way by both.
+    """
+    stated = _goal_choice(goals, prompts, hit_key)
+    if not stated or hit_key is None:
+        return False
+    opened = _newest((k, t) for k, t in prompts if k <= hit_key)
+    return bool(opened) and stated[0] < opened[0]
 
 
 # In plain words: one block of the agent's transcript, read newest line first. Most lines
@@ -466,7 +531,7 @@ def scan_live_log(chat_dir: str) -> dict:
     """
     path = os.path.join(chat_dir, "log.jsonl")
     thread = os.path.basename(chat_dir.rstrip("/"))
-    scan = {"hit": None, "goal": None, "goal_source": None, "now": None,
+    scan = {"hit": None, "goal": None, "goal_source": None, "goal_stale": False, "now": None,
             "turn_ended": False, "summary": None, "observed": [], "turn": {}}
     try:
         st = os.stat(path)
@@ -600,23 +665,17 @@ def scan_live_log(chat_dir: str) -> dict:
         #
         # Which line belongs to which list is a question about TURNS, and a turn is
         # bracketed by its prompt: prose and tool calls are separate iterations, so the
-        # heading of a turn can be written after the list it belongs to. Hence the three
-        # positions below — before the list, before the newest request (same turn as the
-        # list), or nowhere yet.
+        # heading of a turn can be written after the list it belongs to. That choice is
+        # `pick_goal`'s, shared with the desktop app's live history so the two readers of
+        # agent prose cannot answer it differently.
         asked = _newest(prompts)
-        if hit_key is None:
-            # No list yet: the newest statement of what is going on is the heading.
-            stated = _newest(goals)
-            scan["goal"] = stated[1] if stated else None
-        else:
-            stated = (
-                _newest((k, t) for k, t in goals if k <= hit_key)
-                or _newest((k, t) for k, t in goals if asked and k < asked[0])
-                or (_newest((k, t) for k, t in goals if k > hit_key) if not newer else None)
-            )
-            scan["goal"] = stated[1] if stated else None
+        scan["goal"] = pick_goal(goals, prompts, hit_key)
         if scan["goal"]:
             scan["goal_source"] = "agent"
+            # ...and whether that heading is left over from an earlier turn than the list
+            # it heads — the same rule the desktop source applies, so a stale heading is
+            # reported identically by both (see `goal_stale_at`).
+            scan["goal_stale"] = goal_stale_at(goals, prompts, hit_key)
         # "Since" compares against the newest REQUEST: a heading written after it is the
         # agent's line for that request, which reads the same way the heading does and so
         # beats the raw prompt. A line written before it belongs to the previous turn.
@@ -666,6 +725,88 @@ def scan_live_log(chat_dir: str) -> dict:
         fh.close()
 
 
+# How much of a journal's end the LIVENESS read looks at: the agent's newest records are
+# within a few lines of the file's end, so a bounded tail is enough to name them, and a
+# liveness question is asked on every poll of every `auto` pane.
+LIVE_TAIL_BYTES = 256 * 1024
+
+
+# What marks a record as the AGENT's rather than the app's: the turn boundary (`prompt` on
+# the request that opened a turn, `shouldEndTurn` on every iteration), its prose
+# (`fullResponse`) and its tool calls. The desktop app appends its own records to the same
+# journal — `cli.feedback_button_hovered`, a note saved, a tab closed — and those carry
+# none of these, which is the whole point of asking.
+AGENT_RECORD_NEEDLES = (b'"shouldEndTurn"', b'"prompt"', b'"fullResponse"', b'"toolCalls"')
+
+_LIVE_CACHE: dict = {}
+
+
+def journal_liveness(chat_dir: str) -> tuple:
+    """`(agent_ms, ended)` — when the AGENT last wrote to this journal, and whether it stopped.
+
+    Not the file's mtime, which is what liveness used to be judged by: the desktop app appends
+    its own records to the same journal (`cli.feedback_button_hovered`, a note saved, a tab
+    closed), so a chat whose turn ended at 11:20 read as "just written" at 12:04 and `auto` kept
+    answering a live desktop thread with that finished list, frozen (measured 2026-10-04: an
+    `ALL DONE` 6/6 pane under a thread working in the app, unchanged across two tabs). Only the
+    agent's own records are read, newest first, and the first turn boundary among them decides:
+
+    * a `shouldEndTurn: true` record is the agent saying it has finished and is waiting for
+      you, so `ended` is True — not the session WORKING here, whatever else has touched the
+      file since;
+    * a `prompt` record opens a turn, so a bare `continue` puts the session back to work with
+      no clock involved at all.
+
+    A tail with no boundary in it (a journal longer than the tail, or one holding nothing but
+    prose) is not a guess: `ended` is False and the newest agent record still answers, so an
+    unusual journal falls back to the quiet window as it always did.
+    """
+    path = os.path.join(chat_dir, "log.jsonl")
+    try:
+        st = os.stat(path)
+        key = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+        cached = _LIVE_CACHE.get(path)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        with open(path, "rb") as fh:
+            start = max(0, st.st_size - LIVE_TAIL_BYTES)
+            fh.seek(start)
+            blob = fh.read()
+    except OSError:
+        return (None, False)
+    agent_ms = None
+    # Newest first, and the first boundary found is the answer — the walk stops there rather
+    # than reading the tail to its end, so this costs a handful of lines on a live journal.
+    lines = blob.split(b"\n")
+    if start > 0:
+        lines = lines[1:]  # the first line here began before the window and is half a record
+    for raw in reversed(lines):
+        if not raw.strip() or not any(n in raw for n in AGENT_RECORD_NEEDLES):
+            continue
+        try:
+            rec = json.loads(raw.decode("utf-8", "replace"))
+        except Exception:
+            continue
+        data = rec.get("data")
+        if not isinstance(data, dict):
+            continue
+        ts = _iso_ms(rec.get("timestamp"))
+        agent_ms = ts if ts else agent_ms
+        ended = data.get("shouldEndTurn")
+        if isinstance(ended, bool):
+            answer = (agent_ms, ended)
+            break
+        if isinstance(data.get("prompt"), str) and data["prompt"].strip():
+            answer = (agent_ms, False)   # a new request: working again
+            break
+    else:
+        answer = (agent_ms, False)
+    if len(_LIVE_CACHE) > 8:  # a long-lived pane that keeps switching sessions
+        _LIVE_CACHE.clear()
+    _LIVE_CACHE[path] = (key, answer)
+    return answer
+
+
 def read_cli(chat_dir: str) -> dict:
     scan = scan_live_log(chat_dir)
     state = scan.get("hit")
@@ -690,6 +831,12 @@ def read_cli(chat_dir: str) -> dict:
     # and `json`, never rendered as a goal (a quote is the phrasing, not the objective).
     state["goal"] = scan.get("goal")
     state["goal_source"] = scan.get("goal_source") if state["goal"] else None
+    # The heading can be left over from an earlier turn than the list it heads (see
+    # `goal_stale_at`); carried on the state so the pane can badge it rather than head this
+    # list with the previous turn's objective. The key rides WITH the goal: no heading, no
+    # staleness, and no field — the same shape the desktop source keeps.
+    if state["goal"] and scan.get("goal_stale"):
+        state["goal_stale"] = True
     # Has the agent finished this turn (and is it therefore waiting for you)? Read from the
     # same backward pass; the bell rings on "all todos done AND turn ended", so a long
     # command that merely leaves the journal quiet never rings it.
@@ -717,6 +864,8 @@ __all__ = [
     "ACTION_SCAN_KEEP", "FILE_KEEP", "EDIT_VERBS", "TURN_CHASE_CHUNKS", "QUIET_MS",
     "_action_what", "_record_actions", "_record_goal", "prose_text", "_record_summary",
     "_record_prompt", "_record_turn", "is_nudge", "pick_prompt", "_newest", "_turn_extend",
+    "goal_line", "pick_goal", "goal_stale_at",
     "journal_scan", "_SCAN_CACHE", "_SCAN_HITS", "_SCAN_PARSED", "_SCAN_REUSED",
-    "CACHED_CHUNKS", "scan_live_log", "read_cli",
+    "CACHED_CHUNKS", "scan_live_log", "read_cli", "journal_liveness",
+    "LIVE_TAIL_BYTES", "AGENT_RECORD_NEEDLES",
 ]

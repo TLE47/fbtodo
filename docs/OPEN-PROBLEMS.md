@@ -7,9 +7,11 @@ measurement that shows it, what it costs today, and the directions a fix could t
 
 ## 1. The desktop app's todo list is only readable at turn boundaries
 
-**Status:** open · measured 2026-09-30 on Freebuff Desktop, fbtodo 4.29.0 · the local API
-re-measured 2026-10-01 (fbtodo 4.30.2): **direction 1 is answered, and the answer is no** —
-see *Ruled out: no LOCAL channel either*
+**Status:** **addressed 2026-10-03 (fbtodo 4.30.x)** · measured 2026-09-30 on Freebuff Desktop,
+fbtodo 4.29.0 · the local API re-measured 2026-10-01 (fbtodo 4.30.2): **direction 1 is
+answered, and the answer is no** — see *Ruled out: no LOCAL channel either*. The transcript
+really is deferred, but the in-flight list was in the store's OTHER column all along:
+`threads.harness_state` — see *Shipped: the list was in `harness_state`*, below.
 **Affects:** `-s desktop` (and therefore the tail of `-s auto`, which asks `cli` first)
 
 ### Symptom
@@ -63,6 +65,37 @@ Streaming a partial assistant message would mean either rewriting a growing mult
 index and the transcript observe half-finished turns. Committing once at settle keeps every
 message row immutable and complete. The app's own live signal (`turn_state`, `turn_alive_at`)
 lives on the `threads` row, which *does* move mid-turn.
+
+### Shipped: the list was in `harness_state` (2026-10-03)
+
+The transcript is not the whole store. `threads.harness_state` is a JSON blob the app rewrites
+as the agent works, and `sessionState.mainAgentState.messageHistory` inside it holds the tool
+calls **as they are made** — `write_todos` among them — before any of them is committed as a
+`messages` row. Measured while a turn was running: the newest `write_todos` in that history was
+the live list (a step ticked off seconds earlier), and its `sentAt` is the call's own clock.
+
+So no channel was needed, only another column. `-s desktop` now reads it
+(`desktop.harness_turn`), with SQLite's own `json_each` walk so a blob that grows with the whole
+session is never materialized in Python. Three rules keep it the CURRENT list: read only while
+the turn is running, only when the list was written at or after the turn's own start
+(`last_prompt_at`), and only when it is not older than what is committed. The turn's start also
+rides on the state, so `finish_state` drops a **finished** previous list — the pane says
+`last turn's list is done — waiting for this turn's list` rather than showing steps already
+over. `turn_running` and `turn` are carried on the observation now too, so the `turn running`
+sentence from direction 2 actually reaches the renderers it was written for.
+
+The same history also carries the **requests**: every user message the app tagged
+`USER_PROMPT` (compaction summaries and tool-error injections are tagged otherwise and stay
+out). `desktop._now_and_nudge` reads them with the CLI journal's own `is_nudge` / `pick_prompt`
+/ `_newest`, so a running desktop turn shows `now`/`nudge` for a request newer than the list —
+the same line a CLI pane shows — and a `Goal:` heading written for that request wins the slot.
+
+The agent's own `Goal:` heading for the list is read from the same `harness_state` text parts
+(`goal_line`) and matched to its list by `pick_goal`, the CLI journal's own rule factored out
+and shared, so a mid-turn desktop pane is headed exactly as a CLI pane would be — `goal` and
+`goal_source` now ride on the desktop observation. `turn.verbs`/`turn.files` (the counts in
+`turn 8m · 106 iterations · 4 files edited`) are still the journal's; a desktop turn line
+names its age only.
 
 ### Ruled out: no LOCAL channel either — the door a bridge would use is closed on purpose
 
@@ -140,6 +173,9 @@ cloud, not for a local reader.
    *"turn running · no list yet"* instead of `no write_todos call yet in this session` — which
    read as "the agent forgot" when it actually meant "the store has not committed yet". A
    stale heartbeat is a turn that died rather than one in flight, so it is not called running.
+   **Extended 2026-10-03:** the signal now leads to the list itself — the newest in-flight
+   `write_todos` from `harness_state`, on the state as this turn's list, so a running desktop
+   turn shows what the CLI shows (see *Shipped: the list was in `harness_state`*).
 3. **Ask for the change upstream — the only fix left that needs code.** Have the app append
    tool-call parts as they happen (or write the assistant row at turn start and update it).
    This needs the app's storage layer, which is not in this repo. Two smaller things are now
@@ -179,12 +215,11 @@ cloud, not for a local reader.
    separate one.
 
    Caveat: on a store read per turn this is only detectable *at* the boundary — it cannot warn
-   mid-turn. That is fine: the boundary is exactly where the bell makes its decision. The NAS
-   records no `shouldEndTurn` and no tool inputs (`docs/INTERNALS.md:134` says `files` is empty
-   there), so a guard on that source would have to lean on `verbs` plus the quiet-window rule
-   the bell already uses. The desktop store does carry inputs — fbtodo already extracts
-   `$.input.todos` from `parts_json` — so both halves are available on the source this guard is
-   for.
+   mid-turn. That is fine: the boundary is exactly where the bell makes its decision. The
+   desktop store records no `shouldEndTurn`, so a guard on that source would have to lean on
+   `verbs` plus the quiet-window rule the bell already uses. It does carry inputs — fbtodo
+   already extracts `$.input.todos` from `parts_json` — so both halves are available on the
+   source this guard is for.
 
 ### To verify a fix
 

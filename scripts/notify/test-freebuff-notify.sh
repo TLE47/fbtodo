@@ -617,7 +617,7 @@ DONE='{"backend":"cli","session":"s1","list_id":"L1","done":3,"total":3,"turn_en
 BUSY="{\"backend\":\"cli\",\"session\":\"s1\",\"list_id\":\"L1\",\"done\":3,\"total\":3,\"turn_ended\":false}"
 MID='{"backend":"cli","session":"s1","list_id":"L1","done":2,"total":3,"turn_ended":true}'
 NOLIST='{"backend":"cli","session":"s1","list_id":"x","done":0,"total":0,"turn_ended":true}'
-NAS='{"backend":"nas","session":"s1","list_id":"L1","done":3,"total":3,"turn_ended":true}'
+DESKTOP='{"backend":"desktop","session":"s1","list_id":"L1","done":3,"total":3,"turn_ended":true}'
 
 tb_clear
 tb_state "$DONE"
@@ -657,9 +657,9 @@ tb_state "$NOLIST"
 tb_run_silent
 check "silent before there is a list" "$(tb_plays)" "2"
 
-tb_state "$NAS"
+tb_state "$DESKTOP"
 tb_run_silent
-check "silent for a NAS session (no journal to ask)" "$(tb_plays)" "2"
+check "silent for a store that writes no journal to ask" "$(tb_plays)" "2"
 
 tb_clear
 echo off >"$TB/home/.config/freebuff-notify/state"
@@ -676,7 +676,7 @@ tb_state ''
 tb_run >/dev/null
 check "an unreadable state is silent, not an error" "$?" "0"
 tb_state "$DONE"
-check_match "a NAS-shaped state is asked about locally, never invented" \
+check_match "an unreadable state is asked about, never invented" \
   "$(tb_run --print)" '^(RING|silent):'
 
 before=$(tb_plays)
@@ -697,7 +697,7 @@ check "and the tab title kept its clock meanwhile" \
   "$(titles "$TB/timer.log" | tail -1 | grep -cE '^⏱ freebuff [0-9]+s$')" "1"
 
 echo
-echo "== the phone push: the bell's question, answered for the NAS too =="
+echo "== the phone push: the same question the bell asks =="
 PB="$SANDBOX/phone"
 mkdir -p "$PB/bin" "$PB/notify" "$PB/home"
 cp "$HERE/todo-bell.py" "$HERE/bell.sh" "$PB/notify/"
@@ -705,7 +705,7 @@ chmod +x "$PB/notify/todo-bell.py" "$PB/notify/bell.sh"
 # A sender that records what it was asked to send: the DECISION is what is under test
 # here (phone.sh's own mechanics get their own block below).
 # A stand-in for phone.sh: --print answers the readiness question (the notifier asks it
-# before following a NAS session), and anything else is recorded as ONE line — the body
+# before sending), and anything else is recorded as ONE line — the body
 # carries a newline (goal, then count), so it is flattened: lines = pushes.
 printf '#!/bin/sh\ncase "$*" in *--print*) printf "url=stub topic=set token= enabled=on\\n"; exit 0;; esac\nprintf "%%s\\n" "$*" | tr "\\n" "~" >>"%s"\nprintf "\\n" >>"%s"\n' \
   "$PB/sends.log" "$PB/sends.log" >"$PB/notify/phone.sh"
@@ -736,9 +736,6 @@ NOW=$(date +%s)
 PDONE='{"backend":"cli","cwd":"/Users/x/proj","session":"s1","list_id":"P1","done":3,"total":3,"turn_ended":true,"store_mtime_ms":1000,"goal":"make the push land"}'
 PBUSY='{"backend":"cli","session":"s1","list_id":"P1","done":3,"total":3,"turn_ended":false,"store_mtime_ms":1000}'
 PMID='{"backend":"cli","session":"s1","list_id":"P1","done":2,"total":3,"turn_ended":true,"store_mtime_ms":1000}'
-PNAS="{\"backend\":\"nas\",\"session\":\"s2\",\"list_id\":\"N1\",\"done\":4,\"total\":4,\"instance_alive\":true,\"store_mtime_ms\":$(((NOW - 600) * 1000)),\"goal\":\"finish the NAS run\"}"
-PNASFRESH="{\"backend\":\"nas\",\"session\":\"s2\",\"list_id\":\"N1\",\"done\":4,\"total\":4,\"instance_alive\":true,\"store_mtime_ms\":$((NOW * 1000))}"
-PNASDEAD="{\"backend\":\"nas\",\"session\":\"s2\",\"list_id\":\"N1\",\"done\":4,\"total\":4,\"instance_alive\":false,\"store_mtime_ms\":$(((NOW - 600) * 1000))}"
 
 pb_run "$PDONE" >/dev/null
 pb_wait 1
@@ -749,8 +746,8 @@ check_match "...with the agent's own words left out by default" \
 pb_run "$PDONE" >/dev/null
 check "a finished list that just sits there pushes once" "$(pb_sends)" "1"
 # The same list with the store moved on is still the SAME list: keying the claim on the
-# mtime as well pushed a live NAS session's finished list every couple of minutes (its
-# transcript is rewritten per turn), which is what gets a topic muted on the phone.
+# mtime as well pushed a finished list every couple of minutes (a journal is rewritten
+# per turn), which is what gets a topic muted on the phone.
 pb_run "${PDONE/1000/2000}" >/dev/null
 check "the same list with the store moved stays silent" "$(pb_sends)" "1"
 pb_run "${PDONE/P1/P2}" >/dev/null
@@ -762,22 +759,6 @@ out=$(pb_run "$PBUSY" --print)
 check "silent through a long command, with every box ticked" "$(pb_sends)" "2"
 check_match "--print names the turn for the push too" "$out" \
   'no push: all 3 done, but the agent has not finished its turn'
-pb_run "$PNASFRESH" >/dev/null
-check "silent while the NAS store is still moving" "$(pb_sends)" "2"
-out=$(pb_run "$PNASFRESH" --print)
-check_match "...and says why" "$out" 'the store is still moving'
-pb_run "$PNAS" >/dev/null
-pb_wait 3
-check "pushes for a NAS session whose list is done and store gone quiet" "$(pb_sends)" "3"
-check_match "the NAS push carries its metadata" "$(tail -1 "$PB/sends.log")" '4/4 steps done'
-check_match "...and not its prose" \
-  "$(printf %s "$(tail -1 "$PB/sends.log")" | grep -c 'finish the NAS run' || true)" '^0$'
-pb_run "$PNAS" >/dev/null
-check "and not twice for the same quiet store" "$(pb_sends)" "3"
-pb_run "$PNASDEAD" >/dev/null
-check "silent when the NAS session is gone" "$(pb_sends)" "3"
-out=$(pb_run "$PNASDEAD" --print)
-check_match "...and says so" "$out" 'no NAS session is running'
 # A fresh record on purpose: P1 was pushed earlier in this block, and the claim now
 # remembers every list it has pushed (that memory is the fix), so reusing P1 here would
 # probe the repeat branch instead of the wording this check is about.
@@ -785,24 +766,6 @@ rm -f "$PB/sends.log" "$PB/bell.json"
 out=$(pb_run "$PDONE" --print)
 check "report-only pushes nothing" "$(pb_sends)" "0"
 check_match "report-only says PUSH and why" "$out" '^PUSH: all 3 todos done and the turn ended'
-
-# Two NAS watchers can be alive at once (a stale lock, an upgrade race) and ask at
-# their own phase: the second must see the first's claim rather than send again.
-printf '%s\n' "$PNAS" >"$PB/state.json"
-rm -f "$PB/sends.log" "$PB/bell.json" "$PB/bell.json.lock"
-for _ in 1 2; do
-  PATH="$PB/bin:$PATH" HOME="$PB/home" FREEBUFF_BELL=off \
-    FREEBUFF_TODO_BELL_STATE="$PB/bell.json" FREEBUFF_PHONE_SH="$PB/notify/phone.sh" \
-    python3 "$PB/notify/todo-bell.py" --nas-watch --once --quiet &
-done
-wait
-pb_wait 1
-check "two racing passes push once" "$(pb_sends)" "1"
-PATH="$PB/bin:$PATH" HOME="$PB/home" FREEBUFF_BELL=off \
-  FREEBUFF_TODO_BELL_STATE="$PB/bell.json" FREEBUFF_PHONE_SH="$PB/notify/phone.sh" \
-  python3 "$PB/notify/todo-bell.py" --nas-watch --once --quiet >/dev/null 2>&1
-wait_for_change 1 pb_sends 1
-check "and a later pass stays silent for the same finish" "$(pb_sends)" "1"
 
 # The same race on the LOCAL path, which is the one the timer drives every 5s and the one
 # that had no lock at all. One shell can carry two timers (the wrapper kills its timer when
@@ -826,19 +789,20 @@ PATH="$PB/bin:$PATH" HOME="$PB/home" TZ=UTC FREEBUFF_BELL=off \
 wait_for_change 1 pb_sends 1
 check "and a later local pass stays silent for the same finish" "$(pb_sends)" "1"
 
-# THE BUG THIS PINS: the claim was ONE slot, so the NAS watcher and a local session
+# THE BUG THIS PINS: the claim was ONE slot, so two sessions
 # overwrote each other's — and then each pushed again on every pass, which is the
 # "freebuff done" landing every ~15s until the thread gets muted. Two instances must
 # each hold their own claim, however often the other one asks.
+PMID2="{\"backend\":\"cli\",\"cwd\":\"/Users/y/other\",\"session\":\"s9\",\"list_id\":\"P9\",\"done\":2,\"total\":2,\"turn_ended\":true,\"store_mtime_ms\":1000,\"goal\":\"tidy the settings panel\"}"
 rm -f "$PB/sends.log" "$PB/bell.json"
 pb_run "$PDONE" >/dev/null
-pb_run "$PNAS" --nas-watch --once >/dev/null
+pb_run "$PMID2" >/dev/null
 pb_wait 2
 check "two instances push once each" "$(pb_sends)" "2"
 check_match "the claims live in a map, not one shared slot" "$(cat "$PB/bell.json")" '"pushed"'
-pb_run "$PNAS" --nas-watch --once >/dev/null
+pb_run "$PMID2" >/dev/null
 pb_run "$PDONE" >/dev/null
-pb_run "$PNAS" --nas-watch --once >/dev/null
+pb_run "$PMID2" >/dev/null
 pb_run "$PDONE" >/dev/null
 check "and alternating passes do not resurrect either claim" "$(pb_sends)" "2"
 
@@ -899,18 +863,13 @@ pb_wait 1
 check_match "...and off by default that request is not sent either" \
   "$(printf %s "$(tail -1 "$PB/sends.log")" | grep -c 'why is the bell silent' || true)" '^0$'
 
-PNASRUN="{\"backend\":\"nas\",\"session\":\"/srv/app/state/manicode/projects/chats/2026-09-21T21-49-13.448Z\",\"list_id\":\"N9\",\"done\":2,\"total\":2,\"instance_alive\":true,\"store_mtime_ms\":$(((NOW - 600) * 1000)),\"goal\":\"tidy the settings panel\"}"
-rm -f "$PB/sends.log"
-pb_run "$PNASRUN" --nas-watch --once >/dev/null
+# A push from a session in ANOTHER directory names that project, so two machines' worth
+# of projects cannot be read as one run in the phone's history.
+rm -f "$PB/sends.log" "$PB/bell.json"
+pb_run "$PMID2" >/dev/null
 pb_wait 1
-check_match "a NAS push names the run, not just the clock" "$(tail -1 "$PB/sends.log")" \
-  'NAS freebuff done · run 21:49:13'
-
-# the NAS watcher asks the notifier on its own clock
-out=$(PATH="$PB/bin:$PATH" HOME="$PB/home" FREEBUFF_BELL=off \
-  FREEBUFF_TODO_BELL_STATE="$PB/bell.json" FREEBUFF_PHONE_SH="$PB/notify/phone.sh" \
-  python3 "$PB/notify/todo-bell.py" --nas-watch --once --print 2>&1)
-check_match "--nas-watch answers for the NAS store" "$out" '^(PUSH|no push):'
+check_match "a push names the project it came from" "$(tail -1 "$PB/sends.log")" \
+  'freebuff done · other'
 
 echo
 echo "== phone.sh: the topic never reaches argv, and failures stay bounded =="
@@ -1304,31 +1263,6 @@ check_match "...naming the death, not the store" "$(tail -1 "$DW/sends.log")" 't
 check "and kept on disk with it" "$(grep -c 'drop vanished session=s1' "$DW/watch.log")" "1"
 
 echo
-echo "== the drop watch on the NAS: a marker that outlived its session =="
-# The marker is the witness: `fb` removes it on the way out, so a marker whose pid is
-# gone was left by a session that was killed (an ssh or a window going away). No marker
-# at all is what a clean exit looks like — and what a NAS without the hook looks like —
-# so it is not called a drop.
-DDONE2=$(printf '%s' "$DDONE" | sed 's/"s1"/"s2"/')
-out=$(dw_run "$DDONE" --nas --fb - --live 0 --print)
-check "a NAS session that closed normally is not a drop" "$?" "0"
-check_match "...and says so" "$out" 'no drop: the session closed normally'
-n=$(dw_sends)
-dw_run "$DDONE" --nas --fb 0 --live 0 --cwd /srv/app >/dev/null
-rc=$?
-check "a marker whose pid is gone is a drop" "$rc" "10"
-dw_wait dw_sends "$((n + 1))"
-check_match "pushed as a NAS session" "$(tail -1 "$DW/sends.log")" 'NAS freebuff dropped · app'
-check_match "...carrying the far store's goal" "$(tail -1 "$DW/sends.log")" 'ship the drop watch'
-check "...once" "$(dw_sends)" "$((n + 1))"
-out=$(dw_run "$DDONE" --nas --fb 0 --live 0 --print)
-check_match "a second look at that death is silent" "$out" 'already reported'
-n=$(dw_sends)
-dw_run "$DDONE2" --nas --fb 1 --live 0 >/dev/null
-dw_wait dw_sends "$((n + 1))"
-check "a CLI that went while its session was still up is a drop too" "$(dw_sends)" "$((n + 1))"
-check_match "...named for what vanished" "$(tail -1 "$DW/sends.log")" 'freebuff process disappeared'
-
 echo
 echo "== the drop note: its own voice, and still the one off switch =="
 DH="$SANDBOX/dropsound"
@@ -1391,7 +1325,7 @@ echo "== the ask watch: the pane is the only place a pending question is visible
 # The journal cannot answer this one — the CLI writes `ask_user` only when the iteration
 # ENDS, i.e. after the answer arrived (measured: one record holding the tool call and its
 # `answers`, `duration` 385767ms). The screen can, and it draws its own title. So the
-# frames below are real captures off a NAS session mid-question, and tmux is a stub: what
+# frames below are real captures off a session mid-question, and tmux is a stub: what
 # is under test is the decision and the once-per-question record, not tmux's own plumbing.
 AB="$SANDBOX/ask-bell"
 mkdir -p "$AB/bin" "$AB/notify" "$AB/home" "$AB/panes"

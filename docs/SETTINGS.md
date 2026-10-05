@@ -6,6 +6,7 @@ Precedence is the usual one: a command-line flag, then the environment, then a f
 |---|---|---|
 | `FBTODO_HOME` | — | one directory for state, locks and logs, overriding the XDG default below |
 | `XDG_STATE_HOME` | `~/.local/state` | state lives in `$XDG_STATE_HOME/fbtodo`; a legacy `~/.freebuff` is moved there once, when no watcher holds it |
+| `FBTODO_FB_MARKER` | `$HOME/.fb-session` | the session marker the watcher reads to find live sessions (the `--fb-marker` default) |
 | `FBTODO_NOTIFY` / `_DROP` / `_ASK` / `_PAUSE` / `_PANE_BELL` | `~/.config/freebuff-notify/*.py` | the five watches |
 | `FBTODO_ASK_SECONDS` / `_PAUSE_SECONDS` / `_PANE_BELL_SECONDS` | 3 / 30 / 60 | their cadences (0 = never) |
 | `FBTODO_PANE_SECONDS` | 3 | how often the keeper looks |
@@ -20,8 +21,24 @@ Precedence is the usual one: a command-line flag, then the environment, then a f
 | `FBTODO_LABEL_FLOOR` | `10` | estimates: a finished span under this many seconds is not evidence — it sets no pace and moves no memory (`0` keeps every span, the pre-4.23.0 behaviour) |
 | `FBTODO_BLEND_WEIGHT` | `0.5` | estimates: how much a *waiting* step's number comes from its wording rather than the list's pace, `0`–`1` (`0` = pace only; `1` = wording only, which drops the pace and mis-sizes the tail) |
 | `FBTODO_GOAL_LINES` | `3` | how many lines the goal heading may take (`0` hides it) |
-| `FREEBUFF_PHONE` | on | `off` / `0` / `false` / `no` / `disabled` mutes the phone, read when a bell sends |
+| `FREEBUFF_PHONE` | on | `off` / `0` / `false` / `no` / `disabled` mutes the phone, read when a bell sends; the notify kit's `phone-state` file, the pane's `m`/`u` keys and `fbtodo mute on|off` write the same word to the same place |
+| `FBTODO_NOTIFY_DIR` | `~/.config/freebuff-notify` | where the pane's mute key and `fbtodo mute` write the kit's two switch files (`phone-state` for `phone.sh`, `state` for `bell.sh`) |
+| `FBTODO_PANE_KEYS` | on | `off` / `0` / `false` / `no` mutes the pane's KEYBOARD: `m`, `M` and `u` stop acting, and a pane opens with the terminal as it found it (`--no-keys` says the same thing) |
 | `FREEBUFF_NO_REFRESH` | — | the `fb` launcher skips its `npm i -g freebuff` round trip |
+
+A pane is handed the settings that decide **where it works and where its bells go**, not left to
+inherit them: tmux starts a pane from its server's environment, so `FBTODO_HOME`, `XDG_STATE_HOME`,
+`FBTODO_TMUX`, `FBTODO_FB_MARKER` and the six watch paths (`FBTODO_NOTIFY`, `_DROP`, `_ASK`,
+`_PAUSE`, `_PANE_BELL`, `_LOCKS_BELL`) are written into the pane's own command line — beside the
+pinned interpreter and `PATH` — by both `pane_command` and the `fb` launcher. Each rides only
+when it is set, and because the value is in the command string a `tmux respawn-pane` (or the
+keeper's repair) brings it back rather than the server's. Without that, a server started before
+the owner exported one of them would leave the pane reading another state root, following another
+set of sessions, or ringing the default bells instead of the ones this machine installed. A pane
+whose recorded command is an **older pin** — one of these keys missing or carrying an old value —
+is upgraded by the keeper on the next pass, so an answer the build no longer writes does not
+outlive it; only the carried values are compared, so an `fb` pane on `--instance-of` that names
+all of them is left alone.
 
 Pane repair has a per-pane switch that is not an environment variable, because the pane is
 the scope: the tmux user option **`@fbtodo_repair`** turns the keeper's automatic respawn of a

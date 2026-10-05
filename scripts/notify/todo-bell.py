@@ -17,26 +17,20 @@ One ring per list: the list's fingerprint is remembered, so a finished list that
 screen does not ring again, while a new list (or the same one reopened) can.
 
 The same decision, sent to the phone (phone.sh → ntfy), covers the case the bell cannot:
-you are not at the Mac. A NAS session has no end-of-turn record to ask (that build
-writes tool NAMES, never inputs, and no shouldEndTurn), so there the honest test is
-"the list is complete and the store has stopped moving" — the store is written every
-few seconds while the agent works.
+you are not at the Mac.
 
 The push is remembered against the list, in a map keyed by its fingerprint. That was a
-single slot before, which silently assumed ONE session per Mac: the NAS watcher and a
-local session overwrote each other's claim, so on every poll each decided the other had
-never pushed — the phone got the same "done" every ~15s until the thread was muted. The
-fingerprint includes the session, so two instances cannot collide in the map.
+single slot before, which silently assumed ONE session per Mac: two sessions overwrote each
+other's claim, so on every poll each decided the other had never pushed — the phone got the
+same "done" every ~15s until the thread was muted. The fingerprint includes the session, so
+two instances cannot collide in the map.
 
 usage: todo-bell.py <shell-pid> [--print] [--tty PATH]
-       todo-bell.py --nas-watch [--once] [--print]   follow a NAS session (started by
-                                                     `fbtodo nas -f`), exiting with it
        --print  decide and report, play/send nothing (also says WHY it stayed silent)
 
 Environment: FREEBUFF_TODO_BELL_STATE overrides the one-ring-per-list record (tests);
 FREEBUFF_BELL=off mutes the chime (bell.sh); FREEBUFF_PHONE=off mutes the push
-(phone.sh); FREEBUFF_PHONE_NAS_QUIET (45s) and FREEBUFF_PHONE_NAS_POLL (10s) tune the
-NAS side; FREEBUFF_PHONE_SH points at a different sender (tests).
+(phone.sh); FREEBUFF_PHONE_SH points at a different sender (tests).
 """
 
 from __future__ import annotations
@@ -76,8 +70,6 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-NAS_QUIET = _env_float("FREEBUFF_PHONE_NAS_QUIET", 45.0)
-NAS_POLL = _env_float("FREEBUFF_PHONE_NAS_POLL", 10.0)
 
 
 def fbtodo_binary() -> str | None:
@@ -149,19 +141,12 @@ def remember(doc: dict, kind: str, list_id: str | None) -> None:
     doc[kind] = got
 
 
-def snapshot(root: int, source: str | None = None) -> dict | None:
-    """The list for the session that belongs to this shell, or the NAS one.
-
-    `source="nas"` asks `fbtodo -s nas json`, which follows the live session on the
-    NAS (and is mtime-skipped on the far side: an unchanged transcript costs one ssh,
-    no parse).
-    """
+def snapshot(root: int) -> dict | None:
+    """The list for the session that belongs to this shell."""
     binary = fbtodo_binary()
     if not binary:
         return None
-    if source == "nas":
-        argv = [binary, "-s", "nas", "json"]
-    elif root:
+    if root:
         argv = [binary, "--instance-of", str(root), "json"]
     else:
         return None
@@ -208,19 +193,15 @@ def decide(state: dict, doc: dict) -> tuple[bool, str]:
     return True, f"all {total} todos done and the turn ended"
 
 
-def phone_decide(state: dict, doc: dict, now_ms: int | None = None) -> tuple[bool, str]:
-    """(push?, why) — the same question as the bell's, answered for both backends.
+def phone_decide(state: dict, doc: dict) -> tuple[bool, str]:
+    """(push?, why) — the same question as the bell's, and the same answer.
 
-    Local: exactly the bell's rule (every todo done AND the turn ended). NAS: the list
-    is complete AND the store has been quiet for `NAS_QUIET` seconds, since that build
-    records no end of turn. Either way the push is remembered against the LIST: one per
+    Every todo done AND the turn ended. The push is remembered against the LIST: one per
     list, the bell's own rule. It used to also require the store's mtime to have moved,
-    which on a live NAS session rewrote the transcript every turn and pushed the SAME
-    finished list every couple of minutes — the kind of repeat that gets a topic muted,
-    or a thread collapsed and never looked at. A new turn writes a new list, and that
-    pushes.
+    which on a live session rewrote the transcript every turn and pushed the SAME finished
+    list every couple of minutes — the kind of repeat that gets a topic muted, or a thread
+    collapsed and never looked at. A new turn writes a new list, and that pushes.
     """
-    backend = state.get("backend") or ""
     total = int(state.get("total") or 0)
     done = int(state.get("done") or 0)
     if not total:
@@ -230,48 +211,18 @@ def phone_decide(state: dict, doc: dict, now_ms: int | None = None) -> tuple[boo
     list_id = state.get("list_id")
     if not list_id:
         return False, "list has no identity to push once for"
-    mtime = int(state.get("store_mtime_ms") or 0)
-    if backend == "nas":
-        if not state.get("instance_alive"):
-            return False, "no NAS session is running"
-        if not mtime:
-            return False, "no store activity to time the quiet window from"
-        quiet = (int(now_ms or time.time() * 1000) - mtime) / 1000.0
-        if quiet < NAS_QUIET:
-            return False, f"the store is still moving ({quiet:.0f}s quiet, needs {NAS_QUIET:.0f}s)"
-        why = f"all {total} todos done and the store quiet {quiet:.0f}s"
-    else:
-        if not state.get("turn_ended"):
-            return False, f"all {total} done, but the agent has not finished its turn"
-        if state.get("files_unlisted"):
-            return False, f"all {total} done, but {unlisted_files(state)} changed after the list"
-        why = f"all {total} todos done and the turn ended"
+    if not state.get("turn_ended"):
+        return False, f"all {total} done, but the agent has not finished its turn"
+    if state.get("files_unlisted"):
+        return False, f"all {total} done, but {unlisted_files(state)} changed after the list"
     if list_id in claims(doc, "pushed"):
         return False, f"already pushed for this list ({done}/{total})"
-    return True, why
-
-
-def nas_where(path: str) -> str:
-    """Which NAS run this was: `projects/<name>/chats/<thread>`, or the nameless
-    `projects/chats/<thread>` — where the thread's own clock is the honest label."""
-    parts = [p for p in str(path).strip("/").split("/") if p]
-    if "chats" not in parts:
-        return ""
-    i = parts.index("chats")
-    if i >= 1 and parts[i - 1] != "projects":
-        return parts[i - 1]
-    thread = parts[i + 1] if len(parts) > i + 1 else ""
-    if "T" in thread:
-        return thread.split("T", 1)[1][:8].replace("-", ":")
-    return thread
-
-
+    return True, f"all {total} todos done and the turn ended"
 def ended_at(state: dict) -> int:
     """When the run finished, in epoch ms — the store's own last write.
 
-    Not the moment we noticed: for a local session that is the transcript's final append
-    and for the NAS it is the write the quiet window is measured from, so both are the
-    agent stopping rather than the notifier waking up.
+    Not the moment we noticed: that is the transcript's final append, so it is the agent
+    stopping rather than the notifier waking up.
     """
     return int(
         state.get("store_mtime_ms")
@@ -287,18 +238,10 @@ def phone_message(state: dict) -> tuple[str, str]:
 
     The goal is the part worth waking up for; the date and time are what place it (a
     push read hours later is otherwise impossible to date), and the count is the part
-    that says it is over. A NAS store path names the run by its thread clock, which is
-    what a Mac-side title cannot guess — so the body can spend its line on the finish
-    time instead of repeating it.
+    that says it is over.
     """
-    backend = state.get("backend") or ""
-    where = ""
-    if backend == "nas":
-        where = nas_where(state.get("session") or state.get("target") or "")
-        title = f"NAS freebuff done · run {where}" if where else "NAS freebuff done"
-    else:
-        project = os.path.basename((state.get("cwd") or "").rstrip("/"))
-        title = f"freebuff done · {project}" if project else "freebuff done"
+    project = os.path.basename((state.get("cwd") or "").rstrip("/"))
+    title = f"freebuff done · {project}" if project else "freebuff done"
     ended = ended_at(state)
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ended / 1000.0)) if ended else ""
     count = f"{int(state.get('done') or 0)}/{int(state.get('total') or 0)} steps done"
@@ -319,7 +262,7 @@ def phone_message(state: dict) -> tuple[str, str]:
     # What came of it, in the agent's own words: the heading says what the task was FOR,
     # this says what happened and what changed. fbtodo takes the first line of the agent's
     # last answer and keeps it to SUMMARY_MAX_CHARS; the cap here is the phone's, not the
-    # store's, and a store with no prose (a NAS transcript carries none today) simply
+    # store's, and a store with no prose simply
     # contributes no line.
     said = " ".join(str(state.get("summary") or "").split())
     if len(said) > 220:
@@ -366,8 +309,8 @@ def push(state: dict) -> bool:
 class one_pusher:
     """Serialize decide+claim, so two passes cannot both send for the same finish.
 
-    More than one NAS watcher can be running (a stale lock, an upgrade race), and both
-    would ask this script at their own phase. Each asks the store, decides, and only then
+    More than one pass can be in flight (a stale lock, an upgrade race), and both would
+    ask this script at their own phase. Each asks the store, decides, and only then
     records the push — so two passes that overlap in those few milliseconds would both
     send. Holding an exclusive lock across that window makes the second pass re-read the
     claim the first one just wrote, and stay silent. Best effort: no lock available is
@@ -404,58 +347,8 @@ def claim(doc: dict, state: dict) -> dict:
         total=state.get("total"),
     )
     return doc
-
-
-def nas_watch(args: list[str]) -> int:
-    """Follow the NAS session this Mac is driving; push when its list is done and quiet.
-
-    Started by the NAS watcher (`fbtodo nas -f`) for the life of a session and left to
-    exit with it — the same lifetime rule as the pane, but it neither needs the pane nor
-    needs you to be sitting in front of it, which is the whole point of a phone push.
-    """
-    once, print_only = "--once" in args, "--print" in args
-    ready, detail = phone_ready()
-    if not ready:
-        if print_only:
-            print(f"no push: {detail}")
-        return 0 if print_only else 78
-    if print_only:
-        print(f"sender: {detail}")
-    while True:
-        state = snapshot(0, source="nas")
-        if state is None:
-            if print_only:
-                print("no push: fbtodo could not answer for the NAS")
-            if once:
-                return 0
-            time.sleep(NAS_POLL)
-            continue
-        doc = read_state()
-        send, why = phone_decide(state, doc)
-        if print_only:
-            print(f"{'PUSH' if send else 'no push'}: {why}  [session {state.get('session')}]")
-        if send and not print_only:
-            with one_pusher():
-                doc = read_state()  # re-read under the lock: a racing pass may have claimed
-                send, why = phone_decide(state, doc)
-                if send:
-                    write_state(claim(doc, state))
-            if send:
-                push(state)
-        if once:
-            return 0
-        if not state.get("instance_alive"):
-            if print_only:
-                print("the NAS session is gone — notifier exiting")
-            return 0
-        time.sleep(NAS_POLL)
-
-
 def main() -> int:
     argv = sys.argv[1:]
-    if "--nas-watch" in argv:
-        return nas_watch(argv)
-
     root = 0
     for arg in argv:
         if arg.isdigit():
@@ -481,8 +374,8 @@ def main() -> int:
         return 0
 
     if ring or send:
-        # Serialize decide+claim, the way the NAS path below does. The timer asks every
-        # 5s, and one shell can have MORE THAN ONE timer on it: the wrapper kills its
+        # Serialize decide+claim. The timer asks every 5s, and one shell can have
+        # MORE THAN ONE timer on it: the wrapper kills its
         # timer when `command freebuff` returns, but an interrupted launch never gets
         # there, and the timer's own exit condition is the launching shell — which is
         # still alive. Two timers, one finished list, no lock: both ask the store, both

@@ -23,3 +23,8 @@ scripts/notify/*.log
 # Editor / OS noise
 .DS_Store
 *.swp
+
+# Throwaway probes and measurements kept beside the checkout while working. Not source:
+# these are one-off instruments, their output is a pasted screenshot, and they are only
+# meaningful next to the tree they were written against.
+.fb-scratch/

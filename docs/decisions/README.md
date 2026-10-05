@@ -35,7 +35,7 @@ Two processes with two responsibilities must not block each other.
 
 ## The frame is clamped, in both axes
 
-Height: the three early-return frames (the error frame, the no-list NAS frame, the plain strip's
+Height: the three early-return frames (the error frame, the no-list frame, the plain strip's
 no-list branch) skipped the fit-down pass, so a 5-row pane showing a 14-step list produced 9
 rows and scrolled. `_clamp_rows(rows, height, head, tail)` keeps the title row and the
 bar/footer or bottom border and cuts the middle.
@@ -70,11 +70,14 @@ escape sequence, so nothing else is accepted. Anything refused is recorded in `T
 which is *filled in place* (`THEME_PROBLEMS[:] = problems`) because the cached tuple holds that
 same list; rebinding the name left `status` reading an empty one.
 
-## The package is ten modules, one namespace
+## The package is a handful of modules, one namespace
 
-`src/fbtodo/` is split bottom-up — `base`, `locks`, `alerts`, `scan`, `desktop`, `nas`, `tasks`,
-`sources`, `panes`, `render`, and the front door `__init__` — with each module's `__all__` and a
-chain of `from .X import *`. That keeps **one** namespace, so `fbtodo.X` and the suite's patched
+`src/fbtodo/` is split bottom-up — `base`, `locks`, `alerts`, `scan`, `desktop`, `tasks`,
+`sources`, `board`, `panes`, `render`, and the front door `__init__` — with each module's
+`__all__` and a chain of `from .X import *`. The list has grown since the split (the board is
+the newest layer, above `sources` because it reads the same two stores through the same
+readers) and will grow again; the count in [INTERNALS.md](../INTERNALS.md) is the live one, and
+what matters here is the RULE rather than the tally. That keeps **one** namespace, so `fbtodo.X` and the suite's patched
 globals still resolve. Mutable module state that `main` or `read_theme` has to reach (the
 estimate knobs, the theme problems) lives in a container rather than a rebound global, because a
 `global` statement cannot reach a copy in another module.
@@ -82,8 +85,8 @@ estimate knobs, the theme problems) lives in a container rather than a rebound g
 The split exposed five real bugs, each now pinned by a test: two functions named `_plain` (the
 renderer's ANSI-stripper shadowed the prose one), the estimate knobs rebound by `main`,
 `THEME_PROBLEMS` rebound by `read_theme`, a dropped `import shutil as _shutil` (the blocker keyed
-on the module name, the code read the alias), and `nas.py` missing the import that brought
-`_iso_ms`. A static AST check in the self-check now walks every module and asserts no global is
+on the module name, the code read the alias), and one module missing the import that
+brought `_iso_ms`. A static AST check in the self-check now walks every module and asserts no global is
 loaded that nothing provided — which is how a future split fails fast instead of at runtime. A
 second AST check refuses the other import-time trap: a function default or module-level
 expression outside `base.py` that reads one of the state paths, which would freeze the root
@@ -91,7 +94,11 @@ expression outside `base.py` that reads one of the state paths, which would free
 
 ## Limits
 
-- **The CLI journal is the only live Freebuff source.** The Desktop store is read per turn.
+- **The CLI journal is the only live Freebuff source.** The Desktop store commits per turn;
+  since 2026-10-03 its in-flight list is read from `threads.harness_state` (see
+  [OPEN-PROBLEMS.md](../OPEN-PROBLEMS.md) #1), so a running desktop turn shows its list, its
+  `now`/`nudge` and the agent's own `Goal:` heading, all by the CLI journal's own rules — but
+  the turn's `verbs`/`files` counts are still the journal's alone.
 - **A turn is the unit of "ended".** A long turn with a finished list rings nothing until the
   turn actually closes.
 - **The pane needs tmux.** There is no terminal-UI fallback; `snap`/`json`/`bar` are the

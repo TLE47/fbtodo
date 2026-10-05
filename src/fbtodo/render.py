@@ -35,14 +35,11 @@ def _window_anchor(cur_index: int | None, count: int) -> int:
 # In plain words: "there is no list, and here is why" — one sentence, in the words the pane
 # shows. Four situations produce no list at all: a session that has not written one yet, a
 # session that changed (so the old list was dropped rather than left up as if it were
-# current), a turn that began after the previous list was finished (the same misreading one
-# turn earlier — 100% of work that is already over), and a remote session whose pane is open
-# before the session is. Both renderers and `fbtodo status` ask this one function, so the four
-# can never disagree about it.
+# current), and a turn that began after the previous list was finished (the same misreading
+# one turn earlier — 100% of work that is already over). Both renderers and `fbtodo status`
+# ask this one function, so they can never disagree about it.
 def no_list_reason(state: dict) -> str:
     """Why there is no list to draw, in the pane's own words."""
-    if state.get("backend") == "nas" and not state.get("instance_alive"):
-        return "waiting for a NAS freebuff session (run `fb` there)"
     if state.get("cleared_turn"):
         return "last turn's list is done — waiting for this turn's list"
     if state.get("cleared"):
@@ -189,14 +186,46 @@ def observed_rows(state: dict, limit: int = ACTION_ROWS, now_ms: int | None = No
 # `ETA` — is measured by WATCHING the list change from one poll to the next, and a step
 # only gets a clock if it was seen *unfinished* at some point. So a list that arrives with
 # every step already ticked — an agent that wrote it once, at the end — has no numbers to
-# show, and says so rather than looking like a broken clock. (Measured 2026-09-26 on a NAS
-# session: one `write_todos` call, five todos, all completed, so nothing was ever running
-# to time. The build was identical to the Mac's, version 0.0.199; this was the agent, not
-# the store.)
+# show, and says so rather than looking like a broken clock. (Measured 2026-09-26: one
+# `write_todos` call, five todos, all completed, so nothing was ever running to time.
+# This was the agent, not the store.)
 NO_TIMES_TICKED = "no per-step times · the list arrived with every step already ticked"
 
 
 NO_TIMES_UNSEEN = "no per-step times · no step was ever seen running"
+
+
+# In plain words: the heading over a list is the objective that list was written FOR, and a
+# heading left over from an earlier turn heads this list with the wrong objective — the same
+# misreading `now` exists to catch, one step further out. The words are kept (they are the
+# agent's, and usually nearly right) and marked, so the reader knows the list moved on.
+def goal_stale_note(state: dict) -> str:
+    """`stale heading — the list moved on`, or "" when the heading belongs to the list shown."""
+    if not state.get("goal_stale") or not state.get("goal"):
+        return ""
+    return "stale heading — the list moved on"
+
+
+# In plain words: a list with no heading at all is the agent's own rule SKIPPED, not a style
+# choice, and the framed pane used to hide it — it drew no heading row, so a session that never
+# wrote the line looked the same as one that had. Measured 2026-10-03: of every CLI session
+# carrying the AGENTS.md rule, the twelve that wrote `Goal:` lines all also had the
+# `freebuff-todo-pane` skill in context (its Rule 0b), and the two that wrote none of 1464 and
+# 49 replies had only the AGENTS.md bullet. The gap is named here, in the same warn yellow as
+# a stale heading, so a reader can tell the agent skipped it rather than the pane losing it.
+GOAL_MISSING_NOTE = "no heading — the agent owes a `Goal:` line"
+
+
+def goal_missing_note(state: dict) -> str:
+    """The warning for a shown list with no heading — or "" when it has one, or holds no list.
+
+    A dropped list has no `todos`, so a state `finish_state` cleared is never warned about; a
+    list with a heading is not warned about either; only a list that is really on screen with
+    nothing over it is.
+    """
+    if state.get("goal") or not state.get("todos"):
+        return ""
+    return GOAL_MISSING_NOTE
 
 
 # In plain words: why are the numbers missing? There are two honest answers, and the pane
@@ -304,6 +333,12 @@ def _render_plain(
         lines.append(c(bold, "fbtodo") + "  " + c(dim, identity[8:]))
     else:
         context = f"{backend} · {session}" if session else backend
+        # ...and, when the resolution passed a source over, WHY this list and not that one:
+        # `cli finished 31h → desktop`. The same note the framed title carries, in the same
+        # place — the line that says what this pane is looking at.
+        why = str(state.get("source_why") or "")
+        if why:
+            context = f"{context} · {why}" if context else why
         lines.append(
             c(bold, "Freebuff todos")
             + "  "
@@ -315,20 +350,14 @@ def _render_plain(
         return "\n".join(_clamp_rows(lines, height, head=1, tail=0))
 
     if watching:
-        # What is being followed differs by backend: a local pid here, or the remote
-        # session for the NAS store (where there is no local pid at all).
-        followed = (
-            "the NAS session"
-            if backend == "nas"
-            else f"freebuff pid {state.get('instance_pid')}"
-        )
         if compact:
             # Short form on a narrow pane: the long one wraps mid-word at 22 columns,
             # which is the whole reason the layout is width-aware.
-            short = "the NAS session" if backend == "nas" else f"pid {state.get('instance_pid')}"
+            short = f"pid {state.get('instance_pid')}"
             lines += [c(dim, seg) for seg in _wrap(f"watch {watching} → {short}", width, 2)]
         else:
-            lines.append(c(dim, f"watcher: pid {watching} following {followed}"))
+            lines.append(c(dim, f"watcher: pid {watching} following "
+                               f"freebuff pid {state.get('instance_pid')}"))
     if state.get("title"):
         lines += [c(dim, seg) for seg in _wrap(str(state["title"])[:90], width, 2)]
 
@@ -347,16 +376,18 @@ def _render_plain(
     if goal_lines > 0:
         if not goal and state.get("todos"):
             # Said, not silently replaced by a quote of the request: the heading is the
-            # agent's to write, and a missing one is a rule that was skipped. Wrapped like the
-            # heading itself, at the width it was given: a floor here (16 columns, once) drew
-            # rows wider than a 12-column pane, which is the frame wrapping as it is printed.
+            # agent's to write, and a missing one is a rule that was skipped. Drawn in the
+            # warn yellow, with the same words the framed pane prints — a note that only
+            # dims reads as if there were nothing to report. Wrapped like the heading itself,
+            # at the width it was given: a floor here (16 columns, once) drew rows wider than
+            # a 12-column pane, which is the frame wrapping as it is printed.
             segs = _wrap_segs(
-                "— none stated", max(1, width),
+                GOAL_MISSING_NOTE, max(1, width),
                 initial_indent="big goal · ",
                 subsequent_indent="           ",
                 max_lines=goal_lines,
             )
-            lines += [c(dim, seg) for seg in segs]
+            lines += [c(yellow, seg) for seg in segs]
         if goal:
             # `initial_indent` is counted INSIDE `width`, so the full pane width goes
             # here: subtracting the label as well wrapped headings 11 columns early.
@@ -372,6 +403,11 @@ def _render_plain(
             if segs:
                 lines.append(c(bold, segs[0]))
                 lines += [c(dim, seg) for seg in segs[1:]]
+            # ...and a heading left over from an earlier turn says so, on its own row: the
+            # words are the agent's, but the list under them moved on.
+            stale = goal_stale_note(state)
+            if stale:
+                lines += [c(yellow, seg) for seg in _wrap(stale, max(1, width), 11)]
         if now_txt:
             segs = _wrap_segs(
                 now_txt, max(1, width),
@@ -510,9 +546,11 @@ def _render_plain(
     # the progress bar clean off the top of a 16-row strip.
     # counted from the list being drawn, as in the framed pane: the state's own tally is
     # the same number while this build wrote it, and a stale one must never let the bar
-    # contradict the steps printed right above it
-    total = len(todos)
-    done = sum(1 for t in todos if t.get("completed"))
+    # contradict the steps printed right above it. `drawn_counts` is the one place that
+    # rule lives, and it falls back to the lists this snapshot actually prints, so a
+    # stacked pane whose followed list was dropped cannot say `0/0 done` under another
+    # thread's steps.
+    done, total = drawn_counts(state)
     # the bar shares its line with "  [" + "]" + " n/m done"; size it to fit
     label = f"{done}/{total} done" if width >= 40 else f"{done}/{total}"
     bar_w = max(1, min(20, width - (len(label) + 6)))
@@ -651,6 +689,37 @@ def _session_label(state: dict) -> str:
     if backend and stamp:
         return f"{backend} · {stamp}"
     return stamp or backend or "no session"
+
+
+def _source_title(state: dict, width: int, right: str) -> str:
+    """The pane's name — plus, when the resolution passed something over, why it did.
+
+    The right slot says which session the pane IS showing (a watcher pid, or `backend ·
+    stamp`), which answers `what`. It does not answer `why not the other one`, and a list
+    that looks wrong is nearly always that question: a directory whose CLI session ended
+    yesterday still has its chat, so a pane showing the app's thread over it is a CHOICE
+    (`cli finished 31h → desktop`, from `_snapshot`) — and the choice belongs on the pane,
+    not only in `fbtodo why`. No note, no change: a frame that never had one is the frame it
+    always was.
+
+    The note is clipped, and dropped outright when it cannot be said usefully, so the right
+    slot keeps its columns — that slot carries what the pane is showing, the note is the
+    newcomer, and a title that shoved the session off the border would trade an explanation
+    for a mystery.
+    """
+    why = str(state.get("source_why") or "")
+    if not why:
+        return "FREEBUFF TODOS"
+    head = "FREEBUFF TODOS · "
+    # `_top_border` draws the right slot only while it has `room >= 12`, with `room - 4`
+    # cells for it: whatever the note takes comes out of that budget. The slot's own claim
+    # is capped at a third of the pane, though — a desktop session is a uuid, and reserving
+    # all of it would reserve the note away in exactly the case that needs one (the app's
+    # store answering while a chat sits there finished). A right slot that has to give up a
+    # few cells of a thread id is the cheaper loss; `_top_border` clips it to fit.
+    reserve = min(_cell_width(right), max(14, width // 3))
+    budget = width - 13 - _cell_width(head) - reserve
+    return head + _clip_cells(why, budget) if budget >= 12 else "FREEBUFF TODOS"
 
 
 def _top_border(width: int, frame, title: str, right: str, badge) -> str:
@@ -889,6 +958,31 @@ def _styles(theme: dict, truecolor: bool) -> dict:
 # third of a list draws as a third of a bar instead of rounding away to a whole cell.
 BAR_EIGHTHS = " ▏▎▍▌▋▊▉█"
 
+# Every glyph the framed pane draws for itself — the box, the markers, the bar, the spinner,
+# the dashes it uses in prose. A frame is a grid of fixed-width rows, so ONE glyph whose width
+# the code and the terminal disagree about steps the whole right edge sideways (measured
+# 2026-10-04: `🎯` is two cells to `wcwidth` and one in the terminal the pane was read in, and
+# every goal row was a column short against its neighbours). The inventory is here so that a
+# future character with the same ambiguity is caught by a check rather than by a reader.
+FRAME_CHROME = (
+    "╭╮╰╯├┤─│",      # the box
+    "▸✔○➔✖⚠",        # the markers
+    "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏",  # the spinner
+    BAR_EIGHTHS,        # the bar
+    "·…—✓",             # punctuation used inside the frame
+)
+
+
+def frame_chrome_is_single_cell() -> list:
+    """The chrome glyphs that do NOT measure one cell — empty is the only good answer.
+
+    The list is not a style choice; it is the invariant that keeps every row of a frame the
+    same width on the reader's screen as well as in this process. A glyph that measures two
+    here and one there makes the row it is on a column short, and the frame's border stops
+    lining up under it.
+    """
+    return sorted({ch for group in FRAME_CHROME for ch in group if _cell_width(ch) != 1})
+
 
 # The status strip's spinner while a step is running: one frame per second, advanced by the
 # pane's own repaint clock rather than a timer of its own.
@@ -1000,6 +1094,7 @@ def _render_rich(
     theme: dict | None = None,
     truecolor: bool | None = None,
     reloaded: str | None = None,
+    mute_note: str | None = None,
 ) -> str:
     """The framed, high-density pane shown on a colour terminal.
 
@@ -1037,9 +1132,9 @@ def _render_rich(
 
     inner = max(10, width - 4)
     # The patches' own two facts, each on a row of its own when the pane is too narrow to
-    # share one: the outcome the owner would otherwise ssh in to read, and when the phone
-    # was last told something. They cost rows of the fixed height, which the budgets below
-    # are told about through `patch_rows`.
+    # share one: the outcome the owner would otherwise have to open the log to read, and
+    # when the phone was last told something. They cost rows of the fixed height, which the
+    # budgets below are told about through `patch_rows`.
     patch_row_here = patch_row(state, inner)
     refit_row_here = refit_row(state, inner)
 
@@ -1064,14 +1159,19 @@ def _render_rich(
     who = f"watcher: pid {watching}" if watching else _session_label(state)
     right = f"{who} · {model}" if model else who
     # A pane that has just replaced itself says which build it is now (`reloaded`, from
-    # `cmd_pane`) on its own title chip for a few seconds. The chip is the one slot on the
-    # frame that belongs to the PROCESS rather than to the list, so the note spends no data
-    # row and moves nothing: the ruler beside it just gives the longer label its columns,
-    # and the chip is the pane's own name again when the note expires. Clipped to a budget
-    # that keeps the right-hand metadata its room — the note is transient, the watcher's pid
-    # is not — so a narrow pane loses the note's tail, not the whole right slot, for five
-    # seconds.
-    title = _clip_cells(reloaded, max(8, width - 22)) if reloaded else "FREEBUFF TODOS"
+    # `cmd_pane`) on its own title chip for a few seconds, and a pane whose notifications
+    # are switched off says so for as long as they are (`mute_note`, from the mute key) — both
+    # from `cmd_pane`, both facts about the PROCESS rather than about the list. The chip is
+    # the one slot on the frame that belongs to the process, so neither note spends a data
+    # row or moves anything: the ruler beside it just gives the longer label its columns,
+    # and the chip is the pane's own name again when the transient note expires. Both can
+    # be true at once (a reload while quiet reads `reloaded · quiet until done · u`), and
+    # the clipping budget is the same one that already keeps the right-hand metadata its
+    # room — the note is secondary, the watcher's pid is not — so a narrow pane loses a
+    # note's tail rather than the whole right slot.
+    chip_notes = " · ".join(part for part in (reloaded, mute_note) if part)
+    title = (_clip_cells(chip_notes, max(8, width - 22)) if chip_notes
+             else _source_title(state, width, right))
     rows = [_top_border(width, frame, title, right, badge)]
 
     if state.get("error"):
@@ -1084,17 +1184,24 @@ def _render_rich(
     # The heading is the agent's own `Goal:` line, in muted grey so the steps below it
     # are what the eye lands on. A session that wrote none gets no heading ROW at all —
     # the strip is fixed-height, and `— none stated` spent one of its rows saying
-    # nothing; `fbtodo status` reports the missing line instead. The emoji is two cells
-    # but one character, which is why the wrap budget is a column short.
+    # nothing; `fbtodo status` reports the missing line instead.
+    #
+    # The marker's width is not decoration. `🎯` measured TWO cells here and ONE cell in the
+    # terminal the pane was being read in (measured 2026-10-04), so every row carrying it was
+    # a column short on screen: the frame's right edge stepped left under the goal heading and
+    # the border stopped lining up. A frame is a grid of fixed-width rows, and one glyph whose
+    # width the code and the terminal disagree about is enough to break the whole thing — so
+    # the chrome uses only glyphs every terminal draws at one cell (`▸` here, as on the state
+    # chip), and `frame_chrome_is_single_cell` is what keeps it that way.
     goal = str(state.get("goal") or "")
     now_txt = str(state.get("now") or "")
     nudge = str(state.get("nudge") or "")
     head: list[str] = []
     max_goal_lines = min(goal_lines, 2) if width < 60 else goal_lines
-    goal_prefix = "🎯 Goal: "
+    goal_prefix = "▸ Goal: "
     if max_goal_lines > 0 and goal:
         segs = _wrap_segs(
-            goal, max(12, inner - 1),
+            goal, max(12, inner),
             initial_indent=goal_prefix,
             subsequent_indent=" " * _cell_width(goal_prefix),
             max_lines=max_goal_lines,
@@ -1109,6 +1216,19 @@ def _render_rich(
         if segs:  # a whitespace-only goal wraps to nothing: draw no heading, do not crash
             head.append(c(muted, goal_prefix) + c(active_ink, segs[0][len(goal_prefix):]))
             head += [c(active_ink, pad + seg[len(pad):]) for seg in segs[1:]]
+    # A heading left over from an earlier turn than the list it heads says so, on its own
+    # row: the words are the agent's, but the list under them moved on. Drawn whether or not
+    # the heading row itself was (a `--goal-lines 0` pane still gets the warning).
+    stale = goal_stale_note(state)
+    if stale:
+        head += [c(yellow, seg) for seg in _wrap_segs(stale, inner, max_lines=1)]
+    # A list with NO heading at all is named on the row the heading would have taken, in the
+    # same warn yellow: drawing nothing made the skipped rule invisible. It draws whether or
+    # not the heading row was (a `--goal-lines 0` pane still gets it), exactly like the stale
+    # warning above, and first in the head so the height budget never drops it.
+    missing = goal_missing_note(state)
+    if missing:
+        head += [c(yellow, seg) for seg in _wrap_segs(missing, inner, max_lines=1)]
     if now_txt:
         segs = _wrap_segs(
             now_txt, inner, initial_indent="NOW · ", subsequent_indent="      ",
@@ -1143,7 +1263,7 @@ def _render_rich(
     # In plain words: the same situations the plain renderer names, plus the one line the
     # framed pane can afford and a script's snapshot cannot — what the session has been doing
     # instead of writing a list.
-    # The lists this state carries: one for a journal, a NAS session or a file, and one per
+    # The lists this state carries: one for a journal or a file, and one per
     # live thread for a desktop store asked to stack them (`--threads`). `todos` stays the
     # list the pane FOLLOWS — the bar, the totals and the footer are about it — while the
     # groups are what the step area draws (`list_groups`).
@@ -1177,8 +1297,8 @@ def _render_rich(
             for seg in _wrap(note, inner, 1) if note else []:
                 rows.append(_frame_row(c(muted, seg), width, frame))
         if patch_row_here:
-            # A frame with no list at all is exactly the NAS pane waiting for `fb` — when
-            # "did the hook's patch step come out clean?" is the question being asked.
+            # A frame with no list at all still says whether the patch step came out
+            # clean — which is the question being asked before a session writes one.
             rows.append(_frame_row(patch_row_styled(patch_row_here), width, frame))
         if refit_row_here:
             rows.append(_frame_row(patch_row_styled(refit_row_here), width, frame))
@@ -1354,9 +1474,11 @@ def _render_rich(
 
     # Counted from the list being drawn, not from the state's own tally: the two agree
     # when this build wrote the state, and a state left by another one must never paint
-    # 100% over a step list that still has unticked steps in it.
-    total = len(todos)
-    done = sum(1 for t in todos if t.get("completed"))
+    # 100% over a step list that still has unticked steps in it. When the followed thread
+    # has NO list — its finished one was dropped for a newer request — the count falls to
+    # the lists this frame draws, so the bar cannot read `0% (0/0)` under a heading that
+    # says `11/11` (see `drawn_counts`).
+    done, total = drawn_counts(state)
     pct = int(round(100.0 * done / total)) if total else 0
     label = f"{pct}% ({done}/{total})"
     # The bar keeps its size; the projection only borrows space the row already has left
@@ -1647,6 +1769,7 @@ def render(
     theme: dict | None = None,
     truecolor: bool | None = None,
     reloaded: str | None = None,
+    mute_note: str | None = None,
 ) -> str:
     """Pick the framed pane (colour terminal) or the plain machine-readable text.
 
@@ -1654,8 +1777,11 @@ def render(
     here from the environment and the theme files, which is how every command calls this; passed
     in, the frame is a function of the arguments alone — the same state and clock give the same
     bytes, whatever the terminal says. That is what makes a recorded frame a contract and lets
-    the pane diff one paint against the last (see `pane_repaint`). `reloaded` is a transient
-    note for the framed pane's title chip only — a plain frame has no chrome to say it on.
+    the pane diff one paint against the last (see `pane_repaint`). `reloaded` and `mute_note`
+    are notes for the framed pane's title chip only — a plain frame has no chrome to say them
+    on. They differ in LIFE, which is why one chip carries both: a reload is a fact about the
+    last few seconds and goes away on its own, while a mute is a switch the reader set and can
+    only undo by pressing the key its own words name, so it stays for as long as it is true.
     """
     # The second half of the text filter (see `clean_text`): a state that came off disk —
     # this process's own cache, or a file an older build wrote — is filtered here, so no
@@ -1665,7 +1791,7 @@ def render(
     if color and width >= 30:
         frame = _render_rich(
             state, color, watching, width, now_ms, idle_s, stale_after_s, goal_lines, height,
-            theme=theme, truecolor=truecolor, reloaded=reloaded,
+            theme=theme, truecolor=truecolor, reloaded=reloaded, mute_note=mute_note,
         )
     else:
         frame = _render_plain(
@@ -1694,22 +1820,27 @@ def adopt_version(state: dict) -> dict:
 
 
 def bar_text(state: dict) -> str:
-    todos = state.get("todos") or []
-    if not todos:
+    done, total = drawn_counts(state)
+    if not total:
         return "todos -"
-    done = sum(1 for t in todos if t.get("completed"))
-    return f"todos {done}/{len(todos)}"# ======================================================================== lock
+    return f"todos {done}/{total}"# ======================================================================== lock
 
 
 __all__ = [
     "_window_anchor", "no_list_reason", "list_behind", "unlisted_note", "tools_note",
     "turn_note",
     "observed_rows", "NO_TIMES_TICKED", "NO_TIMES_UNSEEN", "no_times_note", "_render_plain",
+    "GOAL_MISSING_NOTE", "goal_missing_note",
+    # The two guarantees BEHIND a frame's budgets, offered to the board too: a board is a
+    # second frame in a second module, and it must be cut to its pane by the same rules.
+    "_clamp_widths", "_clamp_rows",
     "_frame_row", "_divider_row", "_bottom_row", "_SESSION_RE", "_session_label",
+    "_source_title",
     "_top_border", "THEME_DEFAULTS", "THEME_KEYS", "THEME_FILE_LOCAL", "THEME_FILE_GLOBAL",
     "_hex_rgb", "_rgb_256", "_color_sgr", "_theme_stamp", "_THEME_CACHE", "THEME_VALUE_RE",
     "THEME_PROBLEMS", "_theme_value", "read_theme", "_theme_gradient", "_supports_truecolor",
-    "_styles", "BAR_EIGHTHS", "SPINNER", "_progress_bar", "_elision_note", "_thread_heading",
+    "_styles", "BAR_EIGHTHS", "SPINNER", "FRAME_CHROME", "frame_chrome_is_single_cell",
+    "_progress_bar", "_elision_note", "_thread_heading",
     "_render_rich",
     "render", "width_of_default", "adopt_version", "bar_text",
 ]

@@ -29,10 +29,9 @@ wrapper splits the pane itself a moment before the CLI exists. 30s is ten keeper
 long enough that a healthy repair never reaches it, short enough that a real failure is
 announced while there is still a session to look at.
 
-Deliberately local. Every fact here is about panes on this machine's tmux, and the NAS half
-has its own watcher, its own log and its own failure modes; reporting it from here would
-mean guessing. A `-s nas` daemon still asks, and the bell stays silent on its own when
-there is no local session to want a pane.
+Deliberately local. Every fact here is about panes on this machine's tmux, and every
+session that could want a pane runs on this machine; the bell stays silent on its own when
+there is no session to want one.
 
 usage: pane-bell.py --keeper PATH [--print] [--quiet]
 

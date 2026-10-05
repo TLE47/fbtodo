@@ -7,7 +7,7 @@ Four siblings one per thing that can hold a session up: `todo-bell.py` says the 
 it is the only bell whose subject is not a session at all but the records that say who is
 watching:
 
-  - an ORPHAN: a watcher, keeper or NAS watcher RUNNING with a claim no reader can find. The
+  - an ORPHAN: a watcher or keeper RUNNING with a claim no reader can find. The
     process holds a lock on an inode the name has left behind, so every file-based read calls
     the role not running, a new one may be started over the fresh name, and whatever the
     process is protecting is unguarded from the outside.

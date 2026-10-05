@@ -19,8 +19,9 @@ Two smaller conventions make a list much better on screen, and both cost the age
 - write the list **before** the work, not after it. A clock is built by *watching* a step run,
   so a list that arrives with every step already ticked has no durations in it at all.
 - open the task with a `Goal:` line of six words or fewer. It becomes the heading above the
-  list. Without one the list is headed `— none stated`, which is the honest answer to "what is
-  this list for?" but a worse one to glance at.
+  list. Without one the pane warns in the warn yellow — `big goal · no heading`, naming the
+  `Goal:` line the agent owes — which is the honest answer to "what is this list for?" but a
+  worse one to glance at.
 
 If you would rather not edit a file, the same thing works as an ask inside a session: *plan
 this as a todo list, and tick items off as you go.*

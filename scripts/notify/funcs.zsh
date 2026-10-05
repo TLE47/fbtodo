@@ -208,12 +208,12 @@ freebuff() {
   # no output), and a heal that cannot be proven changes nothing at all — either way the session
   # starts. Best-effort on purpose: what it could not do it says on stderr, which this wrapper is
   # already tapping into $errlog.
-  # Set FREEBUFF_WRAPPER_NO_PATCH=1 to skip it, as on the NAS.
+  # Set FREEBUFF_WRAPPER_NO_PATCH=1 to skip it.
   #
-  # CONVERGE FIRST, as the NAS hook does (2026-09-23): npm refreshes the launcher package and the
-  # first launcher run after that replaces the binary — both inside one launch, and the INSTALL is
-  # the later step. Patching here first therefore patched a file that was deleted moments later,
-  # and the session that installed a release always ran unpatched ("the ads are back on the NAS").
+  # CONVERGE FIRST: npm refreshes the launcher package and the first launcher run after that
+  # replaces the binary — both inside one launch, and the INSTALL is the later step. Patching
+  # here first therefore patched a file that was deleted moments later, and a session that
+  # installed a release always ran unpatched ("the ads are back").
   # freebuff-converge.cjs asks the launcher for its install now — two JSON reads and no network
   # when nothing is pending — so the re-anchor below lands on the binary this session will run.
   if [[ ${FREEBUFF_WRAPPER_NO_PATCH:-0} != 1 ]] && (( $+commands[node] )); then

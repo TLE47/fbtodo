@@ -19,9 +19,9 @@ screen says everything: the modal draws its own title, and that title is the tes
     │   ○ Custom                                         │
     ╰────────────────────────────────────────────────────╯
 
-The pane is also the only place BOTH sessions are visible from this Mac: the local CLI
-and the NAS one carried over ssh are panes on the same tmux server, so one scan covers
-both. (A freebuff started outside tmux has no pane to read — nothing here can see it.)
+The pane is where every session on this Mac is visible at once: they are panes on the
+same tmux server, so one scan covers all of them. (A freebuff started outside tmux has no
+pane to read — nothing here can see it.)
 
 Two things keep a painted string from becoming a notification: the header must sit on a
 line that also carries the box's own `╭`, and the pane's foreground command must be one
@@ -86,8 +86,8 @@ BOX = "│"
 # is read from the drawing rather than guessed from the text.
 BULLETS = ("○", "●")
 MARKER = "▼"
-# Foreground commands a TUI runs under. `ssh` is not a guess: the NAS session is
-# `ssh <nas> docker exec … fb`, so that pane's command is ssh and its window is node.
+# Foreground commands a TUI runs under. `ssh` is here because a remote shell opened in
+# tmux is a pane this scan must skip rather than mistake for a session's window.
 PANE_CMDS = {
     c.strip()
     for c in os.environ.get("FREEBUFF_ASK_CMDS", "node,freebuff,ssh,docker,deno,bun").split(",")
@@ -339,8 +339,8 @@ def phone_ready() -> bool:
 class one_pusher:
     """Serialize decide+claim, so two watchers cannot both announce the same question.
 
-    More than one watcher can be running (the local daemon and a NAS one, a stale lock,
-    an upgrade race) and each asks this script on its own clock. Each pass scans,
+    More than one watcher can be running (a stale lock, an upgrade race) and each asks
+    this script on its own clock. Each pass scans,
     decides and only then records — two passes overlapping in those milliseconds would
     both send. Holding an exclusive lock across that window makes the second pass
     re-read the claim the first one just wrote, and stay silent. Best effort: no lock

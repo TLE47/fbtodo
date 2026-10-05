@@ -9,7 +9,6 @@ rather than a line per idea.
 | Idea | Why it would matter |
 |---|---|
 | **`brew install fbtodo` + `uvx fbtodo` + a one-line installer** | Removing "clone and symlink" is the single biggest adoption lever. |
-| **`fbtodo board` — all live sessions in one pane** | People run two or three agents at once. One pane showing every session, its list and its clock beats switching windows. |
 | **Watch the desktop app live, not per turn** | The app commits a message only when a turn closes, so its list is up to a turn behind — measured, with the mechanism and the fix directions in [OPEN-PROBLEMS.md](OPEN-PROBLEMS.md). |
 | **`fb --one-step` — a working mode that keeps the list honest by construction** | The desktop store commits per turn, so the lag is the turn's length. Completing one step per turn makes every boundary carry a fresh list: a working convention, no app change, and the cheapest way to make the pane trustworthy on the app. |
 | **`fbtodo serve` — a read-only web mirror** | Watch from your phone or another machine, no ssh. Pairs with the notify kit you already have. |

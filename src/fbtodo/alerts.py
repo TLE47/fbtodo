@@ -16,8 +16,8 @@ from .base import *  # noqa: F401,F403 — the package is one namespace
 # The pane says two things about the CLI patches that no store knows: what the last
 # patch pass DID, and when the phone was last told something. Both are already in a log,
 # so the reader is a tail plus one classification.
-# A log line's own stamp: the Mac watcher writes local time (`2026-09-27 12:44:09`), the
-# NAS hook writes UTC (`2026-09-27T19:53:48Z`), and the separator is what tells them apart.
+# A log line's own stamp: the watcher writes local time (`2026-09-27 12:44:09`), and the
+# `T` separator form (`2026-09-27T19:53:48Z`) is UTC and decides its own clock.
 _STAMP_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})")
 
 
@@ -34,11 +34,6 @@ LOCAL_PATCH_WORDS = (
 )
 
 
-# The NAS hook writes one line per pass — `…Z converge=ok patch=ok binary=0.1.1 [size …]` —
-# with anything wrong on the indented lines under it.
-NAS_PATCH_RE = re.compile(r"patch=(\w+)\s+binary=(\S+)")
-
-
 # An alert's own words -> the colour it gets. Everything the kit sends is a fact; `muted`
 # means the phone was deliberately NOT told, which is worth an amber row.
 ALERT_KIND_SEVERITY = {"sent": "ok", "resolved": "ok", "duplicate": "ok", "muted": "warn"}
@@ -47,17 +42,16 @@ ALERT_KIND_SEVERITY = {"sent": "ok", "resolved": "ok", "duplicate": "ok", "muted
 PATCH_SEVERITY = {"ok": "ok", "pending": "warn", "incomplete": "bad", "failed": "bad"}
 
 
-def entry_ms(text: str, utc: bool = False) -> int | None:
+def entry_ms(text: str) -> int | None:
     """The epoch-ms a log entry starts with, or None when it starts with no stamp.
 
-    A continuation line (the NAS hook indents its complaints) has no stamp, which is how
-    the reader tells one entry from the next.
+    A continuation line has no stamp, which is how the reader tells one entry from the
+    next.
 
-    Two clocks write the space-separated form: this Mac's kit logs LOCAL time and the NAS
-    container logs UTC (`TZ` unset over there), so the SOURCE has to say which — `utc` is
-    passed by the NAS readers. The `T…Z` form is unambiguous and decides itself. Guessing
-    from the format alone made a 28-minute-old NAS alert read as `0s ago`: its UTC stamp
-    was a future time on a PDT clock, and the age was clamped to zero.
+    Two clocks write the space-separated form, so the SEPARATOR decides: this Mac's kit
+    logs LOCAL time after a space, and the `T…Z` form is UTC and says so. Guessing from
+    the format alone made a 28-minute-old alert read as `0s ago`: a UTC stamp was a future
+    time on a PDT clock, and the age was clamped to zero.
     """
     m = _STAMP_RE.match(text or "")
     if not m:
@@ -65,7 +59,7 @@ def entry_ms(text: str, utc: bool = False) -> int | None:
     y, mo, d, h, mi, s = (int(g) for g in m.groups())
     secs = (
         calendar.timegm((y, mo, d, h, mi, s, 0, 0, 0))
-        if utc or (text or "")[10:11] == "T"
+        if (text or "")[10:11] == "T"
         else time.mktime((y, mo, d, h, mi, s, 0, 0, -1))
     )
     return int(secs * 1000)
@@ -142,12 +136,11 @@ def local_patch_alert(patch_log: str | None = None, alert_log: str | None = None
     }
 
 
-def alert_from_lines(lines: list[str], source: str, utc: bool = False) -> dict | None:
-    """The newest alert line, in either host's format, as {kind, text, at_ms, severity}.
+def alert_from_lines(lines: list[str], source: str) -> dict | None:
+    """The newest alert line as {kind, text, at_ms, severity}.
 
-    `source` and `utc` are passed in rather than read from the constants because the NAS
-    answer arrives inside the probe: its path is the honest one to report, and its clock
-    is the container's (UTC), not this Mac's.
+    `source` is passed in rather than read from the constant so a caller reading a
+    fixture's tail reports the path it actually read.
     """
     for line in reversed(lines):
         m = _STAMP_RE.match(line)
@@ -157,7 +150,7 @@ def alert_from_lines(lines: list[str], source: str, utc: bool = False) -> dict |
         kind = (body.split(" ", 1)[0] or "").lower()
         if kind not in ("sent", "muted", "duplicate", "resolved"):
             continue
-        at = entry_ms(line, utc)
+        at = entry_ms(line)
         # ` — http 200 {"id":…}` is the transport's own reply: not what this row is about,
         # and long. The digest in `(2f14bfcf14a4d794)` is the dedupe key, not news either.
         text = re.split(r"\s+—\s+http\s", body)[0]
@@ -171,48 +164,6 @@ def alert_from_lines(lines: list[str], source: str, utc: bool = False) -> dict |
             "source": source,
         }
     return None
-
-
-def nas_patch_from_tail(blob: str) -> dict | None:
-    """The NAS patch tail, as it came back in the probe: entries split on the \\x1c the
-    far side joins them with.
-
-    The outcome entry is the last one that starts with a stamp; the indented lines under
-    it are its own account of what went wrong, which is the text worth showing when the
-    news is bad. Parsed here rather than over there because BusyBox is a poor place to
-    classify anything.
-    """
-    lines = (blob or "").split("\x1c")
-    idx = None
-    for i, line in enumerate(lines):
-        if entry_ms(line, True) is not None and NAS_PATCH_RE.search(line):
-            idx = i
-    if idx is None:
-        return None
-    m = NAS_PATCH_RE.search(lines[idx])
-    outcome = (m.group(1) or "").lower()
-    # `freebuff: local CLI patches incomplete (no window for …); the rest were applied` is
-    # the hook's own wording: the program's tag and the outcome word are what the row
-    # already says, and the parenthetical IS the reason, so all three are taken off.
-    reasons = [
-        _tidy(re.sub(
-            r"^\((.*?)\)",
-            r"\1",
-            re.sub(r"^(incomplete|failed|ok)\s+", "",
-                   re.sub(r"^\s*local CLI patches\s+", "", re.sub(r"^\s*freebuff:\s*", "", ln))),
-        ))
-        for ln in lines[idx + 1:] if ln.strip() and entry_ms(ln, True) is None
-    ]
-    at = entry_ms(lines[idx], True)
-    return {
-        "outcome": outcome,
-        "severity": PATCH_SEVERITY.get(outcome, "warn"),
-        "reason": reasons[0] if reasons else "",
-        "version": m.group(2),
-        "at_ms": at,
-        "age_s": _age_s(at),
-        "source": NAS_PATCH_LOG,
-    }
 
 
 def patch_row_text(pairs: list) -> str:
@@ -324,8 +275,8 @@ def patch_row(state: dict, width: int | None = None) -> list:
 
 
 __all__ = [
-    "_STAMP_RE", "LOCAL_PATCH_WORDS", "NAS_PATCH_RE", "ALERT_KIND_SEVERITY", "PATCH_SEVERITY",
+    "_STAMP_RE", "LOCAL_PATCH_WORDS", "ALERT_KIND_SEVERITY", "PATCH_SEVERITY",
     "entry_ms", "read_tail", "_age_s", "_tidy", "local_patch_alert", "alert_from_lines",
-    "nas_patch_from_tail", "patch_row_text", "patch_detail_forms", "_shrink", "refit_row",
+    "patch_row_text", "patch_detail_forms", "_shrink", "refit_row",
     "patch_row",
 ]

@@ -9,6 +9,7 @@ is the layer underneath it.
 - [The scoreboard, the spread and the duel](#the-scoreboard-the-spread-and-the-duel)
 - [The sources](#the-sources)
 - [`fbtodo push`](#fbtodo-push)
+- [`fbtodo board`](#fbtodo-board)
 - [Notifier contracts](#notifier-contracts)
 - [The pane lifecycle](#the-pane-lifecycle)
 - [Conventions worth keeping](#conventions-worth-keeping)
@@ -32,7 +33,7 @@ scripts/fbtodo-selfcheck.py
 scripts/notify/        the watches, each invoked as a subprocess
 ```
 
-The program is one package in ten modules, and it is **one namespace** still: each module
+The program is one package in eleven modules, and it is **one namespace** still: each module
 lists what it holds in `__all__` and `__init__.py` imports it back with `from .base import *`,
 so `fbtodo.<anything>` reaches the same name it always did, and the self-check's patched knobs
 keep working. The layers only ever import downwards:
@@ -45,29 +46,30 @@ locks.py     the claim files: who is watching, held by the kernel rather than by
 alerts.py    the two rows no store holds: the last patch outcome, the last phone alert
 scan.py      the CLI journal: its record parsers, the chunk memory, `read_cli`
 desktop.py   the desktop app's SQLite conversation
-nas.py       the remote host: one ssh per poll, carrying the extractor that runs there
 tasks.py     the task log (event stream + folded memo), the clocks, the estimates, the pruning
-sources.py   the `Source` protocol and the loop that asks the four readers in order
+sources.py   the `Source` protocol and the loop that asks the readers in order
 panes.py     tmux: the pane, its layout and pins, the keeper, and the watcher loops
+board.py     every live session in one frame: discovery across both local stores, and its
+             renderers (`fbtodo board`)
 render.py    one state -> lines: the plain renderer, the framed pane, the theme
 __init__.py  the front door: the commands, the daemon, and the import of every layer above
 ```
 
 A module's own imports are the promise it keeps: `from .scan import *` at the top of
-`nas.py` is why its liveness probe can read a journal timestamp. The self-check reads the
+`sources.py` is why its `cli` reader can read a journal timestamp. The self-check reads the
 package statically and fails if any module loads a name nothing under `fbtodo/` provides —
 which is what a forgotten layer looks like before the line that needs it ever runs.
 
 The same static read keeps the **state paths** from being captured at import: `base` chooses
 the root at import and `init_state_root` may move it before the first command, so a function
 default or a module-level expression outside `base` that reads `SCRATCH`, `STATE_PATH`,
-`TASKS_PATH`, `LOCK_PATH`, `LOG_PATH`, `NAS_LOCK_PATH`, `PANE_KEEPER_PATH`, `PANE_LOG_PATH`,
-`PINS_PATH`, `LAST_PATH`, `NAS_STATE_PATH` or `NAS_LOG_PATH` would freeze the path this process
+`TASKS_PATH`, `LOCK_PATH`, `LOG_PATH`, `PANE_KEEPER_PATH`, `PANE_LOG_PATH`, `PINS_PATH`
+or `LAST_PATH` would freeze the path this process
 started with — the pane and the daemon disagreeing about where the state lives. Every read must
 happen at call time, through `base`'s namespace.
 
 `self_argv(here="")` is how the program re-invokes itself — the panes, the pane keeper, the
-NAS watcher, and the daemon re-execing itself in the foreground: `sys.executable` plus the
+pane keeper, and the daemon re-execing itself in the foreground: `sys.executable` plus the
 **launcher**, never the asking file's own path, because a package's `__init__.py` run as a
 script is not the package (every module loaded twice, no relative import resolvable). It
 takes the asking file so the answer does not depend on which module holds the function; a copy
@@ -104,6 +106,10 @@ of the real one. A machine that ran from the legacy `~/.freebuff` is moved there
 import, and only when nothing is still writing it: a live watcher's pid or claim keeps the old
 root (and `fbtodo doctor` says so), because copying a store out from under the process that
 updates it would leave the pane reading a file nobody writes. `FBTODO_HOME` is never migrated.
+A pane does not rediscover this root for itself: tmux starts it from the **server's**
+environment, so whichever of `FBTODO_HOME` / `XDG_STATE_HOME` chose it here is written into the
+pane's own command line (`pinned_env`, below), and a respawn or a login shell keeps the opener's
+answer rather than the server's.
 
 | File | Written by | What it is |
 |---|---|---|
@@ -129,20 +135,21 @@ fields that matter:
 | `schema` | state layout version; a state from another build is ignored, not trusted |
 | `instance_pid` | the freebuff process this state describes |
 | `cwd` | the directory the session runs in |
-| `backend` | `cli` \| `desktop` \| `nas` \| `file` \| `push` — who the state describes |
+| `backend` | `cli` \| `desktop` \| `file` \| `push` — who the state describes |
 | `target` | the chat directory, database or state file that was read |
 | `source` | how it was read (`cli-journal`, `desktop-db`, `state-file`, `push`, `fallback`, `last`) |
 | `session` | the session/thread identifier |
 | `title`, `first_prompt`, `summary` | what the session is about, when the store carries it |
-| `goal`, `goal_source` | the agent's `Goal:` line and where it was found |
-| `now`, `nudge` | a newer request since the list was written; `nudge` when it is a continuation |
+| `goal`, `goal_source` | the agent's `Goal:` line and where it was found. On the CLI it is the journal's prose (`scan_live_log`), on the desktop source the app's live `harness_state` text parts; both read it with `goal_line` and choose which heading belongs to which list with the shared `pick_goal` |
+| `now`, `nudge` | a newer request since the list was written; `nudge` when it is a continuation. On the CLI both come from the journal's request records; on the desktop source from the app's live history — every user message tagged `USER_PROMPT`, with the CLI's own `is_nudge` / `pick_prompt` / `_newest` rules applied (`desktop._now_and_nudge`), so the two sources cannot drift |
 | `todos` | the list, newest `write_todos` only — state is never merged |
 | `threads` | present **only** when the desktop store holds more than one live thread: `[{id, title, todos, current, running, source_updated_ms}]`, the followed thread first and marked `current`. `list_groups` reads it — or, with the key absent, makes one untitled group from `todos` — and a renderer with more than one group prints each thread's heading on its first step. The key is left off a single-thread answer rather than set empty, which is what keeps every other source, a single-list frame and the recorded goldens byte-identical |
 | `observed` | the newest calls the session actually made, `{verb, what, ts_ms}` newest first, capped at `ACTION_KEEP`. The second source: `write_todos` is the only *plan* in the transcript, so a model that skips it leaves `todos` empty — and the calls it did make are a fact, which is what the pane draws instead (`edited fbtodo · 2m ago`). Never a plan, so never a progress bar, an estimate or a tick |
 | `done`, `total`, `list_id`, `list_version` | progress, and the identity of *this* list |
 | `cleared`, `cleared_turn` | no list is drawn, and which drop caused it. `cleared` is a dropped list: a new session, or a **finished** list the next turn replaced. `cleared_turn` names the second and is what `no_list_reason` prints for it. A drop never touches `list_version` — the number identifies a list, and the new turn's list is what increments it |
 | `turn_ended` | the journal's `shouldEndTurn` — the other half of "finished" |
-| `files_unlisted` | the **boundary guard**: true when the turn ENDED having edited files but having published no `write_todos` since its own last edit, so the list does not account for the work that just landed. Both halves come from the CLI journal (the newest edit's position against the newest list's), so it is the CLI scan's answer alone — the desktop store carries no turn, and the NAS records no end-of-turn. Three consumers: the status chip says `STEPS OPEN` instead of `ALL DONE`, `unlisted_note` names the files in the strip / `status` / `snap`, and the completion bell and phone push are withheld (`todo-bell.decide`). Mid-turn it is false by construction: the boundary is where the bell decides |
+| `turn_running` | the desktop app's own live signal — `threads.turn_state = running` with a fresh `turn_alive_at` heartbeat — carried on the observation (`DesktopSource.describe`) so `no_list_reason` says `turn running · no list yet` instead of `no write_todos call yet in this session`. A stale heartbeat is a turn that DIED, not one in flight, so it is not called running. Only the desktop source sets it |
+| `files_unlisted` | the **boundary guard**: true when the turn ENDED having edited files but having published no `write_todos` since its own last edit, so the list does not account for the work that just landed. Both halves come from the CLI journal (the newest edit's position against the newest list's), so it is the CLI scan's answer alone — the desktop store carries no turn. Three consumers: the status chip says `STEPS OPEN` instead of `ALL DONE`, `unlisted_note` names the files in the strip / `status` / `snap`, and the completion bell and phone push are withheld (`todo-bell.decide`). Mid-turn it is false by construction: the boundary is where the bell decides |
 | `lv` (in the task log) | the list version the step was last seen in. Read by `refit_readiness`, which reconstructs whether the young-list clip was consulted on a step: the pace a step inherited came from the steps finished before it in its OWN list, and a session holds many lists — grouping by session would count earlier turns as this step's past. Records written before the field existed group by session, which undercounts and so is the safe direction |
 | `task_times` | per-step `started_ms` / `done_ms` / `elapsed_ms` / `shape`, from the tick that saw it. `shape` is the call tally the step has revealed so far, credited from the turn's own tally by order, and only for the step in flight |
 | `est_ms` / `est_src` (in the task log) | the estimate the pane was showing for the step in flight, and which rung of the ladder produced it (`shape` / `blend` / `pace`), stamped on every poll while it runs. When the step closes, the pair (projection, outcome) is what `fbtodo status` scores as `estimate error`, per source — so "is this getting better?" is answered from records rather than from a tally that could drift |
@@ -154,7 +161,7 @@ fields that matter:
 | `model` | the model the session names; the pace is quoted with it |
 | `patch`, `alert` | the two optional footer facts, read from the logs that produce them |
 | `ts`, `source_updated_ms`, `store_mtime_ms`, `probed_ms`, `heartbeat_ms` | the clocks. `ts` is when the drawn `write_todos` record was written (and `source_updated_ms` mirrors it), which is what the pane's `LIST: #7 · 12m ago` and `status`'s `list written` report; `store_mtime_ms` is the transcript's mtime, and `store_mtime_ms - ts` past `LIST_BEHIND_MS` in a session with every step ticked is the `[STALE?]` marker and `status`'s `list behind` |
-| `turn` | `{start_ms, iterations, verbs, files, truncated}` — this turn, bounded by the request that opened it (the journal logs it on its own record). A boundary and a numerator only: nothing in the store is a denominator, so nothing here is progress. `iterations` counts records carrying `shouldEndTurn`; `verbs` is the tally of the calls `observed` is a slice of; `files` is the distinct files edited (empty on the NAS, which records no inputs); `truncated` means the walk never reached the request, so every count is a lower bound and the pane prints `9+`. The scan also tracks `last_edit_key` while the turn is open — the newest edit's walk position, compared with the newest `write_todos` to set `files_unlisted` — but it is a walk key (a tuple), so it is popped before the turn is written to the state |
+| `turn` | `{start_ms, iterations, verbs, files, truncated}` — this turn, bounded by the request that opened it (the journal logs it on its own record). A boundary and a numerator only: nothing in the store is a denominator, so nothing here is progress. `iterations` counts records carrying `shouldEndTurn`; `verbs` is the tally of the calls `observed` is a slice of; `files` is the distinct files edited; `truncated` means the walk never reached the request, so every count is a lower bound and the pane prints `9+`. The scan also tracks `last_edit_key` while the turn is open — the newest edit's walk position, compared with the newest `write_todos` to set `files_unlisted` — but it is a walk key (a tuple), so it is popped before the turn is written to the state. On the **desktop** source it carries `start_ms` alone, read from `threads.last_prompt_at` while the turn runs: it is the boundary `finish_state` drops a finished previous list against, and the age `turn_note` names — the store records no iterations, verbs or files |
 | `status`, `stop_reason` | why the watcher is where it is |
 | `tool_version` | the build that wrote it |
 
@@ -220,13 +227,12 @@ Every reader downstream — the pane, `snap`, `json`, the estimates — reads **
 and a list can come from a journal, a database, a remote host, or a plain file. That seam is
 `Source`: each one answers "is there anything of this kind here?" in its own vocabulary and
 then translates what it found into the state's fields, so `_snapshot` is a loop rather than
-four branches.
+two branches.
 
 | Class | `-s` / `backend` | `find()` reads | `miss()` says |
 |---|---|---|---|
 | `CliSource` | `cli` | this directory's chat journal (`log.jsonl`) | `no CLI chat for this directory` |
 | `DesktopSource` | `desktop` | one thread of the desktop app's sqlite store | `no conversation DB found` |
-| `NasSource` | `nas` | a session on the NAS, over ssh | `no NAS session` (a probe never misses) |
 | `FileSource` | `file:PATH` | the state JSON at `PATH` (a directory means `fbtodo-state.json` inside it) | `no state file at PATH` |
 
 The contract is three methods: `find(args, cwd)` fetches and returns the raw observation
@@ -237,6 +243,29 @@ word for a source, `backend` is the state's.
 `-s auto` asks `cli` then `desktop`; every other value asks exactly one source, and the
 **last source asked** speaks for the chain when none found anything (`-s cli` in a
 directory with no journal is an error, never a fall-through into the desktop store).
+
+The desktop store commits a `messages` row only at the turn's close, so `DesktopSource`
+reads the in-flight turn from the one live place the store keeps — `threads.harness_state`, a
+JSON blob the app rewrites as the agent works, whose
+`sessionState.mainAgentState.messageHistory` holds the tool calls as they are made. The
+newest `write_todos` there is the live list (`desktop.harness_turn`, walked with SQLite's own
+`json_each` so a blob that grows with the whole session is never pulled into Python — a pane
+ticks once a second). `desktop._live_turn` folds it in under three rules: only while
+`turn_running`, only when the list was written at or after the turn's own start
+(`threads.last_prompt_at`), and only when it is not older than the committed list — so a
+finished previous list is not read as this turn's progress and `finish_state` drops it the way
+the CLI does. The same history carries the REQUESTS (`mainAgentState.messageHistory`'s user
+messages the app tagged `USER_PROMPT`) and the agent's `Goal:` headings, so
+`desktop._now_and_nudge` can say `now`/`nudge` for a request newer than the list — reusing the
+CLI journal's own `is_nudge` / `pick_prompt` / `_newest`, so the two sources cannot drift
+apart. The same prose carries the agent's `Goal:` heading, read with `goal_line` and chosen
+by the shared `pick_goal` — the CLI journal's rule, factored out so the two sources cannot
+differ — so a mid-turn desktop pane is headed exactly as a CLI pane would be; a heading
+written for a newer request becomes that line's `now` instead. The two readers are held to
+that promise by a **replay**: the self-check writes each case to a journal and to a harness
+history at the same positions, reads both (`read_cli` and `read_desktop`), and asserts the
+same `goal`, `now` and `nudge` — so a rule that holds in one store and not the other fails
+as a diff between the two, not as a surprise in a pane.
 
 `-s` is a word or a `file:PATH`, so the word set is validated by `main` rather than by
 argparse's `choices`: a typo exits `64` (a usage error), and the `file:` prefix has to reach
@@ -270,6 +299,46 @@ file left to the source's own "no state file" answer. `--source
 file:PATH` makes the readers answer from it: because the pushed state carries `backend: push`,
 a cached live state never satisfies a `file:` request, so a hand-pushed list needs no watcher to
 be shown.
+
+## `fbtodo board`
+
+The other question a pane cannot answer: what is **every** live session doing, at once. A pane
+follows one list — one cwd, one thread, one ssh — and people run two or three agents at a time,
+so the board is a second frame over the same two local stores, not a new reader of them.
+
+`board_sessions` walks `--cli-root` and `--db` and returns rows, newest activity first:
+
+* **CLI** — every chat under `<root>/<project>/chats/*` whose `log.jsonl` mtime is inside the
+  window. The order matters: `glob` + `store_mtime_ms` first, `read_cli` only for the few that
+  qualify and only for the newest `BOARD_SCAN_MAX` (12) of them. A store holding a hundred
+  finished chats therefore costs a hundred stats and one scan, which is what keeps a board
+  cheap enough to redraw once a second.
+* **Desktop** — every live thread of every project store, through `live_threads` with no
+  followed thread (the board follows none: every row is somebody else's session).
+
+Both rows are the readers' own answers — `read_cli`'s state and `live_threads`' dict — so the
+board cannot disagree with a pane about what a list says; it is a subset of the fields, because
+a row is one line and a state is a screenful. `board_row_cli` picks the list, the heading, the
+clock and the two newer-request lines.
+
+**Live** is a store clock, not a process: a journal is appended every iteration while the agent
+works, and a desktop thread's only clock is its newest `write_todos` (the app commits per turn).
+Both use the same 90-minute window (`BOARD_LIVE_MS`), the window the desktop source already
+gives its stacked threads, and `--board-live MIN` overrides it (0 = no window). A session that
+stopped drops off by itself, so there is no bookkeeping to go stale and nothing to clean up.
+`BOARD_RUNNING_MS` (3 minutes) is the shorter question the arrow marks.
+
+There is no third store here: the board reads the two that live on this machine, because its
+whole promise is that one look is cheap.
+
+Two renderers, split exactly as `render` splits them: `board_plain` for a pipe (a heading line
+per session, its steps indented under it, no borders) and `board_frame` for a TTY — one box,
+a heading row per session with the project and the age, then `--board-rows` of its steps. The
+frame's `theme` and `truecolor` are arguments like every other frame's, so the same rows and the
+same clock give the same bytes; `_clamp_widths` and `_clamp_rows` are the same two guarantees
+behind it, and `--live` diffs one paint against the last with `pane_repaint` (cursor hidden, and
+restored on every exit path). `--json` is the rows themselves, with the window it was asked for
+and the count — a document, never a pane, so `--live --json` is refused at the parser (`2`).
 
 ## Notifier contracts
 
@@ -320,7 +389,13 @@ what a snapshot cannot see.
    take the pane away exactly when its owner is looking at it) or while `reload_probe_error`
    finds a tree that parses but will not load (a pane that execs into a corpse is a pane the
    keeper reopens, into the same broken tree, over and over), and it pays a compile and a
-   probe only when a source actually changed. Before this, an upgrade left the list drawn by the build
+   probe only when a source actually changed. Neither check can see a tree whose call sites no
+   longer agree with its definitions — that parses and imports perfectly — so the poll is
+   guarded too: an exception in a tick is logged once per distinct message and drawn on the
+   frame's own error row (`poll failed reading desktop — OperationalError: …`), and the next
+   tick polls again. Measured 2026-10-03, the unguarded version lost a working pane to a
+   `TypeError` raised by an edit that was half-applied on disk; guarded, the same pane stays
+   up, says so, and recovers by itself once the build is fixed. Before this, an upgrade left the list drawn by the build
    the pane had imported until somebody respawned it by hand: measured 2026-10-01, a pane
    started the day before a release still rendering the day-before's fields beside a watcher
    that had already been replaced. The watcher and the keeper now replace themselves the same
@@ -334,10 +409,23 @@ what a snapshot cannot see.
    that changes is the top border. What one image cannot know about the other crosses the exec
    in the environment (`FBTODO_PANE_RELOADED`: the old `VERSION` and the file that changed),
    since memory is exactly what an exec throws away; the note's clock starts at the first frame
-   it can be part of, so a reload whose first poll is an ssh round trip still gets to show it.
-5. When the instance exits, the pane exits; the watcher drops its lock and stops; the keeper
-   stops once no freebuff is left (after a grace period, because the wrapper splits the pane
-   *before* the CLI exists).
+   it can be part of, so a reload whose first poll is a slow read still gets to show it.
+5. A pane exits on **its window**, and on nothing else. It was told otherwise for a long
+   time, in two steps: first when the process it was opened beside died, then (2026-10-03)
+   when the *session* it followed was judged over — which fixed `auto` drawing the app's
+   thread behind an exited CLI and still closed mid-run, and then fixed the store's clock
+   reading a session the reader was still working through as ended. Every rule for it was
+   still a rule about a clock, and what the pane draws is a LIST: a list whose session is
+   over is a list somebody is finishing, waiting on, or re-reading. So the whole question is
+   gone (2026-10-04). What ends a pane is named in `cmd_pane`: `--stale-after`, Ctrl-C, a
+   `--once` that has drawn its frame, and the window going away. `--stale-after` is the
+   reader's OWN window (minutes; `0`, the default, never fires) measured on the store the
+   pane is following, so the one clock left is one the reader asked for. An `auto` pane has
+   no session to close on at all: its subject is fixed (below), so a chat ending is a finished
+   LIST on screen rather than a hand-over, and nothing about the session is left to ask. The
+   watcher below it drops
+   its lock and stops when its process does, and the keeper stops once no freebuff is left
+   (after a grace period, because the wrapper splits the pane *before* the CLI exists).
 6. The keeper's other job is the repair, in two kinds. Every 3 s it re-derives the pane
    geometry and `move-pane` a drifted pane back **in place** — same process, same scrollback,
    same step clocks. And a pane found on a different interpreter than its watcher's is
@@ -447,7 +535,7 @@ the directory and the watcher would re-claim into it. The re-claim is written to
 log (`watcher re-claimed its name`).
 
 The questions a claim can be asked are a command now: `fbtodo locks` audits every claim file
-this root knows — the watcher's, the keeper's, the NAS pane watcher's, and the legacy root's
+this root knows — the watcher's, the keeper's, and the legacy root's
 while they are still there — and answers with the same machinery the readers use, with no
 write anywhere (the probe `lock_holder` removes a leftover it finds; an audit exists to say
 so instead). Holder: the record's pid, tested for life. Name↔inode: a held claim blocks this
@@ -464,7 +552,7 @@ A claim file can only name a holder that still ties to its name, so the audit ha
 half the file cannot produce: a watcher or keeper whose name was replaced under it holds a
 lock on an unlinked inode, and the file it left behind reads `absent` or `free` while the
 process keeps running. `claim_processes` asks the process table instead: every watcher,
-keeper and NAS watcher whose command line is an fbtodo invocation of that subcommand (the
+keeper whose command line is an fbtodo invocation of that subcommand (the
 token right after the launcher, or the package's own `__init__.py`; the `--foreground` that
 distinguishes a running watcher from a bare spawn that only starts one) and whose
 environment names this state root. The read is the interesting half. It is the copy the
@@ -510,13 +598,11 @@ older than the re-claim, down to the argv shape the rule reads) is still named u
 claim that reads `absent`, and still ended.
 
 Every reader that only LOOKS goes through `lock_peek` for the same reason, not just the
-audit: `doctor`'s watcher row, `status` (which used to read the daemon claim through
+audit: `doctor`'s watcher row, and `status` (which used to read the daemon claim through
 `daemon_pid()`, the destructive probe, and would empty a dead watcher's leftover as it
-reported on it) and `nas --status` (which used to read its claim through
-`nas_pane_daemon_pid` — `lock_holder` again, and for a watcher from another build it even
-kills the process and clears the claim). The self-check seeds the three claim records with
+reported on it). The self-check seeds the claim records with
 a dead pid and runs the whole look-only family — `status`, `why`, `ledger`, `locks`,
-`doctor`, `nas --status`, `bar`, `pin --list` — asserting each leaves every record
+`doctor`, `bar`, `pin --list` — asserting each leaves every record
 byte-identical and still present, and nothing else under the state root moved; the
 task-log writers `snap` and `json` are held to the claim files only, since recording
 tracking events in the log is what they are for. Then it holds the daemon claim and checks
@@ -524,7 +610,7 @@ the row and `--json` name the holder, with no byte moving either.
 
 Every remaining `lock_holder` caller is a path that ACTS, and each says so in place: the
 start guard (`spawn_daemon`'s wait, `daemon_loop`, `ensure_pane_keeper`), the stop
-(`cmd_stop`, `nas --stop`), the pane's own poll, a keeper pass (`ensure_local_panes`),
+(`cmd_stop`), the pane's own poll, a keeper pass (`ensure_local_panes`),
 `claim_or_force` (`--force` is ending the holder) and `live_watcher_pid` (which replaces a
 watcher left on another build, killing it). They must probe because they are *doing*
 something to the claim: a free record naming a dead pid is a leftover to clear, and a start
@@ -581,6 +667,22 @@ what the keeper, `status` and `why` read back — so a `tmux respawn-pane` of th
 brings the pin with it. The shell wrapper (`fb`) does the same thing from the other side: it
 resolves the interpreter, the launcher and the PATH in the owner's own shell, which is the last
 place that PATH is known.
+
+The same rebuild covers more than PATH, and the rest of the pin is `pinned_env`: the values the
+program reads from its OWN environment to decide **where** it works. They are the state root
+(`FBTODO_HOME` first, `XDG_STATE_HOME` second — the pair `_state_root` reads), the tmux server a
+pane drives (`FBTODO_TMUX`), the session marker it counts live sessions by (`FBTODO_FB_MARKER`),
+and the six notify-watch paths its bells are sent to (`FBTODO_NOTIFY`, `_DROP`, `_ASK`, `_PAUSE`,
+`_PANE_BELL`, `_LOCKS_BELL`); they ride in the same command line as `KEY=value` arguments to
+`env`. A pane whose server predates one of them — the server was started before the owner
+exported `FBTODO_HOME`, or a login shell's profile set a different `XDG_STATE_HOME` — would
+otherwise read another store, follow another set of sessions, or send every bell to
+`~/.config/freebuff-notify/` (absent, or somebody else's, on the machine that pointed its watches
+elsewhere), with nothing on screen to say so. Only values that are actually SET are
+carried: an empty `FBTODO_HOME=` in the command line would read as "this process names a root"
+to `_proc_environ` in `locks.py`, which has to keep a command line and an environment apart.
+Every value a pane or daemon needs is carried either way: the ones that are SET ride in
+the command line, which a respawn re-runs verbatim.
 
 With the pin in place a pane and its watcher agree about the interpreter, and `fbtodo status`
 prints what came of it: `pane python : … (same as the watcher)`. The pane's is
@@ -642,6 +744,43 @@ case a respawn cannot mend — the pin is what ran, so the child's interpreter c
 somewhere else — and the keeper says so once (`held %id: a child (pid N) is on …`) instead of
 respawning on every pass.
 
+The interpreter is not the only thing that can be behind. The rest of the pin (`pinned_env`)
+arrived one key at a time across several builds, and the pin is re-run only when a pane is
+respawned — which happens for a drift, or by hand, and otherwise never — so a pane opened by an
+earlier build keeps its old answer about the state root, the tmux server and the bells, with
+its recorded command still naming the old values. The keeper's third repair reads that recorded
+command and, when it predates this build, reopens the pane once on the current pin
+(`stale_pin` decides, `upgrade_stale_panes` acts): same pane id, same window, and the recorded
+command becomes this build's, which is the point — it is what a later respawn would re-run.
+Only the carried values are compared: `stale_pin` asks that every value this build hands on
+appears as a `KEY=value` token in the line, and nothing else. The interpreter, the `PATH` and
+the arguments after them are deliberately not compared, because the `fb` launcher opens a pane
+that names the same values under `--instance-of` while a fresh split says `--watch-pid`, and
+calling that stale would replace a working pane to change an argument nobody disagreed about;
+with no values to hand on, no command is stale at all (the server's environment is the answer).
+The key set is read off `wanted` rather than matched by a prefix, so `XDG_STATE_HOME` — which
+rides with the `FBTODO_*` keys but is not one — counts too. The repair has the drift repair's
+brakes and its memory, kept separate so one cannot spend the other's retry budget: the pane's
+`@fbtodo_repair` switch keeps it, one attempt per `DRIFT_RETRY_S` (`_STALE_TRIED`), and the
+`reopen` note tells the person watching (`REOPENED ON THE PIN`) rather than changing a pane
+under them. A pass settles: after one respawn the recorded command is the pin and the next pass
+is a no-op.
+
+The keeper's upgrade would rewrite a stale pane on the next pass, so the pane it is about to
+change is named first: `status` prints a `pane pin` line and `why` sets `stale_pin` on the
+record — both from `stale_pane_ids`, the same predicate (`stale_pin`) the upgrade acts on, read
+from the same rows, so the diagnosis and the repair cannot disagree about which panes are
+behind. The line splits by the knob: a pane the keeper will reopen reads `on an older pin — the
+keeper reopens it on the current one`, and one marked `@fbtodo_repair off` reads `kept`,
+because nothing else will change it and that is the state somebody asked for. The values the
+diagnostic compares against are the SESSION's, not the shell it happens to be typed in
+(`session_pinned_env`): the KEEPER's own environment is read first — it is the process that
+would rewrite the pane, so agreeing with it is the point — and, with no live keeper, the shell
+the session is drawn in (`freebuff_pane_id`'s pane); only when neither can be read does the
+reader fall back to its own `pinned_env`. A variable exported only in the CLI's shell can no
+longer make a current pane read as behind, and `status`/`why` answer the same however they
+were launched.
+
 A bell is the one member of that tree no repair can ever reach: it lives for as long as it
 takes to send and is gone by the time the keeper reads the process table, so its interpreter is
 fixed at the launch instead. Every bell in `scripts/notify/` is an `env python3` script whose
@@ -671,7 +810,7 @@ a doctor run over a dead watcher's leftovers deleted `fbtodo-daemon.pid` — the
 `_claim_live` decides the state root from and `one python` reads a pid from. The watcher row
 now asks `lock_peek`, the read-only twin of the probe: open and try the lock, with no unlink
 and no write anywhere, answering held-or-free and the pid the record names (0 when it names
-none). The self-check pins the whole contract: daemon, keeper and NAS-pane records seeded with
+none). The self-check pins the whole contract: the daemon and keeper records seeded with
 a dead pid — free, the exact case a cleanup removes — and a held daemon claim are all
 byte-identical after a `doctor` run.
 
@@ -733,7 +872,73 @@ module's live namespace (which already holds what its imports and `from .x impor
 in the builtins? A missing name is printed with its module and enclosing function and the exit
 is 70, so the caller holds; zero is a yes. It is not a linter — attribute names are not
 symbols, locals and closure variables are not globals, and a name bound at run time passes,
-because the lookup is the live namespace. Exit 0 is a yes; a nonzero exit, a signal, or a hang past
+because the lookup is the live namespace.
+
+The parse is asked the other half of the same question. A name that no longer exists is one
+way a build is quietly wrong; code its own source proves will never execute is the other, and
+an import cannot see either. So `unreachable_code` walks each module's AST and fails the build
+on the first stretch that cannot run: a statement after the one that ends its suite (`return`,
+`raise`, `break`, `continue` — nothing after it in that same list can execute) or the dead arm
+of a constant conditional (`if False:`, `if True: … else:`, `while False:`, an `if`
+expression with a literal test). The test is also folded when it **compares literals**
+(`if 1 > 2:`, `while 0 == 1:`, a chained `0 < 1 < 0`), which `_compare_value` walks link by
+link the way Python does — stopping at the first false link, so a later one that would raise
+is never asked. It only ever speaks from certainty: a test is reduced only when it is a
+literal, a `not` around one, or a comparison whose EVERY operand is a literal (`ast.literal_eval`
+answers for each operand or the whole thing is declined), and a body is called dead only when
+its test is a constant that rules it out. So a comparison against a name (`if x > 2:`), an
+`in` that cannot be made (`1 in 2`), and `is`/`is not` (identity is not a value question) are
+left alone, and so is a live `while True:` with a `break` or an ordinary `if x:` — the
+self-check holds all of them as controls. That matters because the probe itself runs the
+build: a check that called live code dead would refuse to reload a perfectly good tree. Like
+the name pass it is pinned both ways — this checkout must pass, and a copy carrying a
+statement after a `return`, a constant-false branch, or a literal comparison that is false
+must fail and name it.
+
+The parse is asked one more thing, and it is the one that needs an argument rather than a
+table: `_guarded_in` follows a **guard**. Inside one function, `if P: return` at the top means
+P is FALSE for every line below it — control only gets past the guard by not entering it — so a
+later `if P:` can never run and a later `if not P:` can never take its `else`; an `assert P`
+makes the same promise by the other route, since control continues past it only when P held, so
+the same test is already TRUE below it and its negation already false. (`assert` is believed on
+purpose: the pass runs on a build about to be exec'd, never under `-O`, which strips asserts.)
+Each half of that
+sentence is a place to be wrong, so each is refused unless it is certain. The guard's body must
+leave on EVERY path (`_always_terminates`: the four terminators, an `if`/`else` where both arms
+leave, a `with` whose body does; a `for` or `while` is never assumed to run). The two tests must
+be the same expression read twice, or one of them its exact negation — and only `not`, `is` /
+`is not` and `in` / `not in` are taken as negations, because `__ne__` and `__ge__` are free to
+answer something other than the negation of `__eq__` and `__lt__`. The test may read nothing but
+names this function binds for itself (`_function_locals`): a global or a closure cell is another
+pass's to change, an attribute or a call could do anything at all, and a walrus binds — all four
+are declined rather than guessed. And no statement between the two may bind one of the names the
+sentence reads (`_assigned_names`, deliberately over-inclusive), because the sentence would then
+no longer mean what the guard proved.
+
+A fact is carried into the blocks the statement DOMINATES — the body of a later `if`/`with`/`try`,
+its handlers, and a loop's body and `else` (`_nested_guards`) — so the same test looked at a
+third time inside one of them is caught. A LOOP body is the one place a repeat, not a dominated
+run, could justify the fact, so it is entered with only the facts the loop cannot disturb: any
+fact whose names the loop ASSIGNS anywhere is dropped first (the same `_assigned_names` filter
+every statement gets, and over the whole loop here — target, body and `else`), leaving facts a
+previous pass through the body could not have changed. It is never carried across a SCOPE
+boundary (a nested `def` or `class`, whose own turn it gets with its own locals). That keeps the
+rule small enough to check by eye, and the self-check holds the refusals as controls (a
+rebinding, a global, an attribute, a call, a loop that assigns the name) next to the baits a
+guard does catch — a repeated test, a negated one, an `assert` read both ways, a repetition
+nested in a dominated block, and a repetition inside a `for`/`while` body the loop does not
+disturb.
+
+The probe is a search, not a census: `unreachable_code` returns the FIRST finding across the
+package, because one is enough to refuse a build. `fbtodo dead` is the same two passes with
+the findings KEPT instead of cut short — `_unreachable_all` (literals and what follows a
+terminator) and `_guarded_suites` (a guard's promise) are generators, the first-only readers
+are their first element, and `dead_code` collects `{path, line, why}` for every file. So the
+subcommand and the probe cannot disagree: the first row `fbtodo dead` prints is exactly what
+`unreachable_code` would have held the build for. `--json` is the same rows, and the exit is
+nonzero once anything is found.
+
+Exit 0 is a yes; a nonzero exit, a signal, or a hang past
 `RELOAD_PROBE_TIMEOUT_S` is a reason to hold. The child's last stderr line is what the log
 names, so the hold says WHY (`… the new build does not load: RuntimeError: …`). Holding is the
 fallback the name promises: the process keeps the build it is running — the last one that
@@ -790,7 +995,23 @@ single untitled group when the state has only its own `todos`), and both rendere
 `plan` of `(group, index, todo, heading)` rows from it, printing a heading only when there is more
 than one group. The heading is added **after** the `TASK_MAX_LINES` cap — it costs no step's line
 — and the fit is anchored on the followed thread's current step, so stacking a second list cannot
-push the list the pane was pointed at out of view.
+push the list the pane was pointed at out of view. A PANE never gets there: `cmd_pane` sets
+`--threads 1` from the first poll and `latch_pane_subject` then narrows the pane's own arguments
+to one source plus `--thread`/`--chat`, so every later poll asks for that subject by name. The
+first accepted poll is what decides — and it is still `auto`'s chain doing the deciding, after
+`pane_cached_state` has dropped any cached state whose session ended, so a pane still lands on
+the live thread rather than the finished chat. A finished turn does not release the lock, a second
+thread going live cannot steal it, and the lock rides out in `FBTODO_PANE_LOCK` so a pane that
+`exec`s itself into a new build comes back holding the same list. The stacking above is for the
+reads (`json`, `snap`, `board`), which are surveys rather than somebody's window.
+
+The bar's two numbers are **not** taken from the groups: `drawn_counts(state)` counts the
+list the pane FOLLOWS (`state["todos"]`) whenever it is there, and only when it is not — a
+finished list dropped by `finish_state` for a newer request, while the other threads' lists go
+on being drawn — does it fall back to `done/total` summed over the groups being painted. Without
+that fallback a stacked pane printed `0% (0/0)` (and `0/0 done`, and `todos -`) directly under a
+heading reading `11/11`. The estimates on that row (`EST REM`, `ETA`, `GOAL`) are still measured
+from the followed list, because they are still about it.
 
 ## Conventions worth keeping
 
@@ -814,12 +1035,12 @@ push the list the pane was pointed at out of view.
   because a state file an older build wrote is still on disk. H1 measured all of it reaching
   the terminal verbatim before (OSC 52, OSC 0, CSI moves, U+202E) in the rich pane, in
   `snap` and in `json`.
-- **A source reads, `describe` translates.** Nothing that fetches (an ssh, a DB open, a
-  file stat) may happen inside `describe`, and nothing that knows the state's field names
-  may happen inside `find`: that split is what makes a source's cost visible at the call
-  site and keeps the three mappings comparable. Adding a field means adding it to the
-  source that can supply it — the others leave it unset on purpose, which is the contract
-  (`turn_ended` is false for NAS because the NAS build records no end-of-turn).
+- **A source reads, `describe` translates.** Nothing that fetches (a DB open, a file stat)
+  may happen inside `describe`, and nothing that knows the state's field names may happen
+  inside `find`: that split is what makes a source's cost visible at the call site and keeps
+  the mappings comparable. Adding a field means adding it to the source that can supply it —
+  the others leave it unset on purpose, which is the contract (`turn_ended` is false for the
+  desktop store because it records no end of turn).
 - **A theme value is validated where it is read.** `THEME_VALUE_RE` accepts a `#rrggbb`
   colour or a raw SGR parameter list and nothing else, because the value is interpolated into
   an escape sequence. A refused value leaves the role at whatever the next source down gave

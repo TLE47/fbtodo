@@ -11,7 +11,7 @@ all, which looks exactly like a long step. The two are told apart on the PANE:
     working...                  ↓             40m 45s  ■ Esc     <- a step is running
     ❯ Enter a coding task                                        <- ...and this alone
 
-A five-minute command keeps the first line up for the whole five minutes (measured: a NAS
+A five-minute command keeps the first line up for the whole five minutes (measured: a
 pane showed 40m of `working...`), so a quiet store plus no `working...` on screen is a
 session that stopped rather than one that is busy. A quiet window on its own would be the
 quiet-window heuristic `todo-bell.py` already rejected — this is that heuristic with the

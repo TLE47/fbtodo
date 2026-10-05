@@ -302,7 +302,7 @@ def daemon_pid() -> int | None:
     says it stopped something, the daemon loop's start guard must not stand down for a
     leftover, and a keeper pass reads the watcher's interpreter from it — and it is
     exactly what a command that only LOOKS must not do. The look-only family (`status`,
-    `doctor`, `nas --status`, and the audit) reads the same claims through `lock_peek` or
+    `doctor`, and the audit) reads the same claims through `lock_peek` or
     `claim_audit`, because the record it was asked to report on is also what `_claim_live`
     decides the state root from: a cleanup would erase the fact being reported, or (for a
     watcher from an older build) kill the very process the row is about. A new caller that
@@ -327,7 +327,6 @@ def daemon_pid() -> int | None:
 ROLE_PROCS = {
     "watcher": ("daemon", ("--foreground",)),
     "keeper": ("pane-watch", ()),
-    "nas pane": ("nas", ("-f", "--foreground")),
 }
 
 # How long a process must have been running before the cross-check calls it untied. A
@@ -340,8 +339,8 @@ ORPHAN_MIN_AGE_S = 2.0
 def _fbtodo_subcommand(cmd: str) -> str | None:
     """The fbtodo subcommand a command line runs, or None when it is not fbtodo at all.
 
-    One rule for every spawn shape this program has: `spawn_daemon`, `ensure_pane_keeper`
-    and `spawn_nas_daemon` all build `[python, <launcher>, <subcommand>, …]`, the panes are
+    One rule for every spawn shape this program has: `spawn_daemon` and
+    `ensure_pane_keeper` both build `[python, <launcher>, <subcommand>, …]`, the panes are
     `[env, PATH=…, python, <launcher>, pane|snap, …]`, and a launcher-less copy names
     `<pkg>/fbtodo/__init__.py` instead. The token AFTER the program is the subcommand —
     never a flag, because the flags come after it — so a process that merely mentions the
@@ -582,7 +581,7 @@ def _proc_environ(pid: int) -> tuple[str, bool]:
 
 def claim_processes(root: str = "", table: dict | None = None,
                     environs: dict | None = None) -> list[dict]:
-    """Every fbtodo watcher, keeper and NAS watcher RUNNING with the state root `root`.
+    """Every fbtodo watcher or keeper RUNNING with the state root `root`.
 
     In plain words: a claim file can only name a holder that still ties to its name, so a
     process whose name was replaced is invisible to every read of the file — the audit
@@ -704,8 +703,8 @@ def write_lock(cwd: str, instance_pid, path: str | None = None,
                extra: dict | None = None) -> bool:
     """Claim `path` for this process, and write the record a reader sees.
 
-    `path` exists for the NAS watcher and the pane keeper, whose claims on the scratch dir
-    are their own files: three roles, three claims, and they must not block each other.
+    `path` exists for the pane keeper, whose claim on the scratch dir is its own file:
+    two roles, two claims, and they must not block each other.
     `version` lets a reader tell a live watcher from one left behind by an upgrade.
 
     False when someone else holds it — the caller must stop rather than run a second

@@ -88,17 +88,29 @@ fb() {
         # Each arm calls tmux itself: a variable holding "-h -b" would split into one
         # word under zsh and two under bash.
         _fb_size="${FBTODO_PANE_SIZE:-12}"
-        # The pane is named by ABSOLUTE paths and carries this shell's PATH: tmux rebuilds a
-        # pane's environment, so a command resolved through PATH could come up on a different
-        # Python than the watcher it starts beside it (measured 2026-10-01: a pane on
-        # /usr/bin/python3 3.9.6 beside a watcher on Homebrew's 3.14). This shell has the
-        # owner's own PATH, so the answer is taken HERE, where it is still known. `env`
-        # carries the assignment because the login shell that runs a pane command may be
-        # fish, which has no `VAR=value command` form.
+        # The pane is named by ABSOLUTE paths and carries this shell's own environment:
+        # tmux rebuilds a pane from its SERVER's environment, so a command resolved through
+        # PATH could come up on a different Python than the watcher it starts beside it
+        # (measured 2026-10-01: a pane on /usr/bin/python3 3.9.6 beside a watcher on
+        # Homebrew's 3.14), and a value the server never had would move the pane to another
+        # state root, tmux server or set of sessions — or send its bells to the default
+        # scripts. This shell is the last place those are still known. `env` carries the
+        # assignments because the login shell that runs a pane command may be fish, which has
+        # no `VAR=value command` form. The names are read one at a time with `eval
+        # "_fb_val=\${$_fb_v}"` rather than spelled out ten times: the `eval` only performs
+        # the parameter expansion (the value is never re-parsed for a command substitution),
+        # and one list is one place to keep in step with `PINNED_ENV_KEYS`.
         _fb_py=$(command -v python3 || command -v python)
         _fb_bin=$(command -v fbtodo)
+        _fb_carry=""
+        for _fb_v in FBTODO_HOME XDG_STATE_HOME FBTODO_TMUX FBTODO_FB_MARKER \
+                     FBTODO_NOTIFY FBTODO_DROP FBTODO_ASK FBTODO_PAUSE \
+                     FBTODO_PANE_BELL FBTODO_LOCKS_BELL; do
+            eval "_fb_val=\${$_fb_v}"
+            [ -n "$_fb_val" ] && _fb_carry="$_fb_carry $_fb_v='$_fb_val'"
+        done
         if [ -n "$_fb_py" ] && [ -n "$_fb_bin" ]; then
-            _fb_cmd="FBTODO_SPLIT=${FBTODO_SPLIT:-v} /usr/bin/env PATH='$PATH' '$_fb_py' '$_fb_bin' --instance-of $$ --stale-after 0"
+            _fb_cmd="FBTODO_SPLIT=${FBTODO_SPLIT:-v} /usr/bin/env PATH='$PATH'$_fb_carry '$_fb_py' '$_fb_bin' --instance-of $$ --stale-after 0"
         else
             _fb_cmd="FBTODO_SPLIT=${FBTODO_SPLIT:-v} fbtodo --instance-of $$ --stale-after 0"
         fi
@@ -174,18 +186,29 @@ function fb
             set _fb_where $FBTODO_SPLIT
         end
         # $fish_pid is the interactive shell's pid — the analogue of `$$`.
-        # Absolute paths and an explicit PATH, for the same reason as the POSIX body: tmux
-        # rebuilds a pane's environment, and this shell is the last place the owner's own
-        # PATH is known. `string join : $PATH` because fish holds PATH as a list, and the
-        # assignment inside the branch is BARE on purpose: `set -l` in a block is scoped to
-        # that block, so the pane command would be empty by the time tmux was called —
-        # measured, with a stub tmux, before this line was written.
+        # Absolute paths and an explicit environment, for the same reason as the POSIX body:
+        # tmux rebuilds a pane from its server's, and this shell is the last place the
+        # owner's own PATH — and the values that say where the pane works — is known.
+        # `string join : $PATH` because fish holds PATH as a list, and the assignment inside
+        # the branch is BARE on purpose: `set -l` in a block is scoped to that block, so the
+        # pane command would be empty by the time tmux was called — measured, with a stub
+        # tmux, before this line was written. `_fb_carry` is one `KEY='value'` per variable
+        # this shell HAS (fish has no `${VAR:+…}`), read by name with `$$_fb_v` so the list
+        # is the only thing to keep in step with `PINNED_ENV_KEYS`: the state root, the tmux
+        # server, the session marker, and the six notify-watch paths a pane's bells are sent
+        # to. A variable nobody set is skipped rather than carried empty.
         set -l _fb_py (command -v python3; or command -v python)
         set -l _fb_bin (command -v fbtodo)
         set -l _fb_path (string join : $PATH)
+        set -l _fb_carry ""
+        for _fb_v in FBTODO_HOME XDG_STATE_HOME FBTODO_TMUX FBTODO_FB_MARKER FBTODO_NOTIFY FBTODO_DROP FBTODO_ASK FBTODO_PAUSE FBTODO_PANE_BELL FBTODO_LOCKS_BELL
+            if set -q $_fb_v; and test -n "$$_fb_v"
+                set _fb_carry "$_fb_carry $_fb_v='$$_fb_v'"
+            end
+        end
         set -l _fb_cmd "FBTODO_SPLIT=$_fb_where fbtodo --instance-of $fish_pid --stale-after 0"
         if test -n "$_fb_py"; and test -n "$_fb_bin"
-            set _fb_cmd "FBTODO_SPLIT=$_fb_where /usr/bin/env PATH='$_fb_path' '$_fb_py' '$_fb_bin' --instance-of $fish_pid --stale-after 0"
+            set _fb_cmd "FBTODO_SPLIT=$_fb_where /usr/bin/env PATH='$_fb_path'$_fb_carry '$_fb_py' '$_fb_bin' --instance-of $fish_pid --stale-after 0"
         end
         switch $_fb_where
             case left

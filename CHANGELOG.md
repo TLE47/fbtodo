@@ -6,6 +6,99 @@ Entries start at the newest release; each one is a contract change, not a diff.
 ## Unreleased
 
 ### Added
+- **`fbtodo mute` drives the same switch without a keystroke — `on`, `off`, `list`, `until-done`.**
+  The pane keys are the fast way when the pane is what you are looking at, and the wrong way
+  for everything else: a script, a status row, another program's button, a shell that is not a
+  pane at all. So the switch is also a command, over the SAME two files and the SAME record —
+  there is no second implementation to drift. `fbtodo mute`, or `fbtodo mute list`, reports the
+  row the pane would be showing (`  notifications : on`, or `off — <scope>, by <who>`) and names
+  which of the kit's two switches are actually off; `--json` gives the same facts as a document
+  a script can parse (`muted`, `scope`, `by`, `chip`, `switches`, `record`). `on` mutes until
+  told otherwise, `off` gives them back by restoring the word that was there (a `phone-state`
+  that never existed is removed again) and is a no-op rather than an overwrite when there is
+  nothing of ours to undo, and `until-done` mutes until the list this directory is working on
+  is finished. That last one is a PROMISE about a list, so it reads the list instead of assuming
+  one, and asked when the list is already finished it says so and writes nothing: a mute whose
+  condition is already met is a mute nobody would have wanted. The promise is kept by the
+  program, not by the pane that was asked — `auto_unmute` lifts it when the list is finished,
+  which means by the NEXT pane to run if none is open now. WHO asked decides who lifts it: a
+  mute a key took is the pane's promise to itself and a pane that closes hands the phone back;
+  a mute a command took is the person's promise to themselves, so a pane closing leaves it alone
+  and only the finished list (or `fbtodo mute off`) ends it. A word that is not one of the four
+  verbs is a usage error (2) that prints the verbs it did find, a verb on a command that takes
+  none still is, and a switch that could not be written is 73 — the file is the switch, and a
+  switch that was not written is not a mute. Teeth: dropping `mute` from the verb routing and
+  pointing the dispatch at another command each fail the new check.
+- **A key in the pane mutes the phone, and gives it back when the list is finished.** `m` is
+  quiet until this list finishes (the default, because a mute that needs a second visit to undo
+  is not a mute), `M` is quiet until you say, and `u` is loud again — and none of them means
+  leaving the pane to learn a file's name: the key writes the notify kit's OWN two switch words,
+  `phone-state` (which `phone.sh` reads) and `state` (which `bell.sh` reads), the same six words
+  (`off 0 false no disable disabled`) the scripts already accept. No new switch and no new
+  argument in the kit: a pane that muted and a shell that muted are then the same state and
+  cannot disagree about it. The undo RESTORES rather than overwrites — the word that was there
+  goes back, a `phone-state` that was never there is removed again, and a switch that was already
+  off before the keypress (yours, or `FREEBUFF_PHONE=off` in a wrapper, which no file can lift) is
+  left exactly as it is and the chip says so rather than pretending an undo worked. The pane's
+  title chip carries the switch and the key that lifts it (`quiet until done · u`, `muted · u`),
+  next to a reload note if both are true. What the key promised is kept by the program, not by
+  the pane: the record of the switch is on disk, because a pane re-execs itself into every new
+  build under it (`BUILD_CHECK_S`) and a mute held in a variable would be dropped by the upgrade
+  it was pressed a minute earlier — so the next pane honours it, lifts it when the list finishes,
+  and lifts it when the pane closes (a pane that exits holding a mute leaves a phone that never
+  rings again, and the only key that fixes it is on the pane that just closed). `--no-keys` (or
+  `FBTODO_PANE_KEYS=off`) is the opt-out for a pane whose terminal is not its own to read.
+  Found while building it: `termios` with `TCSADRAIN` BLOCKS in the pane's SIGINT handler — it
+  waits for output to drain first, and a pane writes output every second — so a pane with the key
+  reader open could not be Ctrl-C'd and had to be killed; `TCSANOW`, which is all these input
+  modes ever needed, is why the check exists. The self-check drives the real pane on a pty: `m`
+  writes both files and the chip names the undo key, `u` puts back exactly what was there, `q`
+  changes nothing, `--no-keys` ignores `m`, and the terminal attributes are back after Ctrl-C.
+  Teeth: dropping the chip from the title, dropping the key reader, and reverting to `TCSADRAIN`
+  each fail on their own check (the last one on the suite's pre-existing "must still leave
+  cleanly on Ctrl-C").
+- **Every reader of a desktop store answers the same four facts about every thread — and the
+  suite now holds them to it.** A stacked row (`--threads`), `json`'s `threads` array and
+  `board`'s desktop rows all carry each thread's own heading and staleness now, with the same
+  read the followed thread's own read makes: `live_threads` runs `_live_turn` then
+  `_committed_prose` per thread, anchored to that thread's list — so a running thread's row is
+  the LIVE list from `harness_state` (as the followed thread's is) and a finished one's is its
+  committed list, and a glance at another tab says whose objective the list carries instead of
+  only how far it got. The board draws `goal:` / `stale goal:` for a desktop thread exactly as
+  it already did for a CLI one. The self-check adds the cross-reader invariant: over one
+  fixture store (a fresh heading, a stale heading left one row back, a heading-less thread and
+  a running one whose live list differs from its committed list), `json`, the pane's stacked
+  rows and the board must agree per thread on done/total, heading and staleness. Teeth verified
+  both ways — dropping the board's heading and dropping the stacked staleness each fail on the
+  exact thread — and the fixture had to be given a `role` column: without one the prose read
+  fails softly and the invariant passes VACUOUSLY, which is its own warning about testing
+  agreement (the sanity assertions pin a heading, a stale one and a live list so it cannot).
+  Measured 2026-10-04 on a real three-thread store: the stacked read is 119 ms against 55 ms
+  for the followed thread alone, on a 1 s pane tick.
+- **The pane's title says which source answered, and what it passed over to do it.** A list
+  that looks wrong is nearly always the same question — *why is this list here and not the other
+  one* — and only `fbtodo why` could answer it. `_snapshot` now records the `auto` chain's own
+  account of itself (`source_why`, e.g. `cli finished 31h → desktop`, or `cli none here` when a
+  source had nothing for the directory), and both renderers carry it in the place that says what
+  the pane is showing: the framed title chip (`FREEBUFF TODOS · cli finished 31h → desktop`) and
+  the plain heading, beside the existing `backend · stamp`. Only `auto` writes a note — a chain
+  of one source has nothing to explain away, so `-s cli|desktop|nas|file` frames are untouched —
+  and a state without one draws exactly the title it always did. The note is clipped, and
+  dropped outright below the width where it can still say something, so the right slot keeps the
+  session it is naming: on a narrow pane the pane keeps its name and the session its columns.
+- **`fbtodo board` — every live session in one frame.** A pane follows one list; people run two
+  or three agents at once, and the question "what is everything doing" had no answer short of
+  switching windows. The board asks the same two local stores the pane already reads and draws
+  one row per live session: the project, where it came from (`cli`/`desktop`), its `done/total`,
+  how long ago its store moved, and the first `--board-rows` (2) of its steps. `--board-max N`
+  caps how many sessions are drawn, `--board-live MIN` (90) is how quiet one may be and still
+  count as live — a store clock, so a session that stopped drops off by itself — and `--live`
+  keeps redrawing in place, diffed row by row, with the cursor always restored. `--json` is the
+  rows for a script. A CLI session is read through `read_cli` and a desktop one through
+  `live_threads`, so a row is the same list the pane would draw, not a second opinion about it;
+  the remote store is left out on purpose, since an ssh per poll is the opposite of one cheap
+  look. Newest activity first, and the CLI half stats before it reads: a store with a hundred
+  finished chats costs a hundred stats and one journal scan.
 - `fbtodo init` — installs the `fb` launcher: detects the shell (`$SHELL`, then the launching
   process), writes the function into `~/.config/fbtodo/`, and adds the `source` line to the
   startup file (idempotent; `--shell`, `--startup-file`, `--dry-run`). One word after a
@@ -217,8 +310,66 @@ Entries start at the newest release; each one is a contract change, not a diff.
   instead of believing it — and that record is what the state root's "a live keeper owns this"
   answer is read from (`_claim_live`), so a diagnostic that emptied it would erase the fact it
   had just reported on (found by the self-check's state-root case).
+- **`fbtodo dead` lists EVERY piece of unreachable code, not just the first.** The reload
+  probe holds a build the moment its own source proves one branch can never run
+  (`unreachable_code`), but it only ever names the FIRST finding — enough to refuse the
+  build, not enough to fix it. The two passes behind that check (a literal or a terminator,
+  and a guard's promise) are now the collection as well as the search: `dead_code` asks the
+  same `_unreachable_all` / `_guarded_suites` over every file and keeps all findings, and
+  `unreachable_code` is its first element, so the probe and the list can never disagree. The  subcommand prints `path:line` with the reason for each (compact and `--json`), and exits
+  nonzero when it finds any — the same fact the probe acts on.
+- **A replay holds the CLI journal and the desktop's live history to one answer.** `pick_goal`
+  and `_now_and_nudge` are shared code, but the two stores are not — the CLI reads
+  `log.jsonl`, the desktop reads `threads.harness_state` — so a rule right in one and wrong
+  in the other would only ever be caught by reading the SAME turn twice. The self-check now
+  writes each case (a heading before the list, a request after it, a bare continuation, the
+  same words again, a heading with no list, a nudge with nothing to anchor on, a compaction
+  summary) to both a journal and a harness history at the same positions, reads both, and
+  asserts identical `goal`, `now` and `nudge` — a drift fails as a diff between the two
+  readers, naming the case and the field, not as a surprise in a pane.
+
 
 ### Changed
+- **A pane locks to the list it first resolved, and never moves again.** It used to follow the
+  work: re-choosing per poll meant that typing in another tab — which is exactly what the app's
+  own thread picker reads as "the thread you are working in" — moved the reader's window to
+  another list, silently and mid-read, with both frames valid and nothing drawn to say so.
+  "It keeps switching threads" is that. The first successful poll now decides, and the decision
+  is made in the ARGUMENTS every later poll already goes through: one source, one `--thread` or
+  `--chat`, so nothing has to be remembered between polls and a pane that reloads itself into a
+  new build comes back locked the same way. A finished turn does NOT release the lock (a finished
+  list is still a list somebody is reading) and a second thread going live does not steal it —
+  the pane holds its last list until you close it, which is what was asked for. What the lock
+  does not do is choose the FIRST list: that is still `auto`'s chain, and a pane still drops a
+  cached state whose session has ended before it latches anything (`pane_cached_state`), so the
+  2026-10-04 freeze fix is untouched — a pane still reaches the live thread rather than the
+  finished chat, and then stays there.
+- **A pane draws one list, not a stack of live threads.** `--threads N` gave a pane a heading
+  per live thread, so the question a reader asks of a pane — how far is THIS list — got an
+  answer about several, and the set changed under them. A pane now asks for one thread from the
+  first poll, before it has anything to latch to (latching after the first resolve left one
+  stacked frame on screen, which is the flinch this is meant to remove). The reads keep the
+  flag: `fbtodo json`, `snap` and `board` still stack on request, which is the right place for a
+  survey. Teeth: the pane beside the source-switch check is now asserted to REACH the live
+  thread and STAY on it (the reads there are still asserted to switch, so the freeze fix is
+  untouched), and a new check starts a pane on one thread, makes a SECOND thread the newest
+  running ask, and requires the pane to still be drawing the first.
+- **The remote (`nas`) source is gone, and with it the second pane role.** There are two
+  stores, `cli` and `desktop`, and both are on this machine. What goes: `-s nas` and
+  `--nas-host`/`--nas-root`/`--nas-project`/`--fb-marker`; the `fbtodo nas` subcommand and the
+  `fbtodo-nas-pane.{pid,json,log}` claims it kept; `nas.py` with the ssh probe, the standalone
+  extractor it shipped over the wire and the `NAS_EXTRACT`/`nas_ssh`/`nas_probe`/`nas_pgrep`
+  around them; `NasSource` and the `nas` backend; the second list pane a window could hold,
+  so `pin --role` and the `role` on every layout record are gone and one window has one
+  answer again; the notifier's `--nas-watch` mode and the drop watch's `--nas`/`--fb`/`--live`;
+  the `FBTODO_NAS*` settings; the three self-check phases that drove it. Pins and remembered
+  layouts written by an older build keep working: a `local` half in `fbtodo-pins.json` is read
+  as the window's own answer (and dropped on the next write), and the old `fbtodo-nas-pane.*`
+  names stay in the legacy-migration list so an install that has them is still cleaned up.
+  `NAS_NOTIFY` — which was the local finish bell all along, wearing the remote source's name —
+  is `TODO_NOTIFY`. Every other command keeps its shape: `status`, `why`, `locks --json` and
+  `pin --json` each lose their remote row and role field, and say the same thing about what is
+  left. The self-check drops to 215 checks, all green.
 - **A pane's interpreter and PATH are pinned, not inherited.** tmux rebuilds a pane's
   environment from its own server's, so a pane command that resolved `fbtodo` and `python3`
   through `PATH` could come up on a different interpreter than the process that opened it —
@@ -231,15 +382,456 @@ Entries start at the newest release; each one is a contract change, not a diff.
   commands (`pane_command`) and the `fb` launcher, which resolves the interpreter and the
   launcher in the owner's own shell — the last place that `PATH` is still known. The
   assignment rides in the command string, so a `tmux respawn-pane` of it brings the pin back.
-  `FBTODO_PATH` overrides the base value for a machine that needs a specific one.
+  `FBTODO_PATH` overrides the base value for a machine that needs a specific one. The pin
+  covers **where** the pane works as well as what it runs: tmux starts a pane from its server's
+  environment, so the values the program reads from its own environment to choose a state root
+  (`FBTODO_HOME`, else `XDG_STATE_HOME`), a tmux server (`FBTODO_TMUX`) and the session marker
+  it counts live sessions by (`FBTODO_FB_MARKER`) are carried in the same command line
+  (`pinned_env`), along with the six notify-watch paths (`FBTODO_NOTIFY`, `_DROP`, `_ASK`,
+  `_PAUSE`, `_PANE_BELL`, `_LOCKS_BELL`) — the first four decide where the pane works, the
+  watch paths where its bells GO, so a machine that points its watches at its own scripts
+  keeps them in the pane instead of falling back to `~/.config/freebuff-notify/`. A server started
+  before the owner exported one of them — or a login shell's own profile — would otherwise
+  leave the pane, and the watcher under it, reading another store, following another set of
+  sessions, or ringing the default bells, with nothing on screen to say so. Only values that
+  are set are carried, so a command line never claims a state root it does not have (`locks`
+  keeps a command line and an environment apart); both builders do it, fbtodo's own pane
+  commands and the `fb` launcher. `FBTODO_NAS*` is not carried: it names a project too, but
+  every pane and daemon that needs it is handed it on ARGV, which a respawn re-runs verbatim.
+- **A pane on an older pin is upgraded instead of left behind.** Those carried values were
+  added to the pin over several builds, and the pin is re-run only when a pane is respawned —
+  which nobody has a reason to do — so a pane opened by an earlier build keeps its old
+  answer forever: another state root, another tmux server, the old bells. The keeper now reads
+  each pane's **recorded** command and, when it predates this build, reopens it once on the
+  current pin (`upgrade_stale_panes`) — same pane id, same window, and the recorded command
+  becomes this one, so what a later respawn re-runs is current too. Only the carried values
+  are compared, never the interpreter, the `PATH` or the arguments after them: an `fb` pane
+  that names `--instance-of` carries every value and is not stale for disagreeing with a
+  split's `--watch-pid`, and with no values to hand on no command is stale at all. The drift
+  repair's brakes apply: the pane's own `@fbtodo_repair` switch keeps it, it is tried once per
+  `DRIFT_RETRY_S`, and it is told on its chip (`REOPENED ON THE PIN`) rather than changed
+  under the person watching it. Because that upgrade rewrites the pane on the next pass, the
+  pane is **named first**: `fbtodo status` prints a `pane pin` line and `fbtodo why` sets
+  `stale_pin` on the pane's record, both from the same predicate the upgrade acts on
+  (`stale_pane_ids`), so the diagnosis and the repair cannot disagree. The values it compares
+  against are the SESSION's — read from the keeper's own process, or the shell the session is
+  drawn in when no keeper is live — rather than the shell the command was typed in, so a
+  variable exported only in that shell no longer reads a current pane as behind. The line
+  splits by the knob — `on an older pin — the keeper reopens it on the current one` versus
+  `kept (@fbtodo_repair off)`, which nothing else will change.
 - A **running desktop turn says so**: the app commits a message row only when a turn closes,
   so a thread that is working has no list to read yet — and `no write_todos call yet in this
   session` read as "the agent forgot" when the store had simply not committed. `-s desktop`
   now reads the store's own live signal (`threads.turn_state` / `turn_alive_at`) and says
   `turn running · no list yet` instead; a stale heartbeat means a turn that died, not one in
   flight, so it is not called running.
+- **A running desktop turn shows its list, like a CLI pane mid-turn.** The app commits a
+  message row only at the turn's close, so a `-s desktop` pane had nothing to read mid-turn
+  and stood on the previous turn's list (or on "no list yet"). The app does keep the agent's
+  own live state — `threads.harness_state`, rewritten as it works, whose
+  `mainAgentState.messageHistory` carries the tool calls as they are made — and the newest
+  `write_todos` there is the in-flight list. `-s desktop` now reads it, with SQLite's own
+  JSON walk so a blob that grows with the whole session is never pulled into Python (a pane
+  ticks once a second). Three rules keep it the CURRENT list: only while the turn is running,
+  only when the list was written at or after the turn's own start (`last_prompt_at`), and only
+  when it is not older than what is committed. The turn's start rides along, so `finish_state`
+  drops a **finished** previous list rather than reading it as this turn's progress — the pane
+  says `last turn's list is done — waiting for this turn's list` instead of showing steps that
+  are already over. `turn_running` and `turn` are now carried on the observation as well, so
+  the `turn running` sentence reaches the renderers it was written for.
+- **The same live history gives the desktop source a `now`/`nudge` line.** A request that
+  arrived after the list is the newest work the list does not describe, and the CLI journal
+  already says so (`NOW · …`, or `NUDGE · …` for a bare `continue`). `-s desktop` now reads
+  the requests from `harness_state` too — every user message the app tagged `USER_PROMPT`,
+  which is its own word for a real prompt (a compaction summary or a tool-error injection is
+  tagged differently and stays out) — and applies the **CLI's own rules**, reusing `is_nudge`,
+  `pick_prompt` and `_newest` rather than re-writing them, so the two sources cannot drift:
+  the request after the list is `now`, a `Goal:` heading written for it wins the line, a bare
+  `continue` is a nudge, and a request the current list already answers is not drift. With no
+  list to measure against there is no `now`, but a nudge can still be said.
+- **The desktop source now heads its list with the agent's own `Goal:` line.** A desktop pane
+  could say *what* a running turn was doing but not the one-line objective the CLI pane puts
+  at the top, because the app's store only ever wrote a heading into the transcript at the
+  turn's close. The same `harness_state` prose the `now`/`nudge` line already reads carries
+  it mid-turn, so `-s desktop` reads the heading from those text parts (`goal_line`) and
+  decides which heading belongs to which list by the **CLI's own rule**, factored out as
+  `pick_goal` and shared with the journal rather than rewritten — a heading at or before the
+  list belongs to it, a heading written as the turn opens belongs to its prompt, and with no
+  list at all the newest heading is what is going on. `goal` and `goal_source` ride on the
+  observation, so a desktop pane mid-turn is headed exactly as a CLI pane would be.
 
 ### Fixed
+- **The frame's border lines up again.** The goal heading was drawn with `🎯`, which measures
+  TWO cells to `wcwidth` and ONE cell in the terminal the pane was being read in (measured
+  2026-10-04), so every row carrying it came out a column short on screen: the right edge
+  stepped left under the heading while the dividers above and below carried on to the full
+  width. Every width check in this suite still passed, because they compare the renderer's own
+  arithmetic against itself — which is the whole blind spot: a frame is a grid of fixed-width
+  rows, and one glyph the code and the terminal disagree about breaks the grid on screen only.
+  The mark is now `▸`, the one the state chip already uses, and the column the emoji used to
+  waste goes back to the heading text (which is why the recorded frames' goal rows gained a
+  space and their continuation lines lost one indent). Teeth: `FRAME_CHROME` inventories every
+  glyph the framed pane draws for itself — box, markers, spinner, bar, the punctuation used
+  inside the frame — and `frame_chrome_is_single_cell()` must come back empty, so the next
+  ambiguous character is caught by a check instead of by a reader. Beside it, a frame rendered
+  at six widths must be exactly that wide on EVERY row and keep both its edges, which is the
+  invariant the old checks only bounded (`<= width`) instead of stating. Four golden frames
+  were re-recorded for the marker; the diff is the marker and its indent, nothing else.
+- **The width check that was supposed to catch that, now can.** The six-width grid check
+  measures each row with `_cell_width`, which is the same ruler that called `🎯` two cells:
+  `unicodedata.east_asian_width` says `Wide`, and `frame_chrome_is_single_cell` asks the same
+  table the same question. Both therefore agree with each other and disagree with the
+  terminal, which is why the pane stayed a column short after the fix shipped — verified by
+  rendering the pre-fix code again, which still reports every row exactly the width it was
+  asked for while emitting the one glyph that broke the grid. The check beside them reads a
+  real render's glyphs and asks Unicode directly, so it is not consulting the thing it is
+  measuring: a frame may only draw characters Unicode calls one cell, and `Wide`/`Fullwidth`
+  are precisely the two answers a terminal is free to disagree with. It fails on the pre-fix
+  render and passes on this one, which is the only evidence that it is a check and not a
+  decoration.
+- **The two states a pane's close used to be decided by are pinned again, by the code that
+  owns them now.** `session_still_live` — the helper that answered "is this session still
+  live?" for the close rule — was deleted with that rule (2026-10-04: a pane's lifetime is its
+  window's), so there is nothing left to pin by name, and the two states it was asked about had
+  no check between them: an ERROR state and an ENDED JOURNAL. Both are now pinned, and they are
+  pinned as a pair because the deleted helper collapsed them into one question while they are in
+  fact opposite answers. An error is not a finished session: nothing was read, nothing was
+  watched, and no journal behind it could have ended, so `followed_session_over` must answer
+  False — True would send a pane back to `snapshot`, which resolves the same error and costs a
+  re-read to learn nothing — and the frame must say `no conversation DB found` INSTEAD of a
+  list, which is what distinguishes "no source here" from "a source with nothing written yet".
+  An ended journal IS a finished session: every reader agrees (`followed_session_over` drops the
+  cached list however fresh the heartbeat, `_chat_is_live` will not choose the chat again), and
+  the pane still draws that list at 100% with `ALL DONE`, because a finished session is not a
+  finished pane.
+- **The self-check's remaining blind waits are waits now, and three source paths nobody
+  reaches have checks.** The locks/reload/keeper families were audited earlier; the rest of the
+  suite was not, and it had the same shape in three places. Two `spawn_quiet` stand-ins were
+  followed by `time.sleep(0.4)` — a guess that the process table can see a process that has
+  just been spawned, which only holds on an idle machine; both now `wait_for` the condition the
+  next line needs (alive AND in `freebuff_pids()`), so a slow start costs time instead of
+  failing. A keeper stand-in's `time.sleep(2.5)` said "past the cross-check's grace" and is now
+  `KEEPER_CLAIM_CHECK_S * 2.5` — the keeper's own claim-check interval, so it cannot stop
+  meaning "one pass" when that constant moves. And the two pane checks that wait for a
+  `--stale-after` window use `stale_window_bound()` (the window the test itself sets, plus
+  start-up) rather than a flat `+ 25` that said nothing about which subject it belonged to.
+  On the source side, reading the branches of `sources.py` against the suite found three with
+  no coverage at all: `--project/-p` (never appears in the suite, so the way a pane is pointed
+  at a sibling project was untested), `FileSource.miss()` (its `no state file at PATH` wording
+  appears nowhere), and the held-chat fallback — the one branch where `auto` deliberately
+  answers a FINISHED chat because nothing fresher exists, which is where the 2026-10-04 freeze
+  fix pushed the work and which no check read. All three are now pinned, each against the
+  behaviour measured live first (`--project` answering with the named project's chat while the
+  cwd has none; `auto` reporting `cli finished 18h30m · desktop none here → cli`).
+  Honest limit on this one: the audit was meant to be measured, not read. A throwaway
+  instrumented copy that recorded every bounded wait's headroom was built and run, and the
+  numbers it produced for the waits it could attribute were healthy (the tightest attributed
+  wait used 21% of its bound), but two of its three runs died in the harness itself and its
+  remaining rows could not be attributed to a bound — so no change above is justified by a
+  measurement, only by reading the call site and naming the clock it should have used.
+- **A live `--watch-pid` no longer makes `auto` follow a chat that has ended.** `_chat_is_live`
+  asked the pid FIRST and returned on it: a resolved pid is evidence that the pane has a
+  session to sit beside, and every pane the shell wrapper opens carries `--watch-pid`, so in a
+  directory the desktop app also works in, an ENDED CLI chat was answered as if it were the
+  live session — the pane painting a finished list over a thread actually being worked on,
+  which is the freeze the rule (and `journal_liveness`, added 2026-10-04) exists to prevent. The
+  switch check missed it because its pane is given a pid that cannot be alive, which is the one
+  shape where the shortcut does not fire. Measured on the fixture the pane-close check now
+  builds — one directory, an ended chat and a live desktop thread: with a live `--watch-pid` the
+  first frame was `cli · 2026-02-02…` and the ended step's list; with none it was
+  `desktop · AU · cli finished 2h00m → desktop`. What outranks a turn boundary is now a
+  **Freebuff process behind that chat** and nothing else — the check's own sentence, which the
+  bare integer in its fixture never earned: a Freebuff process is working that chat whatever the
+  boundary says, because it is evidence about the chat; a pid that is merely alive is evidence
+  about the pane. So the boundary is asked first, a live pid rescues a merely QUIET chat exactly
+  as before, and the pid's identity is consulted only when the boundary has already said no
+  (the one time it changes an answer). Teeth, two halves: the rule check now spawns a stand-in
+  whose command line ends in `bin/freebuff` and requires it to keep the ended chat live, then
+  requires the suite's own pid — alive, not Freebuff — not to; and the pane-close check's new
+  `auto` case runs a pane in that directory with a live `--watch-pid`, kills its instance, and
+  requires the ended chat's step to appear nowhere in what it drew.
+- **The progress bar no longer reads `0% (0/0)` under a list that is all ticked.** The bar
+  counted `state["todos"]` — the list the pane FOLLOWS — while the step area draws whatever
+  `list_groups` hands it. Those are the same list until they are not: `finish_state` drops a
+  FINISHED list the moment a newer request or turn arrives, and a stacked pane (`--threads N`)
+  goes on drawing the other live threads, each under its own `done/total` heading. The
+  followed list was then gone and the bar was counting nothing, so a desktop pane could show a
+  heading reading `11/11` over eleven ticked steps and print `0% (0/0)` on the row underneath —
+  the frame contradicting itself, which reads as a bar stuck at zero rather than as an absent
+  list. `fbtodo snap` said the same thing (`[---…] 0/0 done`), and so did `fbtodo bar`
+  (`todos -`). The rule now lives in one place, `drawn_counts`: the followed list when it is
+  there, and otherwise `done/total` summed over the lists the frame is actually painting — a
+  number the steps above it add up to. A single-list pane is byte-for-byte unchanged (it has
+  one list either way), the estimates on that row still describe the followed list because
+  they are still measured from it, and a state with nothing to draw at all still gets the
+  no-list frame rather than a bar. Teeth: the stacked-frame check now pins both halves —
+  `drawn_counts` is the followed list's `(1, 2)` while it exists, `(2, 3)` once it is dropped —
+  and asserts `67% (2/3)` / `2/3 done` with no `0/0` anywhere in the frame.
+- **A pane no longer closes itself because the session it is drawing ended.** `fbtodo pane`
+  printed `freebuff instance exited — fbtodo pane closing` and left, and the notice was only
+  half true: what it had actually asked was whether the SESSION was over, and it asked it the
+  way every earlier version did — from a clock. First the pid the pane had resolved (wrong for
+  `auto`, which can follow the app's thread while the CLI that opened the pane has exited);
+  then, from 2026-10-03, the journal's own turn boundary and the quiet window around it. Both
+  rules were about a clock, and both were the same mistake: what the pane draws is a LIST, and
+  a list whose session is over is a list somebody is finishing, waiting on, or re-reading. A
+  pane that leaves on its own takes the reader's eyes with it at the moment they are most
+  likely to be looking, which is why "it keeps closing mid-run" outlived both fixes. The
+  question is gone. What ends a pane is named in `cmd_pane` and nowhere else: `--stale-after`,
+  Ctrl-C, a `--once` that has drawn its frame, and the window going away. `--wait`, the switch
+  that used to opt out, is still accepted and says nothing: its meaning became the default, so
+  a command line already carrying it must not start failing over it. `session_still_live` — the
+  helper the close decision used, `nas` arm and all — is deleted rather than left unused.
+  Teeth: a pane watching a journal older
+  than the live window, whose instance is then killed, must still be drawing that list; and the
+  keeper's end-of-session check now asserts the pane is STILL there when its session's process
+  is gone, which is the check that could not be made to pass before.
+  What an `auto` pane closes on is now decided rather than left to the same question asked
+  again per source: **nothing it did not ask for.** `auto` re-picks its subject every poll, so
+  a session ending is a hand-over — to whatever the directory is working on now — and not an
+  event a pane can be closed by; the only clock left is the reader's own `--stale-after`
+  window, measured on the store being followed. The close check's fixture said otherwise: it
+  announced a rule ("a finished journal must still let the pane go") its assertions had
+  stopped testing, and it had no `auto` case at all, though `auto` is the default source. The
+  fixture now states a finished session the way one is finished — a `shouldEndTurn` boundary
+  in the journal's tail, separate from the mtime `--stale-after` reads — and two cases pin the
+  decision: an `auto` pane in a directory with an ended chat and a live desktop thread, whose
+  instance is then killed, must go on drawing (the thread, not the chat's list, and never
+  `instance exited`); and the same pane asked for `--stale-after 0.05` must exit 0 with
+  `idle … closing`, which is the whole of what an `auto` pane can be closed by.
+- **`fbtodo board` no longer counts a finished session as a live one.** The board asked the
+  same question the single-session pane asks and answered it the old way — from the journal
+  file's mtime — so every chat the desktop app had touched counted as a session in progress
+  (it appends its own records to the same journal: `cli.feedback_button_hovered`, a note
+  saved, a tab closed). It now asks `journal_liveness`, the same code and the same rule the
+  pane uses: the agent's last word decides, so a chat whose turn ended drops off the board
+  however recently its file was written, and only a journal with no boundary in its tail falls
+  back to the quiet window. The two budgets stay apart — a `stat` per chat for the window, a
+  cached tail read for the boundary, and `BOARD_SCAN_MAX` still bounds the full `read_cli`
+  parses, so a store full of finished chats costs less reading than it did before, not more.
+- **The self-check no longer depends on being the only run on the machine.** Its state root is
+  per RUN (`~/.freebuff/fbtodo-test-<pid>`) and every private tmux server it drives carries the
+  pid in its socket name, so a second run — a second shell's, or the one this session starts
+  while the first is still going — cannot delete the other's state mid-check or kill the
+  server its sibling is about to inspect (measured: `FileNotFoundError` on
+  `fbtodo-state.json`, a keeper `print`ing no repair line because the pane it named was gone,
+  and, under three concurrent runs, two of them dying in the same block on a FIXED socket name
+  `fbstalesock` this sweep had missed). A run killed mid-phase now leaves a directory only it
+  owned, and a sweep clears the ones demonstrably stale rather than a live run's.
+- **The waits in the locks, reload and keeper checks are their subject's own clocks.** A fixed
+  20 s only holds on an idle machine: a child told to poll every six seconds needs two ticks
+  for `open` and two for `clear`, and under load its ticks arrive after the bound did. The
+  bound is now derived from the interval the child was launched with (`poll_bound`), a
+  "did NOT reload" window is the child's settle time plus several of its build checks
+  (`hold_window`) instead of a guessed `sleep(2.5)`, and the reload count is relative to a
+  baseline taken inside the check rather than absolute — the log is this run's, so an absolute
+  `== 2` was waiting for a number that would never arrive once an earlier phase had reloaded.
+- **A check that named only the desktop store was still reading the operator's chats.** The
+  CLI half globs `~/.config/manicode/projects` exactly the way the desktop half globs its
+  stores, so the `push` block's own `todos 1/1` assertion was answered by whatever the
+  operator's running session held — measured 2026-10-04, `todos 1/6`, from the very thread
+  doing the work as it added todos. Both sources are named now, fixture roots both, the way the
+  `json`/`bar`/`snap` block beside it already did.
+- **The check that every name the code loads is defined reads a SNAPSHOT of the tree.** It
+  parses every source file, so anything writing the checkout while the suite runs — an agent
+  turn in this very repo, an IDE save — could leave a half-written file under the reader and
+  fail a check about the build rather than about the code. The names are still resolved against
+  the live namespaces: the question is still "does the code we RUN name everything it uses".
+- **The pane follows the tab you are working in NOW, not the one the app's file last wrote.**
+  Following the app's `workspace.activeId` was only ever as good as that file. It is written when
+  the layout changes and not otherwise — measured 2026-10-04, a switch lands in 0–1 s but a
+  ten-minute stretch passed with no write at all — and it names the **tab**, while the work can be
+  running in a split opened from that tab, which is exactly the case this fixes. Every live channel
+  the app has was tried first and none of them answers: its
+  orchestrator API and its CDP bridge (both on 127.0.0.1, ports handed to the child process)
+  return `401` to anything that is not the app itself, which is where their tokens are minted;
+  the store has no focus column, no table and no receipt naming the tab in front of you; and
+  `turn_alive_at`, the one column that looks like a heartbeat, is written ONE VALUE FOR ALL
+  THREADS — three threads, three identical beats — so a liveness test built on it would call
+  every tab live at once and say nothing about which one is yours. What IS per-thread is the
+  ask, so `focused_thread` corrects the persisted tab with the thread most recently worked in,
+  and the pane's title says so (`… · b2422dbe behind → 53d4cd37 asked 13m ago`). It is a
+  correction, not a replacement, and deliberately timid: the app's own tab still wins whenever
+  it is itself among the live threads, a thread asked outside `DESKTOP_LIVE_MS` is not "where
+  you are", the newest ask wins when several are live, and a store written by an older app
+  carries neither column and answers nothing at all — `activeId` is then the whole answer, as
+  before. The window is that same `DESKTOP_LIVE_MS` because it is sized by the lag being
+  covered and by a long turn alike: a turn running longer than a narrow window would otherwise
+  leave the pane falling back to the tab you had left half-way through it. Its note and the `auto` chain's own note (WHICH source
+  answered) are joined rather than sharing a key, which had the second silently overwrite the
+  first. Teeth: with the correction disabled the fixture's pane follows the stale tab, which is
+  the bug.
+- **The pane inside the desktop app follows the thread you are looking at.** It did not, and the
+  list it drew never changed: `-s auto` asks the CLI journal before the app's store, and the
+  journal's LIVENESS was judged by the FILE's mtime — which the desktop app moves, because it
+  appends its own records (`cli.feedback_button_hovered`, a note saved, a tab closed) to the
+  same `log.jsonl`. So a session that had ended its turn at 11:20 still read as "just written"
+  at 12:04, `auto` kept handing the pane that finished list, and the pane sat frozen on one
+  session's `ALL DONE` while a thread worked in the app (measured 2026-10-04: `Goal: fix
+  Freebuff Desktop black screen`, 6/6, unchanged across two tabs). The journal is now asked
+  instead of statted: `journal_liveness` reads the tail for the AGENT's own turn boundary — a
+  `shouldEndTurn: true` record is the agent saying it has finished and is waiting for you, so
+  that chat is not the session WORKING in this directory however fresh its bytes are, and a
+  `prompt` record puts it back to work with no clock at all (a bare `continue`). The same
+  answer governs `followed_session_over`, so the pane's cached watcher state is dropped the
+  moment the chat behind it ended rather than drawn until the state file aged out, and the
+  store-vs-store freshness comparison uses the agent's clock rather than the app's appends.
+  With the CLI chat handed over, the desktop store answers `auto` — and `read_desktop`
+  re-reads the app's workspace on every poll, so the pane follows the active tab from then on
+  (verified live: one frame per tab over a three-tab space, each with its own heading, list and
+  count, and a title reading `desktop · <thread> · cli finished 1h48m → desktop`). The quiet
+  window is untouched and still decides sessions that ended without saying so: this changes
+  WHICH source answers, never whether a pane closes.
+- **Only a request the app's receipt attributes to the user becomes `now`/`nudge` — the app's
+  own prompts and its resume line do not.** The committed rows carry no `USER_PROMPT` tag; the
+  app keeps that fact in a receipt instead, and ignoring it let anything the app wrote for
+  itself stand in for the user's ask. Every user message the app writes carries the `input_id`
+  of a `queue_items` row whose `source` is its own word for the asker (`user` for the person,
+  `assistant` for an auto-run decision, a suggestion or a sponsored task, `mission-*`,
+  `skill`), and whose `kind` says whether the row is a request at all (`prompt`, versus
+  `skill-context` or `close-tab`). `_committed_prose` now joins that receipt and lets only a
+  `user` `prompt` feed `now`/`nudge` (a store older than the receipts, with no such table,
+  keeps every row a request the way it always read). Measured 2026-10-04 on a live thread whose
+  newest row after the list was an auto-run step: the pane offered it as the newest ask; it now
+  stays out. One prompt no receipt can mark: the app's Continue button sends
+  `Continue the interrupted request from where you left off.` through the ordinary send path,
+  so its row is marked exactly like a typed prompt — it is recognised by its words
+  (`DESKTOP_RESUME_PROMPTS`), in the committed rows and in the live history whose
+  `USER_PROMPT` tag it also carries, because a resume is not an ask and the app pressing its
+  own button must not redraw the pane as if the user had asked for the work already running.
+- **A finished desktop turn has a heading, a `now` and a `nudge` — read from its own rows.** The
+  app commits a whole turn as one `messages` row, and the prose in it (the agent's `Goal:`
+  line, the requests around it) was never read at all: only `harness_state` was, and that holds
+  the LIVE turn. So a pane following the app whose agent state carried no history drew the
+  row's list under `no heading — the agent owes a Goal: line` while the very row it was reading
+  held the line beside its `write_todos` parts (measured 2026-10-03, on the pane following this
+  session). The committed row is now read by the same rules the live history and the CLI's
+  journal use — `pick_goal` picks the heading that belongs to this list, `_now_and_nudge` the
+  request after it, `goal_stale_at` says when the heading is a leftover — anchored to the
+  list's own position in that row. Two consequences worth knowing: a heading written one row
+  back still heads the list (the agent states its goal once and re-publishes the list in later
+  turns), carried with `stale heading — the list moved on` when the list's own turn opened
+  after it; and the LIVE history's heading is never carried over a committed list, where it
+  would head work it was not written for. The read is bounded (`COMMITTED_PROSE_ROWS`, 24 rows
+  back from the list) and measured: 3.6 ms on this session's own thread, whose rows run to
+  350 KB, beside 44 ms for the read it rides on. An older store whose `messages` rows carry no
+  `role` answers nothing here, and a thread whose heading is further back than the bound gets
+  the honest `no heading` rather than an answer about a turn nobody can see.
+- **A heading is told from another heading in the SAME message.** The live history is one
+  message per turn, each holding that turn's parts — so two `Goal:` lines in one message used
+  to share a position, and `_newest` took the FIRST of them: the pane drew the turn's opening
+  objective instead of the one it finished under. Positions are `(message, part)` pairs now,
+  in the app's live history and in the committed rows both (`part.key` is already how a turn's
+  last `write_todos` is found), and both readers order by them — the CLI's own positions are
+  journal byte offsets, so each store orders its own and the two are never compared.
+- **A desktop turn's list is its LAST `write_todos`, not its first.** The app commits a whole
+  turn as ONE message row whose parts carry every call the agent made in it — and updating a
+  todo list means writing it many times — so a single row holds several lists and only the last
+  of them is that turn's. The store reader took whichever part SQLite happened to hand over
+  (`json_each` promises no order), in practice the turn's OPENING list: measured 2026-10-03 on
+  the pane following this very session, which drew a finished turn as `0/6` with a live clock
+  and an arrow on a step that had long been ticked, while the row's last part said `6/6`. All
+  three reads are ordered now (`m.ts DESC, m.seq DESC, part.key DESC`) — the followed thread,
+  the newest-list fallback, and `live_threads`, so `fbtodo board` and the stacked-thread rows
+  read the same list the pane does. Verified against the live store: the same turn now reads
+  `6/6` through `json`, the pane, and the board.
+- **The pane closes on the session, not on the process it was opened beside.** `freebuff
+  instance exited — fbtodo pane closing` was printed the moment the pid the pane had resolved
+  went away, and that rule was written before `auto` could follow the app: a pane drawing a live
+  desktop thread closed mid-run because the CLI that opened it had exited (measured 2026-10-03 —
+  the reported "it keeps closing even in mid run"). The close now asks the STATE on the screen
+  (`session_still_live`, `followed_session_over`'s positive half): a CLI journal that moved
+  inside the live window keeps the pane, and a `file:` state and the app's store are never
+  called over at all — neither has a process that outlives it, which is the same reason
+  `followed_session_over` only ever answers for a CLI chat. A NAS pane still closes on the
+  remote session's own `instance_alive`, a finished CLI chat still lets its pane go, and a
+  state whose poll just failed keeps the pane, because a broken read is not an ended session.
+  Driven live on this Mac: the pane that used to die here now re-resolves onto the app's live
+  thread and stays up.
+- **A poll that raises becomes the frame, not the end of the pane.** The pane re-execs itself
+  into whatever is on disk ("A pane keeps itself current"), and the reload probe it asks first
+  can prove a tree PARSES and IMPORTS without proving its call sites still agree — so an edit
+  that changes a signature in one step and its call site in the next execs a live pane into the
+  between-state: measured 2026-10-03, a `TypeError` from `pane_cached_state()` took a working
+  pane down mid-turn, leaving a traceback where the list had been. A failed poll now costs one
+  tick: the exception is logged once per distinct message, drawn on the error row the renderer
+  already has (`poll failed reading desktop — OperationalError: …`, keeping the backend and
+  session so the title still names what it had been reading), and the next tick polls again —
+  which is how a pane left running a broken build comes back by itself the moment that build is
+  fixed. The drawing half of the tick is guarded the same way, for the same reason. Only
+  `Exception` is caught, so Ctrl-C still restores the cursor and exits 130.
+- **`auto` answers a directory with its OWN desktop project, never a parent's.** The store's
+  `project.json` records the folder the app opened, and projects nest: the home directory is
+  the one path that contains every path there is, so `auto`'s search for "the project this
+  directory belongs to" found home for every repo under it and answered with the home
+  project's session — measured 2026-10-03, a pane in a repository drawing the home thread's
+  list, over a repository the app had never opened. The store is now picked by depth (the
+  deepest project containing the directory wins, so a broad project can never shadow a narrow
+  one), and `auto` narrows it further to the project that *is* the directory — mirroring
+  `cli_chat_dir`, which reads `basename(cwd)` and never walks up. An explicit `-s desktop`
+  was not told a directory, so it keeps the wider walk, deepest first. A directory with no
+  project of its own now falls through to its own CLI chat (or to "no conversation DB
+  found") instead of borrowing a parent's session.
+- **A pane notices its session ended and re-resolves, instead of waiting for a reload.** The
+  watcher heartbeats the state file it owns, so a cached state stays *fresh* after the chat
+  behind it has finished — and the pane kept rendering that ended session until the file aged
+  out or somebody reloaded it by hand. Measured 2026-10-03: a pane reading `ALL DONE` over a
+  two-day-old chat whose journal had been silent since `09-30 07:12` (the `LIVE` clock beside
+  it only ticked because the watcher was still writing). A cached state must now also name a
+  session that is still live (`pane_cached_state` → `followed_session_over`), and when it does
+  not the pane asks `snapshot` again on that same poll — which is where `auto` re-chooses its
+  source, so it lands on the live desktop thread within one interval — and it keeps answering
+  from `snapshot` until the file itself names a live session again (a running watcher rewrites
+  it within a poll; with no watcher, one probe per poll is what this pane already does). There
+  is deliberately no "already handled" memo: remembering the session the pane re-resolved AWAY
+  from means trusting the still-unchanged file that names it, and the pane dropped a list only
+  to pick it straight back up one frame after the switch (found by the end-to-end check below,
+  which is why that check watches several polls instead of one). Only a CLI state can be
+  called over: a `file:` state has no process to outlive it, and the desktop store windows its
+  own threads on every read.
+- **The look-only reads had the pane's freeze of their own.** `fbtodo json` and `fbtodo bar`
+  serve the cached watcher state while it is fresh and describes what was asked for, and that
+  rule was missing the half the pane was missing too: a watcher heartbeats the file it owns
+  after the chat behind it has finished, so both answered with an ended session's list from a
+  directory whose live work had moved into the app (`cached_state_ok`, same
+  `followed_session_over` test, the instance resolved only once the file is otherwise an
+  answer so a live session still costs no `pgrep`). Found by the self-check that drives a
+  cached CLI chat into a live desktop thread through the real CLI.
+- **`auto` follows the live session, not a finished chat's last list.** A chat directory keeps
+  its last chat forever, and `--source auto` took it for "there is a session here" — so a pane
+  in a directory whose CLI session had ended days ago rendered that session's list, frozen, with
+  the live session in the desktop store never seen. Measured 2026-10-03: a pane pinned to a
+  two-day-old `09-30 07:12` chat reading `ALL DONE`, while two desktop threads in the same
+  project moved every minute. A journal is now *live* — and so answers `auto` — only when a
+  Freebuff process is behind it or it moved inside the live window (90 min); a finished chat is
+  held, and answers only when nothing fresher is here. `-s cli` is unchanged: asking for one
+  source still means exactly that.
+- **A list with no heading is named loudly, not drawn blank.** The heading is the agent's own
+  `Goal:` line, and the framed pane drew NO heading row when one was missing — so a session
+  that skipped the rule looked identical to one that had obeyed it, and the skip went
+  unnoticed until the list was read carefully. A shown list with no heading now draws the
+  same warning the plain renderer prints — `no heading — the agent owes a `Goal:` line` — in
+  the warn yellow, on the row the heading would have taken, in both renderers. The warning is
+  tied to the list: a heading silences it, and a list `finish_state` dropped (no todos) has
+  nothing to head, so a cleared state never warns about a list that is not there. The gap it
+  names is real and measurable: of every CLI session carrying the AGENTS.md rule, the twelve
+  that wrote `Goal:` lines all also had the `freebuff-todo-pane` skill in context, while the
+  two sessions that wrote none of 1464 and 49 replies carried only the AGENTS.md bullet.
+- **A dropped list takes its clocks with it.** `finish_state` empties a finished list when the
+  next turn (or a new session) arrives, but left `task_times` — the per-step start/stop records
+  for that very list — standing in the state. The timings then had no list to describe, and the
+  pane, which rebuilds them only when they are MISSING, never rebuilt them for the next list
+  written into the same session; a state cleared by hand could even render the old session's
+  clocks. The list and its clocks now go together, so a cleared state has nothing left to time,
+  while the cross-session memories a new list projects from stay put.
+- **A finished list's clock stops, instead of billing the idle hours.** The pane's `GOAL` row
+  (`TOT` on the flat renderer) measured `spent` from the list's first start to *now*, so a
+  list that had been done for days and a pane that had simply been left open read as a
+  two-and-a-half-day job — `65h59m spent · 65h59m total` on a five-step list that ran for one
+  hour. `elapsed_total_ms` now ends the span at the last stopped clock once every clocked step
+  has stopped: while a step is still in flight it measures to now and keeps moving, and once
+  nothing is running the number freezes at the work's real span. A fresh pane reopened on an
+  old finished state shows the hour it took, not the days since.
 - **A self-reload can no longer exec into a build that parses but will not load.** The pane,
   the watcher and the keeper all start themselves over by EXEC (`os.execv`), and the only
   guard was a parse (`source_syntax_error`). A tree can compile file by file and still be
@@ -261,10 +853,39 @@ Entries start at the newest release; each one is a contract change, not a diff.
   through (it builds the command parser, so `build_parser`'s body and its defaults run) and
   then resolves every global the package's functions LOAD (`undefined_global_names`, over
   each module's `symtable`), so a name used only inside a command that was never called
-  still fails the pre-flight. Attribute names, locals and closure variables are not globals
-  and are not asked about; a name bound at run time passes, because the lookup is the live
-  module namespace. It is pinned both ways: this checkout must pass, and a copied tree whose
-  uncalled function names a global that does not exist must fail with that name.
+  still fails the pre-flight. The parse is asked the other half of the same question too:
+  `unreachable_code` fails a build whose own source proves some of it can never run — a
+  statement after a `return` in the same suite, a whole `if False:` branch, a body under
+  `while False:` — because that is code an import accepts happily and no run will ever
+  reach, which is exactly how a path that should have executed goes missing quietly. A test
+  is also folded when it COMPARES literals (`if 1 > 2:`, `while 0 == 1:`, a chained
+  `0 < 1 < 0`), which is the same kind of certainty one step out; only certainties count,
+  so a test with any operand that is not a literal is left alone, as is `is`/`is not`
+  (identity is not a value question) and a comparison that cannot be made (`1 in 2`). Live
+  shapes (`while True:` with a `break`, an ordinary `if x:`) are the controls. And the parse
+  follows a GUARD, not only a literal: inside one function `if P: return` at the top means P
+  is false for every line below it, so a later `if P:` can never run and a later `if not P:`
+  can never take its `else`; an `assert P` makes the same promise by the other route — control
+  continues past it only when P held — so the same test is already true below it and its
+  negation already false. The fact is carried into any block the guard DOMINATES (the body of
+  a later `if`/`with`/`try`, a handler, and a loop body), so a third look at the test inside one
+  is caught too. A loop body is the one place a repeat matters, so it is entered with only the
+  facts the loop cannot disturb: any fact whose names the loop ASSIGNS anywhere (target, body
+  or `else`) is dropped first, so a test settled before the loop and repeated inside a
+  `for`/`while` body is caught, while one the body could have moved is not. That promise is
+  only made where it cannot be wrong — the guard's body must leave on every
+  path (`return`/`raise`/`break`/`continue`, an `if`/`else` that both leave, a `with`
+  whose body does), the test may read nothing but locals THIS function binds (a global or a
+  closure cell is another pass's to move, and an attribute or a call is refused outright), and
+  no statement between the two may rebind one of those names. It never crosses a scope, so no
+  guard is ever asked to speak for a nested `def` or a variable it does not own; a rebinding, a
+  module global, a closure cell, an attribute, a call, a guard that does not always leave, and a
+  loop that assigns the name are all pinned as controls. Attribute
+  names, locals and closure variables are not globals and are not asked about; a name bound
+  at run time passes, because the lookup is the live module namespace. Both checks are
+  pinned both ways: this checkout must pass, and a copied tree whose uncalled function names
+  a global that does not exist, or whose code sits after a `return` or behind a constant
+  false, must fail and name it.
 - **A process's environment is read from two sources, and a clipped copy is never believed.**
   The cross-check places each role process by the state root its environment names, and it
   read that environment through `ps -Eww` alone. Verified on this machine 2026-10-02: `ps`

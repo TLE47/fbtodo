@@ -12,6 +12,7 @@ fbtodo displays your [Freebuff](https://freebuff.com) agent's todo list in a sid
 - **What's done, running, and next** — with live timers
 - **How much time is left** — estimates based on your project history
 - **If it's stuck or waiting** — with optional alerts to your phone
+- **One keypress to hush it** — press `m` in the pane and the phone stays quiet until the list finishes
 
 No configuration: it reads the list your agent already keeps. Freebuff's list turns up on its own;
 anything else can push one over stdin — see [docs/SOURCES.md](https://github.com/TLE47/fbtodo/blob/main/docs/SOURCES.md).
@@ -125,10 +126,28 @@ Your agent writes a todo list (by calling `write_todos`). fbtodo watches that li
 fbtodo              # watch the pane (default)
 fbtodo bar          # show "todos 3/5" in your status bar
 fbtodo snap         # print one snapshot
+fbtodo board        # every live session in one frame (--live keeps redrawing)
 fbtodo status       # show pane info and why it might be empty
 ```
 
-**Other commands:** `ledger` (forecast vs. actual), `why` (pane location), `pin` (resize pane), `keep` (pane-repair switch), `locks` (claim-file audit; `--fix` clears leftovers and ends untied processes, `--fix --restart` re-claims the watcher and keeper through the normal ask afterwards, `--watch` streams a line per finding and rings the kit's locks bell), `stop` (close watcher), `prune` (clean up old data).
+### Pane keys
+
+While you are looking at a pane, the keyboard is the quickest way to mute the phone:
+
+| key | what it does |
+|---|---|
+| `m` | quiet until this list finishes, then it rings again on its own |
+| `M` | quiet until you press `u` |
+| `u` | loud again |
+
+`--no-keys` (or `FBTODO_PANE_KEYS=off`) turns the keys off in a pane whose terminal it should not
+read, and the same switch is `fbtodo mute` for a script, a status row or any shell that is not a
+pane — see [Quiet while you read](#quiet-while-you-read).
+
+Running more than one agent? `fbtodo board` draws them all at once — one row per live session
+with its list, its heading and its clock, newest activity first, instead of one pane per window.
+
+**Other commands:** `ledger` (forecast vs. actual), `why` (pane location), `pin` (resize pane), `keep` (pane-repair switch), `mute` (the notification switch, without a keystroke: `on` / `off` / `list` / `until-done`), `locks` (claim-file audit; `--fix` clears leftovers and ends untied processes, `--fix --restart` re-claims the watcher and keeper through the normal ask afterwards, `--watch` streams a line per finding and rings the kit's locks bell), `stop` (close watcher), `prune` (clean up old data).
 
 Run `fbtodo -h` for all flags.
 
@@ -168,6 +187,41 @@ fbtodo pin --list                # show current settings
 `--size` is counted along the split: **columns** for `--side h` (the pane sits beside the
 session) and **lines** for `--side v` (below it). The pane remembers your last size and opens
 that way next time. Default: 12 lines below.
+
+### Quiet while you read
+
+If you use the notification kit (below), the pane can turn it off for you:
+
+| key | what it does |
+|---|---|
+| `m` | quiet until this list finishes — then the phone rings again on its own |
+| `M` | quiet until you press `u` |
+| `u` | loud again |
+
+Nothing is invented for this: the key writes the kit's own switch words — `phone-state`, which
+`phone.sh` reads, and `state`, which `bell.sh` reads — so muting from the pane and muting from a
+shell (`FREEBUFF_PHONE=off`) are the same state. `u` puts back what was there before, including
+removing a `phone-state` that did not exist. The pane's title says which switch is in force and
+which key lifts it (`quiet until done · u`). A pane that closes while muted gives the
+notifications back, so a phone is never left quiet with nothing left holding the key.
+
+`--no-keys` (or `FBTODO_PANE_KEYS=off`) turns the keys off in a pane whose terminal it should not
+read.
+
+The keys are for a pane you are looking at. Everything else — a script, a status row, another
+program's button, a shell that is not a pane at all — uses the same switch as a command:
+
+```sh
+fbtodo mute              # or `fbtodo mute list` — what is in force
+fbtodo mute on           # quiet until you say otherwise
+fbtodo mute until-done   # quiet until the list in this directory finishes
+fbtodo mute off          # loud again, putting back what was there
+fbtodo mute --json       # the same facts, for a script to read
+```
+
+`until-done` reads the list first and declines, writing nothing, if that list is already
+finished. Who asked decides who lifts the mute: one a key took ends when the pane closes, and
+one a command took does not — the finished list, or `fbtodo mute off`, ends that one.
 
 ### Disable the pane
 
