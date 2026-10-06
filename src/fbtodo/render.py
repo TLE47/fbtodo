@@ -670,7 +670,7 @@ def _divider_row(width: int, frame) -> str:
 
 
 def _bottom_row(width: int, frame) -> str:
-    return frame("╰" + "─" * max(0, width - 2) + "╯")
+    return frame("└" + "─" * max(0, width - 2) + "┘")
 
 
 _SESSION_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})")
@@ -723,7 +723,7 @@ def _source_title(state: dict, width: int, right: str) -> str:
 
 
 def _top_border(width: int, frame, title: str, right: str, badge) -> str:
-    """A rounded top border: the title on an accent badge, faint metadata right.
+    """The top border: the title on an accent badge, faint metadata right.
 
     `frame` is the border's painter and `badge` the title's chip — both role-bound, so
     this stays layout. The chip is reverse video (`7;<accent>`), which needs no
@@ -731,16 +731,23 @@ def _top_border(width: int, frame, title: str, right: str, badge) -> str:
     gets whatever columns the title leaves, so a long session label shrinks rather than
     pushing the corner off the pane — and drops out entirely when there is not room for
     a readable tag.
+
+    The corners are SHARP, and that is a measurement rather than a taste (2026-10-05).
+    The dividers inside the box have always been `├`/`┤`, which meet the rule flush; the
+    outer corners were `╭`/`╮`, and an ARC is drawn inset — on the pane measured here the
+    top rule stopped three pixels short of its own corner on the rule's outer row while
+    reaching the border's column on its core row, so the corner read as a notch against
+    the crisp T-junctions a few rows below it. One box, one kind of join.
     """
     label = f" {title} "
-    left = f"╭── {label} "
+    left = f"┌── {label} "
     room = width - _cell_width(left) - 2  # corner cell, plus the space before it
     if right and room >= 12:
-        tail = f" {_clip_cells(right, room - 4)} ──╮"
+        tail = f" {_clip_cells(right, room - 4)} ──┐"
     else:
-        tail = "╮"
+        tail = "┐"
     fill = max(0, width - _cell_width(left) - _cell_width(tail))
-    return frame("╭── ") + badge(label) + frame(" ") + frame("─" * fill) + frame(tail)
+    return frame("┌── ") + badge(label) + frame(" ") + frame("─" * fill) + frame(tail)
 
 
 # The frame's palette. `accent` may be a `#rrggbb` colour or a raw SGR code (`1;36`);
@@ -965,7 +972,7 @@ BAR_EIGHTHS = " ▏▎▍▌▋▊▉█"
 # every goal row was a column short against its neighbours). The inventory is here so that a
 # future character with the same ambiguity is caught by a check rather than by a reader.
 FRAME_CHROME = (
-    "╭╮╰╯├┤─│",      # the box
+    "┌┐└┘├┤─│",      # the box
     "▸✔○➔✖⚠",        # the markers
     "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏",  # the spinner
     BAR_EIGHTHS,        # the bar

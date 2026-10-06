@@ -30,6 +30,9 @@
     fbtodo why          why each list pane is where it is: the side and size in force,
                         the source that supplied them, the pane it sits beside
                         (--window TARGET, --json)
+    fbtodo panes        every todo pane on this machine: its pane and window (its tty
+                        outside tmux), the subject it holds and the interpreter it runs
+                        (--json)
     fbtodo board        every live session on this machine in one frame: its list, its
                         heading and its clock, most recently active first (--live keeps
                         redrawing it; --json for a script; --board-max N, --board-live
@@ -487,7 +490,32 @@ def state_matches_request(state: dict | None, args) -> bool:
     if state.get("tool_version") != VERSION:
         return False
     source = source_kind(getattr(args, "source", "auto"))
-    return source == "auto" or (state.get("backend") or "") == source
+    if source != "auto" and (state.get("backend") or "") != source:
+        return False
+    # ...and it has to be about the SUBJECT this caller named. A watcher is ONE process
+    # serving whoever asks first, so its file can hold another chat's or another thread's
+    # list; a pane that latched to one subject and then drew the watcher's answer to a
+    # different question is "one pane, two threads" — the lock held in the arguments while
+    # the frame came from somewhere else. `--chat` is the CLI's chat directory and
+    # `--thread` the desktop thread's id, which is exactly how each state names its subject
+    # (`target`, `session`), so the comparison is the state's own words.
+    wanted_thread = getattr(args, "thread", None)
+    wanted_chat = getattr(args, "chat", None)
+    if wanted_thread:
+        if state.get("session") != wanted_thread:
+            return False
+    elif wanted_chat:
+        target = str(state.get("target") or "")
+        if not target or os.path.realpath(target) != os.path.realpath(
+                os.path.expanduser(str(wanted_chat))):
+            return False
+    # ...and the stack has to be the size that was asked for. A pane asks for ONE list
+    # (`cmd_pane` sets `--threads 1`) while the watcher it shares with `fbtodo json --threads
+    # 4` writes four of them: without this the pane drew every live thread of the store under
+    # one frame, which is the same report in its other shape.
+    if int(getattr(args, "threads", 0) or 0) <= 1 and state.get("threads"):
+        return False
+    return True
 
 
 def pane_cached_state(st: dict | None, args, instance_pid, now_ms: int) -> bool:
@@ -513,6 +541,115 @@ def pane_cached_state(st: dict | None, args, instance_pid, now_ms: int) -> bool:
     if not state_is_fresh(st, max(HEARTBEAT_GRACE, getattr(args, "interval", 1.0) * 3)):
         return False
     return not followed_session_over(st, instance_pid, now_ms)
+
+
+def pane_subject_from_argv(argv=None) -> bool:
+    """Did this pane's OWN command line name its subject, so nothing may override it?
+
+    A lock that rode in from the environment cannot say whether a person asked for that
+    subject or `auto` resolved it, and the two must be treated differently: `auto`'s answer
+    inside the desktop app is the bug `pane_place_subject` exists to correct, while a
+    `-s cli` / `--chat` / `--thread` somebody typed is theirs to keep. The pane's own argv
+    still knows which it was, and `-s auto` is not a subject: it is the request to choose.
+    """
+    toks = list(sys.argv[1:] if argv is None else argv)
+    for at, tok in enumerate(toks):
+        if tok in ("-s", "--source"):
+            value = toks[at + 1] if at + 1 < len(toks) else ""
+            if value and source_kind(value) != "auto":
+                return True
+        elif tok.startswith("--source="):
+            if source_kind(tok.partition("=")[2]) != "auto":
+                return True
+        elif tok in ("--chat", "-t", "--thread") or tok.startswith(("--chat=", "--thread=")):
+            return True
+    return False
+
+
+def apply_pane_subject_lock(args, subject: str) -> str:
+    """Pin this pane to a subject a caller already resolved, and describe it in one line.
+
+    The same mechanics `latch_pane_subject` uses for the subject a poll RETURNED — the
+    arguments become the lock (`--chat`/`--thread`, `--threads 1`), the environment carries
+    it across a reload, and the record under `pane-subjects/` makes it readable from outside.
+    Factored out because one caller decides the subject BEFORE the poll
+    (`pane_place_subject`) and both must end in exactly the same state; "" is a subject that
+    names nothing, which locks nothing.
+    """
+    kind, _, what = (subject or "").partition(":")
+    if not what or kind not in ("cli", "desktop"):
+        return ""
+    if kind == "cli":
+        args.chat, args.source = what, "cli"
+    else:
+        # A desktop thread is named by its id, and `others` goes to zero so the frame stops
+        # stacking the threads this pane was not asked about.
+        args.thread, args.source, args.threads = what, "desktop", 1
+    os.environ[PANE_LOCK_ENV] = subject
+    pane_subject_write(subject)
+    args.pane_locked = True
+    if kind == "cli":
+        return f"locked to the cli chat {os.path.basename(what.rstrip('/'))}"
+    return f"locked to the desktop thread {what[:8]}"
+
+
+def pane_place_subject(args, cwd: str) -> str:
+    """The subject the pane's own PLACE names — a desktop thread inside the app, else "".
+
+    In plain words: *why does it use the cli pane?* A pane the desktop app opens runs a bare
+    `fbtodo` in a thread's terminal, and `auto` answered it with whatever was live in the
+    directory — a CLI chat — so every desktop pane latched the SAME chat while the thread it
+    was drawn beside went unshown. The app hands the pane no thread id (measured 2026-10-05:
+    its terminal environment carries `FREEBUFF_DESKTOP_STATE_PATH` and nothing per-thread,
+    and the orchestrator keeps the per-terminal `threadId` in memory behind a launch token
+    that is deliberately stripped), so the binding is inferred from the app's own store: the
+    live threads of THIS project, the one the app is working in first (the store's own focus
+    rule, `focused_thread`), then any other live thread. A thread another live pane already
+    holds (`held_pane_subjects`) is passed over — that is what makes two panes of one project
+    hold two threads rather than both holding the focused one.
+
+    Deliberately narrow, because a wrong guess moves a reader's window: only inside the app
+    (`desktop_app_pane`), only with no subject named (`-s auto`, no `--chat`/`--thread`), and
+    only when the store really has a thread to name. Anything else returns "" and the pane
+    keeps the answer it had — `auto`'s chain, cli included — so a machine with the app closed
+    or a project with no desktop thread behaves exactly as before.
+    """
+    if not desktop_app_pane():
+        return ""
+    # A person who named the subject keeps it; only `auto` is ours to resolve.
+    if pane_subject_from_argv():
+        return ""
+    # A store named outright (`--db PATH`) is that store, the way `DesktopSource.find` reads it;
+    # the glob is only the search when nobody named one.
+    pattern = getattr(args, "db", DEFAULT_DB_GLOB) or DEFAULT_DB_GLOB
+    explicit = pattern if "*" not in pattern else None
+    try:
+        db = os.path.expanduser(explicit) if explicit else pick_db(
+            pattern, getattr(args, "project", None), cwd=cwd, own_only=True)
+    except Exception:
+        return ""
+    if not db or not os.path.exists(db):
+        return ""
+    try:
+        st = read_desktop(db, source="active", others=8,
+                          state_path=getattr(args, "state", DEFAULT_WORKSPACE_STATE))
+    except Exception:
+        return ""
+    order: list[str] = []
+    session = str(st.get("session") or "")
+    if session:
+        order.append(session)
+    for row in st.get("threads") or []:
+        tid = str((row or {}).get("id") or "")
+        if tid and tid not in order:
+            order.append(tid)
+    if not order:
+        return ""
+    held = held_pane_subjects()
+    for tid in order:
+        if f"desktop:{tid}" not in held:
+            return f"desktop:{tid}"
+    return ""
 
 
 def latch_pane_subject(args, state: dict) -> str:
@@ -549,11 +686,25 @@ def latch_pane_subject(args, state: dict) -> str:
             return ""
         args.chat, args.source = target, "cli"
         os.environ[PANE_LOCK_ENV] = f"cli:{target}"
+        # ...and written down, because the environment it rides in cannot be read from
+        # outside on every platform (the kernel snapshots an environment at exec, and this
+        # write is later): `fbtodo panes` reads the record instead. See `pane_subject_write`.
+        pane_subject_write(f"cli:{target}")
+        # The flag is set HERE and not only read from the environment: it is what makes the
+        # lock hold for the life of this process rather than only across a reload. Without
+        # it every poll re-latched, so a pane whose accepted state named a different chat
+        # (the watcher's answer to whoever asked first) silently moved the reader's window —
+        # measured on this machine 2026-10-05: four different chats between 10:52:37 and
+        # 10:52:57. Set only where a subject was actually named, so a state that cannot say
+        # which chat or thread it is leaves the pane asking.
+        args.pane_locked = True
         return f"locked to the cli chat {os.path.basename(target.rstrip('/'))}"
     # A desktop thread is named by its id, and `others` goes to zero so the frame stops
     # stacking the threads this pane was not asked about.
     args.thread, args.source, args.threads = session, "desktop", 1
     os.environ[PANE_LOCK_ENV] = f"desktop:{session}"
+    pane_subject_write(f"desktop:{session}")
+    args.pane_locked = True
     return f"locked to the desktop thread {session[:8]}"
 
 
@@ -2535,6 +2686,23 @@ def reopen_note(note: dict | None) -> str | None:
     return f"{'KEPT' if kept else 'REOPENED'} ({who} {_short_python(was)})"
 
 
+def pane_lock_subject(args) -> str:
+    """The subject a set of pane ARGUMENTS already names, as a record string, or "".
+
+    A reloaded pane applies its lock from the environment before its first poll (`cmd_pane`),
+    so it knows what it holds without latching again — and the record it left under its OLD
+    pid is about a process that has just exec'd away. Recording it under the new pid is how
+    the subject survives a reload in a form a reader outside the process can find; "" is a
+    pane that has not locked yet, which records nothing.
+    """
+    source = source_kind(getattr(args, "source", "auto"))
+    if source == "cli" and getattr(args, "chat", None):
+        return f"cli:{args.chat}"
+    if source == "desktop" and getattr(args, "thread", None):
+        return f"desktop:{args.thread}"
+    return ""
+
+
 def cmd_pane(args) -> int:
     cwd = os.path.realpath(os.getcwd())
     if not args.no_daemon:
@@ -2560,6 +2728,21 @@ def cmd_pane(args) -> int:
         # ...and marked as already decided, or the first poll would latch onto whatever the
         # new image happens to resolve and quietly undo the lock it was given.
         args.pane_locked = True
+        # The record follows the reload: the pid is new, so the old process's record names a
+        # process that no longer exists (`pane_subject_write`). A one-shot is not a pane on
+        # screen and leaves nothing behind.
+        if not args.once:
+            pane_subject_write(pane_lock_subject(args))
+
+    # ...and the pane a DESKTOP APP opened belongs to a desktop thread from the start. The
+    # app hands its terminals no thread id (see `pane_place_subject`), so the thread this pane
+    # is drawn beside is resolved here — once, before the first poll — which is also what
+    # replaces a carried `cli:` lock that `auto` chose for a pane that is not a CLI pane.
+    # A person who named the subject in this pane's own command line keeps it.
+    if not args.once and not pane_subject_from_argv():
+        placed = apply_pane_subject_lock(args, pane_place_subject(args, cwd))
+        if placed:
+            pane_log(f"pane {placed} (its own terminal)")
 
     color = use_color()
     # A PANE is one window on one list, so it asks for one thread from the first poll —
@@ -3137,6 +3320,47 @@ def why_records(pins: dict | None = None, last: dict | None = None) -> list[dict
     return records
 
 
+def cmd_panes(args) -> int:
+    """Every todo pane on this machine, with the subject it holds and the interpreter it runs.
+
+    In plain words: `why` answers where ONE session's list pane is, for a window the reader
+    chose; this answers which todo panes exist at all, across every window and every session —
+    including the ones OUTSIDE tmux, which no `list-panes` can name. Each row is a pane
+    process (`todo_panes`): its tmux pane and window when it has them, else its controlling
+    terminal, which is how the desktop app's panes are named; the subject it latched itself to
+    (`cli:<chat>` / `desktop:<thread>`, read from the record the pane writes — see
+    `pane_subject_write`); and the interpreter its own command line names. `--json` is the same
+    document for a script; `--quiet` prints nothing.
+    """
+    rows, table = pane_rows(), process_table()
+    found = todo_panes(rows=rows, table=table)
+    names = {}
+    for row in rows:
+        if row["window"] and row["window"] not in names:
+            names[row["window"]] = window_key(row["window"]) or ""
+    panes = [
+        {**rec, "window_name": names.get(rec["window"] or "") or None} for rec in found
+    ]
+    if args.json:
+        json.dump({"panes": panes, "count": len(panes)}, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+    if args.quiet:
+        return 0
+    if not panes:
+        print("no todo pane on this machine")
+        return 0
+    c = paint(use_color())
+    print(f"{c('1', 'fbtodo panes')}  {len(panes)} todo pane(s)")
+    for rec in panes:
+        where = rec["window_name"] or rec["pane"] or rec["tty"] or "—"
+        hold = subject_note(rec["subject"]) if rec["subject"] else "— (not locked yet)"
+        python = _short_python(rec["python"]) if rec["python"] else "— not known"
+        print(f"  {rec['pane'] or '—':<6} {where:<12} pid {rec['pid']:<7} {hold}"
+              f"  python {python}")
+    return 0
+
+
 def cmd_why(args) -> int:
     """Say why every list pane is where it is — the rule, the anchor, and the numbers.
 
@@ -3353,7 +3577,7 @@ def build_parser():
     )
     ap.add_argument("command", nargs="?", default="pane",
                     choices=["pane", "snap", "json", "bar", "daemon", "stop", "status",
-                             "prune", "pane-watch", "pin", "why", "ledger", "doctor",
+                             "prune", "pane-watch", "pin", "why", "panes", "ledger", "doctor",
                              "push", "init", "keep", "locks", "dead", "board", "mute"])
     ap.add_argument("verb", nargs="?", default=None, metavar="VERB",
                     help="the command's own verb (omitted: print what is in force): "
@@ -3692,6 +3916,8 @@ def main(argv=None) -> int:
         return cmd_pin(args)
     if args.command == "why":
         return cmd_why(args)
+    if args.command == "panes":
+        return cmd_panes(args)
     if args.command == "dead":
         return cmd_dead(args)
     if args.command == "board":

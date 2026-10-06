@@ -997,13 +997,52 @@ than one group. The heading is added **after** the `TASK_MAX_LINES` cap — it c
 — and the fit is anchored on the followed thread's current step, so stacking a second list cannot
 push the list the pane was pointed at out of view. A PANE never gets there: `cmd_pane` sets
 `--threads 1` from the first poll and `latch_pane_subject` then narrows the pane's own arguments
-to one source plus `--thread`/`--chat`, so every later poll asks for that subject by name. The
+to one source plus `--thread`/`--chat`, so every later poll asks for that subject by name — and it
+sets `pane_locked` on those arguments as it does, so the lock is held for the life of the process
+and not only in `FBTODO_PANE_LOCK` (without that flag every poll re-latched, and a pane whose
+accepted state named a different subject moved the reader's window). `state_matches_request`
+answers the other half: a cached state is only usable when it names the SUBJECT the caller asked
+for — `target` for a chat, `session` for a thread — and carries no stack of threads to a caller
+that asked for one, so the shared watcher's file can hold somebody else's list without the pane
+ever being handed it. The
 first accepted poll is what decides — and it is still `auto`'s chain doing the deciding, after
 `pane_cached_state` has dropped any cached state whose session ended, so a pane still lands on
 the live thread rather than the finished chat. A finished turn does not release the lock, a second
 thread going live cannot steal it, and the lock rides out in `FBTODO_PANE_LOCK` so a pane that
 `exec`s itself into a new build comes back holding the same list. The stacking above is for the
 reads (`json`, `snap`, `board`), which are surveys rather than somebody's window.
+
+Nothing outside the process could see which subject a pane holds: the lock lives in the pane's
+arguments (memory) and in `FBTODO_PANE_LOCK` (its own environment, which the kernel snapshots at
+exec — the latch writes after that, so `ps` never shows it). `pane_subject_write` therefore has
+the pane write `pane-subjects/<pid>.json` beside its state root, one file per process so panes
+starting in a burst cannot lose each other's entry to a read-modify-write race, and a reloaded
+pane (a new pid) rewrites it from the lock it applies at startup. Dead pids are swept by the
+next writer; the reader never cleans up, because a look must change nothing. `todo_panes` pairs
+those records with the pane processes the PROCESS TABLE names — not `list-panes`, which would
+never see the panes the desktop app holds on a pty — tying each process back to its tmux pane,
+window and tty by ancestry. A pane pointed at another `FBTODO_HOME` is read from its own root,
+taken from the pin in its command line. `fbtodo panes` prints that set; `is_todo_pane_command`
+is the rule that decides what a pane is (a `fbtodo` whose subcommand is absent, `pane`, or a
+leading flag), and it requires the launcher to be the PROGRAM token so a command line that
+merely mentions the name — `grep fbtodo` — is not mistaken for one.
+
+Where that FIRST subject comes from is the pane's own PLACE, not only `auto`'s chain. A pane the
+desktop app opens runs a bare `fbtodo` in a thread's terminal, and the app marks the process
+(`FREEBUFF_DESKTOP_STATE_PATH`) while handing it nothing per-thread — the orchestrator keeps the
+per-terminal thread id in memory, behind a launch token it strips on purpose — so `auto`, which
+prefers a live CLI chat, made EVERY desktop pane latch the same chat. `pane_place_subject`
+therefore answers first, before the cached state is consulted: inside the app (the marker is
+`FREEBUFF_DESKTOP_STATE_PATH` or the bundle id, and a pane in TMUX never counts, so a tmux server
+that inherited the app's environment cannot claim its panes), and with no subject
+named on the pane's OWN command line, it takes the app's store for this directory (`pick_db` with
+`own_only`), reads its live threads the way the store's own focus rule does (`read_desktop`), and
+returns the first thread no other live pane already holds (`held_pane_subjects`, read from the
+`pane-subjects/` records) — which is what makes two panes of one project hold two threads rather
+than both holding the one the app is working in. `apply_pane_subject_lock` then plants exactly
+the lock `latch_pane_subject` plants (arguments, environment, record), and
+`pane_subject_from_argv` is the guard around both: a `-s cli`, `--chat` or `--thread` somebody
+typed is theirs to keep, while a `-s auto` is not a subject — it is the request to choose.
 
 The bar's two numbers are **not** taken from the groups: `drawn_counts(state)` counts the
 list the pane FOLLOWS (`state["todos"]`) whenever it is there, and only when it is not — a

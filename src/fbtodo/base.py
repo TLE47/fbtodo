@@ -1133,6 +1133,18 @@ PANE_LOG_PATH = os.path.join(SCRATCH, "fbtodo-pane.log")
 PANE_NOTE_PATH = os.path.join(SCRATCH, "fbtodo-pane-note.json")
 
 
+# What each todo pane has latched itself to, one small file per pane process:
+#   pane-subjects/<pid>.json -> {"subject": "cli:<chat dir>" | "desktop:<thread id>", "at_ms": …}
+# The lock itself lives in the pane's OWN environment (`PANE_LOCK_ENV`), and that is not
+# readable from outside on every platform: the kernel snapshots a process's environment at
+# exec, so a value written at runtime — which is exactly what `latch_pane_subject` does — is
+# invisible to `ps` and to every other reader. The pane therefore WRITES ITS SUBJECT DOWN as
+# well, and `fbtodo panes` reads the records back, keyed by the pid the process table already
+# gives it. A directory of one file per pid rather than one shared file, so two panes
+# starting together cannot lose each other's entry to a read-modify-write race.
+PANE_SUBJECT_DIR = os.path.join(SCRATCH, "pane-subjects")
+
+
 # Where the list pane goes, per window (`fbtodo pin`):
 #   {`session:index`: {side, size}}
 # The halves are the window's answer, flat. A pin file written while a window held two list
@@ -1167,6 +1179,7 @@ def _state_paths(root: str) -> dict:
         "PANE_KEEPER_PATH": os.path.join(root, "fbtodo-pane-keeper.pid"),
         "PANE_LOG_PATH": os.path.join(root, "fbtodo-pane.log"),
         "PANE_NOTE_PATH": os.path.join(root, "fbtodo-pane-note.json"),
+        "PANE_SUBJECT_DIR": os.path.join(root, "pane-subjects"),
         "PINS_PATH": os.path.join(root, "fbtodo-pins.json"),
         "LAST_PATH": os.path.join(root, "fbtodo-last.json"),
         "MUTE_PATH": os.path.join(root, "fbtodo-pane-mute.json"),
@@ -2016,6 +2029,29 @@ def process_table() -> dict[int, tuple[int, str]]:
     return table
 
 
+def process_ttys() -> dict[int, str]:
+    """pid -> its controlling terminal's short name, from one `ps` call.
+
+    In plain words: a pane outside tmux has no pane id and no window to be named by — the two
+    the desktop app attaches to a pty have only their terminal — so `fbtodo panes` reads the
+    tty here to have something to print beside such a pane. `?` is ps's "no terminal", which
+    is no answer rather than a name, so it is left out.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-Ao", "pid=,tty="], capture_output=True, text=True, timeout=5
+        ).stdout
+    except Exception:
+        return {}
+    ttys: dict[int, str] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or not parts[0].isdigit() or parts[1] in ("?", "??"):
+            continue
+        ttys[int(parts[0])] = parts[1]
+    return ttys
+
+
 def instance_of_parent(parent_pid: int) -> int | None:
     """The Freebuff process launched by this shell."""
     return descendant_instance(process_table(), parent_pid)
@@ -2310,8 +2346,8 @@ __all__ = [
     "python_of",
     "LOCK_PATH", "LOG_PATH",
     "pid_alive", "pid_running",
-    "PANE_KEEPER_PATH", "PANE_LOG_PATH", "PANE_NOTE_PATH", "PINS_PATH", "LAST_PATH",
-    "MUTE_PATH", "NOTIFY_DIR",
+    "PANE_KEEPER_PATH", "PANE_LOG_PATH", "PANE_NOTE_PATH", "PANE_SUBJECT_DIR",
+    "PINS_PATH", "LAST_PATH", "MUTE_PATH", "NOTIFY_DIR",
     "TODO_NOTIFY", "DROP_NOTIFY", "ASK_NOTIFY", "PAUSE_NOTIFY", "PANE_NOTIFY",
     "LOCKS_NOTIFY",
     "TMUX_BIN", "TMUX_SUBCOMMANDS", "DEFAULT_DB_GLOB", "DEFAULT_WORKSPACE_STATE",
@@ -2331,7 +2367,7 @@ __all__ = [
     "clean_text", "clean_observation", "atomic_write_json", "atomic_write_text",
     "read_json", "pid_alive", "proc_cwds", "lsof_cwds", "cwds_for", "pid_cwd", "parse_etime",
     "ages_for", "installed_freebuff", "is_freebuff_cmd", "freebuff_pids", "process_table",
-    "instance_of_parent", "descendant_pids", "descendant_instance", "find_instance",
+    "process_ttys", "instance_of_parent", "descendant_pids", "descendant_instance", "find_instance",
     "cli_chat_dir", "use_color", "paint", "fmt_age", "_ANSI_RE", "_plain", "_cell_width",
     "_clip_cells", "_pad_cells", "_wrap", "_clip", "_fit_blocks", "_drop_clock",
     "state_evidence", "state_is_fresh",

@@ -81,7 +81,7 @@ and both renderers draw it where they already say what the pane is showing — t
 chip and the plain heading:
 
 ```
-╭──  FREEBUFF TODOS · cli finished 31h → desktop  ──────  desktop · dad7b13e… ──╮
+┌──  FREEBUFF TODOS · cli finished 31h  ───────────── desktop · dad7b13e ──┐
 Freebuff todos  desktop · dad7b13e… · cli finished 31h → desktop
 ```
 
@@ -127,7 +127,11 @@ under them. And a following pane moves on its own: the picker above reads "you t
 tab" as "that is the thread you are working in", so typing in another tab silently swapped the
 list on screen mid-read — both frames valid, nothing drawn to say so. A finished turn does NOT
 release the latch (a finished list is still a list somebody is reading), a second thread going
-live does not steal it, and the pane holds its last list until you close it. The latch does not
+live does not steal it, and the pane holds its last list until you close it. The latch is held
+twice: in the pane's own process (`pane_locked`, so no later poll can re-latch) and in
+`FBTODO_PANE_LOCK` for the reload. The shared watcher's cached state is used only when it names
+that same subject, so a pane pinned to one chat or thread is never handed the list the watcher
+wrote for another. The latch does not
 choose the first list, though: that is still `auto`'s chain, and a cached state whose session has
 ended is still dropped before anything latches, so a pane still lands on the live thread rather
 than the finished chat.

@@ -758,6 +758,17 @@ def read_desktop(db: str, thread_id=None, source="active", state_path=DEFAULT_WO
                 target, source_note = live_id, note
         if target and not exists(target):
             target = None
+        if not target and thread_id:
+            # The caller NAMED a thread and this store does not have it (a tab that has
+            # since been closed, a `-t` for another project's store). Falling through to the
+            # newest list ANY thread wrote is the pane that renders another thread's list,
+            # and for a locked pane it is unrecoverable — the frame looks valid. So the
+            # answer stays about the thread that was asked for, which has no list here yet.
+            state = {"ts": None, "todos": [], "thread": thread_id, "title": ""}
+            state["active"] = False
+            state["source"] = "pinned"
+            state["session"] = thread_id
+            return _with_threads(cur, state, thread_id, others, now_ms, window_ms)
         if target:
             state = _thread_query(
                 cur,

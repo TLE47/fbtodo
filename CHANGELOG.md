@@ -6,6 +6,25 @@ Entries start at the newest release; each one is a contract change, not a diff.
 ## Unreleased
 
 ### Added
+- **`fbtodo panes` lists every todo pane on the machine, with the subject it holds and the
+  interpreter it runs.** `why` answers where ONE session's list pane is, for a window you name;
+  nothing answered *which* todo panes exist — so after restarting three of them by hand the
+  only way to see all three was `tmux list-panes` plus two `ps` calls, and the two the desktop
+  app holds are not tmux panes at all. This walks the PROCESS table rather than tmux, which is
+  what makes it every pane on the machine: a tmux pane's process is tied back to its pane id,
+  window and tty by ancestry, and a pane outside tmux is named by its tty instead. Each row is
+  the pane's tmux pane and window (its tty when it has none), its pid, the subject it latched
+  itself to, and the interpreter its own command line names; `--json` is the same document for
+  a script. The subject needed recording to be readable: the lock lives in the pane's arguments
+  and in its own environment, and the kernel snapshots an environment at exec, so a value
+  written at runtime is invisible to `ps` — the pane now also writes `pane-subjects/<pid>.json`
+  beside its state root (one file per process, so panes starting in a burst cannot lose each
+  other's entry to a race) and `fbtodo panes` pairs those records with the processes it finds.
+  A pane pointed at another `FBTODO_HOME` is read from its OWN root, taken from the pin in its
+  command line. Teeth: the suite pins the command-line rule (a pinned pane and a bare `fbtodo`
+  are panes; a watcher, a one-shot read and a `grep fbtodo` are not), the pairing of a record
+  with a process and with a tmux pane, and end to end a real pane on a pty, whose recorded
+  subject and interpreter `fbtodo panes --json` must name.
 - **`fbtodo mute` drives the same switch without a keystroke — `on`, `off`, `list`, `until-done`.**
   The pane keys are the fast way when the pane is what you are looking at, and the wrong way
   for everything else: a script, a status row, another program's button, a shell that is not a
@@ -461,6 +480,46 @@ Entries start at the newest release; each one is a contract change, not a diff.
   observation, so a desktop pane mid-turn is headed exactly as a CLI pane would be.
 
 ### Fixed
+- **A pane the desktop app opens holds the thread it is drawn beside, not the CLI chat that
+  happened to be live.** The app spawns one terminal per thread and runs a bare `fbtodo` in it;
+  that pane asked `auto`, which prefers a live CLI chat, so every desktop pane latched the SAME
+  chat — measured 2026-10-05: `ttys000` (pid 70764) and `ttys001` (pid 21248) both holding
+  `cli 2026-10-05T17-52-39.193Z` while the thread each was drawn beside went unshown. The app
+  hands its terminal no thread id (it marks the process with `FREEBUFF_DESKTOP_STATE_PATH` and
+  nothing per-thread, and the orchestrator keeps the per-terminal id in memory behind a launch
+  token it strips on purpose), so the binding is inferred from the app's own store: the live
+  threads of THIS project, the one the app is working in first (the store's own focus rule),
+  then the others — skipping a thread another live pane already holds
+  (`held_pane_subjects`), which is what makes two panes hold two threads. A subject named on
+  the pane's OWN command line (`-s cli`, `--chat`, `--thread`) is the person's and is never
+  overridden, and outside the app nothing changes at all (a pane in TMUX never counts as the
+  app's, so a tmux server that inherited the app's environment cannot claim its panes). Teeth:
+  the suite pins the app-marker
+  rule, the argv guard, the thread chosen for a two-thread fixture store, the second pane's
+  different thread, and the lock the binding applies (arguments, environment and the
+  `pane-subjects/` record).
+- **A pane pinned to one thread no longer draws another's list.** The lock `latch_pane_subject`
+  puts in the arguments was never made to STICK: it wrote `--chat`/`--thread` and the
+  environment the reload reads, but never set the `pane_locked` flag that its own first line
+  checks, so every poll re-latched to whatever subject that poll happened to resolve. This
+  machine's own pane log shows the result — `pane locked to the cli chat …` at 10:52:37, :40,
+  :41 and :57, four different chats inside twenty seconds, each one replacing the list the
+  reader was on. Beside it, `state_matches_request` compared only the BACKEND, so a pane
+  locked to one chat was still handed the shared watcher's state about another: the watcher is
+  ONE process serving whoever asks first, and "it answers `cli`" is not the same answer as "it
+  answers `cli` about the chat you asked for". A cached state now has to name the subject the
+  caller named — `target` for a chat, `session` for a desktop thread — and may not carry a
+  STACK of threads when the caller asked for one, which is the same report in its other shape:
+  a pane asks for one list while the watcher it shares with `fbtodo json --threads 4` writes
+  four, and the pane drew every live thread of the store under one frame. Teeth, from the
+  probe that found it (all three now assertions in the suite): a read pinned to one chat, with
+  a fresh cached state about another sitting right beside it, must answer with its OWN chat's
+  list — it answered with the other's; the latch must set its own flag and must not move when a
+  later poll resolves a second subject; and a stacked state must be refused at `--threads 1`
+  while `--threads 4` still stacks. The same defect had one more door: `read_desktop` fell back
+  to "the newest list any thread wrote" whenever the thread a caller NAMED was not in the store,
+  so closing the tab a pane was pinned to handed the reader the other tab's steps — a named
+  subject now answers about itself (no list here yet) instead of about somebody else.
 - **The frame's border lines up again.** The goal heading was drawn with `🎯`, which measures
   TWO cells to `wcwidth` and ONE cell in the terminal the pane was being read in (measured
   2026-10-04), so every row carrying it came out a column short on screen: the right edge
@@ -489,6 +548,34 @@ Entries start at the newest release; each one is a contract change, not a diff.
   are precisely the two answers a terminal is free to disagree with. It fails on the pre-fix
   render and passes on this one, which is the only evidence that it is a check and not a
   decoration.
+- **The frame with no list in it is a grid too — it is now checked, and it was not.** Every
+  width check above renders a pane that HAS a list. A pane spends real time without one (a
+  turn opens before the agent writes its first `write_todos`), and that frame comes out of a
+  different branch of the renderer entirely, which had no width assertion at all. It is also
+  the branch that wraps a SENTENCE rather than a step, so it is where a wrap bug would show:
+  two note lines, a `NOW` line and both footer rows inside one frame. Measured from a pane
+  photographed in exactly that state on 2026-10-04: all eight of its row bands draw both
+  borders at the same column, so the frame itself was sound and nothing needed repairing
+  there. The gap was in the SUITE, not the frame, and that is what this closes. The no-list
+  frame is now rendered at the same six widths and must be exactly that wide on every row and
+  keep both its edges — and must still BE that frame, with the note and the `REFIT` row
+  asserted present, so the check cannot pass by quietly rendering nothing. Each assertion was
+  shown to fail on a copy of the renderer with that one defect put back, and the width check
+  still passed on the wide-glyph copy, which is the reason the Unicode one is not redundant.
+- **The frame's corners join the way its dividers do.** The outer corners were drawn with
+  ARCS (`╭ ╮ ╰ ╯`) while the dividers inside the same box have always been sharp (`├ ┤`),
+  and an arc does not meet a rule the way a corner does. Measured on a pane read on
+  2026-10-05: the top rule stopped three pixels short of its own corner on the rule's outer
+  row and reached the border's column only on its core row, so the corner read as a notch
+  beside the crisp T-junctions a few rows below it — a box with two kinds of join in it. The
+  outer corners are now `┌ ┐ └ ┘`, so every junction in a frame is flush. Note what this was
+  NOT: the corners were never misplaced, and no row was a cell out — at a threshold that
+  includes the font's antialiasing the rule meets the border column exactly, which is how
+  the earlier "the border is broken" readings were ruled out. The frame's own shape is a
+  property of a render now, not a list someone has to remember: any arc anywhere in a frame
+  fails the check, at three widths. The notifier's own modal boxes keep their rounded style —
+  a different surface, drawn in a different program. Teeth shown by loading the pre-change
+  renderer beside this one: the check fails on it and passes here.
 - **The two states a pane's close used to be decided by are pinned again, by the code that
   owns them now.** `session_still_live` — the helper that answered "is this session still
   live?" for the close rule — was deleted with that rule (2026-10-04: a pane's lifetime is its

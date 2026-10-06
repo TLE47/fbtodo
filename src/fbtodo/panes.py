@@ -1336,6 +1336,233 @@ def pane_note_take(pane: str | None, kind: str | None = None,
     return None
 
 
+# ------------------------------------- what a pane holds, said where a reader can find it
+# A pane's subject is decided by `latch_pane_subject` and lives in its arguments and its own
+# environment. Neither answers a reader outside the process: the arguments are memory, and the
+# kernel snapshots an environment at exec, so a value written at runtime — which is exactly
+# what the latch writes — is invisible to `ps` and to everything else that only looks. So the
+# pane also WRITES IT DOWN, one small file per process, and `fbtodo panes` pairs those records
+# with the pane processes the process table already names.
+
+def pane_subject_write(subject: str, root: str | None = None) -> None:
+    """Write what this pane holds, and sweep the records of panes that have ended.
+
+    In plain words: `pane-subjects/<pid>.json` is the pane's note to anybody reading from
+    outside, written when it latches and again by a reloaded image (whose pid is new). Its OWN
+    file, not a shared registry: panes start in bursts — a machine-wide restart, a tmux server
+    coming up — and a read-modify-write merge would drop an entry to a race that a per-pid file
+    cannot have. The sweep is what keeps the directory to the panes actually running: a record
+    whose pid is gone belongs to a pane that has ended, and it goes the next time any pane
+    writes. `fbtodo panes` itself never cleans up — a look must change nothing.
+    """
+    if not subject:
+        return
+    where = pane_subject_dir(root)
+    try:
+        os.makedirs(where, mode=0o700, exist_ok=True)
+        atomic_write_json(
+            os.path.join(where, f"{os.getpid()}.json"),
+            {"subject": subject, "at_ms": int(time.time() * 1000)},
+        )
+    except OSError:
+        return
+    try:
+        names = os.listdir(where)
+    except OSError:
+        return
+    for name in names:
+        stem, _, suffix = name.partition(".")
+        if suffix != "json" or not stem.isdigit():
+            continue
+        if int(stem) != os.getpid() and not pid_alive(int(stem)):
+            try:
+                os.unlink(os.path.join(where, name))
+            except OSError:
+                pass
+
+
+def pane_subject_dir(root: str | None = None) -> str:
+    """Where a state root keeps its panes' subject records — `<root>/pane-subjects`."""
+    return PANE_SUBJECT_DIR if not root else os.path.join(root, "pane-subjects")
+
+
+def pane_process_root(pid: int, blob: str | None = None) -> str:
+    """The state root a pane process works in, from its OWN environment.
+
+    In plain words: the record a pane leaves is written under the root the pane works in, and
+    different roots mean different panes — one pointed at another `FBTODO_HOME` keeps its
+    subject somewhere else. The root is the one thing the environment answers from outside,
+    because the pin writes it into the command line and so it is there at exec; `_proc_root`
+    reads it the way the program does. An environment that cannot be read at all falls back to
+    this run's root, the safe direction: a pane sharing it is still found.
+    """
+    if blob is None:
+        try:
+            blob, _clipped = _proc_environ(int(pid))
+        except (OSError, TypeError, ValueError):
+            blob = ""
+    if not blob:
+        return SCRATCH
+    return _proc_root(blob)
+
+
+def pane_subject_read(pid: int, root: str | None = None) -> str:
+    """What the pane process `pid` recorded as its subject, or "" — its own root first.
+
+    `root` is that pane's own answer when the caller could read it (`pane_process_root`); this
+    process's root is tried as well, because an environment that could not be read must not
+    turn a pane sharing this root into one that holds nothing.
+    """
+    where = [pane_subject_dir(root)] if root else []
+    if PANE_SUBJECT_DIR not in where:
+        where.append(PANE_SUBJECT_DIR)
+    for folder in where:
+        rec = read_json(os.path.join(folder, f"{int(pid)}.json"), {})
+        if isinstance(rec, dict) and rec.get("subject"):
+            return str(rec["subject"])
+    return ""
+
+
+def subject_note(subject: str) -> str:
+    """A recorded subject as a person reads it: `cli 2026-10-05T17-52-39.193Z`, or `—`.
+
+    The raw record is the honest thing to keep (`cli:<full chat dir>`), and the name a reader
+    says out loud is the short one: the chat directory's own name, or the first eight
+    characters of a desktop thread's id — the same shortening the latch's log line uses.
+    """
+    kind, _, what = (subject or "").partition(":")
+    if not what:
+        return "—"
+    if kind == "cli":
+        return f"cli {os.path.basename(what.rstrip('/')) or what}"
+    return f"{kind or 'subject'} {what[:8]}"
+
+
+def desktop_app_pane(environ=None) -> bool:
+    """Is this process a pane the Freebuff DESKTOP app opened?
+
+    In plain words: the app spawns one terminal per thread and the pane runs bare `fbtodo`
+    inside it, so the pane's own environment is the only thing that says where it lives —
+    and the app marks every process it starts with `FREEBUFF_DESKTOP_STATE_PATH` (its own
+    workspace-state file) and the bundle id. A pane typed in a terminal has neither, which
+    is exactly the distinction this is for: inside the app a pane's subject belongs to a
+    desktop thread, and a pane in a plain shell keeps asking `auto` the way it always did.
+    """
+    env = os.environ if environ is None else environ
+    # ...and a pane inside tmux is never one of the app's: the app's terminals are plain ptys
+    # (its own `~/.zshrc` excludes it from tmux), while a tmux SERVER started from one would
+    # hand the marker to every pane it spawns — a Terminal.app pane measured with
+    # `__CFBundleIdentifier=com.apple.Terminal`, and the guard is what keeps that answer true
+    # even if the server's environment ever carries the app's.
+    if env.get("TMUX"):
+        return False
+    return bool(
+        env.get("FREEBUFF_DESKTOP_STATE_PATH")
+        or env.get("__CFBundleIdentifier") == "com.freebuff.desktop"
+    )
+
+
+def held_pane_subjects(root: str | None = None) -> set[str]:
+    """The subjects LIVE panes already hold, read from their own records.
+
+    The records are per-pid files (`pane_subject_write`), and a record whose pid is gone is a
+    pane that has ended: this reads only the living ones. It is what lets two panes of the
+    same project share out the app's live threads instead of both landing on the one thread
+    the app is working in — see `pane_place_subject`.
+    """
+    folder = pane_subject_dir(root)
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return set()
+    held: set[str] = set()
+    for name in names:
+        stem, _, suffix = name.partition(".")
+        if suffix != "json" or not stem.isdigit() or not pid_alive(int(stem)):
+            continue
+        rec = read_json(os.path.join(folder, name), {})
+        if isinstance(rec, dict) and rec.get("subject"):
+            held.add(str(rec["subject"]))
+    return held
+
+
+def is_todo_pane_command(cmd: str) -> bool:
+    """Whether a command line is a todo pane — a `fbtodo` that asked for no other command.
+
+    In plain words: a pane is a `fbtodo` invocation that named no subcommand (`pane` is the
+    default) or said `pane` outright — the wrapper's `--watch-pid …` form, a pinned
+    `respawn-pane`, and the desktop app's bare `fbtodo` are all that shape. The launcher has to
+    be the PROGRAM token, the one right after the interpreter and past the `/usr/bin/env` and
+    `KEY=value` prefix a pin carries: `grep fbtodo`, `rg fbtodo` and a script that merely
+    mentions the name have the word in them too, and none of them is a pane. A leading flag IS
+    the default subcommand (`--watch-pid`, `--once`, `-s cli`); `-h` and `-V` are the two that
+    leave without ever drawing a list.
+    """
+    toks = shlex.split(cmd)
+    at = 0
+    while at < len(toks) and (toks[at].endswith("env") or "=" in toks[at]):
+        at += 1
+    if at >= len(toks):
+        return False
+    if os.path.basename(toks[at]).lower().startswith("python"):
+        at += 1
+    if at >= len(toks):
+        return False
+    if os.path.basename(toks[at]) != "fbtodo" and not toks[at].endswith(
+            os.path.join("fbtodo", "__init__.py")):
+        return False
+    sub = toks[at + 1] if at + 1 < len(toks) else None
+    if sub is None or sub == "pane":
+        return True
+    return sub.startswith("-") and sub not in ("-h", "--help", "-V", "--version")
+
+
+def todo_panes(rows=None, table=None, environs=None, ttys=None) -> list[dict]:
+    """Every todo pane on this machine: where it is, what it holds, and what runs it.
+
+    In plain words: a pane is a PROCESS — the one fbtodo a window is showing — so this walks
+    the process table rather than tmux, and THAT is what makes it every pane on the machine:
+    the two the desktop app attaches to a pty are panes as much as a tmux one, and a
+    `list-panes` reader would never see them. A tmux pane's process is tied back to its pane id
+    and window by ancestry, so the panes that ARE in tmux are named the way tmux names them.
+    Each row is one pane: its pid, its tmux pane and window (`None` outside tmux), its
+    controlling terminal, the subject it recorded (`pane_subject_read`), and the interpreter
+    its command line names (`python_of`).
+
+    The injection points are for the self-check, exactly like `claim_processes`: `rows` and
+    `table` (tmux and ps), `environs` (pid -> environment blob, so the root a pane works under
+    can be pinned), and `ttys`. Read-only by construction: no record is written and nothing is
+    pruned, so a look never changes what it reports.
+    """
+    table = process_table() if table is None else table
+    rows = pane_rows() if rows is None else rows
+    ttys = process_ttys() if ttys is None else ttys
+    # pid -> (pane, window) for every tmux pane, by ancestry: a split pane's process is the
+    # login shell that runs the pinned command, a respawned pane's IS the command.
+    where: dict[int, tuple] = {}
+    for row in rows:
+        if not row["pid"]:
+            continue
+        where.setdefault(row["pid"], (row["pane"], row["window"]))
+        for pid, _depth in descendant_pids(table, row["pid"]):
+            where.setdefault(pid, (row["pane"], row["window"]))
+    found = []
+    for pid, (_ppid, cmd) in sorted(table.items()):
+        if not is_todo_pane_command(cmd):
+            continue
+        pane, window = where.get(pid, (None, None))
+        blob = (environs or {}).get(pid)
+        found.append({
+            "pid": pid,
+            "pane": pane,
+            "window": window,
+            "tty": ttys.get(pid),
+            "subject": pane_subject_read(pid, pane_process_root(pid, blob)),
+            "python": python_of(cmd),
+        })
+    return found
+
+
 # The spellings that MEAN off. A person may write any of them; anything else — including
 # unset, which reads as an empty string — leaves the repair running.
 REPAIR_OFF_WORDS = ("off", "no", "0", "false")
@@ -2118,6 +2345,9 @@ __all__ = [
     "hold_pane_size", "forget_settled", "remember_layout", "save_pins", "window_of",
     "KEEPER_GRACE", "KEEPER_CLAIM_CHECK_S", "keeper_reclaim",
     "PANE_NOTE_S", "pane_note_write", "pane_note_forget", "pane_note_take",
+    "pane_subject_write", "pane_subject_read", "pane_subject_dir", "pane_process_root",
+    "subject_note", "desktop_app_pane", "held_pane_subjects",
+    "is_todo_pane_command", "todo_panes",
     "tmux_identity", "tmux_identity_outside", "tmux_socket_of", "same_tmux_server",
     "keeper_serves",
     "ensure_pane_keeper", "cmd_pane_watch",

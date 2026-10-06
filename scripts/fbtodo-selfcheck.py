@@ -5676,6 +5676,322 @@ def _probe_live_for_target(x, y):
         kill_tree(lock_pane)
     say("a pane stays on its thread when another tab starts working: ok")
 
+    # ---- ...and the same rule for the SUBJECT a pane is pinned to, which is the other way
+    #      the leak was reported (2026-10-05: "freebuff todo for one thread should not render
+    #      the other thread"). Two defects met here. `latch_pane_subject` wrote the lock into
+    #      the arguments but never set the flag that makes it stick, so every poll re-latched:
+    #      this machine's own pane log shows four different chats inside twenty seconds
+    #      (`pane locked to the cli chat …` at 10:52:37, :40, :41 and :57). And
+    #      `state_matches_request` compared only the BACKEND, so a pane locked to one chat was
+    #      still handed the shared watcher's state about another — the same report, the lock
+    #      held in the arguments while the frame came from somewhere else.
+    subj_root = os.path.join(TEST_HOME, "subjprojects")
+    subj_proj = os.path.join(TEST_HOME, "subjproj")
+    os.makedirs(subj_proj, exist_ok=True)
+    own_step, other_step = "the pinned chat's own step", "the other chat's step"
+    subj_chats = {}
+    for name, step in (("PINA", own_step), ("PINB", other_step)):
+        chat_dir = os.path.join(subj_root, "subjproj", "chats", name)
+        os.makedirs(chat_dir, exist_ok=True)
+        with open(os.path.join(chat_dir, "log.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"data": {"toolCalls": [
+                {"toolName": "write_todos", "input": {"todos": [
+                    {"task": step, "completed": False}]}}]}}) + "\n")
+        subj_chats[name] = chat_dir
+    # The cached watcher state: fresh, matching, and about the OTHER chat. What was there
+    # before is kept and put back: a fresh `cli` state left in the shared root is accepted by
+    # `auto`, so it would answer the NEXT check's `auto` pane with this fixture's chat.
+    saved_state = None
+    try:
+        with open(module.STATE_PATH, "rb") as fh:
+            saved_state = fh.read()
+    except OSError:
+        pass
+    subj_now = int(time.time() * 1000)
+    with open(module.STATE_PATH, "w", encoding="utf-8") as fh:
+        json.dump({
+            "schema": 1, "backend": "cli", "session": "PINB", "target": subj_chats["PINB"],
+            "status": "watching", "tool_version": module.VERSION, "heartbeat_ms": subj_now,
+            "store_mtime_ms": subj_now, "probed_ms": subj_now,
+            "todos": [{"task": other_step, "completed": False}],
+        }, fh)
+    subj_keep = spawn_quiet("sleep", "600")
+    try:
+        pinned = run("json", "-s", "cli", "--chat", subj_chats["PINA"],
+                     "--cli-root", subj_root, "--watch-pid", str(subj_keep.pid))
+    finally:
+        kill_tree(subj_keep)
+        if saved_state is None:
+            try:
+                os.unlink(module.STATE_PATH)
+            except OSError:
+                pass
+        else:
+            with open(module.STATE_PATH, "wb") as fh:
+                fh.write(saved_state)
+    pinned_doc = json.loads(pinned.stdout)
+    assert pinned_doc["session"] == "PINA" and [t["task"] for t in pinned_doc["todos"]] == [own_step], (
+        "a read pinned to one chat answered with another chat's cached state\n" + pinned.stdout
+    )
+    # ...and the latch holds for the LIFE of the process, not only across the reload the
+    # environment covers: a second poll that resolves another subject must not move the pane
+    subj_args = module.build_parser().parse_args([])
+    assert not getattr(subj_args, "pane_locked", False), "the parser must not pre-lock a pane"
+    # The latch writes its lock to THIS process's environment as well as the arguments (that
+    # is how a reloaded pane comes back locked), and a phase's pane is forked from this very
+    # process: left behind, the lock would answer the NEXT check's pane with this chat —
+    # which is exactly what happened the first time this check was written, and it is the
+    # lock working. So it is put back the way it was found.
+    saved_lock = os.environ.get(module.PANE_LOCK_ENV)
+    try:
+        first_note = module.latch_pane_subject(subj_args, {
+            "backend": "cli", "session": "PINA", "target": subj_chats["PINA"]})
+        assert first_note and subj_args.pane_locked, first_note
+        moved_note = module.latch_pane_subject(subj_args, {
+            "backend": "cli", "session": "PINB", "target": subj_chats["PINB"]})
+        assert moved_note == "" and subj_args.chat == subj_chats["PINA"], (
+            "the latch moved to another chat on a later poll\n"
+            f"note {moved_note!r}, chat now {subj_args.chat!r}"
+        )
+    finally:
+        if saved_lock is None:
+            os.environ.pop(module.PANE_LOCK_ENV, None)
+        else:
+            os.environ[module.PANE_LOCK_ENV] = saved_lock
+    # ...and a pane asking for ONE list is never handed a STACKED state: the watcher shares
+    # its file with `fbtodo json --threads 4`, and a pane that drew all of it drew the other
+    # threads — the same report in its other shape
+    stacked = {"backend": "desktop", "tool_version": module.VERSION, "session": "TH",
+               "threads": [{"id": "TH", "current": True}, {"id": "OTHER"}]}
+    assert not module.state_matches_request(
+        stacked, module.build_parser().parse_args(["-s", "desktop", "-t", "TH", "--threads", "1"])
+    )
+    assert module.state_matches_request(
+        stacked, module.build_parser().parse_args(["-s", "desktop", "-t", "TH", "--threads", "4"])
+    )
+    # ...and a thread that is not in the store is not answered with SOME thread's list: the
+    # store's own fallback (the newest list anywhere) is what a named subject must never
+    # reach, or closing the tab the pane was pinned to hands it the other tab's steps.
+    gone_thread = module.read_desktop(lock_db, thread_id="NOPE", source="pinned", others=0)
+    assert gone_thread["todos"] == [] and gone_thread["session"] == "NOPE", (
+        "a store answered for another thread because the named one was gone\n"
+        + repr({k: gone_thread.get(k) for k in ("session", "thread", "todos")})
+    )
+    say("a pinned pane draws its own subject, and never the watcher's other one: ok")
+
+    # ---- ...and the same subject said where a reader OUTSIDE the process can find it. A
+    #      pane's lock lives in its arguments and in its own environment, and neither answers
+    #      `ps` — the kernel snapshots an environment at exec, and the latch writes after that
+    #      — so the pane records it beside its state root and `fbtodo panes` pairs those
+    #      records with the pane processes the process table names. That it walks the PROCESS
+    #      table and not tmux is what makes it every todo pane on the machine: one the desktop
+    #      app holds on a pty is found as readily as one in a tmux window.
+    paneroot = os.path.join(TEST_HOME, "paneroot")
+    module.pane_subject_write("cli:/elsewhere/chats/PANEX", root=paneroot)
+    # The rule that decides what a pane IS: a pinned pane's own line and a bare `fbtodo` are
+    # panes; a watcher, a one-shot read and a line that merely names the program are not.
+    assert module.is_todo_pane_command(
+        f"/usr/bin/env PATH=/usr/bin {sys.executable} {FB} --watch-pid 123 --stale-after 0"
+    ), "a pinned pane's own command line was not recognised"
+    assert module.is_todo_pane_command(f"{sys.executable} {FB} --once")
+    assert module.is_todo_pane_command(f"{sys.executable} {FB} pane")
+    assert not module.is_todo_pane_command(f"{sys.executable} {FB} daemon --foreground")
+    assert not module.is_todo_pane_command(f"{sys.executable} {FB} pane-watch")
+    assert not module.is_todo_pane_command(f"{sys.executable} {FB} snap")
+    assert not module.is_todo_pane_command("grep -n fbtodo somewhere")
+    found = module.todo_panes(
+        rows=[],
+        table={os.getpid(): (1, f"{sys.executable} {FB} --watch-pid 5")},
+        environs={os.getpid(): f"FBTODO_HOME={paneroot}"},
+        ttys={os.getpid(): "ttys999"},
+    )
+    assert len(found) == 1 and found[0]["pid"] == os.getpid(), found
+    assert found[0]["subject"] == "cli:/elsewhere/chats/PANEX", found
+    assert found[0]["tty"] == "ttys999" and found[0]["pane"] is None, found
+    assert os.path.realpath(found[0]["python"] or "") == os.path.realpath(sys.executable), found
+    # ...and a pane process under a tmux pane's shell is named by that pane and window, which
+    # is what ties a row back to the window it is drawn in.
+    child, parent = 424242, 424241
+    found = module.todo_panes(
+        rows=[{"pane": "%77", "window": "@9", "pid": parent, "start": "fbtodo"}],
+        table={parent: (1, "zsh"), child: (parent, f"{sys.executable} {FB}")},
+        environs={child: f"FBTODO_HOME={paneroot}"},
+        ttys={child: "ttys42"},
+    )
+    assert [(r["pid"], r["pane"], r["window"]) for r in found] == [(child, "%77", "@9")], found
+    say("every todo pane, its subject and its interpreter are read off the process table: ok")
+
+    # ...and end to end, through the command a person runs: a real pane on a pty, against one of
+    # the cli chats built above, is found by `fbtodo panes --json` holding the chat it latched to
+    # and the interpreter it runs. The pane writes its record on its own first poll.
+    import fcntl as _fcntl
+    import pty as _pty
+    import struct as _struct
+    import termios as _termios
+
+    e2e_chat = subj_chats["PINA"]
+    pane_master, pane_slave = _pty.openpty()
+    _fcntl.ioctl(pane_master, _termios.TIOCSWINSZ, _struct.pack("HHHH", 24, 100, 0, 0))
+    pane_proc = subprocess.Popen(
+        [sys.executable, FB, "pane", "--no-daemon", "--interval", "0.2", "--tick", "1",
+         "--stale-after", "0", "--watch-pid", str(os.getpid()),
+         "-s", "cli", "--chat", e2e_chat, "--cli-root", subj_root],
+        cwd=CWD, stdin=pane_slave, stdout=pane_slave, stderr=pane_slave, env=env, close_fds=True,
+    )
+    os.close(pane_slave)
+    try:
+        mine = []
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            mine = [r for r in module.todo_panes() if r["pid"] == pane_proc.pid]
+            if mine and mine[0]["subject"]:
+                break
+            time.sleep(0.3)
+        assert mine and mine[0]["subject"] == f"cli:{e2e_chat}", (
+            f"the pane's own subject was not found by the collector: {mine}"
+        )
+        assert mine[0]["python"] and os.path.basename(mine[0]["python"]).lower().startswith(
+            "python") and os.path.exists(mine[0]["python"]), mine
+        doc = json.loads(run("panes", "--json").stdout)
+        assert any(p["pid"] == pane_proc.pid and p["subject"] == f"cli:{e2e_chat}"
+                   for p in doc["panes"]), doc
+    finally:
+        pane_proc.terminate()
+        try:
+            pane_proc.wait(timeout=6)
+        except subprocess.TimeoutExpired:
+            pane_proc.kill()
+        os.close(pane_master)
+    say("`fbtodo panes` names a live pane's own subject and interpreter: ok")
+
+    # ---- ...and the pane a DESKTOP APP opened belongs to the thread whose terminal it is,
+    #      not to whatever was live in the directory. The app marks every process it starts
+    #      with its workspace state path (measured 2026-10-05: `FREEBUFF_DESKTOP_STATE_PATH`
+    #      plus the bundle id) and hands the terminal NOTHING per-thread — the orchestrator
+    #      keeps the per-terminal thread id in memory, behind a launch token it strips on
+    #      purpose. So a bare `fbtodo` in an app terminal resolved `auto`, which prefers a
+    #      live CLI chat, and EVERY desktop pane latched the SAME chat while the thread it
+    #      was drawn beside went unshown. The binding is inferred from the app's own store:
+    #      the thread being worked in first, then the other live threads, skipping any a live
+    #      pane already holds — which is what makes two panes hold two threads.
+    place_home = os.path.join(TEST_HOME, "placeproj")
+    place_store = os.path.join(place_home, "store")
+    os.makedirs(place_store, exist_ok=True)
+    place_db = os.path.join(place_store, "desktop-v2.db")
+    if os.path.exists(place_db):
+        os.remove(place_db)
+    with open(os.path.join(place_store, "project.json"), "w", encoding="utf-8") as fh:
+        json.dump({"projectPath": place_home}, fh)
+    place_con = sqlite3.connect(place_db)
+    place_con.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, status TEXT,"
+        " sidebar_archived_at INTEGER, turn_state TEXT, last_prompt_at INTEGER)"
+    )
+    place_con.execute(
+        "CREATE TABLE messages (seq INTEGER, thread_id TEXT, parts_json TEXT, ts INTEGER)"
+    )
+    PLACE_NOW = int(time.time() * 1000)
+    for step, tid in enumerate(("PA", "PB"), start=1):
+        place_con.execute("INSERT INTO threads VALUES (?, ?, 'open', NULL, ?, ?)",
+                          (tid, f"thread {tid}", "idle", PLACE_NOW - step * 1000))
+        place_con.execute("INSERT INTO messages VALUES (?, ?, ?, ?)",
+                          (step, tid, desk_parts(desk_todos((f"step {tid}", False))),
+                           PLACE_NOW - step * 1000))
+    place_con.commit()
+    place_con.close()
+    place_state = os.path.join(place_home, "state.json")
+    with open(place_state, "w", encoding="utf-8") as fh:
+        json.dump({"workspace": {"activeId": "PA", "tabs": [{"id": "PA"}],
+                                 "spaces": [{"id": "s1", "projectPath": place_home,
+                                             "activeId": "PA"}]}}, fh)
+    place_args = module.build_parser().parse_args(
+        ["-s", "auto", "--db", place_db, "-p", place_home, "--state", place_state]
+    )
+    assert not module.desktop_app_pane({}), "a plain shell read as the desktop app"
+    assert module.desktop_app_pane({"FREEBUFF_DESKTOP_STATE_PATH": "/x/state.json"})
+    assert module.desktop_app_pane({"__CFBundleIdentifier": "com.freebuff.desktop"})
+    # ...and a pane in TMUX never is, however the tmux server was started: a Terminal.app pane
+    # carries `com.apple.Terminal`, and the guard keeps that true if a server ever inherits the
+    # app's marker (`desktop_app_pane`).
+    assert not module.desktop_app_pane(
+        {"FREEBUFF_DESKTOP_STATE_PATH": "/x/state.json", "TMUX": "/tmp/t,1,0"}
+    ), "a tmux pane was read as one of the desktop app's"
+    # A named subject in the pane's OWN command line is the person's; `auto` is ours to choose.
+    assert not module.pane_subject_from_argv([])
+    assert not module.pane_subject_from_argv(["-s", "auto"])
+    assert not module.pane_subject_from_argv(["--instance-of", "1"])
+    assert module.pane_subject_from_argv(["-s", "cli"])
+    assert module.pane_subject_from_argv(["--source=desktop"])
+    assert module.pane_subject_from_argv(["--chat", "/x"])
+    assert module.pane_subject_from_argv(["-t", "PA"])
+    saved_argv = list(sys.argv)
+    saved_env = {k: os.environ.get(k) for k in
+                 ("FREEBUFF_DESKTOP_STATE_PATH", "__CFBundleIdentifier")}
+    try:
+        sys.argv = ["fbtodo"]
+        for key in saved_env:
+            os.environ.pop(key, None)
+        # Outside the app: `auto` keeps the answer it always had, store or no store.
+        assert module.pane_place_subject(place_args, place_home) == "", (
+            "a plain terminal's pane was bound to a desktop thread"
+        )
+        os.environ["FREEBUFF_DESKTOP_STATE_PATH"] = "/x/state.json"
+        assert module.pane_place_subject(place_args, place_home) == "desktop:PA", (
+            "an app pane was not bound to the thread it is drawn beside"
+        )
+        # ...and with no store NAMED and none belonging to the directory, there is nothing to
+        # bind to: the search is by cwd (`pick_db` with `own_only`), and this directory has no
+        # project of its own. (A store named outright is that store, whatever the cwd — the
+        # next case — which is how `DesktopSource.find` reads `--db` too.)
+        nodb_args = module.build_parser().parse_args(["-s", "auto", "--state", place_state])
+        assert module.pane_place_subject(nodb_args, "/") == "", (
+            "a directory with no desktop store still named a thread"
+        )
+        # (the fixture store lives outside the real app-config glob, so it is reachable only
+        # by `--db` — which is exactly why `place_args` names it)
+        sys.argv = ["fbtodo", "-s", "cli"]
+        assert module.pane_place_subject(place_args, place_home) == "", (
+            "a subject named on the pane's own command line was overridden"
+        )
+        sys.argv = ["fbtodo"]
+        # ...and two panes of one project share out its live threads instead of both holding
+        # the one the app is working in.
+        real_held = module.held_pane_subjects
+        module.held_pane_subjects = lambda root=None: {"desktop:PA"}
+        try:
+            assert module.pane_place_subject(place_args, place_home) == "desktop:PB", (
+                "a second pane landed on the thread the first one already holds"
+            )
+        finally:
+            module.held_pane_subjects = real_held
+        # ...and the lock it applies is the same lock the latch applies: the arguments, the
+        # environment that carries it across a reload, and the record a reader can find.
+        locked = module.build_parser().parse_args(
+            ["-s", "auto", "--db", place_db, "-p", place_home, "--state", place_state]
+        )
+        note = module.apply_pane_subject_lock(locked, "desktop:PA")
+        assert note == "locked to the desktop thread PA", note
+        assert (locked.source, locked.thread, locked.threads, locked.pane_locked) == (
+            "desktop", "PA", 1, True), (locked.source, locked.thread, locked.threads)
+        assert os.environ.get("FBTODO_PANE_LOCK") == "desktop:PA", os.environ.get("FBTODO_PANE_LOCK")
+        assert module.pane_subject_read(os.getpid()) == "desktop:PA", (
+            module.pane_subject_read(os.getpid())
+        )
+        assert "desktop:PA" in module.held_pane_subjects(), module.held_pane_subjects()
+        # ...and a subject that names nothing locks nothing.
+        assert module.apply_pane_subject_lock(locked, "") == ""
+        assert module.apply_pane_subject_lock(locked, "nonsense") == ""
+    finally:
+        sys.argv = saved_argv
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        os.environ.pop("FBTODO_PANE_LOCK", None)
+    say("a pane inside the desktop app holds the thread it is drawn beside, and two panes "
+        "hold two threads: ok")
+
     # ---- ...and a poll that RAISES — the other half of the same hazard. The pane re-execs
     #      itself into whatever is on disk, and the reload probe can prove a tree PARSES and
     #      IMPORTS without proving its call sites still agree: measured 2026-10-03, an edit
@@ -7748,10 +8064,10 @@ def _probe_live_for_target(x, y):
     rich = ansi.sub("", module.render(
         rich_state, True, watching=999, width=46, height=20, now_ms=SWEEP_NOW,
     ))
-    assert "╭" in rich and "╯" in rich, rich
-    # rounded corners everywhere and no square ones anywhere: the frame is drawn with
-    # `╭ ╮ ╰ ╯` only, which the corner assertions above and this one pin
-    assert not any(ch in rich for ch in "┌┐└┘"), rich
+    assert "┌" in rich and "┘" in rich, rich
+    # sharp corners everywhere and no arcs anywhere: the frame is drawn with
+    # `┌ ┐ └ ┘` only, which the corner assertions above and this one pin
+    assert not any(ch in rich for ch in "╭╮╰╯"), rich
     assert "FREEBUFF TODOS" in rich and "watcher: pid 999" in rich, rich
     # the marker is `▸` and not an emoji: a frame is a grid, and a glyph the code
     # and the terminal measure differently is enough to step its border sideways
@@ -7877,7 +8193,7 @@ def _probe_live_for_target(x, y):
     top = no_watch.splitlines()[0]
     assert "watcher" not in top, top
     assert module._session_label(rich_state) in top, (top, module._session_label(rich_state))
-    assert top.startswith("╭──  FREEBUFF TODOS  ") and top.endswith("╮"), top
+    assert top.startswith("┌──  FREEBUFF TODOS  ") and top.endswith("┐"), top
     assert module._cell_width(top) <= 46, top
     for w in (30, 34, 46, 80):
         line = ansi.sub("", module.render(
@@ -7949,7 +8265,7 @@ def _probe_live_for_target(x, y):
                                    now_ms=SWEEP_NOW)
             got = STRIP(framed).splitlines()
             assert len(got) <= h, (h, framed)
-            assert got[0].startswith("╭──  FREEBUFF TODOS") and got[-1].startswith("╰"), (
+            assert got[0].startswith("┌──  FREEBUFF TODOS") and got[-1].startswith("└"), (
                 h, framed)
     say("fits the pane it is given, at every height, without losing its own title: ok")
 
@@ -8432,7 +8748,7 @@ def _probe_live_for_target(x, y):
         ), repr(grey_row)
         # the frame is drawn in the faint role (242 grey), not the `dim` attribute — the
         # border, the rules and the collapsed-run connectors are all that one ink
-        assert "\x1b[38;2;107;107;115m╭── " in painted, repr(painted.splitlines()[0])
+        assert "\x1b[38;2;107;107;115m┌── " in painted, repr(painted.splitlines()[0])
         assert "\x1b[2m" not in painted, "the pane still rides on the dim attribute"
         # A finished row recedes as ONE unit: the tick is the success hue dimmed exactly
         # like the description beside it, so the marker no longer out-shouts the words it
@@ -8921,13 +9237,13 @@ def _probe_live_for_target(x, y):
             rich_state, True, width=narrow_w, now_ms=SWEEP_NOW,
             theme=module.THEME_DEFAULTS, truecolor=True,
         )
-        assert "╭" not in strip and "│" not in strip, (narrow_w, strip[:120])
+        assert "┌" not in strip and "│" not in strip, (narrow_w, strip[:120])
         assert all(module._cell_width(line) <= narrow_w for line in strip.splitlines()), narrow_w
     boxed = module.render(
         rich_state, True, width=30, now_ms=SWEEP_NOW,
         theme=module.THEME_DEFAULTS, truecolor=True,
     )
-    assert STRIP(boxed).splitlines()[0].startswith("╭"), boxed[:80]
+    assert STRIP(boxed).splitlines()[0].startswith("┌"), boxed[:80]
     say("the frame has a floor of 30 columns; below it the strip is plain: ok")
 
     # ---- the framed top border: the right slot names the watcher, or — with no watcher
@@ -8938,7 +9254,7 @@ def _probe_live_for_target(x, y):
         ).splitlines()[0])
         assert module._cell_width(line) == width, (width, line)
         # the title sits on a chip, so its one space of padding shows on each side
-        assert line.startswith("╭──  FREEBUFF TODOS  ") and line.endswith("╮"), line
+        assert line.startswith("┌──  FREEBUFF TODOS  ") and line.endswith("┐"), line
         return line
 
     border_state = dict(
@@ -8993,7 +9309,7 @@ def _probe_live_for_target(x, y):
     # ...and a title it cannot say usefully is not said: at 44 columns the session keeps its
     # columns and the pane keeps its name, rather than the note shoving the stamp off the rim
     capped = border_of(dict(border_state, **note), 44)
-    assert capped.startswith("╭──  FREEBUFF TODOS  "), capped
+    assert capped.startswith("┌──  FREEBUFF TODOS  "), capped
     assert "cli finished" not in capped, capped
     assert "cli · 09-24" in capped, (
         "...and the session it is showing is still the thing in the slot\n" + capped
@@ -9102,9 +9418,9 @@ def _probe_live_for_target(x, y):
         frame = text.rstrip(b"\n")
         tail = text[len(frame):]
         lines = frame.split(b"\n")
-        assert frame.startswith("╭──  FREEBUFF TODOS".encode()), (label, frame[:80])
-        assert frame.endswith("╯".encode()), (label, frame[-80:])
-        assert sum(1 for line in lines if line.startswith("╭".encode())) == 1, (label, lines)
+        assert frame.startswith("┌──  FREEBUFF TODOS".encode()), (label, frame[:80])
+        assert frame.endswith("┘".encode()), (label, frame[-80:])
+        assert sum(1 for line in lines if line.startswith("┌".encode())) == 1, (label, lines)
         assert len(lines) <= draw_rows, (label, len(lines))
         assert tail == (b"" if len(lines) >= draw_rows else b"\n"), (label, len(lines), tail)
     def rows_of(paint):
@@ -10159,10 +10475,10 @@ def _probe_live_for_target(x, y):
     # same split `render` makes, and the reason a script gets the stable text)
     framed = STRIP(module.render_board(module.board_sessions(bns, int(now_s * 1000)), True,
                                        width=80, now_ms=int(now_s * 1000), height=24))
-    assert framed.splitlines()[0].startswith("╭── ") and "FREEBUFF BOARD" in framed, framed
-    assert framed.splitlines()[-1].startswith("╰"), framed
+    assert framed.splitlines()[0].startswith("┌── ") and "FREEBUFF BOARD" in framed, framed
+    assert framed.splitlines()[-1].startswith("└"), framed
     assert "├" not in framed.splitlines()[-2], framed.splitlines()[-3:]
-    assert framed.count("╭") == 1 and framed.count("╰") == 1, framed
+    assert framed.count("┌") == 1 and framed.count("└") == 1, framed
     # ...and no row of it is wider than the pane it was drawn for — asked of the renderer
     # directly, at a width the frame's own budgets have to give way to
     wide_frame = module.render_board(module.board_sessions(bns, int(now_s * 1000)), True,
@@ -10194,9 +10510,32 @@ def _probe_live_for_target(x, y):
             theme={}, truecolor=False)).split("\n")
         for line in probe:
             assert module._cell_width(line) == probe_w, (probe_w, module._cell_width(line), line)
-            assert line[:1] in "╭│├╰" and line[-1:] in "╮│┤╯", (probe_w, line)
+            assert line[:1] in "┌│├└" and line[-1:] in "┐│┤┘", (probe_w, line)
     say("the frame is a grid: every row the width it was asked for, both edges kept, and "
         "every glyph one cell wide: ok")
+
+    # ---- ONE box, ONE kind of join. The corners were `╭ ╮ ╰ ╯` while the dividers a few
+    #      rows below were `├ ┤`, and the two do not meet the same way: a sharp corner puts
+    #      the rule flush with the border's own column, while an ARC is drawn inset — on the
+    #      pane measured on 2026-10-05 the top rule stopped three pixels short of its corner
+    #      on the rule's outer row and reached the border column only on its core row, so the
+    #      corner read as a notch next to the crisp T-junctions under it. Every glyph a frame
+    #      draws for its own shape is now from the sharp set, and this asserts that as a
+    #      property of a real render rather than as a list someone remembers to update: a
+    #      rounded corner anywhere in a frame fails here.
+    arcs = "╭╮╰╯"
+    for probe_w in (32, 48, 72):
+        corners_probe = STRIP(module.render(
+            {"backend": "cli", "session": "S", "goal": "a heading over a list",
+             "todos": [{"task": "a step", "completed": False}], "done": 0, "total": 1},
+            True, watching=True, width=probe_w, now_ms=grid_now, height=24,
+            theme={}, truecolor=False))
+        found = sorted({ch for ch in corners_probe if ch in arcs})
+        assert not found, (
+            "the frame draws rounded corners " + "".join(found) + f" at width {probe_w}: an "
+            "arc is inset where a corner should meet the rule flush, so it does not join "
+            "the same way as the dividers in the same box")
+    say("the frame's corners join the way its dividers do: one kind of corner, no arcs: ok")
 
     # ---- ...and the width assertion above CANNOT catch that class of bug on its own, which is
     #      why the pane was still a column short after it was written. `_cell_width` decides a
@@ -10228,6 +10567,34 @@ def _probe_live_for_target(x, y):
         "on screen while `_cell_width` still agrees with itself"
     )
     say("the frame's own glyphs are one cell to Unicode, not just to the code's ruler: ok")
+
+    # ---- the OTHER frame. Everything above renders a pane that HAS a list, but a pane
+    #      spends real time without one — a turn opens before the agent writes its first
+    #      `write_todos` — and that frame is drawn by a different branch entirely
+    #      (`render`, the `not any(g["todos"] ...)` arm). It had no width check at all,
+    #      which is why the screenshot taken of one on 2026-10-04 had to be measured by
+    #      hand before it could be believed either way. It is the branch that wraps a
+    #      SENTENCE rather than a step, so it is the one where a wrap bug would show: two
+    #      note lines, a NOW line, and the two footer rows, in a frame.
+    for probe_w in (32, 40, 48, 56, 72, 96):
+        bare = STRIP(module.render(
+            {"backend": "cli", "session": "S", "cleared_turn": True, "todos": [],
+             "done": 0, "total": 0, "now": "can you push and commit to github",
+             "patch": {"outcome": "ok", "version": "9.9.9", "at_ms": grid_now - 43_200_000,
+                       "severity": "ok"},
+             "refit": {"decided": 9, "scored": 83}},
+            True, watching=True, width=probe_w, now_ms=grid_now, height=24,
+            theme={}, truecolor=False)).split("\n")
+        for line in bare:
+            assert module._cell_width(line) == probe_w, (
+                "the no-list frame", probe_w, module._cell_width(line), line)
+            assert line[:1] in "┌│├└" and line[-1:] in "┐│┤┘", ("the no-list frame", probe_w, line)
+        # ...and it must still BE that frame: a check that passes on an empty string is
+        # not a check, so the shape it claims to cover is asserted too.
+        assert any("last turn's list is done" in ln for ln in bare), (probe_w, bare)
+        assert any("REFIT" in ln for ln in bare), (probe_w, bare)
+    say("the frame with no list in it is a grid too: the note, the NOW row and both "
+        "footer rows, every width: ok")
 
     # ---- and how far the log is from re-choosing its own constants: the clip is consulted
     #      only on a young list, and moves the number only sometimes, so the count that
