@@ -33,6 +33,15 @@ export FREEBUFF_SOUNDS_DIR="$SOUNDS"
 mkdir -p "$SOUNDS"
 for s in Glass Hero Basso Submarine Ping; do : >"$SOUNDS/$s.aiff"; done
 
+# The Discord sink is defused for the whole run, the same way the phone is: the REAL one posts
+# into a real channel through the NAS, and a suite that quietly spammed that channel would be
+# worse than one that stays silent. `exit 0` is substituted for the delivery command, so every
+# path that reaches `discord-send.sh` still runs it — the target, the mute switch, the logging
+# and the exit codes are all exercised — and nothing leaves the machine. The section that tests
+# the sink points FREEBUFF_DISCORD_CMD at a recorder of its own, which is why this is the
+# command and not the mute switch (a muted sink would make those checks vacuous).
+export FREEBUFF_DISCORD_CMD='exit 0'
+
 # Per-check timing, opt-in with FBTODO_NOTIFY_TIME=1: `PASS  …` then `  [+0.4s 12s]`.
 # The suite costs 72 s and no single sleep explains it — a hundred-odd checks, each with a
 # stub and a wait, do. That is the same instrument fbtodo-selfcheck.py carries, and it is
@@ -61,7 +70,9 @@ check() { # label, actual, expected
 }
 
 check_match() { # label, actual, regex
-  if printf '%s' "$2" | grep -Eq "$3"; then
+  # `-e` so a pattern may START with a dash: a check about a flag (`--discord-message …`)
+  # would otherwise be read by grep as an option, which fails as "does not match".
+  if printf '%s' "$2" | grep -Eq -e "$3"; then
     echo "PASS  $1"
   else
     echo "FAIL  $1: [$2] does not match /$3/"
@@ -82,7 +93,7 @@ install_bell() {
 # Every one of these is RUN BY PATH — from the wrapper, from fbtodo's watcher, from the
 # skill's commands — so a missing exec bit is a feature that silently does nothing (the
 # sandbox copies are chmod'ed, which is exactly how that hid for a whole session).
-for f in bell.sh drop-bell.py phone.sh session-timer.sh session-task.py todo-bell.py ask-bell.py pause-bell.py pane-bell.py locks-bell.py; do
+for f in bell.sh drop-bell.py phone.sh discord-send.sh session-timer.sh session-task.py todo-bell.py ask-bell.py pause-bell.py pane-bell.py locks-bell.py; do
   check "$f is executable where it lives" "$([ -x "$HERE/$f" ] && echo yes || echo no)" "yes"
 done
 
@@ -720,6 +731,16 @@ pb_sends_at_least() { [ "$(pb_sends)" -ge "$1" ]; }
 pb_wait() { # expected sends
   wait_for 5 pb_sends_at_least "$1"; n=0  # `n` is read by callers below
 }
+# A recorded argv is one line with the body's newlines flattened to `~`, and the two sinks may
+# now carry DIFFERENT bodies, so the checks below have to ask each half separately: the phone's
+# body is what follows `--message ` (never the `--discord-message` that contains it as a
+# substring), and the channel's own is the presence of that second option at all.
+phone_body() { printf '%s' "$1" | sed -n 's/^.*--message //p' | sed 's/ --discord.*$//'; }
+# ...and the channel's body is everything after the option that carries it. Greedy, so it takes
+# the LAST one on the line: the assertion is about what the sink would post, never about where it
+# sits in the argv.
+phone_discord_body() { printf '%s' "$1" | sed -n 's/^.*--discord-message //p'; }
+phone_has_discord_body() { case $1 in *--discord-message*) echo yes ;; *) echo no ;; esac; }
 pb_run() { # json, then extra args; the push is detached, so wait for it to land
   local before
   before=$(pb_sends)
@@ -742,7 +763,11 @@ pb_wait 1
 check "pushes when the local task is finished" "$(pb_sends)" "1"
 check_match "and the push carries the count" "$(cat "$PB/sends.log")" '3/3 steps done'
 check_match "...with the agent's own words left out by default" \
-  "$(printf %s "$(cat "$PB/sends.log")" | grep -c 'make the push land' || true)" '^0$'
+  "$(phone_body "$(cat "$PB/sends.log")" | grep -c 'make the push land' || true)" '^0$'
+# ...while the channel, which is read deliberately, is told what the session was FOR even when the
+# agent said nothing about the outcome: a goal and no prose is still a labelled finish.
+check_match "...and the channel hears what the run was for" "$(cat "$PB/sends.log")" \
+  '--discord-message Goal: make the push land~3/3 steps done'
 pb_run "$PDONE" >/dev/null
 check "a finished list that just sits there pushes once" "$(pb_sends)" "1"
 # The same list with the store moved on is still the SAME list: keying the claim on the
@@ -766,6 +791,69 @@ rm -f "$PB/sends.log" "$PB/bell.json"
 out=$(pb_run "$PDONE" --print)
 check "report-only pushes nothing" "$(pb_sends)" "0"
 check_match "report-only says PUSH and why" "$out" '^PUSH: all 3 todos done and the turn ended'
+
+# A DESKTOP thread: the app writes no journal to ask about, so the store's OWN word for the
+# boundary is the one used — `turn_running` false with every step ticked — and the ask can
+# arrive carrying the state itself (`--state -`), which is how the pane drawing the thread
+# asks. That pane is the only process that can: the app's turns have no `freebuff` behind
+# them, so there is no shell pid for the timer's bell to resolve (measured 2026-10-05: four
+# desktop threads working, every one of them silent on the phone, while the timer's ask
+# spoke about a finished CLI chat in its shell's cwd).
+PDESK='{"backend":"desktop","cwd":"/Users/x/proj","session":"d1","list_id":"P1","done":3,"total":3,"turn_running":false,"store_mtime_ms":1000}'
+PDESK_BUSY='{"backend":"desktop","cwd":"/Users/x/proj","session":"d1","list_id":"P1","done":3,"total":3,"turn_running":true,"store_mtime_ms":1000}'
+rm -f "$PB/sends.log" "$PB/bell.json"
+pb_run "$PDESK" >/dev/null
+pb_wait 1
+check "pushes when the app's thread has finished" "$(pb_sends)" "1"
+check_match "...and the push names the project that finished" "$(cat "$PB/sends.log")" \
+  'freebuff done · proj'
+out=$(pb_run "$PDESK" --print)
+check_match "a finished desktop list pushes once, like any other" "$out" '^no push: already pushed'
+check "...with nothing sent a second time" "$(pb_sends)" "1"
+out=$(pb_run "$PDESK_BUSY" --print)
+check "silent while the app's turn is still running" "$(pb_sends)" "1"
+check_match "--print names the running turn, not the tick boxes" "$out" \
+  'all 3 done, but the turn is still running'
+# The pane's own ask: the state handed over on stdin, no fbtodo call behind it at all.
+rm -f "$PB/sends.log" "$PB/bell.json"
+PDESK_HANDED='{"backend":"desktop","cwd":"/Users/x/proj","session":"d1","list_id":"P5","done":3,"total":3,"turn_running":false,"store_mtime_ms":1000}'
+out=$(printf '%s\n' "$PDESK_HANDED" | PATH="$PB/bin:$PATH" HOME="$PB/home" TZ=UTC \
+  FREEBUFF_TODO_BELL_STATE="$PB/bell.json" FREEBUFF_PHONE_SH="$PB/notify/phone.sh" \
+  python3 "$PB/notify/todo-bell.py" --state - --push-only --print)
+check_match "--push-only leaves the chime to the session's own timer" "$out" \
+  '^silent: the phone alone'
+printf '%s\n' "$PDESK_HANDED" | PATH="$PB/bin:$PATH" HOME="$PB/home" TZ=UTC \
+  FREEBUFF_TODO_BELL_STATE="$PB/bell.json" FREEBUFF_PHONE_SH="$PB/notify/phone.sh" \
+  python3 "$PB/notify/todo-bell.py" --state - --push-only
+pb_wait 1
+check "a state handed over on stdin decides the same way" "$(pb_sends)" "1"
+check_match "...and the push still carries the count" "$(cat "$PB/sends.log")" '3/3 steps done'
+
+# The RECORD: `--note PATH` keeps what was decided, and the refusal is the half that needs
+# keeping — a decision that sends nothing never reaches phone.log, so "the list finished and
+# my phone stayed quiet" had no answer anywhere at all. The same lines come back on stdout,
+# which is how the asker's own log carries them (a pane passes `--note`).
+NOTE="$PB/finish.log"
+rm -f "$NOTE"
+out=$(pb_run "$PBUSY" --note "$NOTE")
+check_match "a refused finish is written down" "$(head -1 "$NOTE")" \
+  '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}  silent  list P1'
+check_match "...and the push's own reason is the line an operator needs" "$(tail -1 "$NOTE")" \
+  'no push  list P1  all 3 done, but the agent has not finished its turn'
+check_match "...and the asker is told the same on stdout" "$out" \
+  'no push  list P1  all 3 done, but the agent has not finished its turn'
+check "one line for the chime and one for the push" "$(wc -l <"$NOTE" | tr -d ' ')" "2"
+pb_run "$PBUSY" --print --note "$NOTE" >/dev/null
+check "a report-only ask writes nothing" "$(wc -l <"$NOTE" | tr -d ' ')" "2"
+PDESK_PUSH='{"backend":"desktop","cwd":"/Users/x/proj","session":"d1","list_id":"P8","done":3,"total":3,"turn_running":false,"store_mtime_ms":1000}'
+pb_run "$PDESK_PUSH" --note "$NOTE" >/dev/null
+check_match "a send is written down beside the refusals" "$(tail -1 "$NOTE")" \
+  'push  list P8  all 3 todos done and the turn ended'
+# ...and it is bounded, because an asker that asks on a clock must not grow it without end.
+for n in $(seq 1 500); do printf '2026-10-05 00:00:00  push  list old%s  filler\n' "$n"; done >"$NOTE"
+pb_run "$PBUSY" --note "$NOTE" >/dev/null
+check "the record keeps the newest lines, not every line ever" \
+  "$(wc -l <"$NOTE" | tr -d ' ')" "500"
 
 # The same race on the LOCAL path, which is the one the timer drives every 5s and the one
 # that had no lock at all. One shell can carry two timers (the wrapper kills its timer when
@@ -827,20 +915,39 @@ check_match "the default push carries the count" "$out" '3/3 steps done'
 check_match "...the date and time it finished" "$out" '2026-09-22 00:55'
 check_match "...and the session it was, so a quiet push can still be traced" "$out" \
   'session s9'
-check_match "...and not one word the agent wrote" \
-  "$(printf %s "$out" | grep -c 'ship the fix' || true)" '^0$'
-check_match "...nor what it said it did" \
-  "$(printf %s "$out" | grep -c 'leaves a live session alone' || true)" '^0$'
+check_match "...and not one word the agent wrote, on the phone" \
+  "$(phone_body "$out" | grep -c 'ship the fix' || true)" '^0$'
+# The agent's prose is split by SINK: the phone body carries none of it, and the channel's body
+# leads with it. So this half of the promise is asserted against the phone half of the argv.
+check_match "...nor what it said it did, on the phone" \
+  "$(phone_body "$out" | grep -c 'leaves a live session alone' || true)" '^0$'
+# The channel is where "what was this, and what came of it" is the whole point, and it is read
+# OUT OF CONTEXT — the Hermes agent answers questions from what reached it, and the owner scrolls
+# past it later — so the body is LABELLED: the agent's own goal heading, then one line about the
+# outcome, then the count and clock that place the finish. A bare sentence above a count says
+# nothing about which half is which.
+chan_body=$(phone_discord_body "$out")
+check_match "the channel is told what the run was for" "$out" \
+  '--discord-message Goal: ship the fix~Summary: the watchdog now leaves a live session alone~3/3 steps done'
+check_match "...closing with the same clock the phone push carries" "$out" \
+  'Summary: the watchdog now leaves a live session alone~3/3 steps done · 2026-09-22 00:55'
 
 # ...and the prose comes back only when the owner asks for it
 rm -f "$PB/sends.log" "$PB/bell.json"
 FREEBUFF_PHONE_TEXT=agent pb_run "$PWHEN" >/dev/null
 pb_wait 1
 out=$(tail -1 "$PB/sends.log")
-check_match "FREEBUFF_PHONE_TEXT=agent carries the big goal" "$out" 'Goal: ship the fix'
-check_match "below it, what the agent said it did" "$out" \
+check_match "FREEBUFF_PHONE_TEXT=agent carries the big goal" "$(phone_body "$out")" \
+  'Goal: ship the fix'
+check_match "below it, what the agent said it did" "$(phone_body "$out")" \
   'Goal: ship the fix~the watchdog now leaves a live session alone'
-check_match "...and the count last" "$out" 'the watchdog now leaves a live session alone~3/3 steps done'
+check_match "...and the count last" "$(phone_body "$out")" \
+  'the watchdog now leaves a live session alone~3/3 steps done'
+# The channel's body is the BELL's decision, not the phone's switch: turning the agent's prose on
+# for the phone must leave the second sink byte-identical, or "the channel is read deliberately"
+# would be a promise that only holds while the phone stays quiet.
+check "the phone's switch leaves the channel's body alone" \
+  "$(phone_discord_body "$out")" "$chan_body"
 
 # An empty summary must not leave a blank line between the heading and the count.
 PNOSUM='{"backend":"cli","cwd":"/Users/x/proj","session":"s9x","list_id":"P9b","done":1,"total":1,"turn_ended":true,"store_mtime_ms":1790038500000,"goal":"no prose over there","summary":null}'
@@ -848,7 +955,60 @@ rm -f "$PB/sends.log" "$PB/bell.json"
 FREEBUFF_PHONE_TEXT=agent pb_run "$PNOSUM" >/dev/null
 pb_wait 1
 check_match "a run with no summary keeps the two-line body" \
-  "$(tail -1 "$PB/sends.log")" 'Goal: no prose over there~1/1 steps done'
+  "$(phone_body "$(tail -1 "$PB/sends.log")")" 'Goal: no prose over there~1/1 steps done'
+
+# A summary is flattened to ONE line before it goes anywhere, because the channel's body is one
+# sentence plus the count and a model's answer is multi-line as often as not. A summary that
+# kept its newline would show up here as a second `~`.
+PMULTI='{"backend":"cli","cwd":"/Users/x/proj","session":"s10","list_id":"P10","done":2,"total":2,"turn_ended":true,"store_mtime_ms":1790038500000,"summary":"first line\nsecond line   with   gaps"}'
+rm -f "$PB/sends.log" "$PB/bell.json"
+pb_run "$PMULTI" >/dev/null
+pb_wait 1
+check_match "a multi-line summary reaches the channel as one line" \
+  "$(tail -1 "$PB/sends.log")" \
+  '--discord-message Summary: first line second line with gaps~2/2 steps done'
+
+# ...and the same for the goal: a heading the agent wrapped over two lines is one line in the
+# channel, labelled, which is what tells a reader it is the heading rather than the outcome.
+PGOALMULTI='{"backend":"cli","cwd":"/Users/x/proj","session":"s11","list_id":"P11","done":2,"total":2,"turn_ended":true,"store_mtime_ms":1790038500000,"goal":"shrink the pane heading\n   to one line","summary":"it fits now"}'
+rm -f "$PB/sends.log" "$PB/bell.json"
+pb_run "$PGOALMULTI" >/dev/null
+pb_wait 1
+check_match "a multi-line goal reaches the channel as one labelled line" \
+  "$(tail -1 "$PB/sends.log")" \
+  '--discord-message Goal: shrink the pane heading to one line~Summary: it fits now~2/2 steps done'
+
+# A goal with nothing said about the outcome still tells the channel what the run was FOR: that
+# is strictly more than the phone's metadata body carries, so it is sent. This is the case the
+# first version of the split got wrong — it dropped the goal on the floor with the summary.
+rm -f "$PB/sends.log" "$PB/bell.json"
+pb_run "$PNOSUM" >/dev/null
+pb_wait 1
+check_match "a run with no summary still tells the channel its goal" \
+  "$(tail -1 "$PB/sends.log")" '--discord-message Goal: no prose over there~1/1 steps done'
+
+# Nothing said, nothing invented: with neither a goal nor a summary the channel gets no body of
+# its own, so the second sink falls back to the phone's message — exactly what it posted before
+# it had one. `first_prompt` does NOT count as a goal here: a quote labelled as one would be a
+# claim the agent never made.
+PNEITHER='{"backend":"cli","cwd":"/Users/x/proj","session":"s12","list_id":"P12","done":1,"total":1,"turn_ended":true,"store_mtime_ms":1790038500000,"first_prompt":"why is the bell silent"}'
+rm -f "$PB/sends.log" "$PB/bell.json"
+pb_run "$PNEITHER" >/dev/null
+pb_wait 1
+check "no goal and no summary means no body of its own for the channel" \
+  "$(phone_has_discord_body "$(tail -1 "$PB/sends.log")")" "no"
+check_match "...so the request is not promoted into a heading it never was" \
+  "$(printf %s "$(tail -1 "$PB/sends.log")" | grep -c 'why is the bell silent' || true)" '^0$'
+# ...and the switch takes the line away for an owner who would rather the channel did not carry
+# the agent's account at all. Exported and unset rather than prefixed to the call, so it cannot
+# leak into the checks that follow.
+export FREEBUFF_DISCORD_SUMMARY=off
+rm -f "$PB/sends.log" "$PB/bell.json"
+pb_run "$PWHEN" >/dev/null
+pb_wait 1
+check "FREEBUFF_DISCORD_SUMMARY=off leaves the channel the phone's message" \
+  "$(phone_has_discord_body "$(tail -1 "$PB/sends.log")")" "no"
+unset FREEBUFF_DISCORD_SUMMARY
 
 # A run with no `Goal:` line must not have its opening request labelled as one.
 PNOWHEN='{"backend":"cli","cwd":"/Users/x/proj","session":"s9","list_id":"P8","done":3,"total":3,"turn_ended":true,"store_mtime_ms":1790038500000,"first_prompt":"why is the bell silent"}'
@@ -856,7 +1016,7 @@ rm -f "$PB/sends.log"
 FREEBUFF_PHONE_TEXT=agent pb_run "$PNOWHEN" >/dev/null
 pb_wait 1
 check_match "a list with no goal falls back to the request, unlabelled" \
-  "$(tail -1 "$PB/sends.log")" 'why is the bell silent~3/3 steps done'
+  "$(phone_body "$(tail -1 "$PB/sends.log")")" 'why is the bell silent~3/3 steps done'
 rm -f "$PB/sends.log"
 pb_run "$PNOWHEN" >/dev/null
 pb_wait 1
@@ -1828,6 +1988,155 @@ check "...and is not claimed" "$([ -e "$LB/fresh.json" ] && echo claimed || echo
 : >"$LB/audit.json"
 check_match "an unanswerable audit is silent, not an error" \
   "$(lb_run 0 --print)" '^silent: fbtodo could not answer'
+
+echo
+echo "== the discord sink: finishes and drops only, and no ssh-agent needed =="
+# The sink is `discord-send.sh`, and the one seam that makes it testable is
+# FREEBUFF_DISCORD_CMD: everything else (ssh, the NAS, docker exec, `hermes send`) is exactly
+# what the seam replaces, so what would be POSTED and to WHICH target is asserted here with no
+# NAS, no container and no Discord token anywhere near the suite.
+DC="$SANDBOX/discord"
+mkdir -p "$DC/bin" "$DC/home/.config/freebuff-notify"
+cp "$HERE/discord-send.sh" "$HERE/phone.sh" "$DC/home/.config/freebuff-notify/"
+chmod +x "$DC/home/.config/freebuff-notify/discord-send.sh" \
+         "$DC/home/.config/freebuff-notify/phone.sh"
+DCDIR="$DC/home/.config/freebuff-notify"
+DCBODY="$DC/body.last"
+printf '#!/bin/sh\ncat >"%s"\nexit ${DC_CODE:-0}\n' "$DCBODY" >"$DC/bin/deliver"
+chmod +x "$DC/bin/deliver"
+dsend() { HOME="$DC/home" FREEBUFF_DISCORD_CMD="$DC/bin/deliver" "$DCDIR/discord-send.sh" "$@"; }
+
+rm -f "$DCBODY"
+dsend --title 'freebuff done' --message 'all 3 steps done' >/dev/null 2>&1
+check "a delivery succeeds" "$?" "0"
+check_match "the title is the message's first line" "$(head -1 "$DCBODY")" '^freebuff done$'
+check_match "and the body follows it" "$(sed -n '2p' "$DCBODY")" '^all 3 steps done$'
+check_match "the delivery is logged with its target" \
+  "$(tail -1 "$DCDIR/discord.log")" 'sent discord:#freebuff freebuff done$'
+
+# The channel is a setting, and the default is the one the owner asked for — a sink that
+# silently posted to somebody else's channel would be worse than one that posts nothing.
+rm -f "$DCBODY"
+FREEBUFF_DISCORD_TARGET='discord:#elsewhere' dsend --test >/dev/null 2>&1
+check "--test succeeds" "$?" "0"
+check_match "the configured target is the one used" \
+  "$(tail -1 "$DCDIR/discord.log")" 'sent discord:#elsewhere '
+check_match "--print names the target it would use" "$(dsend --print)" 'target=discord:#freebuff'
+
+# The mute switch is the phone's, one level out: environment first, then a state file.
+before=$(wc -l <"$DCDIR/discord.log")
+rm -f "$DCBODY"
+FREEBUFF_DISCORD=off dsend --title t --message m >/dev/null 2>&1
+check "muted is exit 0, not an error" "$?" "0"
+check "and it posts nothing" "$([ -e "$DCBODY" ] && echo yes || echo no)" "no"
+check "and writes no log line" "$(wc -l <"$DCDIR/discord.log")" "$before"
+
+# A target is interpolated into a remote command line, so anything that could become a second
+# command is refused rather than escaped and hoped for.
+FREEBUFF_DISCORD_TARGET='discord:#a; touch /tmp/pwned' dsend --title t --message m >/dev/null 2>&1
+check "a target that could be a second command is refused" "$?" "78"
+dsend --title t >/dev/null 2>&1
+check "nothing to send is a usage error" "$?" "2"
+
+# A delivery that fails is reported and RETURNS the failure — a sink nobody can hear fail is
+# the same as no sink, which is the state this whole change exists to leave.
+DC_CODE=1 dsend --title t --message m >/dev/null 2>&1
+check "a failed delivery is exit 69" "$?" "69"
+check_match "and it is on the record as a failure" "$(tail -1 "$DCDIR/discord.log")" '^[0-9: -]+ discord: FAILED '
+
+# ...and `phone.sh --discord` is the only door to it: the phone push is unchanged, and a
+# caller that does not ask for Discord never reaches it.
+rm -f "$DCBODY"
+HOME="$DC/home" FREEBUFF_DISCORD_CMD="$DC/bin/deliver" \
+  "$DCDIR/phone.sh" --discord --title t --message m >/dev/null 2>&1
+wait_for 3 test -f "$DCBODY"
+check "phone.sh --discord reaches the sink" "$([ -e "$DCBODY" ] && echo yes || echo no)" "yes"
+rm -f "$DCBODY"
+HOME="$DC/home" FREEBUFF_DISCORD_CMD="$DC/bin/deliver" \
+  "$DCDIR/phone.sh" --title t --message m >/dev/null 2>&1
+wait_for 1 test -f "$DCBODY"
+check "...and a plain phone.sh does not" "$([ -e "$DCBODY" ] && echo yes || echo no)" "no"
+
+# The two sinks are read differently, so the caller can give the channel a body of its own: the
+# finish bell sends what the turn DID there while the phone keeps its metadata-only default.
+rm -f "$DCBODY"
+HOME="$DC/home" FREEBUFF_DISCORD_CMD="$DC/bin/deliver" \
+  "$DCDIR/phone.sh" --discord --title t --message 'phone body' \
+  --discord-message 'channel body' >/dev/null 2>&1
+wait_for 3 test -f "$DCBODY"
+check_match "a caller can give the channel its own body" "$(sed -n '2p' "$DCBODY")" '^channel body$'
+# The phone's own message is untouched by it (asserted where the bell's argv is recorded: the
+# phone body carries no agent prose there while the channel's does).
+check_match "--dry-run shows the channel the body it would post" \
+  "$(HOME="$DC/home" FREEBUFF_DISCORD_CMD="$DC/bin/deliver" \
+     "$DCDIR/phone.sh" --discord --dry-run --title t --message 'phone body' \
+     --discord-message 'channel body' 2>&1)" \
+  'would send: discord also — channel body'
+# Omitting it keeps the older one-message behaviour, which is what the drop watch still uses.
+rm -f "$DCBODY"
+HOME="$DC/home" FREEBUFF_DISCORD_CMD="$DC/bin/deliver" \
+  "$DCDIR/phone.sh" --discord --title t --message 'plain body' >/dev/null 2>&1
+wait_for 3 test -f "$DCBODY"
+check_match "without one, the channel gets the phone's message" "$(sed -n '2p' "$DCBODY")" '^plain body$'
+# The header comment capitalizes ALSO for emphasis, so both sides are folded to one case:
+# the assertion is about the promise ("posts too, not instead"), never about its casing.
+check_match "phone.sh documents the flag" \
+  "$("$DCDIR/phone.sh" --help | tr 'A-Z' 'a-z')" 'also posts the same message to discord'
+
+# Which bells ring in the channel is a WIRING fact, and the cheapest true assertion of it is
+# the source: exactly the finish bell and the drop watch pass `--discord`, so a later edit that
+# quietly adds a third (or drops one) is caught here rather than being noticed in Discord.
+check "exactly two bells ask for the channel" \
+  "$(grep -l -- '"--discord"' "$HERE"/*.py 2>/dev/null | wc -l | tr -d ' ')" "2"
+check_match "and they are the finish and drop bells" \
+  "$(grep -l -- '"--discord"' "$HERE"/*.py 2>/dev/null | xargs -n1 basename | sort | tr '\n' ' ')" \
+  '^drop-bell.py todo-bell.py $'
+
+echo
+echo "== the installed kit is this kit =="
+# The documented install is a wholesale copy of `*.py` and `*.sh` into the kit's directory,
+# and it is the only supported way the bells get there — but nothing checked that it had been
+# run, so the copy on this Mac drifted a month behind: `locks-bell.py` (the fifth bell,
+# invoked by `fbtodo locks --watch`) was never installed at all, and `todo-bell.py`,
+# `drop-bell.py` and `ask-bell.py` still carried the remote half the repository had retired,
+# so one documented `cp` would have changed what every watch does with nothing on screen to
+# say so. Comparing the two is what makes that impossible to do silently: a bell added here,
+# a bell retired here, or a file edited only in the installed copy all fail this until the
+# install is re-run, and the failure prints the command that fixes it.
+#
+# Skipped, out loud, in the two cases where there is nothing to compare: no kit installed on
+# this machine at all, or this suite IS the installed copy — `$HERE` and the install dir are
+# then the same directory, and every file below is trivially itself.
+INSTALL_DIR="${FBTODO_NOTIFY_DIR:-$HOME/.config/freebuff-notify}"
+if [ ! -d "$INSTALL_DIR" ]; then
+  echo "SKIP  the installed kit: no kit at $INSTALL_DIR"
+elif [ "$(cd "$INSTALL_DIR" && pwd -P)" = "$(cd "$HERE" && pwd -P)" ]; then
+  echo "SKIP  the installed kit: this suite is running from $INSTALL_DIR itself"
+else
+  stale=""
+  for f in "$HERE"/*.py "$HERE"/*.sh; do
+    b="$(basename "$f")"
+    if [ ! -e "$INSTALL_DIR/$b" ]; then
+      stale="$stale $b(not installed)"
+    elif ! cmp -s "$f" "$INSTALL_DIR/$b"; then
+      stale="$stale $b(differs)"
+    fi
+  done
+  check "every file of this kit is installed, byte for byte" "${stale:-agree}" "agree"
+  # ...and the other direction: a file the repository no longer has is a bell or a script
+  # still running on this machine that nothing here maintains.
+  retired=""
+  for f in "$INSTALL_DIR"/*.py "$INSTALL_DIR"/*.sh; do
+    b="$(basename "$f")"
+    [ -e "$HERE/$b" ] || retired="$retired $b"
+  done
+  check "nothing installed is unknown to this kit" "${retired:-agree}" "agree"
+  if [ -n "$stale$retired" ]; then
+    echo "      install with: cp $HERE/*.py $HERE/*.sh $INSTALL_DIR/"
+    echo "      (this replaces the installed kit wholesale; keep local edits HERE)"
+  fi
+fi
+
 echo
 [ "$fails" = 0 ] && echo "ALL PASS" || echo "$fails CHECK(S) FAILED"
 exit "$fails"

@@ -39,6 +39,15 @@
 # without unsetting anything. FREEBUFF_OSASCRIPT points at a different iMessage sender
 # (the test drives a stub with it).
 #
+# `--discord` ALSO posts the same message to Discord, through `discord-send.sh` (the sink the
+# Hermes agent in Discord can read; FREEBUFF_DISCORD_TARGET picks the channel, default
+# discord:#freebuff, and FREEBUFF_DISCORD=off mutes it). It is a second sink, not a transport:
+# the phone push above is unchanged by it, and a caller that does not say `--discord` never
+# reaches Discord at all — which is how "finishes and drops only" is enforced, per bell.
+# `--discord-message TEXT` gives that sink its OWN body, because the two are read differently:
+# the finish bell sends what the turn DID there (the agent's one line about the outcome) while
+# the phone keeps its metadata-only default. Without it both sinks get the same message.
+#
 # Exit: 0 sent or muted · 2 usage · 69 delivery failed · 78 not configured.
 set -u
 
@@ -47,11 +56,11 @@ conf=${FREEBUFF_PHONE_CONF:-$dir/phone.conf}
 log=$dir/phone.log
 version=2
 
-title= message= priority=default tags=white_check_mark
-print_only=0 dry_run=0
+title= message= priority=default tags=white_check_mark discord_message=
+print_only=0 dry_run=0 also_discord=0
 
 usage() {
-  sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,51p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -61,6 +70,8 @@ while [ $# -gt 0 ]; do
     --priority) priority=${2:-}; [ $# -ge 2 ] && shift ;;
     --tags) tags=${2:-}; [ $# -ge 2 ] && shift ;;
     --test) title='freebuff'; message='phone notifications are wired up — this is a test'; ;;
+    --discord) also_discord=1 ;;
+    --discord-message) discord_message=${2:-}; [ $# -ge 2 ] && shift ;;
     --print) print_only=1 ;;
     --dry-run) dry_run=1 ;;
     --init) init=1 ;;
@@ -275,6 +286,23 @@ fi
   printf 'phone.sh: nothing to send (--message is required)\n' >&2
   exit 2
 }
+
+# The Discord sink, only when a caller asked for it by name. Started HERE, before the phone
+# transport is decided, and detached, for two reasons: it is an ADDITIONAL sink rather than a
+# fallback, so it must not depend on whether the phone succeeded (or on ntfy being configured
+# at all), and the bells must never wait on a network — the same rule that makes the iMessage
+# send a backgrounded, capped child. A machine with no `discord-send.sh` is a machine whose
+# kit predates it, which is silence rather than a failure.
+discord_send=$dir/discord-send.sh
+if [ "$also_discord" = 1 ]; then
+  # The channel's body, which is the phone's unless the caller gave it one of its own.
+  [ -n "$discord_message" ] || discord_message=$message
+  if [ "$dry_run" = 1 ]; then
+    printf 'would send: discord also — %s\n' "$(printf %s "$discord_message" | tr '\n' ' ')"
+  elif [ -x "$discord_send" ]; then
+    "$discord_send" --title "${title:-freebuff}" --message "$discord_message" >/dev/null 2>&1 &
+  fi
+fi
 
 if [ "$transport" = both ] && [ -z "$topic" ]; then
   printf 'phone.sh: FREEBUFF_PHONE_TRANSPORT=both needs NTFY_TOPIC too (set one in %s)\n' \

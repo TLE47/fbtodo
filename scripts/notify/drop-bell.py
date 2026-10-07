@@ -339,9 +339,13 @@ def push(title: str, body: str, priority: str) -> bool:
     if not os.path.exists(PHONE):
         return False
     try:
+        # `--discord` alongside the phone push: a drop is the other event that also goes to
+        # Discord (see `discord-send.sh`) — a session that died by itself is exactly the kind of
+        # thing to be able to find afterwards in a channel rather than on a lock screen. The
+        # bells that are not wanted there (ask, pause, pane, locks) do not pass it.
         subprocess.Popen(
             [PHONE, "--title", title, "--message", body,
-             "--priority", priority, "--tags", "warning"],
+             "--priority", priority, "--tags", "warning", "--discord"],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True,
         )

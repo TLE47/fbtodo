@@ -221,7 +221,7 @@ for a re-resolve; it never decides that a pane closes.
 
 ### Watching every live session at once — `fbtodo board`
 
-A pane answers about **one** list: the cwd's journal, one thread, one ssh. Running two or three
+A pane answers about **one** list: the cwd's journal, one thread. Running two or three
 agents at once is the normal case, and the board answers the other question with the same two
 local stores and no new reader — one row per live session, newest activity first, with its
 project, its backend, its `done/total`, how long ago its store moved, and its first few steps.
@@ -233,10 +233,9 @@ project, its backend, its `done/total`, how long ago its store moved, and its fi
 * `--live` — keep redrawing in place instead of printing once; `--json` is the rows themselves.
 
 A row is `read_cli`'s answer for a CLI chat and `live_threads`' for a desktop thread, so the
-board cannot disagree with a pane about what a list says. The remote store is deliberately left
-out: an ssh per poll is the opposite of one cheap look. The CLI half stats every journal before
-it reads any of them, so a store with a hundred finished chats costs a hundred stats and one
-scan.
+board cannot disagree with a pane about what a list says. Both stores are local, and the CLI
+half stats every journal before it reads any of them, so a store with a hundred finished chats
+costs a hundred stats and one scan.
 
 ## The generic sources
 

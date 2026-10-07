@@ -109,13 +109,17 @@ def products(module, home: str, golden: str = GOLDEN) -> dict:
         "bar.txt": module.bar_text(state) + "\n",
         # `cmd_snap` at a fixed width, with no colour: what `fbtodo snap` prints.
         "snap.txt": module.render(state, False, width=WIDTH, now_ms=NOW_MS) + "\n",
-        # The pane's rich frame at a fixed size and 24-bit ink: the display contract.
-        "frame.txt": module.render(state, True, width=WIDTH, height=HEIGHT, now_ms=NOW_MS) + "\n",
+        # The pane's rich frame at a fixed size and 24-bit ink: the display contract. The
+        # push's state comes with it (`ntfy=True`: the phone rings — this machine's default),
+        # because the frame's one CONTROL is drawn from it: the switch is a fact about the
+        # machine, so it is handed in rather than read here, and a golden has no notify kit.
+        "frame.txt": module.render(state, True, width=WIDTH, height=HEIGHT, now_ms=NOW_MS,
+                                   ntfy=True) + "\n",
     }
     for name, fixture, width, height in FRAMES:
         other = state_of(module, golden, fixture)
         made[f"{name}.frame.txt"] = module.render(
-            other, True, width=width, height=height, now_ms=NOW_MS,
+            other, True, width=width, height=height, now_ms=NOW_MS, ntfy=True,
         ) + "\n"
     return made
 

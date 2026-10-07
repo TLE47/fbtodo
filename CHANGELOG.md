@@ -6,6 +6,101 @@ Entries start at the newest release; each one is a contract change, not a diff.
 ## Unreleased
 
 ### Added
+- **Idle dead time is reported, not assumed.** AGENTS.md tells a session never to `sleep`
+  merely to wait and never to poll in a loop with no useful work between the polls, and the
+  journal already records every call a session made, in order, with its timestamp — so the rule
+  became askable of the transcript rather than taken on the session's word for itself. `scan.py`
+  gains `journal_calls`, `idle_dead_time`, `journal_dead_time` and `dead_time_report`, beside
+  `_record_actions` — whose action list is deliberately the WRONG substrate for this: `read_files`
+  is left out of `ACTION_TOOLS` on purpose (reading is not progress), so a poll loop with reads
+  between the polls is invisible to it, and that is exactly the session that was working. Two
+  shapes are violations. A **bare sleep** — the command is nothing but a sleep (`sleep 30`), so
+  the window it takes is dead time by construction; `sleep 5 && curl …` is work that happens to
+  wait and is not one, and a backgrounded `sleep 600 &` leaves a process behind rather than
+  holding anyone. A **poll loop** — `poll_run` (3) or more calls of the SAME command in a row
+  with no other call between them, a read included. The walk covers the newest 2 MiB of the
+  journal, needle-gated the way the pane's own walk is, so a megabyte of prose costs one `in`
+  test per line and no json. Teeth: a selfcheck phase (`--only idle-dead-time`) drives three
+  fixture journals — a busy session, and a poll loop broken by reads, both of which must come
+  back clean, and a session that sleeps bare and then polls one command three times, which must
+  come back as exactly those two violations in order, the report naming `sleep 30` and `3x … over
+  2s` — plus the rule's own edges: the answer does not depend on the order the calls are handed
+  over in (the sort is stable, so one record's calls keep the order they were made in), and
+  `min_sleep_s` is the knob that drops a sleep below the cutoff.
+- **The pane can say why it did not ring.** A finish bell that decides "no" leaves nothing
+  behind: a decision that sends nothing never reaches `phone.log`, so "the list finished and my
+  phone stayed quiet" had no answer anywhere — the pane's log said only that it had asked. Now
+  the ask carries a record with it (`todo-bell.py --note PATH`, which the pane passes): one line
+  per ask, `<time>  <action>  list <id>  <why>`, where the refusals are the point — `no push  list
+  8f1c…  already pushed for this list (10/10)`, `no push  list 8f1c…  all 3 done, but the turn is
+  still running`. The same lines are repeated on stdout, so the pane's own log names
+  the reason on the line that records the ask, and `fbtodo status` prints the newest one
+  (`finish push : … — 12m ago`) for an operator who arrives later and does not know the file
+  exists. The bell writes nothing without the flag — the session timer asks every 5s, and a
+  record of that would be a record of the clock — and `--print` writes nothing at all. The record
+  is bounded (the newest 500 lines, rewritten atomically). Teeth: the kit's suite pins the
+  refusal line, the stdout echo, the report-only silence, a send written down beside the
+  refusals, and the bound; fbtodo's suite pins that the ask carries `--note` and that the reason
+  lands on the pane's own log line.
+- **A finished turn in the desktop app reaches the phone.** The finish bell was asked in
+  exactly one place — the shell wrapper's session timer, which names a shell pid and resolves
+  the `freebuff` process under it — and the app's turns have no such process behind them: its
+  agent runs inside the app and its store writes no journal at all. Measured 2026-10-05 on this
+  machine: four desktop threads worked all evening with not one push, while the single ask that
+  existed answered about a finished CLI chat sitting in its shell's cwd and reported "already
+  pushed" for a finish hours old — a list nobody was looking at, and silence for every finish
+  after it. The pane is the process that can see such a finish, because it is drawing the list,
+  so the pane asks: once per list, only for a finish it WATCHED (the list is remembered while
+  it still has work in it, so a pane opened on work that was already over says nothing, which is
+  what keeps a glance at an old thread from buzzing a phone), and it hands the state over
+  (`todo-bell.py --state -`) rather than making the bell re-resolve a session nobody is looking
+  at. The bell still owns the decision and the one-push-per-list record, so two askers cannot
+  double-send, and `--push-only` leaves the chime to the session's own timer — two ringers for
+  one finish is a Mac that rings twice. The desktop's boundary is the store's own word rather
+  than a quiet window: `threads.turn_state` says whether a turn is alive (fbtodo carries it as
+  `turn_running`), so a thread with no turn running and every step ticked is the same news a
+  journal's `shouldEndTurn` gives. No new knob, and nothing guessed from a clock. Teeth: both
+  boundaries' truth tables (`list_has_ended`), the bell's decision matrix for a desktop state (a
+  running turn is silent and `--print` names it), a state handed over on stdin deciding
+  identically, and end to end a real pane on a pty pointed at a fixture store — silent while the
+  turn runs, one ask when the store's turn goes idle with the list complete, that ask carrying
+  the state on screen (`backend`, `turn_running`, the count, the list's own fingerprint), and
+  nothing at all from a second pane opened on the same finished thread.
+- **The pane has a button: the ntfy push, on the frame's status row, turned off and on by a
+  click on it or by the `n` key.** The pane is a picture of a list and the phone is somewhere
+  else in the house: the push had three keys and no handle you could see, and all three move
+  the CHIME as well — which is a different wish, because "my phone is ringing in a meeting" is
+  not "stop chiming at me while I read this". The button is the switch asked for and nothing
+  else: it writes `phone-state` alone and leaves `state`, the word `bell.sh` reads, where it
+  was. It is drawn from the state the pane HANDS the renderer rather than read by it (a frame
+  is a function of its arguments, and a golden file has no notify kit behind it), and it is drawn
+  only in what the status row has left OVER its own floor — the state chip, the rule and the live
+  clock — so the two things that row is FOR cannot be pushed off it by a control, while the
+  readings that follow the clock (the LIST number, the list's age) step aside for it. The floor
+  is measured from the state in hand, not from a constant: at the 43 columns a desktop pane gets,
+  that is the tight `[ntfy on]`, where a reserve measured on a wide split would have shown
+  nothing. Every form is measured on the wider word (`off` is a cell wider than `on`), so the
+  button is drawn in the same shape with the push off as with it on — it is the way back, and a
+  control that vanished in the state it exists to undo would be no way back at all. A pane too
+  narrow for even that keeps the key. A click means asking the terminal for the
+  mouse: SGR reporting is turned on while the pane runs, asked for again with every frame it
+  paints (a desktop window that reloads comes back as a fresh emulator with no mouse mode and no
+  memory of what a still-running pane asked of it, and a button that dies with the window that
+  opened it is a failure with nothing on screen to explain it), and handed back on every way out of it
+  — Ctrl-C, a stale exit, the self-reload's own exec — because a terminal left reporting a
+  mouse nothing is reading cannot select text in any window until something restarts it. A
+  reader who would rather keep their mouse asks for that with `--no-mouse`
+  (`FBTODO_PANE_MOUSE=off`) and keeps the key, and a push this pane did not mute is not this
+  pane's to unmute — the rule `u` already keeps — with one the ENVIRONMENT holds refused by
+  name, because a control that does nothing silently reads as broken. Teeth: the switch (the
+  chime untouched throughout, the record that makes it outlive both the pane and the list, the
+  env and not-ours refusals), the mouse reader's truth table (a press is a click; a release, a
+  drag, the wheel, a right-click and an arrow key are not), the frame (drawn only from the
+  switch it was handed, named with the key that works it too, giving way to the state chip and
+  the clock, and findable in the painted frame at the cells it occupies), and end to end a real
+  pane on a pty whose own painted screen is replayed to find that cell, written a click there,
+  and asked whether the push moved — a click beside it must do nothing, and the mouse must be
+  handed back on the way out.
 - **`fbtodo panes` lists every todo pane on the machine, with the subject it holds and the
   interpreter it runs.** `why` answers where ONE session's list pane is, for a window you name;
   nothing answered *which* todo panes exist — so after restarting three of them by hand the
@@ -346,9 +441,61 @@ Entries start at the newest release; each one is a contract change, not a diff.
   summary) to both a journal and a harness history at the same positions, reads both, and
   asserts identical `goal`, `now` and `nudge` — a drift fails as a diff between the two
   readers, naming the case and the field, not as a surprise in a pane.
+- **A finish or a drop can be posted to a Discord channel, where the Hermes agent can read it.**
+  The kit's sinks were both a phone, so "is freebuff actually doing anything?" had nowhere to
+  look: the agent in Discord answers out of what reached Discord, and nothing this kit sent ever
+  did. `discord-send.sh` posts one message through the gateway's own CLI on the NAS (`hermes send
+  --to discord:#freebuff -f -`) — a bot-token path, so no model, no agent loop and no running
+  gateway turn is needed and a push costs one ssh. It is a **second sink, not a third transport**:
+  `phone.sh --discord` runs the phone push exactly as before and posts beside it, and a caller
+  that does not pass the flag never reaches Discord at all — which is how "finishes and drops
+  only" is enforced per bell, and the two callers are `todo-bell.py` and `drop-bell.py`.
+  `FREEBUFF_DISCORD_TARGET` picks the channel (default `discord:#freebuff`) and
+  `FREEBUFF_DISCORD=off` (or a `discord-state` file) mutes it without unsetting anything; a
+  target that is not a plain channel is exit 78 and a delivery that fails is exit 69 with a line
+  in `discord.log`. The target is validated before use, so a config value can never become a
+  second command on the far side of the ssh, and the ssh is the **agent-less** one
+  (`BatchMode=yes`): the app that rings the bells has no `SSH_AUTH_SOCK`, the same reason the
+  Hermes MCP server over ssh had been failing to start. Teeth: the kit's suite drives the sink
+  through a stub command, and pins the title/body split, the target used and the one logged, the
+  mute, the refused target, the usage error, the exit-69 line, that exactly the two bells ask for
+  the channel, that `phone.sh --help` documents the flag, and that a plain `phone.sh` never
+  reaches Discord.
 
 
 ### Changed
+- **The finish push tells the Discord channel what the run was for and what it did, where the
+  phone keeps its metadata-only nudge.** A finish in the channel was the phone's message verbatim
+  — `3/3 steps done · 2026-10-06 11:20`, session — which answers "is it over" and nothing else, so
+  the one reader there who is not the owner (the Hermes agent in the channel, answering questions
+  out of what reached it) could ever report only that a list had ended. The channel's body is now
+  labelled, one field per line, because it is read out of context:
+
+      Goal: shrink the pane heading to one line
+      Summary: the heading now fits and the two failing checks were fixed
+      3/3 steps done · 2026-10-06 18:14
+
+  `Goal` is the agent's own `Goal:` heading (`state["goal"]`) and never the session's opening
+  request, which would be a claim the agent did not make; `Summary` is the first line of its last
+  answer — the same `state["summary"]` fbtodo already extracts, capped by `SUMMARY_MAX_CHARS` —
+  flattened to ONE line and capped again for the push, with the count and clock under it. Each
+  field is flattened and capped on its own, so a heading the agent wrapped over two lines cannot
+  swallow the summary below it. A field with nothing in it is left out rather than shown empty;
+  a run with a goal but no prose is STILL sent (it says more than the phone's metadata does, and
+  the first cut of this dropped the goal along with the missing summary — the suite now pins
+  that); and with neither, nothing is invented: the channel falls back to the phone's body, which
+  is what a drop still posts (a drop has neither). All of it travels as a new `phone.sh
+  --discord-message TEXT`, which is the second sink's body alone, so the phone's message is
+  byte-for-byte what it was and `FREEBUFF_PHONE_TEXT` does not change the channel's;
+  `--discord` without the option still posts one message to both sinks.
+  `FREEBUFF_DISCORD_SUMMARY=off` takes the labels away for an owner who would rather the channel
+  stayed quiet about it. Teeth: the kit's suite asserts the labelled body (goal, summary, count,
+  clock), that a multi-line goal and a multi-line summary each arrive as one labelled line, that a
+  goal with no summary is still sent while neither means no body of its own and the request is not
+  promoted into a heading, that `FREEBUFF_PHONE_TEXT=agent` leaves the channel's body
+  byte-identical, that `FREEBUFF_DISCORD_SUMMARY=off` restores the older message, that the phone's
+  `--message` carries no agent prose either way, and that `phone.sh` documents and honours the
+  option.
 - **A pane locks to the list it first resolved, and never moves again.** It used to follow the
   work: re-choosing per poll meant that typing in another tab — which is exactly what the app's
   own thread picker reads as "the thread you are working in" — moved the reader's window to
@@ -1131,6 +1278,35 @@ Entries start at the newest release; each one is a contract change, not a diff.
   not word-split an unquoted expansion, so `-h -b` arrived as one argument and only the
   default split worked), and no longer declares `local` (which ksh93 lacks, silently
   emptying `_fb_refresh`'s variables there). Each split arm now calls `tmux` directly.
+- **The two reload clocks are settable, so a build under test is not waited out at an
+  editor's speed.** A pane, the watcher and the keeper each re-exec themselves into a new
+  build, and two module-level numbers decide how they wait for one: `SOURCE_SETTLE_S` (2 s — a
+  save caught halfway through must not be exec'd into, because the pane is the one process
+  that has to survive the person editing it) and `BUILD_CHECK_S` (1 s — how often each asks
+  whether it is still the build on disk). Both are now read from `FBTODO_SOURCE_SETTLE` /
+  `FBTODO_BUILD_CHECK` when `base` is imported, the way `FBTODO_PANE_SECONDS` already is. They
+  are deliberately **not** in `PINNED_ENV_KEYS`: a cadence is not a location, and the same
+  argument that keeps the bells' clocks out of a pane's command line applies here. The
+  defaults are unchanged, and the default is what protects an editor; the caller that turns
+  them down is the self-check, which drives seven reloads through COPIES of the build whose
+  files it writes complete, and was paying an editor's settle window plus a whole check
+  interval for each answer it already knew. It sets `0.2` / `0.1` — and since `hold_window`
+  derives the hold it demands from the same two numbers the child was given, the number of
+  looks a child gets at a tree it must *not* reload is unchanged, so the assertion keeps its
+  teeth while the seconds go.
+
+### Removed
+- **`FBTODO_FB_MARKER` is no longer carried into a pane.** It named the file the watcher read
+  to find live sessions on another host, and the remote source that wrote those markers is
+  gone — nothing has read the setting since, so it rode in every pane command line as a value
+  with no reader, and the pages that listed it still described marker-based session discovery
+  that no longer happens. The pin is now the state root, the tmux server and the six watch
+  paths (`base.PINNED_ENV_KEYS`), and the two launchers, `docs/SETTINGS.md` and
+  `docs/INTERNALS.md` name the same set. A pane whose recorded command still carries the dead
+  key is not called stale for it: only the values this build hands on are compared, so an
+  older pin is read the way it always was. The pages that still counted a remote list among a
+  pane's answers (`docs/SOURCES.md`, `docs/INTERNALS.md`) say what a pane follows now: the
+  cwd's journal and one thread, both local.
 
 ## 4.30.2
 

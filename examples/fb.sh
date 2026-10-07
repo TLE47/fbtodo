@@ -37,9 +37,9 @@
 # disagree about the Python under them (`FBTODO_PATH` overrides the PATH that is passed on,
 # for a machine that needs a specific one). The same rebuild is why the values that decide
 # WHERE the pane works ride along too: the state root (`FBTODO_HOME`, else
-# `XDG_STATE_HOME`), the tmux server (`FBTODO_TMUX`), the session marker
-# (`FBTODO_FB_MARKER`) and the six notify-watch paths (`FBTODO_NOTIFY`, `_DROP`, `_ASK`,
-# `_PAUSE`, `_PANE_BELL`, `_LOCKS_BELL`). Each is carried only when this shell has it set,
+# `XDG_STATE_HOME`), the tmux server (`FBTODO_TMUX`) and the six notify-watch paths
+# (`FBTODO_NOTIFY`, `_DROP`, `_ASK`, `_PAUSE`, `_PANE_BELL`, `_LOCKS_BELL`). Each is
+# carried only when this shell has it set,
 # so a machine pointing its bells at its own scripts keeps them in the pane.
 #
 # Tunables, all optional:
@@ -93,13 +93,13 @@ fb() {
         # with nothing on screen to say so. Only values this shell has are carried, so a
         # variable nobody set stays unset in the pane rather than riding as empty. The names
         # are read one at a time with `eval "_fb_val=\${$_fb_v}"` rather than spelled out
-        # ten times: the `eval` only performs the parameter expansion (the value is never
+        # nine times: the `eval` only performs the parameter expansion (the value is never
         # re-parsed for a command substitution), and one list is one place to keep in step
         # with `PINNED_ENV_KEYS` in base.py.
         _fb_py=$(command -v python3 || command -v python)
         _fb_bin=$(command -v fbtodo)
         _fb_carry=""
-        for _fb_v in FBTODO_HOME XDG_STATE_HOME FBTODO_TMUX FBTODO_FB_MARKER \
+        for _fb_v in FBTODO_HOME XDG_STATE_HOME FBTODO_TMUX \
                      FBTODO_NOTIFY FBTODO_DROP FBTODO_ASK FBTODO_PAUSE \
                      FBTODO_PANE_BELL FBTODO_LOCKS_BELL; do
             eval "_fb_val=\${$_fb_v}"

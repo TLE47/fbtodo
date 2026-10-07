@@ -1084,6 +1084,84 @@ def _elision_note(count: int, flags: list, where: str) -> str:
     return f"  │ {count} {where} step{plural} pending"
 
 
+# ============================================================ the ntfy button
+# The pane's frame is a picture of a list, with ONE control on it: the ntfy push, drawn on the
+# status row and worked by a click on it or by the `n` key (`mute.py` owns the switch). Three
+# rules, and they are what the drawing below is built around:
+#
+#   * the state is PASSED IN (`ntfy`), never read here. A frame is a function of its arguments
+#     — that is what makes a recorded frame a contract — and a golden file has no notify kit,
+#     no phone and no opinion behind it.
+#   * the button asks the status row for the room it needs and never for a cell more: the row's
+#     FLOOR is the chip, the rule and the live clock — the last tier the strip keeps — and the
+#     button is drawn only in what is left OVER that floor. So the two things that row is FOR
+#     cannot be pushed off it, while the readings that come after them on a wide row (the
+#     LIST's age, the guard's field) step aside for the one CONTROL, and the row's own field
+#     rule is spent on the button only if two cells remain for it: a single space joins it just
+#     as well, and the words are the same either way. Too narrow for even the tightest form: no
+#     button, and the key still works.
+#   * it is FOUND in the painted frame rather than computed from the layout (`ntfy_button_span`),
+#     because the thing a click has to line up with is the frame that is on the screen.
+_NTFY_BUTTON_ATS = ("[ ntfy ", "[ntfy ")   # every form of the button starts at one of these
+_NTFY_BUTTON_END = "]"
+# The status row's own separator — one cell of air either side of the rule, and the thing the
+# button is counted against when it asks that row for room.
+_FIELD_SEP = " │ "
+
+
+def ntfy_button_text(push_on: bool, room: int) -> str:
+    """The button's own words, in `room` cells, or "" when it cannot be shown whole.
+
+    Three forms, widest first. The long one names the KEY beside the switch, which is what makes
+    a control on a TTY findable: a reader who has no mouse — or who would rather keep theirs
+    for selecting text — still learns that `n` is the same switch, and the two ways to work it
+    are then one switch with two hands on it rather than two features.
+
+    The tightest form is the pane's real one. A todo pane in the desktop app is around 40
+    columns, and there the status row has 11 cells to spare and no more: `[ ntfy on ]` is the
+    form those panes get, and the form below it keeps a switch on the panes two cells narrower
+    still. What is never traded is the WORD — on or off is the whole reading — only the air
+    inside the brackets and the key beside it.
+    """
+    word = "on" if push_on else "off"
+    # ...chosen against the WIDER word, always. `off` is a cell wider than `on`, and a form
+    # picked from the state in hand would leave the button one cell too wide the moment the push
+    # went off — the pane would hide the control in exactly the state it exists to undo, and a
+    # reader could only get it back from the keyboard. So every form is measured on `off` and
+    # then written with the word that is true.
+    for lead, tail in ((" ", " · n "), (" ", " "), ("", "")):
+        if _cell_width(f"[{lead}ntfy off{tail}]") <= room:
+            return f"[{lead}ntfy {word}{tail}]"
+    return ""
+
+
+def ntfy_button_span(lines: list | None) -> tuple[int, int, int] | None:
+    """Where the button is on a painted frame: `(row, first column, last column)`, 1-based.
+
+    The pane's half of a click. The terminal reports a cell; the answer to "did they hit the
+    button?" is the cells the button occupies in the frame that is on the screen. Sought by
+    the text it draws rather than by arithmetic on the layout, so a row that moved — a note
+    grew on the title, a step wrapped, the pane was resized — cannot leave a button lying
+    about where it used to be. `lines` carry styling; the columns are counted on the plain
+    text, because that is what the terminal counts in.
+    """
+    for row, line in enumerate(lines or [], start=1):
+        plain = _plain(line)
+        at = -1
+        for marker in _NTFY_BUTTON_ATS:
+            found = plain.find(marker)
+            if found >= 0 and (at < 0 or found < at):
+                at = found
+        if at < 0:
+            continue
+        end = plain.find(_NTFY_BUTTON_END, at)
+        if end < 0:
+            continue
+        start = _cell_width(plain[:at]) + 1
+        return row, start, start + _cell_width(plain[at:end + 1]) - 1
+    return None
+
+
 # In plain words: the framed pane. This is the drawing code, and the longest part of the file,
 # because a terminal is not a canvas: every row is measured in screen columns, cut to a frame
 # whose height depends on the pane it is in, and the colours are roles resolved from a theme
@@ -1102,12 +1180,17 @@ def _render_rich(
     truecolor: bool | None = None,
     reloaded: str | None = None,
     mute_note: str | None = None,
+    ntfy: bool | None = None,
 ) -> str:
     """The framed, high-density pane shown on a colour terminal.
 
     The plain renderer above stays the machine-readable path (pipes, `snap`,
     self-checks): it has no borders, so line counts and first-column markers stay
     stable for scripts.  A live pane is a TTY with colour, and gets this layout.
+
+    `ntfy` is the one thing on this frame that is a CONTROL rather than a reading — the push's
+    own switch, `True` for ringing — and `None` means the caller has no such switch to offer
+    (a pipe, a golden, a board), in which case no button is drawn at all.
     """
     c = paint(color)
     # Only the two STATE colours are literals any more; everything else the drawing asks
@@ -1637,8 +1720,48 @@ def _render_rich(
         if gap and keep_gap:
             fields.append(gap)
         return body + "".join(
-            c(st["faint"], " │ ") + c(muted, field) for field in fields + [live_field]
+            c(st["faint"], _FIELD_SEP) + c(muted, field) for field in fields + [live_field]
         )
+
+    # ...and the frame's one CONTROL, on the same row: the ntfy push, and the two ways to work
+    # it (a click on the words, or `n`). Drawn from what the CALLER read rather than read here
+    # (see `ntfy_button_text`), and sized against the row's own FLOOR — the chip, the rule and
+    # the live clock, the last tier the strip keeps (below) — so the button takes only the room
+    # the row's readings can spare, never the room the chip and the clock need. The floor is
+    # MEASURED rather than set as a constant, because it is what the pane's own state makes it:
+    # at 43 columns — what the desktop app gives a todo pane — the row is 39 cells wide, the
+    # floor is 27, and `[ ntfy on ]` fits in what is left OVER it, where a fixed reserve hid the
+    # control on exactly the pane it was built for.
+    button = join = ""
+    if ntfy is not None:
+        floor = _cell_width(strip(word, False, False, False))
+        # The words are chosen against the CHEAPEST join there is — a single space — and the
+        # row's own rule is spent on them only when its two spare cells are left over too. The
+        # words are the control and the rule is the row's manners, so a squeeze costs the
+        # manners first and the same words are what a reader gets either way.
+        text = ntfy_button_text(bool(ntfy), inner - floor - 1)
+        if text:
+            # (`spare` is the FOOTER's own row budget further down — never name this one it:
+            # it decides the blank row above the status row, and shadowing it grew every
+            # frame by a line.)
+            join = _FIELD_SEP if inner - floor >= _cell_width(_FIELD_SEP) + _cell_width(text) else " "
+            # Ringing, or quiet: the switch's own ink. `success` is what this palette uses for
+            # a thing that is working, and `done` (the muted grey, dimmed) for one that is not
+            # — the same two inks a finished step uses, so the frame does not grow a vocabulary
+            # for its one button. The brackets and the AIR they keep are chrome; the words
+            # between them are the reading, and they are the only cells inked. Read off the
+            # form rather than rebuilt, because the three forms keep different air and only
+            # `ntfy_button_text` knows which one fits — and read as "what is not air" rather
+            # than as a list of the strings that may sit there, so a fourth form cannot paint
+            # its words in the wrong ink while the PLAIN text — the thing a click is tested
+            # against — still looks right.
+            cells = text[1:-1]                      # between the brackets: air, words, air
+            lead = len(cells) - len(cells.lstrip(" "))
+            words = cells.strip(" ")
+            button = (c(st["faint"], text[0] + cells[:lead])
+                      + c(st["success"] if ntfy else st["done"], words)
+                      + c(st["faint"], cells[lead + len(words):] + text[-1]))
+    taken = (_cell_width(join) + _cell_width(button)) if button else 0
 
     # On a strip too narrow for all of it the list's own age goes first, then LIST: itself —
     # the state chip and the live clock are what the row is for. The tiers are (keep_list,
@@ -1648,10 +1771,12 @@ def _render_rich(
     for tier in ((word, True, True, True), (word, True, False, True),
                  (word, False, False, True), (word, False, False, False)):
         status = strip(*tier)
-        if _cell_width(status) <= inner:
+        if _cell_width(status) <= inner - taken:
             break
     else:
-        status = _clip_cells(strip(word, False, False, False), inner)
+        status = _clip_cells(strip(word, False, False, False), inner - taken)
+    if button:
+        status = status + c(st["faint"], join) + button
 
     rows += [_frame_row(h, width, frame) for h in head]
     rows.append(_divider_row(width, frame))
@@ -1777,6 +1902,7 @@ def render(
     truecolor: bool | None = None,
     reloaded: str | None = None,
     mute_note: str | None = None,
+    ntfy: bool | None = None,
 ) -> str:
     """Pick the framed pane (colour terminal) or the plain machine-readable text.
 
@@ -1789,6 +1915,8 @@ def render(
     on. They differ in LIFE, which is why one chip carries both: a reload is a fact about the
     last few seconds and goes away on its own, while a mute is a switch the reader set and can
     only undo by pressing the key its own words name, so it stays for as long as it is true.
+    `ntfy` is the push's state (True = the phone will ring) and draws the frame's one BUTTON;
+    it too is framed-pane chrome, and a plain frame ignores it.
     """
     # The second half of the text filter (see `clean_text`): a state that came off disk —
     # this process's own cache, or a file an older build wrote — is filtered here, so no
@@ -1798,7 +1926,7 @@ def render(
     if color and width >= 30:
         frame = _render_rich(
             state, color, watching, width, now_ms, idle_s, stale_after_s, goal_lines, height,
-            theme=theme, truecolor=truecolor, reloaded=reloaded, mute_note=mute_note,
+            theme=theme, truecolor=truecolor, reloaded=reloaded, mute_note=mute_note, ntfy=ntfy,
         )
     else:
         frame = _render_plain(
@@ -1848,6 +1976,7 @@ __all__ = [
     "THEME_PROBLEMS", "_theme_value", "read_theme", "_theme_gradient", "_supports_truecolor",
     "_styles", "BAR_EIGHTHS", "SPINNER", "FRAME_CHROME", "frame_chrome_is_single_cell",
     "_progress_bar", "_elision_note", "_thread_heading",
+    "ntfy_button_text", "ntfy_button_span",
     "_render_rich",
     "render", "width_of_default", "adopt_version", "bar_text",
 ]

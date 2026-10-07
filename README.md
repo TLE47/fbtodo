@@ -139,6 +139,36 @@ While you are looking at a pane, the keyboard is the quickest way to mute the ph
 | `m` | quiet until this list finishes, then it rings again on its own |
 | `M` | quiet until you press `u` |
 | `u` | loud again |
+| `n` | the ntfy push alone — the same switch as the button on the frame |
+
+The push also has a **button** on the pane's status row, saying whether the phone will ring
+(`[ ntfy on · n ]`): click it, or press `n`. It is drawn in the widest form the row has room for
+— `[ ntfy on · n ]` on a wide pane, `[ ntfy on ]` in a tmux split, and the tight `[ntfy on]` on the
+40-odd columns a desktop pane gets, where the row keeps the state chip and the live clock and
+gives up the LIST number and the list's age to make room for it. The same form answers whether
+the push is on or off, so the button is there to click back on after you click it off. Below
+about 42 columns it is left off entirely and the key still works. It is narrower than the keys on purpose — it moves
+`phone-state` alone and leaves the chime (`state`) as it is, because "my phone is ringing in a
+meeting" is a different wish from "stop chiming at me while I read this" — and it is the pane's
+own switch, not the list's, so it outlives both the pane and the list until you click it back.
+The pane asks the terminal for the mouse again with every frame it paints, so a window that comes
+back as a fresh terminal cannot leave the button dead. `--no-mouse` (or `FBTODO_PANE_MOUSE=off`)
+leaves the mouse to your terminal for selecting text
+and keeps `n`.
+
+When the list this pane is showing finishes for good — every step ticked **and** the turn ended —
+the pane also tells the phone, through the same finish bell the shell wrapper's timer uses
+(`todo-bell.py`). That is the only way a finish reaches you from the **desktop app**: its turns
+are the app's own (no `freebuff` process runs them and its store writes no journal), so the
+timer's ask, which names a shell and resolves the process under it, has nothing to resolve there
+— the pane drawing the thread is the one process that can see it. The bell keeps the
+one-push-per-list record, so the pane's ask and the timer's cannot both send, and the pane never
+chimes: the chime belongs to the session's timer. Nothing is asked for a finish this pane did not
+watch, so opening a pane on an old thread does not buzz your phone. When it does ask, the
+bell's answer is kept: the pane's log carries it on the same line that records the ask, and
+`fbtodo status` prints the newest one (`finish push : no push list 8f1c… already pushed for this
+list (10/10) — 12m ago`) — because a decision that sends nothing never reaches `phone.log`, and
+"the list finished and my phone stayed quiet" needs a place of its own.
 
 `--no-keys` (or `FBTODO_PANE_KEYS=off`) turns the keys off in a pane whose terminal it should not
 read, and the same switch is `fbtodo mute` for a script, a status row or any shell that is not a
@@ -197,6 +227,7 @@ If you use the notification kit (below), the pane can turn it off for you:
 | `m` | quiet until this list finishes — then the phone rings again on its own |
 | `M` | quiet until you press `u` |
 | `u` | loud again |
+| `n` | the push alone — the switch the button on the status row works (click it, or press `n`) |
 
 Nothing is invented for this: the key writes the kit's own switch words — `phone-state`, which
 `phone.sh` reads, and `state`, which `bell.sh` reads — so muting from the pane and muting from a

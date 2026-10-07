@@ -97,13 +97,13 @@ fb() {
         # scripts. This shell is the last place those are still known. `env` carries the
         # assignments because the login shell that runs a pane command may be fish, which has
         # no `VAR=value command` form. The names are read one at a time with `eval
-        # "_fb_val=\${$_fb_v}"` rather than spelled out ten times: the `eval` only performs
+        # "_fb_val=\${$_fb_v}"` rather than spelled out nine times: the `eval` only performs
         # the parameter expansion (the value is never re-parsed for a command substitution),
         # and one list is one place to keep in step with `PINNED_ENV_KEYS`.
         _fb_py=$(command -v python3 || command -v python)
         _fb_bin=$(command -v fbtodo)
         _fb_carry=""
-        for _fb_v in FBTODO_HOME XDG_STATE_HOME FBTODO_TMUX FBTODO_FB_MARKER \
+        for _fb_v in FBTODO_HOME XDG_STATE_HOME FBTODO_TMUX \
                      FBTODO_NOTIFY FBTODO_DROP FBTODO_ASK FBTODO_PAUSE \
                      FBTODO_PANE_BELL FBTODO_LOCKS_BELL; do
             eval "_fb_val=\${$_fb_v}"
@@ -195,13 +195,13 @@ function fb
         # tmux, before this line was written. `_fb_carry` is one `KEY='value'` per variable
         # this shell HAS (fish has no `${VAR:+…}`), read by name with `$$_fb_v` so the list
         # is the only thing to keep in step with `PINNED_ENV_KEYS`: the state root, the tmux
-        # server, the session marker, and the six notify-watch paths a pane's bells are sent
-        # to. A variable nobody set is skipped rather than carried empty.
+        # server, and the six notify-watch paths a pane's bells are sent to. A variable
+        # nobody set is skipped rather than carried empty.
         set -l _fb_py (command -v python3; or command -v python)
         set -l _fb_bin (command -v fbtodo)
         set -l _fb_path (string join : $PATH)
         set -l _fb_carry ""
-        for _fb_v in FBTODO_HOME XDG_STATE_HOME FBTODO_TMUX FBTODO_FB_MARKER FBTODO_NOTIFY FBTODO_DROP FBTODO_ASK FBTODO_PAUSE FBTODO_PANE_BELL FBTODO_LOCKS_BELL
+        for _fb_v in FBTODO_HOME XDG_STATE_HOME FBTODO_TMUX FBTODO_NOTIFY FBTODO_DROP FBTODO_ASK FBTODO_PAUSE FBTODO_PANE_BELL FBTODO_LOCKS_BELL
             if set -q $_fb_v; and test -n "$$_fb_v"
                 set _fb_carry "$_fb_carry $_fb_v='$$_fb_v'"
             end

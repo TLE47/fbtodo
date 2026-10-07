@@ -96,7 +96,9 @@ the keeper's — asks both before starting itself over (see
 [The pane lifecycle](#the-pane-lifecycle)).
 `SOURCE_SETTLE_S` is the two seconds a fresh write is left alone first, so a save still landing
 is never read as a finished one, and `BUILD_CHECK_S` is how often they ask at all: one listing
-a second is nothing beside what either of them is already doing.
+a second is nothing beside what either of them is already doing. Both are the defaults of a
+setting (`FBTODO_SOURCE_SETTLE` / `FBTODO_BUILD_CHECK` — `docs/SETTINGS.md`), which is what lets
+a test drive a reload in a fraction of a second instead of waiting out an editor's save.
 
 ## The state directory
 
@@ -224,7 +226,7 @@ so a rung's spread cannot read differently in two places.
 ## The sources
 
 Every reader downstream — the pane, `snap`, `json`, the estimates — reads **one** state,
-and a list can come from a journal, a database, a remote host, or a plain file. That seam is
+and a list can come from a journal, a database, or a plain file. That seam is
 `Source`: each one answers "is there anything of this kind here?" in its own vocabulary and
 then translates what it found into the state's fields, so `_snapshot` is a loop rather than
 two branches.
@@ -303,7 +305,7 @@ be shown.
 ## `fbtodo board`
 
 The other question a pane cannot answer: what is **every** live session doing, at once. A pane
-follows one list — one cwd, one thread, one ssh — and people run two or three agents at a time,
+follows one list — one cwd, one thread — and people run two or three agents at a time,
 so the board is a second frame over the same two local stores, not a new reader of them.
 
 `board_sessions` walks `--cli-root` and `--db` and returns rows, newest activity first:
@@ -356,6 +358,28 @@ Every one of them also takes `--print` (resolve and report, send nothing) plus
 `--title`/`--message`/`--priority`/`--tags` to send something specific, which is how you
 debug one by hand. Sends are handed to `phone.sh` detached, so a poll never waits on a
 network.
+
+The **finish** bell (`todo-bell.py`) is the one watch with two askers, because the list's
+finish is not a cadence a watcher can own. The session timer asks it by shell pid
+(`todo-bell.py <pid>`, resolving the `freebuff` under that shell and reading the journal's
+own `shouldEndTurn`); a **pane** asks it by handing the state over (`--state - --push-only`,
+from `panes.finish_notify`), which is what covers the desktop app, whose turns are the app's
+own: there is no `freebuff` process behind them, and its store writes no journal. The pane is
+then the only process that can see such a finish at all — it is drawing it — and it asks
+once per list, only for a finish it watched (`list_is_finished` and `list_has_ended`, the
+same two halves the bell decides with, plus a memory of the list while it still had work in
+it, so a pane opened on finished work says nothing). The bell still owns the decision and the
+one-push-per-list record, so the two askers cannot double-send. The pane's ask also carries
+`--note` (`FINISH_LOG`, beside the kit's switches), so the bell writes down what it decided —
+one line per ask, newest kept — and repeats it on stdout: the pane's own log carries the reason
+on the line that records the ask, and `fbtodo status` prints the newest line (`finish push`),
+which is where an operator who does not know the file exists will look. That row is the only
+answer there is to "the list finished and the phone stayed quiet": a decision that sends nothing
+never reaches `phone.log`, so an unexplained silence used to leave no trace anywhere. The bell
+writes nothing without the flag — the timer asks every 5s and would fill the file — and `--print`
+writes nothing at all. Measured 2026-10-05 on this
+machine's desktop app: four threads working and not one push, while the timer's ask — the
+only one that existed — spoke about a finished CLI chat in its shell's cwd.
 
 The `locks` notifier is the fifth and the only one whose subject is a CLAIM, so it is not
 run on the watcher's clocks: it rides `fbtodo locks --watch`, which reads the audit once per
@@ -671,9 +695,9 @@ place that PATH is known.
 The same rebuild covers more than PATH, and the rest of the pin is `pinned_env`: the values the
 program reads from its OWN environment to decide **where** it works. They are the state root
 (`FBTODO_HOME` first, `XDG_STATE_HOME` second — the pair `_state_root` reads), the tmux server a
-pane drives (`FBTODO_TMUX`), the session marker it counts live sessions by (`FBTODO_FB_MARKER`),
-and the six notify-watch paths its bells are sent to (`FBTODO_NOTIFY`, `_DROP`, `_ASK`, `_PAUSE`,
-`_PANE_BELL`, `_LOCKS_BELL`); they ride in the same command line as `KEY=value` arguments to
+pane drives (`FBTODO_TMUX`), and the six notify-watch paths its bells are sent to
+(`FBTODO_NOTIFY`, `_DROP`, `_ASK`, `_PAUSE`, `_PANE_BELL`, `_LOCKS_BELL`); they ride in the same
+command line as `KEY=value` arguments to
 `env`. A pane whose server predates one of them — the server was started before the owner
 exported `FBTODO_HOME`, or a login shell's profile set a different `XDG_STATE_HOME` — would
 otherwise read another store, follow another set of sessions, or send every bell to
@@ -981,6 +1005,38 @@ and a frozen clock the same bytes come back whatever the terminal, the env or th
 (what `tests/golden.py` checks). The depth changes the ink, never the layout: a 256-colour pane
 and a 24-bit one disagree about escape sequences and nothing else.
 
+The frame has exactly one CONTROL, and it keeps that same rule: `ntfy` is the ntfy push's state
+(`True` = the phone will ring), passed in by `cmd_pane` rather than read by the renderer, because
+a frame is a function of its arguments and a golden file has no notify kit behind it. It is drawn
+on the status row and only in the widest of three forms (`ntfy_button_text`) that fits what the
+row has left OVER ITS FLOOR — the state chip, the rule and the live clock, which is the last tier
+the strip will fall to. That floor is measured from the state in hand rather than assumed from a
+constant, because it is what the pane's own chip makes it: at 43 columns, which is what the
+desktop app gives a todo pane, the row is 39 cells, the floor 27, and the tight `[ntfy on]` fits
+in the 11 left over — where a reserve measured on a wide tmux split showed no button at all on the
+panes the control is for. What a narrow row spends on the button is the room the readings after
+the clock can spare: the LIST number, its age, the guard's field. The chip and the clock are never
+traded, so a pane too narrow even for the tight form shows no button and keeps the key.
+
+Two smaller rules keep the control honest at the edge it now lives on. Every form is measured
+against the WIDER word, `off` (a cell wider than `on`) and then written with the word that is
+true: a form chosen from the state in hand would leave the button a cell too wide the moment the
+push went off, and the pane would hide the control in exactly the state the control exists to
+undo. And the button is joined to the row by the same ` │ ` rule as every other field only while
+there are two cells for it — below that a single space joins it, because the words are the
+control and the rule is the row's manners. A
+click is answered by `ntfy_button_span`,
+which seeks the button in the frame that is ON THE SCREEN rather than deriving its cells from
+the layout, so a row that moved cannot leave a button lying about where it used to be. The mouse
+is `PaneKeys`'
+other half: SGR reporting is asked for when the pane opens, **asked for again with every frame**
+(`draw` writes the hide and the mouse-mode pair ahead of each repaint) and given back in
+`restore_terminal`, the same pair as the cursor's hide and show — Ctrl-C, the stale exit and the
+self-reload's own `exec` all pass through it, because a terminal left reporting a mouse nothing is
+reading cannot
+select text in any window until something restarts it. `--no-mouse` (or `FBTODO_PANE_MOUSE=off`)
+leaves the mouse alone and keeps the key.
+
 The frame also fits the pane it was asked for, always, and that is enforced rather than intended:
 `_clamp_widths` cuts every row of whichever renderer ran to `width`, and `_clamp_rows` cuts the
 frame to `height`, keeping the ends (the title row and the bar/footer, or the bottom border) and
@@ -1088,8 +1144,7 @@ from the followed list, because they are still about it.
   directly; the palette no longer feeds it any.
 - **The plain renderer is the machine-readable path.** `snap`, `json` and `bar` stay
   line-oriented and uncoloured; colour belongs to the framed pane.
-- **Every subprocess has a timeout**, and every network or ssh call is bounded. A pane is
-  useless if a poll can outlive its interval.
+- **Every subprocess has a timeout.** A pane is useless if a poll can outlive its interval.
 - **A claim is held by the KERNEL, and the number inside it is for humans.** `write_lock`
   takes an `flock` on the file and writes the record through that same fd (a rename would
   leave the new copy unlocked and the claim lost); `lock_holder` decides who is live by

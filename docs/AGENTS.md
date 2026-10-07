@@ -10,6 +10,11 @@ exists and this copy when it does not, so CI still enforces the same phrases aga
 into your own file is [`examples/AGENTS.md`](../examples/AGENTS.md); this is the fuller text
 behind it.
 
+The file is also **budgeted**, because it is injected into every system prompt: at or under
+12 KB and 14 sections, with no more than 8 subsections. The self-check measures whichever
+file it resolves and fails on the first byte or heading over, so the instruction a model
+actually reads cannot quietly grow back into a document.
+
 ## Output
 
 - Head the first reply of a task with one `Goal:` line: a **concise rewrite** of the

@@ -12,13 +12,22 @@ answers to `FREEBUFF_BELL`, else the one-word file `state`; and in both scripts 
 six words mean off (`off 0 false no disable disabled`, casefolded) and anything else means
 on. No new switch, no new argument: writing those two files IS the mute, so a pane that
 muted and a shell that muted are the same state, and the two cannot disagree about it.
+
+The push also has a BUTTON — the one control on the pane's own frame, on the status row,
+worked by a click on it or by the `n` key. It is narrower than the keys on purpose: it moves
+`phone-state` alone, because "my phone is ringing in a meeting" and "stop chiming at me while
+I read this" are two different wishes and the keys already answer the second. Nothing here
+is a second implementation of anything: the button writes the kit's file through the same
+bookkeeping the keys use, so the two cannot drift apart.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
+from typing import NamedTuple
 
 from .base import *  # noqa: F401,F403 — the package is one namespace
 
@@ -42,7 +51,45 @@ PANE_MUTE_KEYS = {
     "m": ("mute", "list"),
     "M": ("mute", "sticky"),
     "u": ("unmute", ""),
+    # ...and the button's own key, so the same switch is reachable from a terminal whose
+    # mouse the reader would rather keep for selecting text (`--no-mouse`).
+    "n": ("push", ""),
 }
+
+# The pane's mouse, for the one thing on its frame that is a CONTROL rather than a picture:
+# the button. Asked for while the pane runs and handed back on every way out of it (see
+# `cmd_pane`, which pairs it with the cursor's own lifecycle), and SGR-encoded (`\x1b[<`),
+# which is the only form that survives a pane wider or taller than 223 cells.
+MOUSE_ON = "\x1b[?1000h\x1b[?1006h"
+MOUSE_OFF = "\x1b[?1000l\x1b[?1006l"
+
+# One SGR mouse report: `\x1b[<button;column;row`, then `M` for a press and `m` for a
+# release. Columns and rows are 1-based from the pane's own top-left corner.
+_MOUSE_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+
+
+class MouseClick(NamedTuple):
+    """A left-button press, in the terminal's own 1-based coordinates."""
+
+    x: int
+    y: int
+
+
+def parse_mouse(seq: bytes) -> MouseClick | None:
+    """The LEFT-BUTTON PRESS in a sequence, or None for anything else that arrives.
+
+    Pure, so the whole truth table is a check rather than a terminal. A press is `M` with
+    button 0; a release (`m`) is not a click, and neither is a drag (32 added to the button),
+    the wheel (64/65), a right- or middle-click, or an arrow key. A release is dropped
+    deliberately rather than acted on: one press-and-release must not toggle the switch twice.
+    """
+    match = _MOUSE_RE.match(seq or b"")
+    if not match:
+        return None
+    button, x, y, kind = match.groups()
+    if kind != b"M" or int(button) != 0:
+        return None
+    return MouseClick(int(x), int(y))
 
 # What the chip says while each kind of mute is in force. The undo key is IN the chip: a
 # switch nobody can find is a switch nobody trusts, and the chip is the only place a pane
@@ -106,6 +153,17 @@ def muted_now() -> bool:
     return any(switch_is_off(name, env) for name, env, _script, _what in MUTE_SWITCHES)
 
 
+def push_switch() -> tuple[str, str | None, str, str]:
+    """The ntfy push's own row of `MUTE_SWITCHES` — the switch the button works."""
+    return MUTE_SWITCHES[0]
+
+
+def push_is_off() -> bool:
+    """Is the ntfy push off right now, as `phone.sh` itself would read it?"""
+    name, env, _script, _what = push_switch()
+    return switch_is_off(name, env)
+
+
 # ===================================================================== the record
 def read_mute_record() -> dict:
     """What the last mute keypress did: `{until, was, at_ms, session, list_id}`, or `{}`.
@@ -144,6 +202,10 @@ def mute_chip() -> str | None:
     if muted_now():
         if scope in ("list", "sticky"):
             return MUTE_CHIPS[scope]
+        if scope == "push":
+            # The button's own mute, and the button is on the status row of the SAME frame,
+            # saying the same switch — a chip here would be this frame saying one thing twice.
+            return None
         # Off, but the record does not say this pane did it. Either the environment holds it
         # (which no file can lift) or a hand edited a file — and the chip must not then
         # promise an undo key that would appear to fail.
@@ -171,7 +233,8 @@ def describe_mute() -> dict:
         })
     return {
         "muted": any(s["off"] for s in switches),
-        "scope": {"list": "until-done", "sticky": "sticky"}.get(rec.get("until")),
+        "scope": {"list": "until-done", "sticky": "sticky", "push": "ntfy"}.get(
+            rec.get("until")),
         "by": rec.get("by", "key") if rec.get("until") else None,
         "chip": mute_chip(),
         "switches": switches,
@@ -201,6 +264,24 @@ def list_is_finished(state: dict | None) -> bool:
         return int(total) > 0 and int(done) >= int(total)
     except (TypeError, ValueError):
         return False
+
+
+def list_has_ended(state: dict | None) -> bool:
+    """Has the TURN that wrote this list ended — the other half of "finished"?
+
+    In plain words: a list can be complete while the agent is still working — the last step
+    ticked off and then prose, or the next thing started without a new list — so "every step
+    is done" is not "the agent has stopped". Each source has its own word for that boundary
+    and this is where they meet: a CLI journal writes `shouldEndTurn` (the state's
+    `turn_ended`), while the desktop store records no such thing but does say whether a turn
+    is alive (`turn_running`), which is the same news once the list is complete. The finish
+    bell decides with the same rule (`todo-bell.py`); this is the half the PANE needs, to
+    know when asking it is worth a process at all.
+    """
+    state = state if isinstance(state, dict) else {}
+    if state.get("backend") == "desktop":
+        return not state.get("turn_running")
+    return bool(state.get("turn_ended"))
 
 
 def _remembered(rec: dict, name: str, env: str) -> str | None:
@@ -264,6 +345,72 @@ def set_muted(until: str = "list", state: dict | None = None, by: str = "key") -
     scope = "until this list is done" if until == "list" else "until you turn it back on"
     scripts = " + ".join(script for _n, _e, script, _w in MUTE_SWITCHES)
     return mute_chip(), f"notifications quiet {scope} ({scripts})"
+
+
+def toggle_push(state: dict | None = None) -> tuple[str | None, str]:
+    """The button: the ntfy push alone, off or back on, and nothing else moves.
+
+    One answer for a click and for the `n` key, because they are the same control. Two rules,
+    and they are the rules the keys already keep: the CHIME is never touched (it is a
+    different switch with a different job), and a push this pane did not turn off is not this
+    pane's to turn back on — `u` refuses for the same reason, and the note says so rather
+    than leaving a reader with a button that appears broken.
+
+    The record is the pane's own (`until: "push"`, `by: "button"`), which is what makes this
+    switch PERSISTENT: a push turned off here is still off after this pane closes and after
+    the list finishes, because neither is a reason anybody gave for it — pressing the button
+    again, or `fbtodo mute off`, is. A mute already in force keeps its own scope and its own
+    record: the button only adds the push's entry to it, or takes that entry back out.
+    """
+    name, env, script, what = push_switch()
+    rec = read_mute_record()
+    was = dict(rec.get("was")) if isinstance(rec.get("was"), dict) else {}
+
+    if not push_is_off():
+        was.setdefault(name, _remembered(rec, name, env))
+        try:
+            atomic_write_text(switch_path(name), "off\n")
+        except OSError:
+            return mute_chip(), f"cannot write the switch: {notify_dir()}"
+        write_mute_record({
+            "until": rec.get("until") or "push",
+            "was": was,
+            "by": (rec.get("by") or "button") if rec.get("until") else "button",
+            "at_ms": int(time.time() * 1000),
+            "session": (state or {}).get("session"),
+            "list_id": (state or {}).get("list_id"),
+            "pane": os.environ.get("TMUX_PANE"),
+        })
+        return mute_chip(), f"{what} off ({script} quiet, the chime is not)"
+
+    # The other direction: the push is off and the button asks for it back. An ENVIRONMENT
+    # is not something a switch file can answer to, and a switch somebody else wrote is not
+    # this pane's to lift — both said out loud, because a click that does nothing silently is
+    # a click that reads as broken.
+    if switch_held_by_env(name, env):
+        return mute_chip(), f"{what} is off by {env}, which no switch file can lift"
+    remembered = was.get(name)
+    if remembered is None:
+        return mute_chip(), f"{what} is off, but not by this pane — nothing of ours to undo"
+    try:
+        if remembered == "":
+            try:
+                os.unlink(switch_path(name))
+            except FileNotFoundError:
+                pass                # already not there is the answer we were putting back
+        else:
+            atomic_write_text(switch_path(name), f"{remembered}\n")
+    except OSError:
+        return mute_chip(), f"cannot write the switch: {notify_dir()}"
+    # ...and the record no longer holds the push: if that entry was all it was for, the
+    # record goes with it, so the next `u` or `fbtodo mute off` cannot claim a switch that
+    # is already back where it was.
+    rest = {k: v for k, v in was.items() if k != name}
+    if rest or rec.get("until") not in (None, "push"):
+        write_mute_record({**rec, "was": rest, "at_ms": int(time.time() * 1000)})
+    else:
+        clear_mute_record()
+    return mute_chip(), f"{what} on"
 
 
 def set_unmuted() -> tuple[str | None, str]:
@@ -349,6 +496,8 @@ def apply_pane_key(key: str, state: dict | None = None) -> tuple[str | None, str
     verb, scope = action
     if verb == "mute":
         return set_muted(scope or "sticky", state)
+    if verb == "push":
+        return toggle_push(state)
     return set_unmuted()
 
 
@@ -416,13 +565,15 @@ class PaneKeys:
             return False
         return True
 
-    def poll(self) -> str | None:
-        """One keypress as a character, or None for nothing (or for bytes that are not keys).
+    def poll(self) -> str | MouseClick | None:
+        """One input event: a keypress, a click on the button, or None for nothing.
 
-        Escape sequences are swallowed whole — an arrow key is three bytes and the last two
-        are letters that would otherwise mute a phone. End of input disables the reader
-        instead of spinning on it: a closed stdin stays "readable" forever, and a pane
-        spinning at 4Hz on a dead descriptor is worse than a pane with no keys.
+        A mouse press is the one escape sequence the pane ANSWERS (`parse_mouse`); every
+        other one is swallowed whole, because an arrow key is three bytes, a click is a
+        dozen, and the letters inside either would otherwise mute a phone. End of input
+        disables the reader instead of spinning on it: a closed stdin stays "readable"
+        forever, and a pane spinning at 4Hz on a dead descriptor is worse than a pane with
+        no keys at all.
         """
         if self.fd is None:
             return None
@@ -439,25 +590,34 @@ class PaneKeys:
             self.fd = None            # stdin is done; stop asking it
             return None
         char = chunk.decode("utf-8", "replace")
-        if char == "\x1b":
-            self._drain()
-        return char if char.isprintable() else None
+        if char != "\x1b":
+            return char if char.isprintable() else None
+        # A terminal writes one sequence in one write, so this is the whole of it: read it
+        # whole, and hand a click back only if that is what it was.
+        return parse_mouse(b"\x1b" + self._gather())
 
-    def _drain(self) -> None:
-        """Take what followed an escape byte and throw it away."""
+    def _gather(self, cap: int = 32) -> bytes:
+        """Everything that followed the escape byte and is there right now.
+
+        `cap` is what keeps a terminal streaming something longer — a bracketed paste, a
+        mouse-move flood from a mode this pane never asked for — from holding the pane here.
+        """
         import select
 
-        while self.fd is not None:
+        out = bytearray()
+        while self.fd is not None and len(out) < cap:
             try:
                 if not select.select([self.fd], [], [], 0)[0]:
-                    return
+                    break
                 more = os.read(self.fd, 32)
             except (OSError, ValueError):
                 self.fd = None
-                return
+                break
             if not more:
                 self.fd = None
-                return
+                break
+            out += more
+        return bytes(out)
 
     def close(self) -> None:
         """Give the terminal its own attributes back. Safe to call more than once."""
@@ -477,7 +637,8 @@ class PaneKeys:
 
 def pane_mute_help() -> str:
     """The keys, in one line, for `--help` and the docs."""
-    return "pane keys: m quiet until this list finishes · M quiet until u · u loud again"
+    return ("pane keys: m quiet until this list finishes · M quiet until u · u loud again · "
+            "n the ntfy push alone (the same switch the frame's button works)")
 
 
 __all__ = [
@@ -485,6 +646,9 @@ __all__ = [
     "notify_dir", "switch_path", "read_switch", "switch_is_off", "switch_held_by_env",
     "muted_now", "read_mute_record", "write_mute_record", "clear_mute_record", "mute_chip",
     "describe_mute",
-    "list_is_finished", "set_muted", "set_unmuted", "mute_release", "auto_unmute",
+    "list_is_finished", "list_has_ended", "set_muted", "set_unmuted", "mute_release",
+    "auto_unmute",
+    "push_switch", "push_is_off", "toggle_push",
     "apply_pane_key", "PaneKeys", "pane_mute_help",
+    "MOUSE_ON", "MOUSE_OFF", "MouseClick", "parse_mouse",
 ]

@@ -133,6 +133,170 @@ def _record_actions(rec: dict, key) -> list:
     return list(reversed(out))
 
 
+# ---- idle dead time: no bare `sleep`, no poll loop with nothing between -----------------
+# AGENTS.md tells a session never to leave dead time — no `sleep` merely to wait, and no poll
+# loop with no useful work between the polls. That is a claim about what a session DID, and
+# the journal records every call it made in order with its timestamp, so the rule is checkable
+# from the transcript instead of from the session's own word for itself.
+#
+# The walk below runs over EVERY call, not over the recounted actions above: `read_files` is
+# left out of `ACTION_TOOLS` on purpose (reading is not progress), and a poll loop interleaved
+# with reads is not a loop with nothing between the polls. Asking this question of the action
+# list would flag exactly the sessions that were working.
+BARE_SLEEP_RE = re.compile(r"^sleep\s+(?P<secs>\d+(?:\.\d+)?)s?$")
+
+
+POLL_RUN = 3  # this many calls of one command in a row, with nothing else called between
+
+
+DEAD_TIME_TAIL = 2 * 1024 * 1024  # bytes of journal read back when looking for dead time
+
+
+DEAD_TIME_KEEP = 4000  # calls remembered; a session that made more has a bigger problem
+
+
+def _record_calls(rec: dict, key) -> list:
+    """(key, ts_ms, tool, what) for EVERY call in this record, in the order it made them.
+
+    `_record_actions` above names only the calls worth showing in the pane. This is the same
+    walk without that filter, because "nothing happened between the polls" is a question about
+    the calls that were NOT shown as much as about the ones that were.
+    """
+    ts = _iso_ms(rec.get("timestamp"))
+    out = []
+    for call in (rec.get("data") or {}).get("toolCalls") or []:
+        if not isinstance(call, dict):
+            continue
+        name = call.get("toolName")
+        if not name:
+            continue
+        inp = call.get("input") or call.get("args") or {}
+        out.append((key, ts, str(name), _action_what(name, inp)))
+    return out
+
+
+def journal_calls(chat_dir: str) -> list:
+    """Every tool call in a session's journal, oldest first: (key, ts_ms, tool, what).
+
+    Only the tail is read (`DEAD_TIME_TAIL`): dead time is a property of what a session is
+    doing, and the start of a long journal is not. Parsing is needle-gated exactly the way the
+    pane's own walk gates it, so a megabyte of prose costs one `in` test per line and no json.
+
+    The relative order of the calls in one record is the order the session made them, and the
+    keys sort records against each other — so an action list built from this needs no re-sort.
+    """
+    try:
+        with open(os.path.join(chat_dir, "log.jsonl"), "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            start = max(0, fh.tell() - DEAD_TIME_TAIL)
+            fh.seek(start)
+            blob = fh.read()
+    except OSError:
+        return []
+    if start:
+        blob = blob.split(b"\n", 1)[-1]  # a partial first line is not a record
+    rows: list = []
+    for order, raw in enumerate(blob.split(b"\n")):
+        if b'"toolCalls"' not in raw or b'"toolName"' not in raw:
+            continue
+        try:
+            rec = json.loads(raw.decode("utf-8", "replace"))
+        except Exception:
+            continue
+        rows.extend(_record_calls(rec, (0, order)))
+        if len(rows) >= DEAD_TIME_KEEP:
+            break
+    return rows[:DEAD_TIME_KEEP]
+
+
+def _bare_sleep_seconds(row) -> float | None:
+    """The seconds this call is *nothing but* a sleep, else None.
+
+    Only a command that is ONLY a sleep counts. `sleep 5 && curl …` is work that happens to
+    wait, and `sleep 600 &` leaves a process behind rather than holding anyone; flagging either
+    would teach the rule's reader to ignore it, which costs more than the miss.
+    """
+    if row[2] != "run_terminal_command":
+        return None
+    match = BARE_SLEEP_RE.match((row[3] or "").strip())
+    return float(match.group("secs")) if match else None
+
+
+def _span_s(first, last) -> float | None:
+    """Seconds between two journal timestamps, or None when either is missing."""
+    if first is None or last is None:
+        return None
+    return round(max(0.0, (last - first) / 1000.0), 1)
+
+
+def idle_dead_time(calls, *, poll_run: int = POLL_RUN, min_sleep_s: float = 0.0) -> list:
+    """The never-idle rule's violations in a session's calls, oldest first.
+
+    `calls` is what `journal_calls` yields — `(key, ts_ms, tool, what)` — in any order; this
+    sorts by key, and the sort is stable, so calls sharing a record keep the order they were
+    made in. Two shapes are violations, and both are about what the session DID:
+
+      * **bare sleep** — the call is nothing but a sleep (`sleep 30`), so the window it takes
+        is dead time by construction. `min_sleep_s` ignores sleeps shorter than that (0 by
+        default: a bare sleep is a bare sleep, whatever it was waiting for).
+      * **poll loop** — `poll_run` or more calls of the SAME command in a row with no other
+        call between them: the session is waiting rather than working. Any other call breaks
+        the run, including a read.
+
+    Each violation is a dict: `kind`, `what`, `seconds` (bare-sleep), `count` (poll-loop),
+    `key` (where in the journal it starts) and `span_s` (the wall time it covered, when the
+    records carry timestamps).
+    """
+    rows = sorted(calls, key=lambda r: r[0])
+    out: list = []
+    i = 0
+    while i < len(rows):
+        secs = _bare_sleep_seconds(rows[i])
+        if secs is not None:
+            if secs >= min_sleep_s:
+                out.append({"kind": "bare-sleep", "what": rows[i][3], "seconds": secs,
+                            "count": 1, "key": rows[i][0], "span_s": secs})
+            i += 1
+            continue
+        # A run of the SAME call, with nothing else called in between. A call with no `what`
+        # is not nameable, so it can neither form a run nor be mistaken for one.
+        if not rows[i][3]:
+            i += 1
+            continue
+        j = i + 1
+        while (j < len(rows) and rows[j][2:] == rows[i][2:]
+               and _bare_sleep_seconds(rows[j]) is None):
+            j += 1
+        if j - i >= poll_run:
+            out.append({"kind": "poll-loop", "what": rows[i][3], "seconds": None,
+                        "count": j - i, "key": rows[i][0],
+                        "span_s": _span_s(rows[i][1], rows[j - 1][1])})
+        i = j
+    return out
+
+
+def journal_dead_time(chat_dir: str, **kw) -> list:
+    """`idle_dead_time` over a session's own journal — one call to ask the rule of a session."""
+    return idle_dead_time(journal_calls(chat_dir), **kw)
+
+
+def dead_time_report(violations) -> list:
+    """One line per violation, oldest first: what a log or a terminal says about it.
+
+    Kept beside the rule so the wording and the detection cannot drift apart — the phase that
+    enforces this reads these lines, not a second copy of them.
+    """
+    out = []
+    for v in violations:
+        if v["kind"] == "bare-sleep":
+            out.append(f"dead time: a bare `sleep {v['seconds']:g}` — nothing else was called")
+        else:
+            span = f", over {v['span_s']:g}s" if v.get("span_s") is not None else ""
+            out.append(f"dead time: `{v['what']}` called {v['count']}x with nothing between"
+                       f"{span}")
+    return out
+
+
 def goal_line(text: str):
     """The first `Goal:` line in a block of the agent's prose, cleaned — or None.
 
@@ -863,6 +1027,8 @@ __all__ = [
     "_iso_ms", "_record_todos", "ACTION_TOOLS", "ACTION_KEEP", "ACTION_ROWS",
     "ACTION_SCAN_KEEP", "FILE_KEEP", "EDIT_VERBS", "TURN_CHASE_CHUNKS", "QUIET_MS",
     "_action_what", "_record_actions", "_record_goal", "prose_text", "_record_summary",
+    "BARE_SLEEP_RE", "POLL_RUN", "DEAD_TIME_TAIL", "DEAD_TIME_KEEP", "_record_calls",
+    "journal_calls", "idle_dead_time", "journal_dead_time", "dead_time_report",
     "_record_prompt", "_record_turn", "is_nudge", "pick_prompt", "_newest", "_turn_extend",
     "goal_line", "pick_goal", "goal_stale_at",
     "journal_scan", "_SCAN_CACHE", "_SCAN_HITS", "_SCAN_PARSED", "_SCAN_REUSED",

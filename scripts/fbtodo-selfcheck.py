@@ -114,6 +114,17 @@ def bar_row_of(framed: str) -> str:
             return line
     raise AssertionError(f"no progress row in the frame:\n{framed}")
 
+# The reload clocks, turned down for the run the way `--pane-seconds` and `--ask-seconds`
+# already are. `SOURCE_SETTLE_S` (2 s) and `BUILD_CHECK_S` (1 s) are the cadences a real
+# EDITOR's save is waited out on, and the two reload checks drive seven reloads between them
+# through a COPY of the build whose files this suite writes complete — so every one of them was
+# paying an editor's settle window plus a whole check interval for an answer it already knew.
+# Set in THIS process's environment as well as in `env`, because that is where the module reads
+# them when `load_fbtodo()` imports it, and where the children spawned with `env` inherit them.
+# `hold_window()` then derives its own window from the same two numbers, so nothing drifts.
+os.environ["FBTODO_SOURCE_SETTLE"] = "0.2"
+os.environ["FBTODO_BUILD_CHECK"] = "0.1"
+
 env = dict(os.environ, FBTODO_HOME=TEST_HOME)
 # ...and the state root in THIS process too, which is not only about `env`. The module
 # instances this script loads in-process (`module`, `mod`, `mp`, `panes_mod`) fix their
@@ -816,6 +827,17 @@ try:
 
     # ---- new session drops the previous list instead of showing it
     module = load_fbtodo()
+    # ...and the reload clocks this run turned down (see the environment at the top of the
+    # file) reach the module that reads them. Without this the two reload checks would go back
+    # to waiting out an editor's save and still pass — a suite that quietly stopped handing the
+    # values down would just be slow — so the handoff `hold_window` derives its window from is
+    # asserted rather than assumed.
+    assert (module.SOURCE_SETTLE_S, module.BUILD_CHECK_S) == (
+        float(os.environ["FBTODO_SOURCE_SETTLE"]), float(os.environ["FBTODO_BUILD_CHECK"]),
+    ), (
+        "the reload clocks did not reach the module",
+        module.SOURCE_SETTLE_S, module.BUILD_CHECK_S,
+    )
 
     # ---- what decides a state write: the clock comes out of the comparison, everything
     #      else stays, and "everything else" includes fields this does not know about — a
@@ -1440,6 +1462,11 @@ try:
         was both too short to catch a late reload on a loaded machine — so the check passed
         vacuously — and pure dead time in every run. Waiting out the real interval and then
         requiring the count to be unchanged is both stronger and the same length.
+
+        Both clocks are turned down for this run (see the environment at the top of the file),
+        so the window is a fraction of a second rather than seconds — but the number of LOOKS
+        the child gets is what the assertion is really in, and reading the same two numbers
+        the child was given keeps that at `checks` however the clocks are set.
         """
         return module.SOURCE_SETTLE_S + checks * module.BUILD_CHECK_S
 
@@ -2497,8 +2524,8 @@ def _probe_live_for_target(x, y):
 
     # ---- ...and the pin covers WHERE the pane works, not only what it runs. tmux starts a
     #      pane from its SERVER's environment, so the state root (`FBTODO_HOME` /
-    #      `XDG_STATE_HOME`), the tmux server it drives, the session marker it counts live
-    #      sessions by and the six notify-watch paths its bells are sent to are the SERVER's
+    #      `XDG_STATE_HOME`), the tmux server it drives and the six notify-watch paths its
+    #      bells are sent to are the SERVER's
     #      answer unless they ride in the command with the PATH — a pane whose server
     #      predates one of them silently reads another store, follows another set of
     #      sessions, or rings the DEFAULT bells. `pinned_env` carries only the values this
@@ -2507,7 +2534,7 @@ def _probe_live_for_target(x, y):
     #      Every PINNED_ENV_KEYS entry needs a sample here, so a key added without one fails
     #      loudly rather than going untested.
     sample = {"FBTODO_HOME": "/p/h", "XDG_STATE_HOME": "/p/x", "FBTODO_TMUX": "tmux -L s",
-              "FBTODO_FB_MARKER": "/p/m", "FBTODO_NOTIFY": "/p/todo.py",
+              "FBTODO_NOTIFY": "/p/todo.py",
               "FBTODO_DROP": "/p/drop.py", "FBTODO_ASK": "/p/ask.py",
               "FBTODO_PAUSE": "/p/pause.py", "FBTODO_PANE_BELL": "/p/pane.py",
               "FBTODO_LOCKS_BELL": "/p/locks.py"}
@@ -2854,7 +2881,7 @@ def _probe_live_for_target(x, y):
     #      called stale for differing from a split's `--watch-pid` — and with no values to
     #      hand on, no command is stale at all (the server's environment IS the answer).
     sample = {"FBTODO_HOME": "/p/h", "XDG_STATE_HOME": "/p/x", "FBTODO_TMUX": "tmux -L s",
-              "FBTODO_FB_MARKER": "/p/m", "FBTODO_NOTIFY": "/p/todo.py",
+              "FBTODO_NOTIFY": "/p/todo.py",
               "FBTODO_DROP": "/p/drop.py", "FBTODO_ASK": "/p/ask.py",
               "FBTODO_PAUSE": "/p/pause.py", "FBTODO_PANE_BELL": "/p/pane.py",
               "FBTODO_LOCKS_BELL": "/p/locks.py"}
@@ -6082,9 +6109,27 @@ def _probe_live_for_target(x, y):
         assert surv_proc.poll() is None, "the pane died after recovering"
     finally:
         surv_proc.send_signal(signal.SIGINT)
-        try:
-            survived = surv_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
+        # WAITING means READING. The pane paints into this pty, and nobody has read it since
+        # `pane_bytes` returned on the step above — so by the time Ctrl-C arrives the buffer can
+        # be full, and the pane's own handler writes to that same pty (it restores the terminal
+        # there) before it can exit: a blocked write is retried by Python and the exit never
+        # happens, which is why this check reported `killed` and read as "the pane ignores
+        # Ctrl-C" (measured 2026-10-06: `ps` showed it alive and still painting five seconds
+        # after the signal, and it left with 130 the moment the pty was drained). Drain while
+        # waiting — the same shape `kill_instance_pane` already uses for the same reason.
+        survived = None
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                os.read(master, 65536)
+            except (BlockingIOError, OSError):
+                pass
+            try:
+                survived = surv_proc.wait(timeout=0.05)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if survived is None:
             surv_proc.kill()
             survived = "killed"
         os.close(master)
@@ -6212,15 +6257,28 @@ def _probe_live_for_target(x, y):
     penv = dict(env, FBTODO_NOTIFY_DIR=mute_dir, TERM="xterm-256color", COLORTERM="truecolor")
     penv.pop("NO_COLOR", None)
 
-    def pty_pane(extra=()):
+    def pty_pane(extra=(), size=(24, 100), state=mute_state, source=None, extra_env=None):
+        """A pane in a terminal of a given SIZE, reading a given state file.
+
+        The size is the argument that matters: a pane's frame is drawn for the terminal it is
+        in, and the terminal a desktop app gives a todo pane is around 40 columns, not the 100
+        a tmux split has. Both are panes; what fits is not the same.
+
+        `source` replaces the state file with the pane's own `-s` arguments (a store rather
+        than a file: `("desktop", "--db", path, "--thread", tid)`), and `extra_env` adds to
+        this suite's environment for that child alone — which is how a check points a pane at
+        ITS notify kit rather than at this machine's (`FBTODO_NOTIFY`).
+        """
         master, slave = pty.openpty()
-        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", *size, 0, 0))
         before = termios.tcgetattr(master)
         proc = subprocess.Popen(
             [sys.executable, FB, "pane", "--no-daemon", "--interval", "0.2", "--tick", "1",
-             "--stale-after", "0", "--watch-pid", "999999", "-s", f"file:{mute_state}",
+             "--stale-after", "0", "--watch-pid", "999999",
+             *(["-s", *source] if source else ["-s", f"file:{state}"]),
              *extra],
-            cwd=CWD, stdin=slave, stdout=slave, stderr=slave, env=penv, close_fds=True,
+            cwd=CWD, stdin=slave, stdout=slave, stderr=slave,
+            env=(dict(penv, **extra_env) if extra_env else penv), close_fds=True,
         )
         os.close(slave)
         os.set_blocking(master, False)
@@ -6303,6 +6361,521 @@ def _probe_live_for_target(x, y):
     say("the pane's keys: m writes the switch from inside the pane and says so on its own "
         "title, u gives the notifications back, --no-keys ignores both, and the terminal is "
         "handed back on exit: ok")
+
+    # ---- the ntfy BUTTON: the pane's one control, and the push is a switch of its own — the
+    #      phone is not the chime, and "ringing in a meeting" is not "stop chiming while I
+    #      read". Two halves, like the keys: the decision (`toggle_push`, which the `n` key
+    #      and a click share, so there is one answer for both) and the control itself, which
+    #      the renderer draws and a coordinate hits. The chime is the witness throughout that
+    #      this never quietly became the `m` key under another name.
+    assert mute_switches() == {"phone-state": None, "state": "on"}, mute_switches()
+    chip, said = module.apply_pane_key("n", quiet)
+    # ...and the chip stays quiet about it: the button is on the status row of the same frame,
+    # saying the same switch, and one frame does not say one thing twice.
+    assert chip is None, chip
+    assert said == "the ntfy push off (phone.sh quiet, the chime is not)", said
+    assert mute_switches() == {"phone-state": "off", "state": "on"}, (
+        "the button moved a switch that is not its own: " + str(mute_switches())
+    )
+    record = module.read_mute_record()
+    assert record["until"] == "push" and record["by"] == "button", record
+    # what to put back is what was there: no `phone-state` file at all, so the undo is to
+    # have none again — `on` would be this pane inventing a word nobody wrote.
+    assert record["was"] == {"phone-state": ""}, record
+    assert module.mute_chip() is None, "the title chip said what the button was already saying"
+    assert module.describe_mute()["scope"] == "ntfy", module.describe_mute()["scope"]
+    # ...and a second press gives the push back, with the record gone: the switch owns nothing
+    # it is not holding, so a later `u` or `fbtodo mute off` cannot claim it.
+    _chip, said = module.apply_pane_key("n", quiet)
+    assert said == "the ntfy push on", said
+    assert mute_switches() == {"phone-state": None, "state": "on"}, mute_switches()
+    assert module.read_mute_record() == {}, module.read_mute_record()
+    # A push the ENVIRONMENT holds is not a file's to lift, and one somebody else wrote is not
+    # this pane's — both refused out loud, because a control that does nothing silently is a
+    # control that reads as broken.
+    os.environ["FREEBUFF_PHONE"] = "off"
+    try:
+        _chip, said = module.apply_pane_key("n", quiet)
+        assert "FREEBUFF_PHONE" in said and "no switch file can lift" in said, said
+        assert mute_switches()["phone-state"] is None, (
+            "the button wrote the switch it had just said it could not"
+        )
+    finally:
+        os.environ.pop("FREEBUFF_PHONE", None)
+    with open(os.path.join(mute_dir, "phone-state"), "w", encoding="utf-8") as fh:
+        fh.write("off\n")            # a hand edit, with no record of ours behind it
+    _chip, said = module.apply_pane_key("n", quiet)
+    assert said.startswith("the ntfy push is off, but not by this pane"), said
+    assert mute_switches()["phone-state"] == "off", (
+        "the button lifted a switch this pane never wrote"
+    )
+    os.unlink(os.path.join(mute_dir, "phone-state"))
+    # The mouse is read, not guessed at: one SGR report is a click, its release is not a second
+    # one, and everything else a terminal sends for the mouse — the wheel, a drag, the other
+    # buttons — is not this pane's business.
+    assert module.parse_mouse(b"\x1b[<0;12;8M") == (12, 8), module.parse_mouse(b"\x1b[<0;12;8M")
+    for junk in (b"\x1b[<0;12;8m", b"\x1b[<1;12;8M", b"\x1b[<2;12;8M", b"\x1b[<32;12;8M",
+                 b"\x1b[<64;12;8M", b"\x1b[A", b"\x1b[<0;12;8", b"", b"[<0;12;8M"):
+        assert module.parse_mouse(junk) is None, junk
+    say("the pane's ntfy button: n (and a click) move the push alone, the chime keeps its own "
+        "switch, and a push this pane did not mute is not its to lift: ok")
+
+    # ---- the control ON THE FRAME, and where it is: a click is a COORDINATE, so the button has
+    #      to be findable in the frame that was painted rather than agreed with by arithmetic.
+    #      Four claims, each of which fails on its own: it is drawn from the switch it was
+    #      HANDED and not read off this machine's kit, it names the key that works it too, it
+    #      gives way to the state chip and the live clock rather than crowding them, and the
+    #      pane's own reader of a painted frame puts the cells where the words are.
+    painted_on = STRIP(module.render(chip_state, True, width=68, height=18, ntfy=True))
+    painted_off = STRIP(module.render(chip_state, True, width=68, height=18, ntfy=False))
+    assert "[ ntfy on · n ]" in painted_on, painted_on
+    assert "[ ntfy off · n ]" in painted_off, painted_off
+    assert "ntfy" not in STRIP(module.render(chip_state, True, width=68, height=18)), (
+        "a frame drew a button nobody handed it a switch for"
+    )
+    assert "ntfy" not in STRIP(module.render(chip_state, False, width=68, ntfy=True)), (
+        "the plain, machine-readable frame grew chrome"
+    )
+    narrow = STRIP(module.render(chip_state, True, width=34, height=10, ntfy=True))
+    assert "ntfy" not in narrow and "IDLE" in narrow, (
+        "a narrow pane traded its own state for the button:\n" + narrow
+    )
+    # ...and the width that matters most is the one a DESKTOP APP pane gets: about 40 columns,
+    # where the status row's own floor (the chip, the rule, the live clock) leaves nine cells
+    # and no more. A reserve measured on a wide pane hid the control on exactly the panes it was
+    # built for, so the button is drawn in what is left OVER that floor and the readings that
+    # come after the clock — the LIST number, its age — step aside for it.
+    # ...and the state has to be a CONSISTENT one, because the chip is read off the steps rather
+    # than off `done` alone: a `done` the todos do not agree with paints `IDLE`, whose chip is
+    # four cells narrower and whose row has room for the airy form. The pane this is measured
+    # on is the one the user has: every step finished, and a list written a while ago.
+    done_state = dict(chip_state, done=2, total=2,
+                      todos=[dict(t, completed=True) for t in chip_state["todos"]],
+                      source_updated_ms=int(time.time() * 1000) - 23 * 60 * 1000)
+    tight_frame = module.render(done_state, True, width=43, height=20, ntfy=True)
+    tight_lines = tight_frame.splitlines()
+    tight = STRIP(tight_frame)
+    tight_row = [r for r in tight.splitlines() if "ntfy" in r][0]
+    assert "[ntfy on]" in tight_row, tight
+    assert "LIVE:" in tight_row and "ALL DONE" in tight_row, (
+        "the button crowded out the two things the status row is for:\n" + tight_row
+    )
+    assert "ago" not in tight_row and "LIST:" not in tight_row, (
+        "a 43-column row kept a reading it could not afford beside the button:\n" + tight_row
+    )
+    assert len(tight_lines) == len(
+        module.render(done_state, True, width=43, height=20).splitlines()), (
+        "the button took a ROW rather than cells: it is a control on the status row, and a "
+        "frame that grew for it would push its own title off a short pane"
+    )
+    tight_span = module.ntfy_button_span(tight_lines)
+    assert tight_span, "a 43-column frame drew no button"
+    trow, tfirst, tlast = tight_span
+    assert STRIP(tight_lines[trow - 1])[tfirst - 1:tlast] == "[ntfy on]", (
+        "the tightest form is painted at cells it does not occupy",
+        tight_span, STRIP(tight_lines[trow - 1]),
+    )
+    # The ladder itself, because the room is what decides: the key's own name is given up
+    # before the WORD is, and the word — on or off — is what the button is for.
+    assert module.ntfy_button_text(False, 16) == "[ ntfy off · n ]", module.ntfy_button_text(False, 16)
+    assert module.ntfy_button_text(True, 15) == "[ ntfy on ]", module.ntfy_button_text(True, 15)
+    assert module.ntfy_button_text(True, 12) == "[ ntfy on ]", module.ntfy_button_text(True, 12)
+    assert module.ntfy_button_text(True, 11) == "[ntfy on]", module.ntfy_button_text(True, 11)
+    assert module.ntfy_button_text(True, 10) == "[ntfy on]", module.ntfy_button_text(True, 10)
+    assert module.ntfy_button_text(False, 9) == "", module.ntfy_button_text(False, 9)
+    # ...and it does not come and go with the SWITCH. `off` is a cell wider than `on`, so a form
+    # chosen from the state in hand would vanish the moment the push went off — the pane would
+    # hide the control in exactly the state the control exists to undo, and only the key could
+    # bring it back. Every form is measured on the wider word, so the room a switch needs is the
+    # same either way, and this is the assert that says so at every width there is.
+    for room in range(0, 20):
+        on_text = module.ntfy_button_text(True, room)
+        off_text = module.ntfy_button_text(False, room)
+        assert bool(on_text) == bool(off_text), (
+            "the button comes and goes with the switch it is for", room, on_text, off_text
+        )
+        assert module._cell_width(off_text) <= room, (room, on_text, off_text)
+    lines = module.render(chip_state, True, width=68, height=18, ntfy=True).splitlines()
+    span = module.ntfy_button_span(lines)
+    assert span is not None, "the button drawn on the frame is not findable in it"
+    row, first, last = span
+    assert STRIP(lines[row - 1])[first - 1:last] == "[ ntfy on · n ]", (
+        span, STRIP(lines[row - 1])
+    )
+    assert module.ntfy_button_span(
+        module.render(chip_state, True, width=34, height=10, ntfy=True).splitlines()) is None, \
+        "a frame with no button reported cells for one"
+    say("the frame's ntfy button: drawn from the switch it was handed, named with its key, "
+        "found in the painted frame at the cells it occupies, and still there on the 40-odd "
+        "columns a desktop pane gives it — never at the chip's or the clock's expense: ok")
+
+    # ---- and the click itself, through a pane and a real terminal. The coordinate is taken
+    #      off the SCREEN the pane painted (replayed here, because a click is a coordinate and a
+    #      test that computes one from its own render is testing its arithmetic), so what is
+    #      being checked is the pane reading its own mouse and finding its own button.
+    def screen_of(stream, rows=24, cols=100):
+        """Replay a pane's output: what a terminal would be left showing.
+
+        Small on purpose. The pane writes two things — a whole frame after a clear, and single
+        rows addressed absolutely — and this reads exactly those: enough to turn "the terminal
+        was sent a click at (x, y)" into "the button was at (x, y)".
+        """
+        screen = [[" "] * cols for _ in range(rows)]
+        row = col = 0
+        text = stream.decode("utf-8", "replace")
+        i = 0
+        while i < len(text):
+            char = text[i]
+            if char == "\x1b":
+                m = re.match(r"\x1b\[([0-9;?]*)([a-zA-Z])", text[i:])
+                if not m:
+                    # A sequence that is still arriving when the read ended: stop here rather
+                    # than write its letters onto the screen as if they were text.
+                    if re.match(r"\x1b\[[0-9;?]*$", text[i:]):
+                        break
+                    i += 1
+                    continue
+                params, final = m.group(1), m.group(2)
+                if final == "H":
+                    nums = [int(p) for p in params.split(";") if p.isdigit()]
+                    row, col = (nums[0] if nums else 1) - 1, (nums[1] - 1) if len(nums) > 1 else 0
+                elif final == "J":
+                    screen = [[" "] * cols for _ in range(rows)]
+                elif final == "K":
+                    # The pane's diff addresses a row and erases it before rewriting it: without
+                    # this, a row that got SHORTER leaves its old tail behind on the screen.
+                    screen[row] = [" "] * cols
+                    col = 0
+                i += m.end()
+                continue
+            if char == "\n":
+                row, col = min(row + 1, rows - 1), 0
+            elif char == "\r":
+                col = 0
+            elif char >= " ":
+                if 0 <= row < rows and 0 <= col < cols:
+                    screen[row][col] = char
+                col += 1
+            i += 1
+        return ["".join(r).rstrip() for r in screen]
+
+    def button_cell(screen):
+        """The middle of the button's own words on a replayed screen: `(x, y)`, 1-based.
+
+        Both ways the button opens — `[ ntfy ` where the row has the air for it, `[ntfy ` on a
+        narrow pane — because which form is painted is the pane's width's decision, and a click
+        test that only knew the wide one would pass on a frame nobody is looking at.
+        """
+        for at, line in enumerate(screen, start=1):
+            for marker in ("[ ntfy ", "[ntfy "):
+                found = line.find(marker)
+                if found >= 0:
+                    return found + 3, at
+        return None
+
+    master, click_proc, _ = pty_pane()
+    try:
+        # ...stopping on the BUTTON's own words and not on `ntfy` anywhere: this suite's patch
+        # fixture has an `ALERT` row reading `sent ntfy …`, and reading only up to that would
+        # cut the frame in half — which is exactly what `screen_of`'s last-rung handling is for.
+        painted = pane_read(master, 4.0, stop_when="ntfy on · n")
+        assert "ntfy on · n" in STRIP(painted.decode("utf-8", "replace")), (
+            "the pane never painted its button:\n" + STRIP(painted.decode("utf-8", "replace"))[-400:]
+        )
+        assert module.MOUSE_ON.encode() in painted, (
+            "the pane never asked the terminal for the mouse the button needs"
+        )
+        # ...and it asks AGAIN with every frame, because a terminal can be reset under a RUNNING
+        # pane: reload the desktop window and the emulator comes back with no mouse mode and no
+        # memory of what was asked of it, while the pane goes on drawing — a mode asked for once
+        # is a button that dies with the window that opened it, and no reader can see why.
+        later = pane_read(master, 3.0)
+        assert later.count(module.MOUSE_ON.encode()) >= 2, (
+            "the pane asked for the mouse once and never again: "
+            + str(later.count(module.MOUSE_ON.encode()))
+        )
+        cell = button_cell(screen_of(painted))
+        assert cell, "no button on the pane's own screen:\n" + "\n".join(screen_of(painted))
+        os.write(master, f"\x1b[<0;{cell[0]};{cell[1]}M".encode())
+        pane_read(master, 2.0)
+        assert mute_switches() == {"phone-state": "off", "state": "on"}, (
+            "a click on the pane's own button did not move the push: " + str(mute_switches())
+        )
+        # ...and a click anywhere else is nothing at all: this is a window on a list, not an
+        # editor, and everything else the mouse could do here the terminal already does better.
+        os.write(master, f"\x1b[<0;2;{cell[1]}M".encode())
+        pane_read(master, 1.5)
+        assert mute_switches() == {"phone-state": "off", "state": "on"}, (
+            "a click beside the button acted anyway"
+        )
+        os.write(master, f"\x1b[<0;{cell[0]};{cell[1]}M".encode())
+        pane_read(master, 2.0)
+        assert mute_switches() == {"phone-state": None, "state": "on"}, mute_switches()
+    finally:
+        click_proc.send_signal(signal.SIGINT)
+        given_back = pane_read(master, 3.0)
+        try:
+            click_code = click_proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            click_proc.kill()
+            click_code = "hung"
+        os.close(master)
+    assert click_code == 130, f"a pane holding the mouse must still leave on Ctrl-C, not {click_code}"
+    assert module.MOUSE_OFF.encode() in given_back, (
+        "the pane left the terminal reporting a mouse nothing was reading — every window after "
+        "it in that terminal could not select text"
+    )
+
+    # `--no-mouse` is a claim about the TERMINAL and not about the button: the pane asks for
+    # nothing, and the control is still on the frame, still naming the key that works it.
+    master, nomouse_proc, _ = pty_pane(extra=("--no-mouse",))
+    try:
+        quiet_paint = pane_read(master, 3.0, stop_when="ntfy on · n")
+        assert module.MOUSE_ON.encode() not in quiet_paint, (
+            "--no-mouse asked for the mouse anyway"
+        )
+        assert "[ ntfy on" in STRIP(quiet_paint.decode("utf-8", "replace")), (
+            "--no-mouse took the button with it"
+        )
+    finally:
+        pane_stop(master, nomouse_proc)
+    # ...and the same click on the pane this was FOR: 43 columns by 37, which is what the
+    # desktop app hands a todo pane, where the row has no air to spare and the button is the
+    # tight form. The switch is read off the FRAME before and after the click, so this checks
+    # the reading as well as the write — a button that toggles without saying so is half a
+    # control — and the click is given back before the pane closes so the rest of the suite
+    # starts from a machine nobody left muted.
+    narrow_state = os.path.join(TEST_HOME, "narrow-state.json")
+    module.atomic_write_json(narrow_state, dict(
+        chip_state, schema=1, done=2, total=2,
+        todos=[dict(t, completed=True) for t in chip_state["todos"]],
+        source_updated_ms=int(time.time() * 1000) - 23 * 60 * 1000,
+    ))
+    master, narrow_proc, _ = pty_pane(size=(37, 43), state=narrow_state)
+    try:
+        narrow_paint = pane_read(master, 4.0, stop_when="[ntfy on]")
+        narrow_screen = screen_of(narrow_paint, rows=37, cols=43)
+        assert any("[ntfy on]" in line for line in narrow_screen), (
+            "a 43-column pane painted no button:\n" + "\n".join(narrow_screen)
+        )
+        cell = button_cell(narrow_screen)
+        assert cell, "no button on the narrow pane's own screen:\n" + "\n".join(narrow_screen)
+        os.write(master, f"\x1b[<0;{cell[0]};{cell[1]}M".encode())
+        said_off = pane_read(master, 3.0, stop_when="[ntfy off]")
+        assert mute_switches()["phone-state"] == "off", (
+            "a click on a narrow pane's button did not move the push: " + str(mute_switches())
+        )
+        assert "[ntfy off]" in STRIP(said_off.decode("utf-8", "replace")), (
+            "the narrow pane's button did not say what it had just done:\n"
+            + STRIP(said_off.decode("utf-8", "replace"))[-400:]
+        )
+        os.write(master, f"\x1b[<0;{cell[0]};{cell[1]}M".encode())
+        pane_read(master, 3.0, stop_when="[ntfy on]")
+        assert mute_switches() == {"phone-state": None, "state": "on"}, (
+            "the second click did not give the push back: " + str(mute_switches())
+        )
+    finally:
+        pane_stop(master, narrow_proc)
+    say("the pane's button in a real terminal: the pixel the pane painted is the pixel that "
+        "toggles, a click elsewhere is nothing, the mouse is asked for again with every frame "
+        "so a window that reset it cannot leave the button dead, given back on the way out, "
+        "--no-mouse leaves it alone, and the 43-column pane a desktop app gives a todo pane "
+        "draws it, reads it back and works it too: ok")
+
+    # ---- and the finish PUSH, which is the half a pane is the only process able to see. The
+    #      session timer's bell follows a SHELL's CLI session (`todo-bell.py <pid>`), and a
+    #      desktop app's turns are the app's own — no `freebuff` process is behind them, so
+    #      that bell has nothing to ask about while the pane drawing the thread knows exactly
+    #      when it finished (measured 2026-10-05: four desktop threads working in the app,
+    #      every one of them silent on the phone). The pane asks the bell ONCE per list and
+    #      hands the state over (`--state -`) rather than naming a session; the bell still owns
+    #      the decision and the record. The negative case is the one that matters as much: a
+    #      pane opened on work that was ALREADY over says nothing, so a glance at an old thread
+    #      cannot buzz a phone.
+    assert module.list_has_ended({"backend": "desktop", "turn_running": False}) is True
+    assert module.list_has_ended({"backend": "desktop", "turn_running": True}) is False
+    assert module.list_has_ended({"backend": "cli", "turn_ended": True}) is True
+    assert module.list_has_ended({"backend": "cli"}) is False
+    assert module.list_has_ended(None) is False, "no state must read as no boundary"
+
+    finish_log = os.path.join(TEST_HOME, "finish-asks.log")
+    finish_stub = os.path.join(TEST_HOME, "finish-stub.sh")
+    with open(finish_stub, "w", encoding="utf-8") as fh:
+        # One ask per run: the caller's argv, then the state handed over on stdin — and one
+        # line on STDOUT, which is the half the real bell repeats there for the asker to log
+        # (`--note`): the pane's own line must carry it.
+        fh.write("#!/bin/sh\n"
+                 'printf "argv: %s\\n" "$*" >>"$FBTODO_FINISH_LOG"\n'
+                 'cat >>"$FBTODO_FINISH_LOG"\n'
+                 'printf "\\n---\\n" >>"$FBTODO_FINISH_LOG"\n'
+                 'printf "no push: the bell was stubbed for this check\\n"\n')
+    os.chmod(finish_stub, 0o755)
+    finish_env = dict(penv, FBTODO_NOTIFY=finish_stub, FBTODO_FINISH_LOG=finish_log)
+
+    fin_dir = os.path.join(TEST_HOME, "finishstore")
+    os.makedirs(fin_dir, exist_ok=True)
+    fin_db = os.path.join(fin_dir, "desktop-v2.db")
+    if os.path.exists(fin_db):
+        os.remove(fin_db)
+    fin_steps = [{"task": "patch the store", "completed": True},
+                 {"task": "tell the phone", "completed": False}]
+    fin_done = [dict(fin_steps[0]), dict(fin_steps[1], completed=True)]
+    fin_now = int(time.time() * 1000)
+
+    def write_finish(turn_state, beat, todos, ts, seq):
+        """The store this check flips: one thread, one committed list per call."""
+        con = sqlite3.connect(fin_db)
+        con.execute("CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, title TEXT,"
+                    " status TEXT, turn_state TEXT, turn_alive_at INTEGER,"
+                    " last_prompt_at INTEGER, sidebar_archived_at INTEGER, harness_state TEXT)")
+        con.execute("CREATE TABLE IF NOT EXISTS messages (seq INTEGER, thread_id TEXT,"
+                    " role TEXT, parts_json TEXT, ts INTEGER)")
+        if turn_state is not None:
+            con.execute("DELETE FROM threads")
+            con.execute("INSERT INTO threads VALUES ('F0', 'Finish thread', 'open', ?, ?, ?, "
+                        "NULL, NULL)", (turn_state, beat, ts))
+        con.execute(
+            "INSERT INTO messages VALUES (?, 'F0', 'assistant', ?, ?)",
+            (seq, json.dumps([{"toolName": "write_todos", "input": {"todos": todos}}]), ts),
+        )
+        con.commit()
+        con.close()
+
+    # The turn is still running and one step is left: nothing to ask about, however many
+    # polls go by. (A pane that pushed here would be announcing a finish that has not
+    # happened, which is the mistake the quiet-window heuristics make.)
+    write_finish("running", fin_now, fin_steps, fin_now - 5_000, 1)
+    fin_source = ("desktop", "--db", fin_db, "--thread", "F0")
+    master, fin_proc, _ = pty_pane(source=fin_source, extra_env=finish_env)
+    try:
+        pane_read(master, 2.5)
+        assert not os.path.exists(finish_log), (
+            "a pane asked the phone about a list that is still being worked on"
+        )
+        pane_log_before = ""
+        try:
+            with open(module.PANE_LOG_PATH, encoding="utf-8") as fh:
+                pane_log_before = fh.read()
+        except OSError:
+            pass
+        # ...then the turn ends and its list is complete: one ask, once.
+        write_finish("idle", 0, fin_done, fin_now + 1_000, 2)
+        pane_read(master, 6.0, stop_when="---")
+        assert os.path.exists(finish_log), (
+            "a pane watched a desktop thread finish and never asked the finish bell"
+        )
+        said = open(finish_log, encoding="utf-8").read()
+        lines = said.splitlines()
+        assert lines[0].startswith("argv: --state - --push-only"), said
+        handed = json.loads(lines[1])
+        assert handed.get("backend") == "desktop", handed
+        assert handed.get("turn_running") is False, handed
+        assert (handed.get("done"), handed.get("total")) == (2, 2), handed
+        assert handed.get("list_id") == module.list_fingerprint(
+            {"session": "F0", "todos": fin_done}), handed
+        # ...and the ask carries the record's path (`--note`), which is what keeps the WHY
+        # readable afterwards; the bell's own line is repeated on stdout and must reach the
+        # pane's own log, where "the list finished and the phone stayed quiet" is asked.
+        assert "--note" in lines[0] and lines[0].rstrip().endswith("finish.log"), lines[0]
+        with open(module.PANE_LOG_PATH, encoding="utf-8") as fh:
+            pane_log_new = fh.read()[len(pane_log_before):]
+        assert "finish bell asked" in pane_log_new, pane_log_new
+        assert handed["list_id"] in pane_log_new, pane_log_new
+        assert "no push: the bell was stubbed for this check" in pane_log_new, pane_log_new
+        pane_read(master, 3.0)
+        assert open(finish_log, encoding="utf-8").read().count("---") == 1, (
+            "the pane asked twice for one finish:\n" + open(finish_log).read()
+        )
+    finally:
+        pane_stop(master, fin_proc)
+    # ...and a pane opened AFTER the work was over asks nothing: it never watched the list
+    # being worked, which is the whole reason it may speak at all.
+    master, late_proc, _ = pty_pane(source=fin_source, extra_env=finish_env)
+    try:
+        pane_read(master, 3.0)
+        assert open(finish_log, encoding="utf-8").read().count("---") == 1, (
+            "a pane opened on a list that was already finished rang the phone anyway"
+        )
+    finally:
+        pane_stop(master, late_proc)
+    say("the finish push: a desktop thread's list is asked about exactly once when its turn "
+        "ends, the pane hands over the state it is drawing (not a session resolved from a "
+        "pid nobody is looking at), it never chimes, and a pane opened on work that was "
+        "already over stays silent: ok")
+
+    # ...and the machine that has no bell at all says THAT, once, rather than looking as if
+    # the finish had been announced: the ask's whole point is to explain a silence, so a
+    # missing kit must not produce one. (Spent once per list, like every other answer — a
+    # pane that said so every 0.2s would be a log nobody reads.)
+    write_finish("running", fin_now + 2_000, fin_steps, fin_now + 2_000, 3)
+    master, miss_proc, _ = pty_pane(
+        source=fin_source,
+        extra_env=dict(penv, FBTODO_NOTIFY=os.path.join(TEST_HOME, "no-such-bell.py")),
+    )
+    try:
+        pane_read(master, 2.0)
+        try:
+            with open(module.PANE_LOG_PATH, encoding="utf-8") as fh:
+                miss_before = fh.read()
+        except OSError:
+            miss_before = ""
+        write_finish("idle", 0, fin_done, fin_now + 3_000, 4)
+        pane_read(master, 5.0)
+        with open(module.PANE_LOG_PATH, encoding="utf-8") as fh:
+            missed = fh.read()[len(miss_before):]
+        assert "no finish bell installed" in missed, (
+            "a pane whose kit is missing said nothing about the finish it watched:\n" + missed
+        )
+        pane_read(master, 2.0)
+        with open(module.PANE_LOG_PATH, encoding="utf-8") as fh:
+            missed = fh.read()[len(miss_before):]
+        assert missed.count("no finish bell installed") == 1, (
+            "a missing kit was reported once per tick instead of once per list:\n" + missed
+        )
+    finally:
+        pane_stop(master, miss_proc)
+    say("the finish push with no bell installed: the pane says which file is missing, once, "
+        "so a machine with no kit is a different silence from a refusal: ok")
+
+    # ---- and the operator's after-the-fact half. The bell's record is where "the list
+    #      finished and the phone stayed quiet" is answered later, and no operator should
+    #      have to know the file exists: `status` prints the newest decision, its reason and
+    #      its age — and names what is missing when there is no kit or no record yet.
+    # Both halves of the kit's location are named: `FBTODO_NOTIFY` is the bell itself (so
+    # this check can hide it) and `FBTODO_NOTIFY_DIR` is where its record lives.
+    finish_dir = os.path.join(TEST_HOME, "finish-record")
+    os.makedirs(finish_dir, mode=0o700, exist_ok=True)
+    finish_bell = os.path.join(finish_dir, "todo-bell.py")
+    finish_env_status = dict(env, FBTODO_NOTIFY_DIR=finish_dir, FBTODO_NOTIFY=finish_bell)
+
+    def finish_row():
+        """The one `finish push` line `status` prints, from the throwaway kit."""
+        out = STRIP(subprocess.run(
+            [sys.executable, FB, "status"], capture_output=True, text=True, cwd=CWD,
+            env=finish_env_status, timeout=30,
+        ).stdout)
+        rows = [ln.strip() for ln in out.splitlines() if ln.strip().startswith("finish push")]
+        assert len(rows) == 1, "wanted exactly one finish push row:\n" + out
+        return rows[0]
+
+    assert "none installed" in finish_row(), "a kit-less machine must say so"
+    open(finish_bell, "w").close()
+    # The record the bell keeps: a send, and after it the REFUSAL that is the reason this
+    # row exists. The newest line is the answer, not the last one that happened to send.
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 7_200))
+    with open(os.path.join(finish_dir, "finish.log"), "w", encoding="utf-8") as fh:
+        fh.write(f"{when}  push  list aaaa  sent ntfy freebuff done · fixture\n")
+        fh.write(f"{when}  no push  list bbbb  already pushed for this list\n")
+    row = finish_row()
+    assert "no push" in row, row
+    assert "already pushed for this list" in row, row
+    assert "ago" in row, "the newest decision's age belongs in the row: " + row
+    assert "list aaaa" not in row, "the row read an older decision than the newest: " + row
+    with open(os.path.join(finish_dir, "finish.log"), "w", encoding="utf-8") as fh:
+        fh.write("a torn line with no stamp and no action\n")
+    assert "nothing recorded yet" in finish_row(), "an unreadable record must say so"
+    say("the finish record: `status` prints the bell's newest decision — a refusal, with its "
+        "reason and its age — and names what is missing when there is no kit or no record: ok")
 
     # ---- the same switch without a keystroke: `fbtodo mute`, for a script, a status row,
     #      or a shell that is not a pane at all. It must be the SAME switch — the same two
@@ -7359,6 +7932,43 @@ def _probe_live_for_target(x, y):
     say("the list rule: it asks for the update the moment a step lands: ok")
     say("the list rule: and for a re-written list before continuing from a nudge: ok")
     say("the list rule: and for the checks themselves to be steps of it: ok")
+
+    # ---- and the file is BUDGETED, because it is injected into every request of every
+    #      session: a document is not a cheaper mistake than a wrong rule, it is a permanent
+    #      tax on context. The failure it guards against is quiet — one more section, one
+    #      more paragraph — so the numbers live in the tool's constants, the file has to
+    #      STATE them for whoever edits it, and the check MEASURES them on the very file the
+    #      phrases above came from. Detail that will not fit belongs in a skill or an
+    #      on-demand reference, which is the rule the file already tells the agent to follow.
+    size = os.path.getsize(agents_md)
+    budget = module.AGENTS_MD_MAX_KB * 1024
+    assert size <= budget, (
+        f"{agents_md} is {size} B, over the {module.AGENTS_MD_MAX_KB} KB budget an injected "
+        "file is held to: move the detail into a skill or an on-demand reference"
+    )
+    headings = [ln for ln in agents_text.splitlines() if ln.startswith("## ")]
+    subheads = [ln for ln in agents_text.splitlines() if ln.startswith("### ")]
+    assert len(headings) <= module.AGENTS_MD_MAX_SECTIONS, (
+        f"{agents_md} has {len(headings)} `## ` sections, over the "
+        f"{module.AGENTS_MD_MAX_SECTIONS} it is budgeted for: "
+        + ", ".join(h[3:].strip() for h in headings)
+    )
+    assert len(subheads) <= module.AGENTS_MD_MAX_SUBSECTIONS, (
+        f"{agents_md} has {len(subheads)} `### ` subsections, over the "
+        f"{module.AGENTS_MD_MAX_SUBSECTIONS} it is budgeted for: "
+        + ", ".join(h[4:].strip() for h in subheads)
+    )
+    assert f"{module.AGENTS_MD_MAX_KB} KB" in agents_text, (
+        f"{agents_md} does not state the size budget the self-check enforces "
+        f"({module.AGENTS_MD_MAX_KB} KB), so an agent editing it cannot know the limit"
+    )
+    assert f"{module.AGENTS_MD_MAX_SECTIONS} sections" in agents_text, (
+        f"{agents_md} does not state the section budget the self-check enforces "
+        f"({module.AGENTS_MD_MAX_SECTIONS} sections)"
+    )
+    say(f"the injected file's budget: {size} B in {len(headings)} sections and "
+        f"{len(subheads)} subsections, inside {module.AGENTS_MD_MAX_KB} KB / "
+        f"{module.AGENTS_MD_MAX_SECTIONS} / {module.AGENTS_MD_MAX_SUBSECTIONS}: ok")
 
     # ...and the skill that CARRIES the rule has to be OFFERED for the task in the first
     # place: Freebuff shows the model each skill's name and DESCRIPTION — nothing else —
@@ -9368,8 +9978,16 @@ def _probe_live_for_target(x, y):
             os.environ["TERM"] = "xterm-256color"
             os.environ["COLORTERM"] = "truecolor"
             os.environ.pop("NO_COLOR", None)
+            # The source is PINNED, and that is not decoration: with no `-s` the pane
+            # resolves `auto`, which answers for the operator's live desktop thread — so
+            # both paints below were the operator's OWN list, the short frame was as tall
+            # as the full one, and the check failed on a machine that was merely busy
+            # rather than on the code (measured 2026-10-06). A `file:` source reads exactly
+            # the state this function just wrote, so the frame under test is the fixture by
+            # construction, whoever is running the suite.
             os.execv(sys.executable, [sys.executable, PANES, "pane", "--watch-pid",
-                                      str(victim.pid), "--no-daemon", "-i", "0.2"])
+                                      str(victim.pid), "--no-daemon", "-i", "0.2",
+                                      "-s", "file:" + draw_state_file])
         os.set_blocking(fd, False)
         # Wait for the frame and ONE diffed row rather than for a fixed second. The split
         # below cuts the first frame at its first row-addressed write; a fixed sleep assumed
@@ -9387,7 +10005,14 @@ def _probe_live_for_target(x, y):
                 break
             time.sleep(0.05)
         kill_tree(victim)
-        data, deadline = early, time.time() + 8
+        # Read until the pane has gone QUIET rather than until it EXITS. A pane whose instance
+        # has died holds its last frame on screen — the pane-lifetime rule this suite pins
+        # elsewhere — so `waitpid` never fired and this waited out its whole 8 s cap, once per
+        # paint, twice below. What the read is here for is the FIRST frame, and the loop above
+        # already ended on the row-addressed write that begins everything after it, so a third
+        # of a second with nothing new is the pane having painted for the last time. (The exit
+        # is still reaped when it happens, just not waited for.)
+        data, deadline, quiet_from = early, time.time() + 8, None
         while time.time() < deadline:
             try:
                 chunk = os.read(fd, 65536)
@@ -9395,10 +10020,17 @@ def _probe_live_for_target(x, y):
                 chunk = b""
             if chunk:
                 data += chunk
+                quiet_from = None
                 continue
-            if os.waitpid(pid, os.WNOHANG)[0]:  # it has painted for the last time
+            if quiet_from is None:
+                quiet_from = time.time()
+            elif time.time() - quiet_from >= 0.3:
                 break
             time.sleep(0.05)
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            pass
         try:
             os.close(fd)
         except OSError:
@@ -10188,8 +10820,12 @@ def _probe_live_for_target(x, y):
     assert json.loads(pr.stdout)["total"] == 2, pr.stdout
     assert run("bar", "-s", f"file:{fpath}").stdout.strip() == "todos 2/2"
     assert json.loads(run("json", "-s", f"file:{fpath}").stdout)["session"] == "FILE1"
-    # --to did not touch the live state: the machine still reports the state it had
-    assert run("bar").stdout.strip() == "todos 1/1", run("bar").stdout
+    # --to did not touch the live state: the machine still reports the state it had. BOTH
+    #      roots are named for the reason spelled out above — a bare `bar` answers from whatever
+    #      live session this machine happens to have, and on 2026-10-05 that was the agent's own
+    #      running list (`todos 5/5`), so the check read a list nothing in this block had pushed.
+    assert run("bar", "--cli-root", cli_root, "--db", no_desk).stdout.strip() == "todos 1/1", \
+        run("bar", "--cli-root", cli_root, "--db", no_desk).stdout
     # a directory is that home's state file, and a recorded list number is left alone
     homedir = os.path.join(TEST_HOME, "file-home")
     os.makedirs(homedir, mode=0o700, exist_ok=True)
@@ -11719,8 +12355,15 @@ def _probe_live_for_target(x, y):
         # close it.
         with open(release, "w"):
             pass
+        # The window is the keeper's own clock, not the flat 20 s this sat on. The keeper is
+        # the one process that may take a pane away, and this phase runs it at
+        # `FBTODO_PANE_SECONDS=1` (set on the server at the top of this block), so five seconds
+        # is five whole passes of the thing that would do it — plus the pane's own poll beside
+        # it. Twenty was pure dead time in every run, and the rules about what DOES close a
+        # pane are pinned where they belong (`a stale list closes the pane`, `an auto pane
+        # closes on the window`), not by how long this happened to wait.
         gone = None
-        deadline = time.time() + 20
+        deadline = time.time() + 5
         while time.time() < deadline:
             cmds = pane_cmds()
             if not any(is_todo_pane(c) for c in cmds):
@@ -11733,6 +12376,97 @@ def _probe_live_for_target(x, y):
 
 
 
+
+    # ---- dead time is REPORTED, not assumed. AGENTS.md's never-idle rule — no `sleep` merely
+    #      to wait, no poll loop with no useful work between the polls — is asked of the
+    #      transcript, of every call the session made in order, so it holds whether or not the
+    #      session says it was busy. It is asked of EVERY call and not of the pane's own action
+    #      list, and the second scene below is why: `read_files` is deliberately left out of
+    #      `ACTION_TOOLS` (reading is not progress), so a poll loop with reads between the
+    #      polls is invisible to the action list — and that session was working.
+    # One node, not three: `--only` cuts a phase by replacing a SINGLE statement, so the
+    # scenes, the fixture journals they are written to and the rule's own edges all live
+    # inside this once-around loop. Its body opens with a plain sentence on purpose — that
+    # is the line `--list` prints for a phase (see `selector_phases`), and an f-string is not
+    # a constant to that reader.
+    #@phase idle-dead-time
+    for dt_scenes in ((
+        # A session doing the work: nothing here is dead time. The `sleep 2 &&` is a command
+        # that happens to wait, and the two polls are separated by an edit, so they are two
+        # polls and not a loop.
+        ("busy-session", [
+            ("write_todos", {"todos": [{"task": "fix the poller", "completed": False}]}),
+            ("run_terminal_command", {"command": "pytest -q"}),
+            ("read_files", {"paths": ["src/poller.py"]}),
+            ("str_replace", {"path": "src/poller.py"}),
+            ("run_terminal_command", {"command": "curl -s localhost:9119/health"}),
+            ("str_replace", {"path": "src/poller.py"}),
+            ("run_terminal_command", {"command": "curl -s localhost:9119/health"}),
+            ("run_terminal_command", {"command": "sleep 2 && curl -s localhost:9119/health"}),
+            ("run_terminal_command", {"command": "pytest -q"}),
+        ], []),
+        # The load-bearing negative: the same command three times, which IS a loop's shape —
+        # but a real call sits between each pair, so the session was reading, not waiting.
+        ("poll-loop-broken-by-reads", [
+            ("run_terminal_command", {"command": "pgrep -f hermes"}),
+            ("read_files", {"paths": ["src/a.py"]}),
+            ("run_terminal_command", {"command": "pgrep -f hermes"}),
+            ("read_files", {"paths": ["src/b.py"]}),
+            ("run_terminal_command", {"command": "pgrep -f hermes"}),
+        ], []),
+        # Both violations, in the order they happened: a bare `sleep 30` with nothing else
+        # called, then one command three times over with nothing between the polls.
+        ("idle-session", [
+            ("run_terminal_command", {"command": "sleep 30"}),
+            ("run_terminal_command", {"command": "curl -s localhost:1933/health"}),
+            ("run_terminal_command", {"command": "curl -s localhost:1933/health"}),
+            ("run_terminal_command", {"command": "curl -s localhost:1933/health"}),
+        ], ["bare-sleep", "poll-loop"]),
+    ),):
+        say("dead time is reported, not assumed: a bare `sleep` and a poll loop with nothing "
+            "called between the polls are violations, and a session doing the work is not: ok")
+        for dt_name, dt_rows, dt_want in dt_scenes:
+            dt_dir = os.path.join(TEST_HOME, "deadtime", dt_name)
+            os.makedirs(dt_dir, exist_ok=True)
+            with open(os.path.join(dt_dir, "log.jsonl"), "w", encoding="utf-8") as fh:
+                for dt_i, (dt_tool, dt_input) in enumerate(dt_rows):
+                    fh.write(json.dumps({
+                        "level": "DEBUG",
+                        "timestamp": f"2026-01-01T00:00:{dt_i:02d}.000Z",
+                        "pid": 1,
+                        "data": {"iteration": dt_i + 1,
+                                 "toolCalls": [{"toolName": dt_tool, "input": dt_input}]},
+                    }) + "\n")
+            dt_got = module.journal_dead_time(dt_dir)
+            assert [v["kind"] for v in dt_got] == dt_want, (dt_name, dt_got)
+            if dt_want:
+                say(f"a session that leaves dead time is reported: {dt_name} — "
+                    + "; ".join(module.dead_time_report(dt_got)))
+            else:
+                say(f"a session doing the work is not reported as dead time: {dt_name}")
+
+        # ...and the rule's own edges, asked of the function rather than of a journal,
+        # because they are properties of it and not of a fixture.
+        dt_calls = module.journal_calls(os.path.join(TEST_HOME, "deadtime", "idle-session"))
+        assert [c[2] for c in dt_calls] == ["run_terminal_command"] * 4, dt_calls
+        assert [c[1] for c in dt_calls] == sorted(c[1] for c in dt_calls), dt_calls
+        dt_worst = module.idle_dead_time(dt_calls)
+        assert module.idle_dead_time(list(reversed(dt_calls))) == dt_worst, (
+            "the answer depends on the order the calls are handed over in"
+        )
+        assert module.idle_dead_time(dt_calls, min_sleep_s=60) == [
+            v for v in dt_worst if v["kind"] != "bare-sleep"], (
+            "min_sleep_s did not drop the bare sleep below the cutoff"
+        )
+        dt_lines = module.dead_time_report(dt_worst)
+        assert len(dt_lines) == 2 and "sleep 30" in dt_lines[0] and "3x" in dt_lines[1], \
+            dt_lines
+        dt_loop = dt_worst[1]
+        assert (dt_loop["count"], dt_loop["span_s"]) == (3, 2.0), dt_loop
+        assert dt_loop["what"] == "curl -s localhost:1933/health", dt_loop
+        assert dt_worst[0]["seconds"] == 30.0 and dt_worst[0]["key"] < dt_loop["key"], dt_worst
+        say("dead time: order-independent, the sleep cutoff is a knob, and the report names "
+            "what was found: ok")
 
     print(f"\n{len(ok)} checks passed")
 finally:

@@ -50,15 +50,24 @@ STARTED_AT = time.time()
 
 # How long to wait after a source write before believing it. An editor caught halfway through
 # a save would otherwise exec a pane into a half-written file, and the pane is the one place
-# that must not die: the person editing is the person looking at it.
-SOURCE_SETTLE_S = 2.0
+# that must not die: the person editing is the person looking at it. `FBTODO_SOURCE_SETTLE`
+# moves it, read here at import the way `FBTODO_PANE_SECONDS` is — a CADENCE rather than a
+# location, so it does not belong in `PINNED_ENV_KEYS` beside the paths. Lowering it is a real
+# trade (a save still landing can be exec'd into), which is why the default is what protects an
+# editor and the one caller that turns it down is the self-check: it swaps in a COPY of the
+# build, writes complete files into it, and cannot spend an editor's settle window on each of
+# the seven reloads it drives.
+SOURCE_SETTLE_S = float(os.environ.get("FBTODO_SOURCE_SETTLE") or 2.0)
 
 
-# How often a long-running process asks whether it is still the build on disk. Both askers —
-# the pane and the watcher — re-exec themselves when the answer is no, and one listing a
-# second is nothing beside the poll either of them already does. The answer only changes when
-# somebody writes a file.
-BUILD_CHECK_S = 1.0
+# How often a long-running process asks whether it is still the build on disk. All three askers
+# — the pane, the watcher and the keeper — re-exec themselves when the answer is no, and one
+# listing a second is nothing beside the poll any of them already does. The answer only changes
+# when somebody writes a file. `FBTODO_BUILD_CHECK` is the same knob one step out: the interval
+# a reload is written to reacts within, and the number the self-check's own hold windows are
+# derived from (`hold_window`), so a suite that turns it down is not guessing at how long a
+# child takes to answer.
+BUILD_CHECK_S = float(os.environ.get("FBTODO_BUILD_CHECK") or 1.0)
 
 
 HOME = os.path.expanduser("~")
@@ -77,8 +86,6 @@ STATE_DIR = os.path.join(
 )
 
 
-# What the move carries. Listed as names rather than taken from the paths below, because the
-# root has to be chosen before those are built.
 # What the move carries. Listed as names rather than taken from the paths below, because the
 # root has to be chosen before those are built. The `nas` names are listed although nothing
 # writes them any more: they are what an install that had the remote source leaves in the old
@@ -1048,12 +1055,11 @@ def pinned_path() -> str:
 # environment (and `respawn-pane` re-runs the recorded command under that same one), not
 # from the environment of the process that asked for the pane — so each of these is
 # whatever the server was started with, which may be a shell from before this one, or a
-# login shell's own profile. Every key here decides WHERE a pane works or WHICH project it
-# follows: the state root is the pair `_state_root` reads (FBTODO_HOME first, XDG_STATE_HOME
-# second), FBTODO_TMUX names the tmux server a pane drives, and FBTODO_FB_MARKER names the
-# session marker it counts live sessions by. Losing one moves the pane — and the watcher it
-# starts — to another store, another server or another set of sessions, with nothing on
-# screen to say so. The six notify-watch paths are the same argument one step out: they
+# login shell's own profile. Every key here decides WHERE a pane works or WHICH server it
+# drives: the state root is the pair `_state_root` reads (FBTODO_HOME first, XDG_STATE_HOME
+# second), and FBTODO_TMUX names the tmux server a pane drives. Losing one moves the pane —
+# and the watcher it starts — to another store or another server, with nothing on screen to
+# say so. The six notify-watch paths are the same argument one step out: they
 # decide WHERE the pane's bells GO, so a machine that points its watches at its own scripts
 # (the shipped notify kit, a stub in a test) must have the pane's watcher use the same ones
 # — otherwise every bell falls back to `~/.config/freebuff-notify/`, which on that machine
@@ -1061,7 +1067,7 @@ def pinned_path() -> str:
 # rings is not a path that moves where it goes, and the script it rings is the half that
 # could be lost without a word.)
 PINNED_ENV_KEYS = (
-    "FBTODO_HOME", "XDG_STATE_HOME", "FBTODO_TMUX", "FBTODO_FB_MARKER",
+    "FBTODO_HOME", "XDG_STATE_HOME", "FBTODO_TMUX",
     "FBTODO_NOTIFY", "FBTODO_DROP", "FBTODO_ASK", "FBTODO_PAUSE",
     "FBTODO_PANE_BELL", "FBTODO_LOCKS_BELL",
 )
@@ -1072,7 +1078,7 @@ def pinned_env() -> list[str]:
 
     In plain words: the pane command already names the interpreter and carries the PATH
     (`pinned_path`); this is the other half — the values the program reads from its OWN
-    environment to choose a state root, a tmux server, the sessions it follows, and the six
+    environment to choose a state root, a tmux server, and the six
     scripts its bells are sent to. They ride in the same command line, so a `respawn-pane`,
     the keeper's repair, or a login shell that sources its own profile brings the opener's
     answer back instead of the server's. Values
@@ -1229,7 +1235,7 @@ TODO_NOTIFY = os.path.expanduser(
 
 
 # The drop watch: asked when a session STOPS instead of ending. A session can die with the
-# terminal under it — the marker's pid is gone while the marker is still there — and that
+# terminal under it — the process is gone while its journal is still there — and that
 # is a different question from "did the task finish", so it has its own script (and its own
 # run-once-per-death record). Optional, like the notifier above.
 DROP_NOTIFY = os.path.expanduser(
@@ -1295,6 +1301,15 @@ NOTIFY_DIR = os.path.expanduser(
     os.environ.get("FBTODO_NOTIFY_DIR") or os.path.join(HOME, ".config", "freebuff-notify")
 )
 
+# The finish bell's own record of what it decided about the lists a PANE watched — the file
+# an operator reads when a list finished and the phone stayed quiet (the reason is the
+# interesting half: "already pushed for this list", "the turn is still running", or a `push`
+# line showing the two are not the same event). The bell writes it only when asked with
+# `--note` — the session timer asks every 5s and would fill it — so this path is what the
+# pane hands over and what `fbtodo status` reads back. It lives beside the kit's switches and
+# logs, and `FBTODO_NOTIFY_DIR` moves it with them.
+FINISH_LOG = os.path.join(NOTIFY_DIR, "finish.log")
+
 
 # tmux overridable so tests drive a private server instead of the owner's.
 TMUX_BIN = shlex.split(os.environ.get("FBTODO_TMUX") or "tmux")
@@ -1327,9 +1342,9 @@ DEFAULT_WORKSPACE_STATE = os.path.join(HOME, ".config/freebuff-desktop/state.jso
 DEFAULT_CLI_ROOT = os.path.join(HOME, ".config/manicode/projects")
 
 
-# The two facts about the CLI patches themselves, shown in the pane so neither has to be
-# fetched with an ssh probe: the last outcome of the patch step, and the last alert that
-# was pushed. Each is read from the log the producing step already writes, so the pane
+# The two facts about the CLI patches themselves, shown in the pane rather than probed for:
+# the last outcome of the patch step, and the last alert that was pushed. Each is read from
+# the log the producing step already writes, so the pane
 # keeps no state of its own and there is nothing to fall out of sync.
 #
 #   local   ~/.config/freebuff-patch-watch/watch.log   the launchd watcher's own log
@@ -1424,6 +1439,18 @@ GOAL_MAX_CHARS = 38
 # The one-line "what happened" the phone message carries under the heading. Long enough
 # for a sentence about the fix, short enough to read on a lock screen.
 SUMMARY_MAX_CHARS = 200
+
+
+# `~/AGENTS.md` is injected into EVERY system prompt, so its words are paid on every request
+# of every session — and the way such a file fails is GROWTH: one more section, one more
+# paragraph, until the rule a model is supposed to follow is buried in a document. So the
+# file is BUDGETED, and the self-check measures the file it resolves (the operator's, else
+# the `docs/AGENTS.md` this repository ships) against these numbers, which the file itself
+# has to state. Detail belongs in a skill or an on-demand reference; a budget is how that
+# preference gets a number instead of a good intention.
+AGENTS_MD_MAX_KB = 12           # generous for what it says today (~10 KB), not for a document
+AGENTS_MD_MAX_SECTIONS = 14     # top-level `## ` headings: it is a checklist, not an outline
+AGENTS_MD_MAX_SUBSECTIONS = 8   # `### ` headings: nesting is where a checklist becomes prose
 
 
 # Which records could carry prose, found WITHOUT json-parsing them: most iterations write
@@ -2347,7 +2374,7 @@ __all__ = [
     "LOCK_PATH", "LOG_PATH",
     "pid_alive", "pid_running",
     "PANE_KEEPER_PATH", "PANE_LOG_PATH", "PANE_NOTE_PATH", "PANE_SUBJECT_DIR",
-    "PINS_PATH", "LAST_PATH", "MUTE_PATH", "NOTIFY_DIR",
+    "PINS_PATH", "LAST_PATH", "MUTE_PATH", "NOTIFY_DIR", "FINISH_LOG",
     "TODO_NOTIFY", "DROP_NOTIFY", "ASK_NOTIFY", "PAUSE_NOTIFY", "PANE_NOTIFY",
     "LOCKS_NOTIFY",
     "TMUX_BIN", "TMUX_SUBCOMMANDS", "DEFAULT_DB_GLOB", "DEFAULT_WORKSPACE_STATE",
@@ -2357,7 +2384,9 @@ __all__ = [
     "FB_PROC", "FB_NAME", "PROC_ROOT", "_FREEBUFF_WHICH",
     "CHUNK", "MAX_SCAN", "PROMPT_MIN_CHARS", "NUDGE_WORDS", "NUDGE_MAX_CHARS",
     "GOAL_CHASE_CHUNKS", "TASK_MAX_LINES", "GOAL_LINE_RE", "GOAL_MAX_CHARS",
-    "SUMMARY_MAX_CHARS", "PROSE_NEEDLE_RE", "MODEL_RE", "HEARTBEAT_GRACE", "HB_REFRESH",
+    "SUMMARY_MAX_CHARS", "AGENTS_MD_MAX_KB", "AGENTS_MD_MAX_SECTIONS",
+    "AGENTS_MD_MAX_SUBSECTIONS",
+    "PROSE_NEEDLE_RE", "MODEL_RE", "HEARTBEAT_GRACE", "HB_REFRESH",
     "STATE_CLOCK_KEYS", "MAX_TASK_RECORDS", "MAX_TASK_AGE_DAYS", "LOG_CAP_BYTES",
     "PRUNE_INTERVAL_S", "TEMP_MAX_AGE_S", "HISTORY_MAX_AGE_DAYS", "HISTORY_MAX_ENTRIES",
     "SHAPE_MIN_SAMPLES", "SHAPE_MIN_BUCKET", "SPREAD_MIN_SAMPLES", "SPREAD_MIN_RATIO",

@@ -2,7 +2,9 @@
 
     fbtodo              live pane (default); auto-starts the watcher, exits with freebuff.
                         m quiet until this list finishes · M quiet until you say · u loud
-                        again (the phone/ntfy switch; --no-keys to ignore the keyboard)
+                        again (the phone/ntfy switch; --no-keys to ignore the keyboard);
+                        n the push alone, or click the button on the status row
+                        (--no-mouse, FBTODO_PANE_MOUSE=off, keeps the mouse for selecting)
     fbtodo snap         one snapshot, plain text
     fbtodo json         one snapshot, clean JSON
     fbtodo bar          "todos 3/5" — for a tmux status bar
@@ -293,9 +295,9 @@ def finish_probe(state: dict) -> dict:
 
 
 # ==================================================================== push
-# In plain words: the generic source. A journal, a database and an ssh session are the three
-# ways THIS machine finds a list; anything else — another agent, a script, a CI job, a hand
-# written file — can say what the list is in one JSON object. `fbtodo push` takes one on
+# In plain words: the generic source. A journal and a database are the two ways THIS machine
+# finds a list; anything else — another agent, a script, a CI job, a hand written file — can
+# say what the list is in one JSON object. `fbtodo push` takes one on
 # stdin and makes it the live state, and `-s file:PATH` reads the same shape back. Neither
 # knows what a Freebuff is.
 PUSH_FIELDS = (
@@ -2133,6 +2135,21 @@ def cmd_status(args) -> int:
                 print("  agent             : turn ended — waiting for you")
         else:
             print("  agent             : working (the list is not the finish line)")
+    # The FINISH push, in the same spirit — and the one notify row that is not a cadence:
+    # the finish bell is asked by the pane that watched a list finish (and, for a CLI
+    # session, by the shell wrapper's timer every 5s), so what belongs in a status line is
+    # the last thing it decided. That row is where "the list finished and my phone stayed
+    # quiet" is answered: a decision that sent nothing never reaches phone.log, and the bell
+    # writes its own record only when the asker asks for it (the pane does).
+    if not os.path.exists(TODO_NOTIFY):
+        print("  finish push       : none installed (~/.config/freebuff-notify/todo-bell.py)")
+    else:
+        last = last_finish()
+        if last:
+            age = short_duration((last.get("age_s") or 0) * 1000)
+            print(f"  finish push       : {last['text']}  — {f'{age} ago' if age else 'just now'}")
+        else:
+            print(f"  finish push       : nothing recorded yet ({FINISH_LOG})")
     # The ask watch, said out loud like the other notifiers: a question on screen stops
     # the agent until it is answered, so "is one up right now" belongs in a status line.
     if not os.path.exists(PAUSE_NOTIFY):
@@ -2760,15 +2777,35 @@ def cmd_pane(args) -> int:
     stale_after_s = max(0.0, args.stale_after) * 60.0
     last_act = None
     last_activity = time.time()
+    # The finish push's memory (`finish_notify`): which list this pane last saw with work
+    # still in it, and which ones it has already asked the finish bell about. The bell owns
+    # the decision and the one-push-per-list record; this pair is only what keeps a pane from
+    # asking about a finish nobody watched — a pane opened on work that was already over has
+    # nothing recorded here, and says nothing.
+    watched_open = None
+    finish_asked = set()
     # The pane's own switch over the phone. Nothing else reads this terminal — it IS the
     # pane's tmux pane — so taking it for single keystrokes costs nobody else anything, and
     # `PaneKeys` hands the attributes back on every way out of this function (see `restore`
     # and the `finally`). Off for a pane that is not a pane (`--once`) and for a pane whose
     # owner said so (`--no-keys`, or FBTODO_PANE_KEYS=off, the flag winning).
-    keys = PaneKeys(enabled=not (args.once or getattr(args, "no_keys", False)
-                                 or str(os.environ.get("FBTODO_PANE_KEYS", "")).strip().casefold()
-                                 in ("off", "0", "no", "false", "disable", "disabled")))
+    keys_on = not (args.once or getattr(args, "no_keys", False)
+                   or str(os.environ.get("FBTODO_PANE_KEYS", "")).strip().casefold()
+                   in ("off", "0", "no", "false", "disable", "disabled"))
+    # ...and the MOUSE, which is the other half of the same control: the frame's button is
+    # clicked, and a pane that cannot be clicked still names its key. Its own switch, because
+    # taking the mouse changes what the terminal does with it — a click is a selection no more
+    # — so a reader who wants their mouse back can have it and keep the keys (`--no-mouse`,
+    # FBTODO_PANE_MOUSE=off). Taken only when there is a terminal to give it back to: a pane
+    # whose stdin is not a TTY would otherwise capture the mouse and never read a click, which
+    # is the one combination nothing on this machine could recover from.
+    mouse_wanted = keys_on and not (
+        getattr(args, "no_mouse", False)
+        or str(os.environ.get("FBTODO_PANE_MOUSE", "")).strip().casefold()
+        in ("off", "0", "no", "false", "disable", "disabled"))
+    keys = PaneKeys(enabled=keys_on)
     keys.open()
+    mouse = mouse_wanted and keys.fd is not None
     # ...and the note a keypress leaves on the chip: the switch itself is said for as long
     # as it is true (`mute_chip`), so this is the transient half — the words of what the key
     # did, and the only word there is when a key was pressed and NOTHING happened (a switch
@@ -2811,10 +2848,24 @@ def cmd_pane(args) -> int:
     poll_note = None
     pane_lock_note = ""
 
-    def restore(*_a):
+    def restore_terminal() -> None:
+        """The cursor and the mouse back: on every way out of this loop, signals included.
+
+        The cursor is shown on STDERR rather than stdout, the way this pane has always done it:
+        a pane can be ending because its stdout is the thing that went away, and what has to be
+        left as it was found is the TERMINAL. The mouse is given back in the same breath and for
+        the sharper version of the same reason: a terminal left in mouse-reporting mode cannot
+        select text in any window until something restarts it, so this write is the pane's way
+        of not being the program that did that.
+        """
         if hide:
             sys.stderr.write("\x1b[?25h")
-            sys.stderr.flush()
+        if mouse:
+            sys.stderr.write(MOUSE_OFF)
+        sys.stderr.flush()
+
+    def restore(*_a):
+        restore_terminal()
         keys.close()
         raise SystemExit(130)
 
@@ -2832,12 +2883,23 @@ def cmd_pane(args) -> int:
         last_frame = frame
         if not out:
             return
-        sys.stdout.write(out)
+        # ...and the two things this pane claims about the TERMINAL rather than about the list
+        # ride out with every frame: the cursor stays hidden and the mouse stays reported.
+        # Asked for once at startup, both are lost to anything that resets the terminal under a
+        # RUNNING pane — a desktop window reloaded (a fresh emulator, with no mouse mode and a
+        # cursor back), a soft reset, a pane re-attached by hand — and a pane whose mouse mode
+        # was reset underneath it is a pane whose button is dead until someone restarts it,
+        # which is the one failure a reader cannot see the cause of. Sixteen bytes a frame asks
+        # again; asking twice is what this sequence already is on a terminal that heard it.
+        marks = (("\x1b[?25l" if hide else "") + (MOUSE_ON if mouse else ""))
+        sys.stdout.write(marks + out)
         sys.stdout.flush()
 
     try:
         if not args.once:
             sys.stdout.write("\x1b[?25l")
+            if mouse:
+                sys.stdout.write(MOUSE_ON)
             sys.stdout.flush()
             hide = True
         while True:
@@ -2868,10 +2930,13 @@ def cmd_pane(args) -> int:
                                 else f"pane holding, the new build does not load: {unfit}",
                             )
                     else:
-                        # The cursor back on first: the exec replaces this process, so a build
-                        # that fails to import should leave a readable pane behind it rather
-                        # than an invisible one.
+                        # The cursor back on first — and the mouse handed back with it: the exec
+                        # replaces this process, so a build that fails to import should leave a
+                        # readable pane behind it rather than an invisible one holding a mouse
+                        # that nothing is listening to.
                         sys.stdout.write("\x1b[?25h")
+                        if mouse:
+                            sys.stdout.write(MOUSE_OFF)
                         sys.stdout.flush()
                         sys.stderr.flush()
                         pane_log(f"pane reloading: {changed} changed after this process started")
@@ -2978,9 +3043,22 @@ def cmd_pane(args) -> int:
                 pressed = keys.poll()
                 if not pressed:
                     break
-                key_chip, key_said = apply_pane_key(pressed, state or {})
+                if isinstance(pressed, MouseClick):
+                    # The pane's mouse answers ONE thing, and only inside the button's own cells:
+                    # anywhere else a click is nothing at all, because this is a window on a list
+                    # and not an editor — everything else the mouse could do here is something
+                    # the terminal itself already does better.
+                    span = ntfy_button_span(last_frame)
+                    if not (span and span[0] == pressed.y
+                            and span[1] <= pressed.x <= span[2]):
+                        continue
+                    key_chip, key_said = toggle_push(state or {})
+                    where = f"button click at {pressed.x},{pressed.y}"
+                else:
+                    key_chip, key_said = apply_pane_key(pressed, state or {})
+                    where = f"key '{pressed}'"
                 if key_said:
-                    pane_log(f"pane key '{pressed}': {key_said}")
+                    pane_log(f"pane {where}: {key_said}")
                     # The standing chip is the better answer whenever it HAS one: a mute
                     # names itself and its undo key on every frame from here, and a chip
                     # that is clipped to make room for a note about itself says less. The
@@ -2996,8 +3074,49 @@ def cmd_pane(args) -> int:
                 pane_log(f"pane: {lifted}")
                 key_note, key_note_until = lifted, now + RELOAD_NOTE_S
                 last_sig = None
+            # ...and the phone's other half, which no other process here can see: a finish
+            # that happens in THIS pane's list. The session timer's bell follows a shell's
+            # CLI session (`todo-bell.py <pid>`), and the desktop app's turns have no such
+            # session at all — its own process runs them, and the only thing watching the
+            # thread is the pane drawing it. So when this list finishes for good (every step
+            # ticked AND the turn ended — `list_is_finished` and `list_has_ended`, the same
+            # two halves the bell decides with) the bell is asked, once, and told which state
+            # to decide about (`--state -`): the list on screen, not one re-resolved from a
+            # pid nobody is looking at. Only a finish this pane WATCHED can ring, which is
+            # why the list is remembered while it still has work in it: a pane opened on a
+            # thread that was already over has nothing remembered and stays silent, and a
+            # pane reloaded mid-turn remembers it again on its first poll.
+            finish_key = (state.get("session"), state.get("list_id"))
+            if finish_key[1] and not state.get("error"):
+                if not list_is_finished(state) or not list_has_ended(state):
+                    watched_open = finish_key
+                elif finish_key == watched_open and finish_key not in finish_asked:
+                    # Asked once per list whatever the answer: a bell that decides "no"
+                    # (already pushed, nothing configured) is not going to decide "yes" on
+                    # the next tick, and a pane asking every three seconds is a process a
+                    # second for nothing. Nothing to ask at all (no kit installed) is spent
+                    # the same way, once: a missing kit is a fact about the machine, not
+                    # about the tick.
+                    # One line per watched finish, saying what happened to it — the bell's own
+                    # account of the decision when there was one ("no push: already pushed for
+                    # this list"), or why there was nobody to ask. That line is the answer to
+                    # "the list finished and the phone stayed quiet", and the bell keeps the
+                    # same account in the kit's record (`FINISH_LOG`), which `fbtodo status`
+                    # reads back for an operator who comes to the question later. Written once
+                    # per list either way: a pane that could not ask must not say so every
+                    # 0.2s, and a missing kit is a fact about the machine, not about the tick.
+                    sent, said = finish_notify(state)
+                    finish_asked.add(finish_key)
+                    pane_log(f"pane: finish bell asked ({state.get('list_id')})"
+                             + (f", exited {sent}" if sent
+                                else (f": {said}" if said else "")))
             # What the chip says about the notifications right now, whatever put them there.
             quiet_chip = mute_chip()
+            # ...and the BUTTON's own fact, which is a different switch from the one above: the
+            # push alone (`toggle_push`). Read here and HANDED to the renderer rather than read
+            # by it, because a frame is a function of its arguments — a golden file has no notify
+            # kit behind it, and a frame that changed with somebody's phone would be no contract.
+            push_on = not push_is_off()
             # the notes, while they last: the frame's own title chip says which build this
             # pane is now, or what the keeper saw of it and did about it — reopened it, or
             # kept it because repair is off — then goes back to the pane's name (see
@@ -3026,6 +3145,7 @@ def cmd_pane(args) -> int:
                     height=_shutil.get_terminal_size(fallback=(80, 24)).lines,
                     reloaded=note,
                     mute_note=quiet_chip,
+                    ntfy=push_on,
                 )
             except Exception as exc:
                 # ...and the drawing half of the same tick, for the same reason: a frame the
@@ -3060,6 +3180,10 @@ def cmd_pane(args) -> int:
                 # list, so without this the frame would sit there unchanged and the reader
                 # would not learn that the phone just went quiet.
                 quiet_chip,
+                # ...and the button's own state, which is neither note nor chip: a click on it
+                # changes no row of the list either, and the word on it has to follow the switch
+                # on the same tick or the button would answer with the state it just left.
+                push_on,
             )
             if sig != last_sig or now - last_draw >= (
                 1.0 if has_running_clock(state, int(now * 1000)) else tick
@@ -3093,9 +3217,7 @@ def cmd_pane(args) -> int:
         restore()
         return 0
     finally:
-        if hide:
-            sys.stderr.write("\x1b[?25h")
-            sys.stderr.flush()
+        restore_terminal()
         keys.close()
         # A pane that exits holding a mute leaves a phone that never rings again, and the
         # only key that fixes it is on the pane that just closed — so the exit gives the
@@ -3157,7 +3279,8 @@ def cmd_mute(args) -> int:
         if not state["muted"]:
             return emit(state, "  notifications : on")
         scope = state["scope"] or "off (set outside this pane)"
-        who = {"key": "a pane key", "command": "`fbtodo mute`"}.get(state["by"], "someone")
+        who = {"key": "a pane key", "command": "`fbtodo mute`",
+               "button": "the pane's ntfy button"}.get(state["by"], "someone")
         detail = []
         for sw in state["switches"]:
             if sw["off"]:
@@ -3181,7 +3304,7 @@ def cmd_mute(args) -> int:
 
     # ...`on` and `until-done`: the switch itself. `until-done` is the one that has to know
     # which list it is promising about, so it reads the state the pane would be showing —
-    # and only it does, because an ssh round trip is not the price of turning a bell off.
+    # and only it does, because a full list read is not the price of turning a bell off.
     state = {}
     if verb == "until-done":
         cwd = os.path.realpath(os.getcwd())
@@ -3625,7 +3748,13 @@ def build_parser():
     ap.add_argument(
         "--no-keys",
         action="store_true",
-        help="pane: ignore the keyboard, so m/M/u do nothing (FBTODO_PANE_KEYS=off)",
+        help="pane: ignore the keyboard, so m/M/u/n do nothing (FBTODO_PANE_KEYS=off)",
+    )
+    ap.add_argument(
+        "--no-mouse",
+        action="store_true",
+        help="pane: leave the mouse alone, so the ntfy button is worked by its key (n) alone "
+             "(FBTODO_PANE_MOUSE=off)",
     )
     ap.add_argument("--tick", type=float, default=5.0,
                     help="pane: repaint at least this often while nothing moves "

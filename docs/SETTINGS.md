@@ -6,10 +6,10 @@ Precedence is the usual one: a command-line flag, then the environment, then a f
 |---|---|---|
 | `FBTODO_HOME` | — | one directory for state, locks and logs, overriding the XDG default below |
 | `XDG_STATE_HOME` | `~/.local/state` | state lives in `$XDG_STATE_HOME/fbtodo`; a legacy `~/.freebuff` is moved there once, when no watcher holds it |
-| `FBTODO_FB_MARKER` | `$HOME/.fb-session` | the session marker the watcher reads to find live sessions (the `--fb-marker` default) |
 | `FBTODO_NOTIFY` / `_DROP` / `_ASK` / `_PAUSE` / `_PANE_BELL` | `~/.config/freebuff-notify/*.py` | the five watches |
 | `FBTODO_ASK_SECONDS` / `_PAUSE_SECONDS` / `_PANE_BELL_SECONDS` | 3 / 30 / 60 | their cadences (0 = never) |
 | `FBTODO_PANE_SECONDS` | 3 | how often the keeper looks |
+| `FBTODO_SOURCE_SETTLE` / `_BUILD_CHECK` | 2 / 1 | the **reload clocks**: how long a source write is waited out before it is believed, and how often the pane, the keeper and the watcher each ask whether they are still the build on disk. Lowering the first is a real trade — a save still landing can be exec'd into, which is why the default is what protects an editor — and it is here for a caller that swaps in a complete copy of the build (the self-check sets `0.2` / `0.1`) |
 | `FBTODO_SPLIT` / `FBTODO_PANE_SIZE` | `v` / `12` | where the pane opens — `left`/`right`/`top`/`bottom` (which fix the edge), or `h`/`v` for the splitter's own trailing edge (right / below) — and its size |
 | `FBTODO_NO_PANE` | — | set to disable panes entirely |
 | `FBTODO_PATCH_LOG` / `_META` / `_ALERT_LOG` | `~/.config/freebuff-patch-watch/watch.log`, `~/.config/manicode/freebuff-metadata.json`, `~/.config/freebuff-notify/phone.log` | the optional `PATCH`/`ALERT` row |
@@ -23,12 +23,13 @@ Precedence is the usual one: a command-line flag, then the environment, then a f
 | `FBTODO_GOAL_LINES` | `3` | how many lines the goal heading may take (`0` hides it) |
 | `FREEBUFF_PHONE` | on | `off` / `0` / `false` / `no` / `disabled` mutes the phone, read when a bell sends; the notify kit's `phone-state` file, the pane's `m`/`u` keys and `fbtodo mute on|off` write the same word to the same place |
 | `FBTODO_NOTIFY_DIR` | `~/.config/freebuff-notify` | where the pane's mute key and `fbtodo mute` write the kit's two switch files (`phone-state` for `phone.sh`, `state` for `bell.sh`) |
-| `FBTODO_PANE_KEYS` | on | `off` / `0` / `false` / `no` mutes the pane's KEYBOARD: `m`, `M` and `u` stop acting, and a pane opens with the terminal as it found it (`--no-keys` says the same thing) |
+| `FBTODO_PANE_KEYS` | on | `off` / `0` / `false` / `no` mutes the pane's KEYBOARD: `m`, `M`, `u` and `n` stop acting, and a pane opens with the terminal as it found it (`--no-keys` says the same thing) |
+| `FBTODO_PANE_MOUSE` | on | `off` / `0` / `false` / `no` leaves the MOUSE to the terminal, so the pane never asks for click reporting and its ntfy button is worked by `n` alone — the opt-out for a reader who wants to select text with the mouse (`--no-mouse` says the same thing) |
 | `FREEBUFF_NO_REFRESH` | — | the `fb` launcher skips its `npm i -g freebuff` round trip |
 
 A pane is handed the settings that decide **where it works and where its bells go**, not left to
 inherit them: tmux starts a pane from its server's environment, so `FBTODO_HOME`, `XDG_STATE_HOME`,
-`FBTODO_TMUX`, `FBTODO_FB_MARKER` and the six watch paths (`FBTODO_NOTIFY`, `_DROP`, `_ASK`,
+`FBTODO_TMUX` and the six watch paths (`FBTODO_NOTIFY`, `_DROP`, `_ASK`,
 `_PAUSE`, `_PANE_BELL`, `_LOCKS_BELL`) are written into the pane's own command line — beside the
 pinned interpreter and `PATH` — by both `pane_command` and the `fb` launcher. Each rides only
 when it is set, and because the value is in the command string a `tmux respawn-pane` (or the

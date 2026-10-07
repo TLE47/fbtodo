@@ -1132,10 +1132,9 @@ def pane_command(argv) -> str:
     of the pin is `pinned_env()`, and the two halves of it are the same argument twice over.
     The PATH decides what the pane's own children resolve — `#!/usr/bin/env python3` in
     `scripts/notify/`, `tmux`, and the watcher the pane starts. The other carried
-    values decide WHERE it works: the state root (`FBTODO_HOME` / `XDG_STATE_HOME`), the tmux
-    server it drives (`FBTODO_TMUX`) and the session marker it counts live sessions by
-    (`FBTODO_FB_MARKER`). A pane inherits the SERVER's environment, so any of those missing
-    there quietly moves the pane and its watcher to another store or another set of sessions.
+    values decide WHERE it works: the state root (`FBTODO_HOME` / `XDG_STATE_HOME`) and the
+    tmux server it drives (`FBTODO_TMUX`). A pane inherits the SERVER's environment, so either
+    missing there quietly moves the pane and its watcher to another store or another server.
 
     `env` carries the assignments rather than a bare `VAR=value command` prefix, because the
     pane command is run by the owner's login shell and fish has no such prefix form. They are
@@ -2193,6 +2192,58 @@ def notify_argv(argv: list) -> list:
     return [env, f"PATH={pinned_path()}", *argv]
 
 
+def finish_notify(state: dict, quiet: bool = True) -> tuple:
+    """Ask the finish bell whether the list this pane is drawing is finished for good.
+
+    In plain words: the phone is the half a pane cannot see, and the process that CAN see a
+    turn end — the one looking at the list while it is still being worked — is the pane
+    itself. The desktop app is exactly this case: its turns are the app's own (no `freebuff`
+    process is behind them), so the shell pid the session timer's bell resolves does not
+    exist for them, and the one process that knows the app's thread finished is the pane
+    drawing that thread's list. Measured 2026-10-05, on this machine's desktop app: the
+    timer's ask resolved the finished CLI chat sitting in the shell's cwd, said "already
+    pushed for this list" for a finish hours old, and would have said it for every finish
+    after it — while nothing anywhere asked the phone about the app's threads at all.
+
+    The bell still owns the decision AND the one-push-per-list record, so this only has to
+    know WHEN to ask — and it hands the state over (`--state -`) rather than naming a
+    session, because re-resolving here would answer about a session nobody is looking at.
+    `--push-only`: the chime belongs to the session's own timer, and two ringers for one
+    finish is a Mac that rings twice.
+
+    `--note FINISH_LOG` is the after-the-fact half, and the reason this returns more than an
+    exit code: the bell records the decision it made and repeats it on stdout, so the pane's
+    own log says WHY the phone did or did not ring for the finish on screen ("already pushed
+    for this list", "the turn is still running"), and the file keeps the same account for an
+    operator who comes to the question later. Exit 78 means there is nothing configured to
+    send to, the same signal the other notifiers use.
+
+    `(None, why)` is the third answer: there was no bell to ask at all, and `why` says so — a
+    pane that says nothing when the kit is missing is the same silence this whole path exists
+    to explain, so the reason travels back either way.
+    """
+    if not os.path.exists(TODO_NOTIFY):
+        return (None, f"no finish bell installed ({TODO_NOTIFY})")
+    try:
+        proc = subprocess.run(
+            notify_argv([TODO_NOTIFY, "--state", "-", "--push-only", "--note", FINISH_LOG]),
+            input=json.dumps(state, ensure_ascii=False), text=True,
+            capture_output=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        if not quiet:
+            print(f"finish bell failed: {exc.__class__.__name__}", file=sys.stderr)
+        return (None, f"the finish bell could not run ({exc.__class__.__name__})")
+    if proc.returncode and not quiet:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        print(
+            f"finish bell exited {proc.returncode}: {(detail[-1] if detail else '')[:120]}",
+            file=sys.stderr,
+        )
+    said = [line for line in (proc.stdout or "").splitlines() if line.strip()]
+    return (proc.returncode, said[-1].strip() if said else "")
+
+
 def ask_notify_once(args, quiet: bool = True) -> int | None:
     """Ask the question watch whether any freebuff pane is waiting on an answer.
 
@@ -2361,5 +2412,6 @@ __all__ = [
     "local_pane_command", "local_pane_open",
     "ensure_local_panes", "notify_argv",
     "ask_notify_once", "pane_notify_once", "locks_notify_once", "pause_notify_once",
+    "finish_notify",
     "live_watcher_pid",
 ]

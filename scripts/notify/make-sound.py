@@ -85,7 +85,6 @@ SOUNDFONTS = [
     os.path.expanduser("~/Documents/MuseScore4/SoundFonts/*.sf2"),
     os.path.expanduser("~/Library/Application Support/MuseScore/MuseScore4/SoundFonts/*.sf2"),
 ]
- 
 
 SEMITONES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 

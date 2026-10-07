@@ -41,6 +41,11 @@ ALERT_KIND_SEVERITY = {"sent": "ok", "resolved": "ok", "duplicate": "ok", "muted
 
 PATCH_SEVERITY = {"ok": "ok", "pending": "warn", "incomplete": "bad", "failed": "bad"}
 
+# How much of a finish decision the rows keep. Wider than a patch reason on purpose: the
+# interesting part of "no push" is its WHY ("already pushed for this list (10/10)"), and a
+# reason clipped to a patch's length would be a reason nobody could act on.
+FINISH_NOTE_MAX_CHARS = 120
+
 
 def entry_ms(text: str) -> int | None:
     """The epoch-ms a log entry starts with, or None when it starts with no stamp.
@@ -166,6 +171,44 @@ def alert_from_lines(lines: list[str], source: str) -> dict | None:
     return None
 
 
+def finish_from_lines(lines: list[str], source: str) -> dict | None:
+    """The newest finish decision as {action, text, at_ms, age_s, source} — or None.
+
+    In plain words: the other half of the ALERT row. `phone.log` says what WAS sent; this
+    says what was DECIDED about a list a pane watched, and it is the half that answers "the
+    list finished and my phone stayed quiet" — because a decision that sends nothing
+    (`no push`, `silent`) never reaches `phone.log` at all. The finish bell keeps it itself
+    when a pane asks with `--note` (`todo-bell.py`), the pane's own log repeats the same
+    line, and this is what `fbtodo status` reads back. The payload is taken verbatim: it is
+    already one line of prose about one list, and paraphrasing it here would only be a
+    second place for the reason to drift.
+    """
+    for line in reversed(lines):
+        m = _STAMP_RE.match(line)
+        if not m:
+            continue
+        body = line[m.end():].strip()
+        action = next((w for w in ("no push", "push", "silent", "ring")
+                       if body.startswith(w)), None)
+        if action is None:
+            continue
+        at = entry_ms(line)
+        return {
+            "action": action,
+            "text": _tidy(body, FINISH_NOTE_MAX_CHARS),
+            "at_ms": at,
+            "age_s": _age_s(at),
+            "source": source,
+        }
+    return None
+
+
+def last_finish(finish_log: str | None = None) -> dict | None:
+    """The newest line of the finish record, read at CALL time (see `local_patch_alert`)."""
+    path = finish_log or FINISH_LOG
+    return finish_from_lines(read_tail(path), path)
+
+
 def patch_row_text(pairs: list) -> str:
     """One row's plain text, `PATCH  …   ALERT  …`, without the leading indent."""
     return "   ".join(f"{label}  {text}" for label, text, _sev in pairs)
@@ -277,6 +320,7 @@ def patch_row(state: dict, width: int | None = None) -> list:
 __all__ = [
     "_STAMP_RE", "LOCAL_PATCH_WORDS", "ALERT_KIND_SEVERITY", "PATCH_SEVERITY",
     "entry_ms", "read_tail", "_age_s", "_tidy", "local_patch_alert", "alert_from_lines",
+    "finish_from_lines", "last_finish", "FINISH_NOTE_MAX_CHARS",
     "patch_row_text", "patch_detail_forms", "_shrink", "refit_row",
     "patch_row",
 ]

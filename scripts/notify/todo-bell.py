@@ -26,11 +26,24 @@ same "done" every ~15s until the thread was muted. The fingerprint includes the 
 two instances cannot collide in the map.
 
 usage: todo-bell.py <shell-pid> [--print] [--tty PATH]
+       todo-bell.py --state -|PATH [--print] [--push-only] [--note PATH]
+                                                the state the CALLER has in hand, rather
+                                                than one resolved from a shell pid
        --print  decide and report, play/send nothing (also says WHY it stayed silent)
+       --push-only
+                the phone alone, never the chime: for an asker that is not the session's
+                own timer (a pane, which reports a finish it watched).
+       --note PATH
+                keep what was decided at PATH (one line per ask, the newest kept) and say
+                the same lines on stdout — the file is for the operator afterwards, the
+                stdout for the asker that wants to log it too. Never written without this
+                flag: the session timer asks every 5s and would fill it.
 
 Environment: FREEBUFF_TODO_BELL_STATE overrides the one-ring-per-list record (tests);
 FREEBUFF_BELL=off mutes the chime (bell.sh); FREEBUFF_PHONE=off mutes the push
-(phone.sh); FREEBUFF_PHONE_SH points at a different sender (tests).
+(phone.sh); FREEBUFF_PHONE_SH points at a different sender (tests);
+FREEBUFF_PHONE_TEXT=agent puts the agent's own prose in the PHONE body (the channel
+gets it by default); FREEBUFF_DISCORD_SUMMARY=off takes it out of the CHANNEL's.
 """
 
 from __future__ import annotations
@@ -58,6 +71,15 @@ BELL = os.path.join(HERE, "bell.sh")
 # back for an owner who wants them. The metadata (session, state, counts) always goes.
 TEXT_AGENT = (os.environ.get("FREEBUFF_PHONE_TEXT") or "").strip().lower() in (
     "agent", "on", "1", "all", "full",
+)
+# The CHANNEL gets the agent's own account of the turn by default — the `Goal:` heading, one
+# line about the outcome and the count — and this is the switch that takes it away
+# (`FREEBUFF_DISCORD_SUMMARY=off`). It is not the phone's rule: a channel is read deliberately,
+# by a person or by the agent living in it, and "the list ended" is the half of the news that
+# never needed saying — while the phone is a nudge where a model's sentence must be asked for.
+# With the switch off the channel falls back to the phone's body.
+DISCORD_TEXT = (os.environ.get("FREEBUFF_DISCORD_SUMMARY") or "").strip().lower() not in (
+    "off", "0", "no", "false", "disabled",
 )
 PHONE = os.environ.get("FREEBUFF_PHONE_SH") or os.path.join(HERE, "phone.sh")
 TIMEOUT = 6.0
@@ -211,7 +233,17 @@ def phone_decide(state: dict, doc: dict) -> tuple[bool, str]:
     list_id = state.get("list_id")
     if not list_id:
         return False, "list has no identity to push once for"
-    if not state.get("turn_ended"):
+    # The turn's own boundary, in the source's own words. A CLI journal writes one
+    # (`shouldEndTurn`, which `turn_ended` carries); the desktop store writes none — its
+    # rows are committed when a turn CLOSES, so the transcript says nothing about the
+    # boundary — but its `threads` row does say whether a turn is alive, and a thread with
+    # no turn running and every step ticked has exactly the news a journal's boundary
+    # gives. (A turn that died leaves that row idle too; the list would have to be complete
+    # for this to announce anything, and a half-done list is the stall watch's question.)
+    if state.get("backend") == "desktop":
+        if state.get("turn_running"):
+            return False, f"all {total} done, but the turn is still running"
+    elif not state.get("turn_ended"):
         return False, f"all {total} done, but the agent has not finished its turn"
     if state.get("files_unlisted"):
         return False, f"all {total} done, but {unlisted_files(state)} changed after the list"
@@ -232,6 +264,50 @@ def ended_at(state: dict) -> int:
     )
 
 
+def push_tail(state: dict) -> str:
+    """`count · when` — the bookkeeping both bodies end with.
+
+    The date and time are what place it (a push read hours later is otherwise impossible
+    to date), and the count is the part that says it is over.
+    """
+    ended = ended_at(state)
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ended / 1000.0)) if ended else ""
+    count = f"{int(state.get('done') or 0)}/{int(state.get('total') or 0)} steps done"
+    return " · ".join(part for part in (count, when) if part)
+
+
+# How much of each labelled line the channel gets. The store caps the summary before it ever
+# arrives (fbtodo's SUMMARY_MAX_CHARS, 200); this is the push's own ceiling, applied after the
+# line has been flattened.
+CHANNEL_LINE_MAX = 220
+
+
+def one_line(text, limit: int = CHANNEL_LINE_MAX) -> str:
+    """`text` as ONE line — "" for nothing to say.
+
+    A model's answer is multi-line as often as not, and every line this script sends is a
+    single field of a sentence-shaped body, so newlines and runs of spaces collapse to one
+    space and an over-long line is cut with an ellipsis. Flattening is not cosmetic: a
+    newline left in place turns one sentence into two, and the second reads as a second
+    thought nobody wrote.
+    """
+    said = " ".join(str(text or "").split())
+    if len(said) > limit:
+        said = said[: limit - 1] + "…"
+    return said
+
+
+def spoken_summary(state: dict) -> str:
+    """The agent's own account of what the turn did, as ONE line — "" when it said nothing.
+
+    `state["summary"]` is fbtodo's first line of the agent's last answer (the journal's
+    `fullResponse`, trimmed to SUMMARY_MAX_CHARS), so this is not a second extraction, just
+    the flattening: every newline and run of spaces becomes one space, and the cap here is
+    the push's rather than the store's. A store with no prose contributes no line at all.
+    """
+    return one_line(state.get("summary"))
+
+
 def phone_message(state: dict) -> tuple[str, str]:
     """(title, body) — title says which run, body carries the big goal, the clock and
     the count.
@@ -242,10 +318,7 @@ def phone_message(state: dict) -> tuple[str, str]:
     """
     project = os.path.basename((state.get("cwd") or "").rstrip("/"))
     title = f"freebuff done · {project}" if project else "freebuff done"
-    ended = ended_at(state)
-    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ended / 1000.0)) if ended else ""
-    count = f"{int(state.get('done') or 0)}/{int(state.get('total') or 0)} steps done"
-    tail = " · ".join(part for part in (count, when) if part)
+    tail = push_tail(state)
     # METADATA ONLY by default: which session, which state, how much of the list it got
     # through. The prose below is the agent's own words — an LLM's sentence arriving on a
     # phone, where a link, a number or an instruction reads as real — so it is opt-in
@@ -264,10 +337,45 @@ def phone_message(state: dict) -> tuple[str, str]:
     # last answer and keeps it to SUMMARY_MAX_CHARS; the cap here is the phone's, not the
     # store's, and a store with no prose simply
     # contributes no line.
-    said = " ".join(str(state.get("summary") or "").split())
-    if len(said) > 220:
-        said = said[:219] + "…"
-    return title, "\n".join(part for part in (head, said, tail) if part)
+    return title, "\n".join(part for part in (head, spoken_summary(state), tail) if part)
+
+
+def discord_message(state: dict) -> str:
+    """What the CHANNEL is told the turn did, or "" to let it post the phone's body.
+
+    Three lines, and every one of them labelled, because this message is read out of
+    context — the agent in the channel answers questions from what reached it, and the
+    owner scrolls past it later — where a bare sentence above a count says nothing about
+    which half is which:
+
+        Goal: shrink the pane heading to one line
+        Summary: the heading now fits and the two failing checks were fixed
+        3/3 steps done · 2026-10-06 18:14
+
+    The goal is the agent's own `Goal:` heading (`state["goal"]`) and nothing else: the
+    session's opening request is NOT promoted into it, because a quote labelled as a goal
+    is a claim the agent never made (the phone's agent-mode body makes the same
+    distinction by leaving the fallback unlabelled). The summary is the same one line the
+    phone can carry — the first line of the agent's last answer — and the tail is the
+    count and clock that place the finish. Each is capped and flattened on its own so a
+    long one cannot swallow the next.
+
+    Nothing is invented: with neither a goal nor a summary this returns "", and the sink
+    posts the phone's body — the message it posted before it had one of its own.
+    """
+    if not DISCORD_TEXT:
+        return ""
+    goal = one_line(state.get("goal"))
+    said = spoken_summary(state)
+    if not goal and not said:
+        return ""
+    lines = []
+    if goal:
+        lines.append(f"Goal: {goal}")
+    if said:
+        lines.append(f"Summary: {said}")
+    lines.append(push_tail(state))
+    return "\n".join(part for part in lines if part)
 
 
 def phone_ready() -> tuple[bool, str]:
@@ -295,9 +403,18 @@ def push(state: dict) -> bool:
     if not os.path.exists(PHONE):
         return False
     title, body = phone_message(state)
+    # `--discord` alongside the phone push: a finished turn is one of the two events that
+    # go to Discord as well (see `discord-send.sh`), so the activity is visible to a reader
+    # there — the Hermes agent in the channel, or the owner's own phone via Discord. The
+    # other bells ask for the sink by name and do not, which is what keeps the channel to
+    # finishes and drops.
+    argv = [PHONE, "--title", title, "--message", body, "--discord"]
+    channel = discord_message(state)
+    if channel:
+        argv += ["--discord-message", channel]
     try:
         subprocess.Popen(
-            [PHONE, "--title", title, "--message", body],
+            argv,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True,
         )
@@ -337,6 +454,81 @@ class one_pusher:
         return False
 
 
+# How many decisions the record keeps. The asker that passes `--note` is the pane, and the
+# pane asks once per finish it watched, so this is a ceiling nobody reaches by accident; it
+# is here so that an asker which DOES ask on a clock cannot grow the file without end.
+NOTE_MAX_LINES = 500
+
+
+def note_line(action: str, state: dict, why: str) -> str:
+    """One line of the record: when, what was decided, which list, and why.
+
+    In plain words: the file an operator reads when the phone stayed quiet. `silent` and
+    `no push` are the ones worth reading — they answer "the list finished and nothing
+    arrived" — and a `push` line beside them is what shows the two are not the same event.
+    """
+    when = time.strftime("%Y-%m-%d %H:%M:%S")
+    # No column padding: the action words differ in length, so aligning them costs the
+    # separators their regularity — and a record is read by both a person and a grep
+    # (`fbtodo status`) whose two-space fields are the only structure it has.
+    return f"{when}  {action}  list {state.get('list_id') or '—'}  {why}"
+
+
+def write_note(path: str, lines: list) -> None:
+    """Append the decision to the record, keeping the newest `NOTE_MAX_LINES` lines.
+
+    A rewrite rather than an append, because the file is BOUNDED: the newest lines are what
+    an operator wants, and a file that can only grow is a file somebody has to clean by
+    hand. Written to a sibling temp file and renamed over the target, so a reader never sees
+    half a line.
+    """
+    if not path or not lines:
+        return
+    try:
+        with open(path, encoding="utf-8") as handle:
+            kept = handle.read().splitlines()
+    except OSError:
+        kept = []
+    kept = (kept + list(lines))[-NOTE_MAX_LINES:]
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(kept) + "\n")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def handed_state(argv: list) -> dict | None:
+    """The list the CALLER already has (`--state -|PATH`), rather than one we resolve.
+
+    In plain words: a pane is the process watching the list on screen, so it is the one that
+    knows a turn ended *here and now* — and for the desktop app there is no shell pid to
+    resolve at all (its turns are the app's own, and no `freebuff` process is behind them).
+    Asking the caller to name a session would make the bell's answer a guess about a
+    session nobody is looking at (measured 2026-10-05: a pane on a desktop thread while the
+    ask resolved a finished CLI chat in the shell's cwd — `quiet` for a list that had
+    already been pushed, and silence for every finish after it). So the asker may hand the
+    state over instead: the same JSON `fbtodo json` prints, from stdin (`-`) or a file.
+    """
+    if "--state" not in argv:
+        return None
+    at = argv.index("--state") + 1
+    path = argv[at] if len(argv) > at else "-"
+    try:
+        text = sys.stdin.read() if path == "-" else open(path).read()
+    except OSError:
+        return None
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
 def claim(doc: dict, state: dict) -> dict:
     """Remember the push BEFORE sending: a repeat tick must not push twice."""
     remember(doc, "pushed", state.get("list_id"))
@@ -354,18 +546,31 @@ def main() -> int:
         if arg.isdigit():
             root = int(arg)
     print_only = "--print" in argv
+    # The phone alone, never the chime: an asker that is not the session's own timer
+    # reports what IT saw (a pane, on the list it is drawing), and the chime belongs to the
+    # session's timer — two ringers for one finish is a Mac that rings twice.
+    push_only = "--push-only" in argv
+    # Where the ASKER wants the decision kept, if it asked for that. Nothing is written
+    # without the flag: the session timer asks every 5s, and a record of that would be a
+    # record of the clock rather than of the finishes.
+    note_path = argv[argv.index("--note") + 1] if "--note" in argv else ""
     tty = "/dev/tty"
     if "--tty" in argv:
         tty = argv[argv.index("--tty") + 1]
 
     state = snapshot(root)
+    if "--state" in argv:
+        state = handed_state(argv)
     if state is None:
         if print_only:
-            print("no state: fbtodo could not answer for this shell")
+            print("no state: nothing usable was handed over" if "--state" in argv
+                  else "no state: fbtodo could not answer for this shell")
         return 0
 
     doc = read_state()
     ring, why = decide(state, doc)
+    if push_only:
+        ring, why = False, "the phone alone (--push-only)"
     send, why_push = phone_decide(state, doc)
     if print_only:
         print(f"{'RING' if ring else 'silent'}: {why}"
@@ -386,6 +591,8 @@ def main() -> int:
         with one_pusher():
             doc = read_state()  # re-read under the lock: a racing pass may have claimed
             ring, why = decide(state, doc)
+            if push_only:
+                ring, why = False, "the phone alone (--push-only)"
             send, why_push = phone_decide(state, doc)
             if ring:
                 remember(doc, "rung", state.get("list_id"))
@@ -404,6 +611,18 @@ def main() -> int:
             pass
     if send:
         push(state)
+    # ...and the record of it. `--note PATH` is how an asker keeps the decision: the pane
+    # passes it, so the file says why the phone did or did not ring for the finish it just
+    # watched, and the same lines go to stdout because the asker that wants them kept is
+    # also the one that logs them. `--print` writes nothing: report only means report only.
+    if note_path:
+        lines = []
+        if not push_only:
+            lines.append(note_line("ring" if ring else "silent", state, why))
+        lines.append(note_line("push" if send else "no push", state, why_push))
+        write_note(note_path, lines)
+        for line in lines:
+            print(line)
     return 0
 
 
