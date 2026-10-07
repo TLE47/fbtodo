@@ -8,7 +8,7 @@
 [![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#installation)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](https://github.com/TLE47/fbtodo/blob/main/LICENSE)
 
-fbtodo displays your [Freebuff](https://freebuff.com) agent's todo list in a side pane while it works. It shows:
+fbtodo displays your [Freebuff](https://freebuff.com) agent's todo list in a side pane while it is working. It shows:
 - **What's done, running, and next** — with live timers
 - **How much time is left** — estimates based on your project history
 - **If it's stuck or waiting** — with optional alerts to your phone
