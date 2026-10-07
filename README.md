@@ -17,7 +17,7 @@ fbtodo displays your [Freebuff](https://freebuff.com) agent's todo list in a sid
 No configuration: it reads the list your agent already keeps. Freebuff's list turns up on its own;
 anything else can push one over stdin — see [docs/SOURCES.md](https://github.com/TLE47/fbtodo/blob/main/docs/SOURCES.md).
 
-**[Installation](#installation)** · **[Commands](#commands)** · **[FAQ](#faq)** · [Install guide](https://github.com/TLE47/fbtodo/blob/main/docs/INSTALL.md) · [Settings](https://github.com/TLE47/fbtodo/blob/main/docs/SETTINGS.md) · [Deep docs](https://github.com/TLE47/fbtodo/blob/main/docs/INTERNALS.md)
+**[Installation](#installation)** · **[Commands](#commands)** · **[FAQ](#faq)** · [Install guide](https://github.com/TLE47/fbtodo/blob/main/docs/INSTALL.md) · [Settings](https://github.com/TLE47/fbtodo/blob/main/docs/SETTINGS.md)
 
 ---
 
@@ -25,7 +25,7 @@ anything else can push one over stdin — see [docs/SOURCES.md](https://github.c
 
 ![fbtodo's pane working through a scripted session](https://raw.githubusercontent.com/TLE47/fbtodo/main/docs/demo/demo.webp)
 
-The clip above shows - `fbtodo pane` in real time. It monitors a scripted session through eight steps, updating continuously until all tasks are marked complete *and* the session ends—the exact trigger required for the notification bell.
+The clip above shows `fbtodo pane` in real time. It monitors a scripted session through eight steps, updating continuously until all tasks are marked complete and the session ends.
 
 ### Side-by-Side View 
 To see how the pane mirrors the active session, here is the side-by-side pairing: the scripted session on the left, and the fbtodo pane tracking it on the right:
@@ -116,7 +116,7 @@ pipx install "git+https://github.com/TLE47/fbtodo@4.30.0"   # from the tag
 
 Your agent writes a todo list (by calling `write_todos`). fbtodo watches that list and displays it in a side pane. The pane updates in real time as the agent works through tasks.
 
-**No configuration needed** — fbtodo reads the list your agent already creates. Just make sure your agent is keeping one. You can ask it once per session: *"Plan this as a todo list and check off items as you go."*
+**No configuration needed** — fbtodo reads the list your agent already creates. Just make sure your agent is keeping one.
 
 ---
 
@@ -132,52 +132,42 @@ fbtodo status       # show pane info and why it might be empty
 
 ### Pane keys
 
-While you are looking at a pane, the keyboard is the quickest way to mute the phone:
+While you are looking at a pane, use these keys to control phone notifications:
 
 | key | what it does |
 |---|---|
-| `m` | quiet until this list finishes, then it rings again on its own |
+| `m` | quiet until this list finishes, then ring again |
 | `M` | quiet until you press `u` |
 | `u` | loud again |
-| `n` | the ntfy push alone — the same switch as the button on the frame |
+| `n` | toggle the notification button |
 
-The push also has a **button** on the pane's status row, saying whether the phone will ring
-(`[ ntfy on · n ]`): click it, or press `n`. It is drawn in the widest form the row has room for
-— `[ ntfy on · n ]` on a wide pane, `[ ntfy on ]` in a tmux split, and the tight `[ntfy on]` on the
-40-odd columns a desktop pane gets, where the row keeps the state chip and the live clock and
-gives up the LIST number and the list's age to make room for it. The same form answers whether
-the push is on or off, so the button is there to click back on after you click it off. Below
-about 42 columns it is left off entirely and the key still works. It is narrower than the keys on purpose — it moves
-`phone-state` alone and leaves the chime (`state`) as it is, because "my phone is ringing in a
-meeting" is a different wish from "stop chiming at me while I read this" — and it is the pane's
-own switch, not the list's, so it outlives both the pane and the list until you click it back.
-The pane asks the terminal for the mouse again with every frame it paints, so a window that comes
-back as a fresh terminal cannot leave the button dead. `--no-mouse` (or `FBTODO_PANE_MOUSE=off`)
-leaves the mouse to your terminal for selecting text
-and keeps `n`.
+The status row also has a **clickable button** (`[ ntfy on · n ]`) to toggle notifications. It adapts to fit your pane's width.
 
-When the list this pane is showing finishes for good — every step ticked **and** the turn ended —
-the pane also tells the phone, through the same finish bell the shell wrapper's timer uses
-(`todo-bell.py`). That is the only way a finish reaches you from the **desktop app**: its turns
-are the app's own (no `freebuff` process runs them and its store writes no journal), so the
-timer's ask, which names a shell and resolves the process under it, has nothing to resolve there
-— the pane drawing the thread is the one process that can see it. The bell keeps the
-one-push-per-list record, so the pane's ask and the timer's cannot both send, and the pane never
-chimes: the chime belongs to the session's timer. Nothing is asked for a finish this pane did not
-watch, so opening a pane on an old thread does not buzz your phone. When it does ask, the
-bell's answer is kept: the pane's log carries it on the same line that records the ask, and
-`fbtodo status` prints the newest one (`finish push : no push list 8f1c… already pushed for this
-list (10/10) — 12m ago`) — because a decision that sends nothing never reaches `phone.log`, and
-"the list finished and my phone stayed quiet" needs a place of its own.
+`--no-mouse` (or `FBTODO_PANE_MOUSE=off`) disables the button and keeps only the `n` key.
 
-`--no-keys` (or `FBTODO_PANE_KEYS=off`) turns the keys off in a pane whose terminal it should not
-read, and the same switch is `fbtodo mute` for a script, a status row or any shell that is not a
-pane — see [Quiet while you read](#quiet-while-you-read).
+### Quiet while you read
 
-Running more than one agent? `fbtodo board` draws them all at once — one row per live session
-with its list, its heading and its clock, newest activity first, instead of one pane per window.
+To mute notifications **without a pane**, use commands:
 
-**Other commands:** `ledger` (forecast vs. actual), `why` (pane location), `pin` (resize pane), `keep` (pane-repair switch), `mute` (the notification switch, without a keystroke: `on` / `off` / `list` / `until-done`), `locks` (claim-file audit; `--fix` clears leftovers and ends untied processes, `--fix --restart` re-claims the watcher and keeper through the normal ask afterwards, `--watch` streams a line per finding and rings the kit's locks bell), `stop` (close watcher), `prune` (clean up old data).
+```sh
+fbtodo mute              # check current state
+fbtodo mute on           # stay quiet
+fbtodo mute until-done   # quiet until this list finishes
+fbtodo mute off          # loud again
+fbtodo mute --json       # output as JSON for scripts
+```
+
+The pane's `m` key and these commands both control the same switches (`phone-state` and `state`), so muting from either place keeps the whole system in sync. When you close a muted pane, notifications turn back on automatically.
+
+`--no-keys` (or `FBTODO_PANE_KEYS=off`) disables keyboard input in a pane whose terminal should not be read.
+
+---
+
+### Multiple sessions
+
+Running more than one agent? Use `fbtodo board` to see them all at once — one row per session with its list, heading, and live clock.
+
+**Other commands:** `ledger` (forecast vs. actual), `why` (pane location), `pin` (resize pane), `keep` (pane-repair switch).
 
 Run `fbtodo -h` for all flags.
 
@@ -217,42 +207,6 @@ fbtodo pin --list                # show current settings
 `--size` is counted along the split: **columns** for `--side h` (the pane sits beside the
 session) and **lines** for `--side v` (below it). The pane remembers your last size and opens
 that way next time. Default: 12 lines below.
-
-### Quiet while you read
-
-If you use the notification kit (below), the pane can turn it off for you:
-
-| key | what it does |
-|---|---|
-| `m` | quiet until this list finishes — then the phone rings again on its own |
-| `M` | quiet until you press `u` |
-| `u` | loud again |
-| `n` | the push alone — the switch the button on the status row works (click it, or press `n`) |
-
-Nothing is invented for this: the key writes the kit's own switch words — `phone-state`, which
-`phone.sh` reads, and `state`, which `bell.sh` reads — so muting from the pane and muting from a
-shell (`FREEBUFF_PHONE=off`) are the same state. `u` puts back what was there before, including
-removing a `phone-state` that did not exist. The pane's title says which switch is in force and
-which key lifts it (`quiet until done · u`). A pane that closes while muted gives the
-notifications back, so a phone is never left quiet with nothing left holding the key.
-
-`--no-keys` (or `FBTODO_PANE_KEYS=off`) turns the keys off in a pane whose terminal it should not
-read.
-
-The keys are for a pane you are looking at. Everything else — a script, a status row, another
-program's button, a shell that is not a pane at all — uses the same switch as a command:
-
-```sh
-fbtodo mute              # or `fbtodo mute list` — what is in force
-fbtodo mute on           # quiet until you say otherwise
-fbtodo mute until-done   # quiet until the list in this directory finishes
-fbtodo mute off          # loud again, putting back what was there
-fbtodo mute --json       # the same facts, for a script to read
-```
-
-`until-done` reads the list first and declines, writing nothing, if that list is already
-finished. Who asked decides who lifts the mute: one a key took ends when the pane closes, and
-one a command took does not — the finished list, or `fbtodo mute off`, ends that one.
 
 ### Disable the pane
 
