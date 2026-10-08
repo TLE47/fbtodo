@@ -97,6 +97,21 @@ sys.path.insert(0, SRC)
 CWD = HOME
 STRIP = lambda s: re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", s)  # noqa: E731
 
+
+# The pane's supporting character stands in the top border's chrome slot (see the buffy-chan
+# checks), and that moves the border's own spacing by the six cells she occupies. Checks that are
+# about the border's TEXT — which banner this is, how the title's chip is padded, whether the
+# frame still fits its pane — read the row with her lifted out, so they go on measuring exactly
+# what they were written to measure instead of learning her spacing. Whether she is on a given
+# border at all, and at which widths she steps aside, is asserted on its own further down.
+def unbuffy(line: str) -> str:
+    """`line` with buffy-chan lifted out of the border's chrome slot, if she is standing on it."""
+    render = importlib.import_module("fbtodo.render")
+    for face in render.BUFFY_FRAMES:
+        if face in line:
+            return line.replace(face, "", 1)
+    return line
+
 # The pane's progress row, found by what is ON it rather than by a label: the bar labels
 # itself (`[████▉░░░]  25% (2/8)`), because `PROGRESS` cost eight columns of a 68-column row
 # and started one column left of `PATCH`, `GOAL`, `ALERT` and `REFIT`.
@@ -145,6 +160,22 @@ MUTE = shutil.which("true") or "/usr/bin/true"
 for _var in ("FBTODO_NOTIFY", "FBTODO_DROP", "FBTODO_ASK", "FBTODO_PAUSE", "FBTODO_PANE_BELL"):
     os.environ[_var] = MUTE
     env[_var] = MUTE
+# ...and her WINDOW's own files, for two reasons that both come from them being on the real
+# machine rather than in the throwaway home. The pane PUBLISHES the room it left her in
+# `~/.cache/fbtodo/pip-slack` on every frame it draws with a height, so a suite that renders
+# 24-row fixtures leaves a 24-row grid on disk for the real window to read — and a window
+# reading a test's numbers refuses the pane it is actually over (measured 2026-10-07:
+# `fit=refused` against a live app window, because the hint said 24 rows of a 68-column pane).
+# The pid file carries the other half: a floating window RUNNING on the operator's machine puts
+# `~(O_o) pip stuck · p` on the title chip, which is a real state of the pane and not the state
+# this suite's frames are about (measured the same day: a frame contract red because the owner
+# had her window up). A path inside the test home names nobody and belongs to nobody.
+for _var, _name in (("FBTODO_PIP_SLACK", "pip-slack"), ("FBTODO_PIP_PID", "pip.pid"),
+                    ("FBTODO_PIP_PIN", "pip-pin"), ("FBTODO_PIP_FREE", "pip-free"),
+                    ("FBTODO_PIP_MOOD", "pip-mood")):
+    _path = os.path.join(TEST_HOME, _name)
+    os.environ[_var] = _path
+    env[_var] = _path
 # The patch row's own sources, pointed at fixtures for the whole run — in this process's
 # environment too, because the module reads these paths when it is imported below. The
 # real ones are this Mac's (~/.config/freebuff-patch-watch/watch.log and
@@ -162,6 +193,16 @@ for _key, _val in (
 ):
     os.environ[_key] = _val
     env[_key] = _val
+# The mute keys' own two files, pointed at an empty fixture for the same reason the patch
+# sources are: `phone-state` and `state` live in the owner's `~/.config/freebuff-notify` and
+# are written by hand from any pane or shell, so a suite that read the real ones would paint
+# the OWNER's mute onto every frame it checks. Measured 2026-10-07: the owner's own `m` key
+# turned the first-paint fixture's title chip into `notifications off · m` and failed a check
+# on a frame that had drawn perfectly. No files at all is the kit's own default, loud.
+NOTIFY_FIXTURE = os.path.join(TEST_HOME, "notify")
+os.makedirs(NOTIFY_FIXTURE, exist_ok=True)
+os.environ["FBTODO_NOTIFY_DIR"] = NOTIFY_FIXTURE
+env["FBTODO_NOTIFY_DIR"] = NOTIFY_FIXTURE
 PATCH_FIXTURE_STAMP = ""  # filled in with the fixtures themselves, below
 
 
@@ -5606,7 +5647,12 @@ def _probe_live_for_target(x, y):
     )
     # ...and then it STAYS: the lock is what makes this true by construction rather than by
     # luck, and a pane that flapped back would draw both subjects' rows into one window.
-    tail = painted[-1200:]
+    # ...and the window is a FRAME rather than a fixed 1200 bytes, because a frame is no longer
+    # 1200 bytes: buffy-chan's picture is half-block cells in 24-bit ink, which is a kilobyte a
+    # row on a pane this wide, so her panel alone is the size of an old frame. The claim is the
+    # same one — the newest frame shows the live thread's step and not the dead chat's — and the
+    # window only has to be big enough to hold the newest frame to be the check it always was.
+    tail = painted[-6000:]
     assert switch_step in tail and dead_step not in tail, tail
     # ...and the READ still says WHY this list is the app's, on its own title: the finished
     # chat is the whole reason a fresh resolve lands on the thread, and a reader running
@@ -6231,13 +6277,13 @@ def _probe_live_for_target(x, y):
                   "todos": [{"task": "step one", "completed": True}, {"task": "step two"}],
                   "done": 1, "total": 2}
     chip_title = STRIP(module.render(chip_state, True, width=100, height=24,
-                                    mute_note="quiet until done · u")).splitlines()[0]
+                                    chip_note="quiet until done · u")).splitlines()[0]
     assert "quiet until done · u" in chip_title, chip_title
     # ...it is the STANDING half of the title, so it survives a transient note taking the
     # chip for a few seconds: both are the process's own facts and both are said at once.
     both_title = STRIP(module.render(chip_state, True, width=100, height=24,
                                      reloaded="reloaded: build 4.30.2",
-                                     mute_note="quiet until done · u")).splitlines()[0]
+                                     chip_note="quiet until done · u")).splitlines()[0]
     assert "reloaded: build 4.30.2" in both_title and "quiet until done" in both_title, both_title
     assert "quiet until done" not in STRIP(
         module.render(chip_state, True, width=100, height=24)), "the chip is on with no switch"
@@ -6946,6 +6992,292 @@ def _probe_live_for_target(x, y):
     assert not module.muted_now(), mute_switches()
     say("fbtodo mute: on, off, list and until-done drive the same switch as the pane's keys, "
         "and only the list lifts the promise a command made: ok")
+
+    # ---- and her WINDOW's pin (`fbtodo pip`): the pane's other switch, built the way the
+    #      notify kit's is — a file the running window only ever READS — so the key, the command
+    #      and the window cannot disagree about which state she is in. The window itself is not
+    #      started here: it is an AppKit program that needs `swiftc`, and a suite that opens a
+    #      floating window is a suite that cannot run headless. A pid file naming THIS live
+    #      process is what "she is running" means, which is exactly the test the CLI makes.
+    pip_dir = os.path.join(TEST_HOME, "pip")
+    os.makedirs(pip_dir, exist_ok=True)
+    pip_pid = os.path.join(pip_dir, "pip.pid")
+    pip_free = os.path.join(pip_dir, "pip-free")
+    pip_pin = os.path.join(pip_dir, "pip-pin")
+    pip_env = dict(env, FBTODO_PIP_PID=pip_pid, FBTODO_PIP_FREE=pip_free,
+                   FBTODO_PIP_PIN=pip_pin)
+
+    def pip_run(*args):
+        return subprocess.run([sys.executable, FB, *args], capture_output=True, text=True,
+                              env=pip_env, cwd=CWD, timeout=30)
+
+    keep_pip = {key: os.environ.get(key) for key in
+                ("FBTODO_PIP_PID", "FBTODO_PIP_FREE", "FBTODO_PIP_PIN", "FBTODO_PIP_HOST")}
+    os.environ["FBTODO_PIP_PID"] = pip_pid
+    os.environ["FBTODO_PIP_FREE"] = pip_free
+    os.environ["FBTODO_PIP_PIN"] = pip_pin
+    try:
+        # With no pid file there is no window, so there is no pin to report and nothing to
+        # release — a chip offering to release a window that is not there is a lie.
+        assert module.pip_chip() is None, module.pip_chip()
+        chip, said = module.pip_pane_key("p")
+        assert chip is None and "no window" in said, (chip, said)
+        assert module.pip_pane_key("x") == (None, ""), "a key of somebody else's must do nothing"
+        assert pip_run("pip", "status").stdout.strip() == (
+            f"pip: not running; would start {module.pip_place()}")
+        # ...a pid file naming NOBODY is not a window (the file outlives the process that wrote
+        # it, and a pane that trusted it would offer to release a window that is long gone).
+        with open(pip_pid, "w") as fh:
+            fh.write("999999\n")
+        assert module.pip_running() is None, "a stale pid file must not count as a window"
+        with open(pip_pid, "w") as fh:
+            fh.write(f"{os.getpid()}\n")
+        assert module.pip_running() == os.getpid(), module.pip_running()
+        assert module.pip_chip() == "pip stuck · p", module.pip_chip()
+        # ...and the chip is a real title: this is the only place a reader learns there IS a key.
+        pinned = STRIP(module.render(chip_state, True, width=100, height=24,
+                                     chip_note=module.pip_chip())).splitlines()[0]
+        assert "pip stuck · p" in pinned, pinned
+        # The key releases her — the file the window reads IS the state — and pins her again.
+        chip, said = module.pip_pane_key("p")
+        assert chip == "pip free · p" and "released" in said, (chip, said)
+        assert os.path.exists(pip_free), "the key did not write the switch her window reads"
+        assert module.pip_chip() == "pip free · p", module.pip_chip()
+        chip, said = module.pip_pane_key("p")
+        assert chip == "pip stuck · p" and not os.path.exists(pip_free), (chip, said)
+        assert "stuck" in said, said
+        # ...and the command is the same switch, with the same status line to read it back.
+        assert pip_run("pip", "free").returncode == 0 and os.path.exists(pip_free)
+        running = pip_run("pip", "status").stdout.strip()
+        assert running == f"pip: running (pid {os.getpid()}), free (draggable)", running
+        assert pip_run("pip", "stuck").returncode == 0 and not os.path.exists(pip_free)
+        # `stop` SIGTERMs the pid its own file names, so the file has to name a CHILD for this
+        # half: pointed at this process it would be the suite asking itself to die, which is
+        # how a check turns a green run into an exit 143 nobody can read.
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            with open(pip_pid, "w") as fh:
+                fh.write(f"{holder.pid}\n")
+            stopped = pip_run("pip", "stop")
+            assert stopped.returncode == 0 and f"stopped (pid {holder.pid})" in stopped.stdout, (
+                stopped.stdout, stopped.stderr)
+            holder.wait(timeout=5)          # bounded: the signal lands, or this check fails
+            assert holder.poll() is not None, "`pip stop` did not stop the window it named"
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+            with open(pip_pid, "w") as fh:      # ...and the pin below is read off a LIVE one
+                fh.write(f"{os.getpid()}\n")
+        # `stuck`/`status` then answer for a window that is running again.
+        assert pip_run("pip", "status").stdout.strip() == (
+            f"pip: running (pid {os.getpid()}), {module.pip_place()}")
+        # The TAUGHT pin: the file her window reads to know where in the pane's window she stands.
+        # It is written by the window itself when it comes back from free — dragging is the only
+        # way anything can learn the app's panel rectangle, which lives in the app's renderer — and
+        # it is a plain `x,y` offset from that window's TOP-LEFT corner, which is what makes it
+        # survive the window being moved or resized rather than being a screen position.
+        assert module.pip_pin_offset() is None, module.pip_pin_offset()
+        assert module.pip_place() == "stuck over the pane's own middle", module.pip_place()
+        with open(pip_pin, "w") as fh:
+            fh.write("620,150\n")
+        assert module.pip_pin_offset() == (620, 150), module.pip_pin_offset()
+        assert module.pip_place() == "stuck over the pane at pin +620,+150", module.pip_place()
+        pinned = pip_run("pip", "status").stdout.strip()
+        assert pinned == f"pip: running (pid {os.getpid()}), {module.pip_place()}", pinned
+        # ...a file that is not a pair of numbers is no pin at all rather than a crash on a tick,
+        # and a space separates them as well as a comma does.
+        with open(pip_pin, "w") as fh:
+            fh.write("not a pin\n")
+        assert module.pip_pin_offset() is None, module.pip_pin_offset()
+        with open(pip_pin, "w") as fh:
+            fh.write("620 150\n")
+        assert module.pip_pin_offset() == (620, 150), module.pip_pin_offset()
+        assert pip_run("pip", "forget").returncode == 0 and not os.path.exists(pip_pin)
+        assert module.pip_place() == "stuck over the pane's own middle", module.pip_place()
+        assert "forgotten" in pip_run("pip", "forget").stdout, "forget twice must be quiet and fine"
+        # Her window's HOME is the pane's own process chain rather than the app's name: the
+        # chain starts at this process (the one the pane ran), so the window that hosts it is
+        # found by pid on any terminal — the name is only the fallback, and an EMPTY name is how
+        # a caller asks for the middle of the screen.
+        chain = module.pip_host_pids()
+        assert chain and chain.split(",")[0] == str(os.getpid()), chain
+        os.environ["FBTODO_PIP_HOST"] = "SomeTerminal"
+        assert module.pip_host_owner() == "SomeTerminal", module.pip_host_owner()
+        os.environ["FBTODO_PIP_HOST"] = ""
+        assert module.pip_host_owner() == "", module.pip_host_owner()
+        sideways = pip_run("pip", "sideways")
+        assert sideways.returncode == 2 and "is not a verb here" in sideways.stderr, sideways
+    finally:
+        if os.path.exists(pip_pid):
+            os.unlink(pip_pid)
+        if os.path.exists(pip_pin):
+            os.unlink(pip_pin)
+        for key, was in keep_pip.items():
+            if was is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = was
+    say("fbtodo pip: the pin is one switch file the window only reads — the pane's `p`, the "
+        "command and the status line all drive the same one — and the chip that names the key "
+        "rides the title, while the window's home is the pane's own process chain: ok")
+
+    # ---- and the ROOM she stands in. Her picture is a window drawn OVER this pane, so the pane
+    #      makes a slot for it out of its own rows — the space the ASCII picture used to be drawn
+    #      in — rather than letting her sit on a step: the owner's ask of 2026-10-07 was "give her
+    #      space so she doesn't block any information", and "a part of the pane and not showing
+    #      outside of the pane". The reservation itself is not new (`buffy_panel_rows` reserves rows
+    #      for her DRAWN panel); what is new is that it is made for a WINDOW while one is running,
+    #      and published in the same note that window reads.
+    slot_home = os.path.join(TEST_HOME, "slot")
+    os.makedirs(slot_home, exist_ok=True)
+    slot_note = os.path.join(slot_home, "pip-slack")
+    slot_pid = os.path.join(slot_home, "pip.pid")
+    keep_slot = {key: os.environ.get(key) for key in
+                 ("FBTODO_PIP_SLACK", "FBTODO_PIP_ROWS", "FBTODO_PIP_PID")}
+
+    def slot_run(*args):
+        # A framed pane needs colour, and a pipe has none: the same three variables the suite's
+        # other rendered-pane checks use (a plain frame has no borders and no slot to read).
+        #
+        # ...and a CLI JOURNAL OF OUR OWN (`-s cli --cli-root`, written below): a `pane --once` with
+        # no store of its own reads the OPERATOR's live session, which made these two runs pass or
+        # fail with whatever the owner's session happened to be doing — and a session that has just
+        # dropped a finished list is legitimately list-less and SHORT, which is not the pane's fault
+        # (measured 2026-10-07: this check went red mid-session for exactly that reason). The journal
+        # carries the same twenty unfinished steps the in-process frame above is built from, so the
+        # height asserted below is the pane's own answer rather than this machine's.
+        return subprocess.run([sys.executable, FB, *args, "-s", "cli",
+                               "--cli-root", slot_root, "-p", "proj"],
+                              capture_output=True, text=True,
+                              env=dict(env, FBTODO_PIP_SLACK=slot_note, FBTODO_PIP_PID=slot_pid,
+                                       TERM="xterm-256color", COLORTERM="truecolor",
+                                       FORCE_COLOR="1"),
+                              cwd=CWD, timeout=30)
+
+    try:
+        os.environ["FBTODO_PIP_SLACK"] = slot_note
+        os.environ.pop("FBTODO_PIP_ROWS", None)
+        # The knob: unset and `auto` are "as many rows as her panel would take", `0`/off is a pane
+        # that reserves nothing at all, and a number is that many rows.
+        assert module.pip_slot_rows() == -1, module.pip_slot_rows()
+        for raw, want in (("-1", -1), ("auto", -1), ("on", -1), ("0", 0), ("off", 0),
+                          ("9", 9), ("nonsense", -1)):
+            os.environ["FBTODO_PIP_ROWS"] = raw
+            assert module.pip_slot_rows() == want, (raw, module.pip_slot_rows())
+        os.environ.pop("FBTODO_PIP_ROWS", None)
+
+        full = {"backend": "cli", "session": "SLOT", "goal": "give her space", "model": "gpt-5",
+                "todos": [{"task": f"step {i}", "completed": False} for i in range(20)],
+                "done": 0, "total": 20}
+        now_slot = 1_700_000_000_000
+        # The journal the two subprocess runs below read (see `slot_run`): the same list the frames
+        # above are rendered from, so a pane that answered from this machine instead of from here
+        # would be visible as a different number of rows.
+        slot_root = os.path.join(slot_home, "cliroot")
+        slot_chat = os.path.join(slot_root, "proj", "chats", "2026-01-01T00-00-00.000Z")
+        os.makedirs(slot_chat, exist_ok=True)
+        with open(os.path.join(slot_chat, "log.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "level": "DEBUG", "timestamp": "2026-01-01T00:00:00.000Z",
+                "data": {"iteration": 1, "prompt": "give her space",
+                         "toolCalls": [{"toolName": "write_todos",
+                                        "input": {"todos": full["todos"]}}]}}) + "\n")
+
+        def slot_frame(reserve):
+            return module.render(full, True, watching=4242, width=68, height=24, now_ms=now_slot,
+                                 reserve_rows=reserve)
+
+        def blank_rows(frame):
+            return [i for i, line in enumerate(STRIP(frame).splitlines())
+                    if line[1:-1].strip() == ""]
+
+        def listed(frame):
+            return sum(1 for line in STRIP(frame).splitlines() if " step " in line)
+
+        placed = slot_frame(None)
+        # ...no caller that says nothing about her window gets a different frame: the goldens and
+        # every renderer that is not a pane with her over it are untouched by the reservation.
+        assert placed == module.render(full, True, watching=4242, width=68, height=24,
+                                       now_ms=now_slot), "a reservation nobody asked for"
+        assert slot_frame(0) == placed, "`0` rows has to be the frame that reserves nothing"
+        roomier = slot_frame(9)
+        assert len(roomier.splitlines()) == 24, "her slot moved the pane's own height"
+        assert listed(roomier) < listed(placed), (
+            "her slot came out of nothing: the list has to be shorter by it",
+            listed(roomier), listed(placed))
+        assert listed(roomier) >= module.BUFFY_LIST_FLOOR, listed(roomier)
+
+        # ...and the pane PUBLISHES that slot in the note her window reads, so the window stands in
+        # blank rows rather than guessing at them. Every row the note names must really be blank,
+        # and the row above the note's range must not be: a note that named a row of steps would
+        # put her on top of one — the thing the reservation exists to prevent.
+        note = open(slot_note).read().split()
+        assert len(note) >= 4, open(slot_note).read()
+        rows_n, cols_n, start_n, count_n = (int(note[0]), int(note[1]), int(note[2]), int(note[3]))
+        assert (rows_n, cols_n) == (24, 68), note
+        assert count_n >= 9, ("the pane has to publish the slot it made", note)
+        blanks = blank_rows(roomier)
+        assert set(range(start_n, start_n + count_n)) <= set(blanks), (
+            "the note named rows that are not blank", note, blanks)
+        assert start_n > 0 and (start_n - 1) not in blanks, (
+            "the note is not tight: the row above its range is blank too", note, blanks)
+
+        # `note_pane_slack` writes on a CHANGE and never twice for the same numbers: this runs on
+        # every frame a pane draws, and a file rewritten forty times a second is a file no reader
+        # can follow.
+        module.note_pane_slack(rows_n, cols_n, start_n, count_n)
+        os.utime(slot_note, (1, 1))
+        module.note_pane_slack(rows_n, cols_n, start_n, count_n)
+        assert os.stat(slot_note).st_mtime == 1, "an unchanged note was rewritten"
+        module.note_pane_slack(rows_n, cols_n, start_n, count_n + 1)
+        assert int(open(slot_note).read().split()[3]) == count_n + 1, open(slot_note).read()
+        # ...and a note nobody can write is a hint her window does without, never a crash on a
+        # frame: the pane is a terminal command, and the cache directory is not its to insist on.
+        broken = os.path.join(slot_note, "deeper", "slack")     # under a FILE, so makedirs fails
+        os.environ["FBTODO_PIP_SLACK"] = broken
+        module.note_pane_slack(3, 4, 5, 6)
+        os.environ["FBTODO_PIP_SLACK"] = slot_note
+        assert module.pip_slack_path() == slot_note, module.pip_slack_path()
+        os.environ.pop("FBTODO_PIP_SLACK", None)
+        assert module.pip_slack_path() == os.path.join(os.path.expanduser("~"),
+                                                      ".cache", "fbtodo", "pip-slack"), \
+            module.pip_slack_path()
+        os.environ["FBTODO_PIP_SLACK"] = slot_note
+
+        # ...and the CLI is where it is decided, because only the CLI can tell whether her window is
+        # RUNNING: `fbtodo pane --once` with her window's pid in the file holds the slot, and the
+        # same command with no window holds none of it.
+        with open(slot_pid, "w") as fh:
+            fh.write(f"{os.getpid()}\n")
+        live_pane = slot_run("pane", "--once")
+        assert live_pane.returncode == 0, (live_pane.stdout, live_pane.stderr)
+        assert len(live_pane.stdout.splitlines()) == 24, live_pane.stdout
+        held = int(open(slot_note).read().split()[3])
+        os.unlink(slot_pid)
+        idle_pane = slot_run("pane", "--once")
+        assert idle_pane.returncode == 0, (idle_pane.stdout, idle_pane.stderr)
+        # ...and with no window it reserves NONE of it. How many rows she gets is what her drawn
+        # panel would have taken, on the SAME twenty-step journal — the difference between the two
+        # runs is the gate, and neither may make the pane taller: the frame is exactly the rows the
+        # pane was asked for either way (which, now that this reads a journal of the suite's own,
+        # is the same 24 whether the owner's session happens to have a list this second or not).
+        assert len(idle_pane.stdout.splitlines()) == 24, idle_pane.stdout
+        empty = int(open(slot_note).read().split()[3])
+        assert held >= empty, ("a pane with no window over it reserved more than one with it",
+                               empty, held)
+        assert held > empty or live_pane.stdout != idle_pane.stdout, (
+            "her window made no difference to the pane at all", empty, held)
+    finally:
+        if os.path.exists(slot_pid):
+            os.unlink(slot_pid)
+        for key, was in keep_slot.items():
+            if was is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = was
+    say("fbtodo pip's slot: the pane reserves rows for her window while it is up (`FBTODO_PIP_ROWS` "
+        "sets how many), publishes exactly the blank ones, and takes them back the moment she is "
+        "gone: ok")
 
     # ---- and the frame stacks them: a heading row per thread (its title, its own
     #      done/total, and whether it is the one being worked in), that thread's steps under
@@ -8678,7 +9010,13 @@ def _probe_live_for_target(x, y):
     # sharp corners everywhere and no arcs anywhere: the frame is drawn with
     # `┌ ┐ └ ┘` only, which the corner assertions above and this one pin
     assert not any(ch in rich for ch in "╭╮╰╯"), rich
-    assert "FREEBUFF TODOS" in rich and "watcher: pid 999" in rich, rich
+    # ...and the tag says as much of itself as the columns allow. buffy-chan's six cells come
+    # out of that slot (see the buffy-chan checks), so at 46 the border carries the tag's head
+    # and the whole reading is back one width up, where the pane has the columns for both.
+    assert "FREEBUFF TODOS" in rich and "watcher: pid" in rich, rich
+    assert "watcher: pid 999" in ansi.sub("", module.render(
+        rich_state, True, watching=999, width=80, height=20, now_ms=SWEEP_NOW,
+    )), "the watcher's pid is whole again once the pane has the columns for it"
     # the marker is `▸` and not an emoji: a frame is a grid, and a glyph the code
     # and the terminal measure differently is enough to step its border sideways
     assert "▸ Goal:" in rich and "✔" in rich and "➔" in rich, rich
@@ -8803,7 +9141,7 @@ def _probe_live_for_target(x, y):
     top = no_watch.splitlines()[0]
     assert "watcher" not in top, top
     assert module._session_label(rich_state) in top, (top, module._session_label(rich_state))
-    assert top.startswith("┌──  FREEBUFF TODOS  ") and top.endswith("┐"), top
+    assert unbuffy(top).startswith("┌──  FREEBUFF TODOS  ") and top.endswith("┐"), top
     assert module._cell_width(top) <= 46, top
     for w in (30, 34, 46, 80):
         line = ansi.sub("", module.render(
@@ -8875,8 +9213,8 @@ def _probe_live_for_target(x, y):
                                    now_ms=SWEEP_NOW)
             got = STRIP(framed).splitlines()
             assert len(got) <= h, (h, framed)
-            assert got[0].startswith("┌──  FREEBUFF TODOS") and got[-1].startswith("└"), (
-                h, framed)
+            assert unbuffy(got[0]).startswith("┌──  FREEBUFF TODOS") \
+                and got[-1].startswith("└"), (h, framed)
     say("fits the pane it is given, at every height, without losing its own title: ok")
 
     say("renders the framed colour pane inside its width and height: ok")
@@ -8959,7 +9297,10 @@ def _probe_live_for_target(x, y):
     assert "preview" not in long_row, repr(long_row)
     # ...and the model is named on the TOP BORDER too, where there is room for it at any
     # width the strip cannot hold: the pane that quotes a pace says whose pace it is.
-    _, bordered = footer_of(dict(rich_state, model="stealth/space-bunny-alpha"))
+    # ...on a pane exactly `BUFFY_CELLS` wider than the default one, because those are the six
+    # columns she stands in: the same tag budget, the same reading.
+    _, bordered = footer_of(dict(rich_state, model="stealth/space-bunny-alpha"),
+                            width=66 + module.BUFFY_CELLS)
     assert "watcher: pid 999 · space-bunny-a…" in bordered.splitlines()[0], bordered
     # A step that is RUNNING does not hide the list's age: that is the case this row exists
     # for, because a list an agent has stopped re-writing looked current for exactly as long
@@ -9864,18 +10205,22 @@ def _probe_live_for_target(x, y):
         ).splitlines()[0])
         assert module._cell_width(line) == width, (width, line)
         # the title sits on a chip, so its one space of padding shows on each side
-        assert line.startswith("┌──  FREEBUFF TODOS  ") and line.endswith("┐"), line
+        assert unbuffy(line).startswith("┌──  FREEBUFF TODOS  ") and line.endswith("┐"), line
         return line
 
     border_state = dict(
         rich_state, backend="cli", session="2026-09-24T07-05-26.585Z",
     )
+    # She stands on this border too, and her six cells come out of the tag's tail (the rule and
+    # the widths it costs are asserted in the buffy-chan checks), so the whole reading is asked
+    # for on a pane that has the columns for it rather than on the one she has to share with.
     watched = top_of(border_state, 46, watching=999)
-    assert "watcher: pid 999" in watched, watched
+    assert "watcher: pid" in watched and "999" not in watched, watched
+    assert "watcher: pid 999" in top_of(border_state, 60, watching=999), "the pid at 60"
     assert module._session_label(border_state) not in watched, watched
     # no watcher is serving this pane, so the border says which session it is showing —
     # and never the raw ISO stamp, which used to be clipped into that slot
-    bare = top_of(border_state, 46)
+    bare = top_of(border_state, 60)
     assert "watcher" not in bare, bare
     assert module._session_label(border_state) in bare, (bare, module._session_label(border_state))
     assert "2026-09-24T07-05" not in bare, bare
@@ -9916,10 +10261,12 @@ def _probe_live_for_target(x, y):
     assert module._session_label(border_state) in noted, (
         "the note costs the right slot no session: both fit at this width"
     )
-    # ...and a title it cannot say usefully is not said: at 44 columns the session keeps its
-    # columns and the pane keeps its name, rather than the note shoving the stamp off the rim
-    capped = border_of(dict(border_state, **note), 44)
-    assert capped.startswith("┌──  FREEBUFF TODOS  "), capped
+    # ...and a title it cannot say usefully is not said: on a pane too narrow for the note the
+    # session keeps its columns and the pane keeps its name, rather than the note shoving the
+    # stamp off the rim. The pane is asked at 44 columns PLUS the six buffy-chan stands in, so
+    # this stays a measurement of the NOTE's priority rather than of hers.
+    capped = border_of(dict(border_state, **note), 44 + module.BUFFY_CELLS)
+    assert unbuffy(capped).startswith("┌──  FREEBUFF TODOS  "), capped
     assert "cli finished" not in capped, capped
     assert "cli · 09-24" in capped, (
         "...and the session it is showing is still the thing in the slot\n" + capped
@@ -10050,7 +10397,8 @@ def _probe_live_for_target(x, y):
         frame = text.rstrip(b"\n")
         tail = text[len(frame):]
         lines = frame.split(b"\n")
-        assert frame.startswith("┌──  FREEBUFF TODOS".encode()), (label, frame[:80])
+        assert unbuffy(frame.decode("utf-8", "replace")).startswith("┌──  FREEBUFF TODOS"), (
+            label, frame[:80])
         assert frame.endswith("┘".encode()), (label, frame[-80:])
         assert sum(1 for line in lines if line.startswith("┌".encode())) == 1, (label, lines)
         assert len(lines) <= draw_rows, (label, len(lines))
@@ -10061,7 +10409,11 @@ def _probe_live_for_target(x, y):
 
     full_lines = rows_of(full_paint)
     assert len(full_lines) == draw_rows, (len(full_lines), full_lines)  # the tight branch ran
-    assert len(rows_of(short_paint)) < draw_rows, short_paint  # ...and so did the roomy one
+    # ...and the roomy list's frame now FILLS its pane too, because buffy-chan's portrait takes
+    # exactly the rows it left over (see `BUFFY_ART`): the contract this check is for is that a
+    # frame never grows past the pane and a newline is written only when a row is left over, which
+    # is what the `tail` assertion above holds for either answer.
+    assert len(rows_of(short_paint)) <= draw_rows, short_paint
     say("a full-height frame is not followed by a newline: ok")
 
     # ---- per-task timing is measured, so it must behave under observation: the clock
@@ -11203,6 +11555,1982 @@ def _probe_live_for_target(x, y):
         "on screen while `_cell_width` still agrees with itself"
     )
     say("the frame's own glyphs are one cell to Unicode, not just to the code's ruler: ok")
+
+    # ---- buffy-chan, the pane's supporting character. She is one ASCII face and her ahoge at
+    #      the left of the top border, and her FACE is the state. Four properties keep her from
+    #      costing the frame anything a reader depends on: she is the same width in every mood (a
+    #      pane must not reflow because she changed expression), she is pure ASCII (no terminal
+    #      gets to disagree with `_cell_width` about her), every mood she can wear is produced by
+    #      a real state (a face nobody can reach is a face that is not there), and on a narrow
+    #      border she STEPS ASIDE rather than push the watcher's pid off it.
+    faces = module.BUFFY_REST
+    wardrobe = set(module.BUFFY_FRAMES)
+    assert {module._cell_width(f) for f in faces.values()} == {module.BUFFY_CELLS}, (
+        "buffy-chan is not one width in every mood, so the pane would reflow when she changed "
+        f"expression: {faces}")
+    assert {module._cell_width(f) for f in wardrobe} == {module.BUFFY_CELLS}, (
+        f"a frame she can wear is not {module.BUFFY_CELLS} cells wide, so an animation step "
+        f"would move the border: {sorted((f, module._cell_width(f)) for f in wardrobe)}")
+    assert wardrobe == {f for cycle in module.BUFFY_CYCLE.values() for f in cycle}, (
+        "the wardrobe and the cycles disagree about what she can wear: "
+        f"{sorted(wardrobe ^ {f for cycle in module.BUFFY_CYCLE.values() for f in cycle})}")
+    non_ascii = sorted({ch for f in wardrobe for ch in f if not ch.isascii()})
+    assert not non_ascii, (
+        f"buffy-chan draws glyphs a terminal may draw at another width: {non_ascii!r}")
+
+    buffy_list = {"backend": "cli", "session": "S", "goal": "a heading over a list",
+                  "todos": [{"task": "a step", "completed": True},
+                            {"task": "another step", "completed": False}],
+                  "done": 1, "total": 2}
+    # mood -> the state that produces it, and the pane's own idle arguments for that state
+    moods = {
+        "error": (dict(buffy_list, error="boom"), {}),
+        "nudge": (dict(buffy_list, nudge="continue"), {}),
+        "done": (dict(buffy_list, done=2, total=2,
+                      todos=[{"task": "a", "completed": True},
+                             {"task": "b", "completed": True}]), {}),
+        "none": ({"backend": "cli", "session": "S", "goal": "g", "todos": []}, {}),
+        "idle": (buffy_list, {"idle_s": 900.0, "stale_after_s": 120.0}),
+        "stale": (dict(buffy_list, goal_stale=True), {}),
+        "wait": (dict(buffy_list, turn_ended=True), {}),
+        "work": (buffy_list, {}),
+    }
+    for mood, (st, kw) in moods.items():
+        assert module.buffy_face(st, **kw) == faces[mood], (mood, module.buffy_face(st, **kw))
+    # ...and her WINDOW is told the same mood, in the same words: her window draws a picture rather
+    # than a face, so the word is the only thing that can keep the art she is and the face on the
+    # border from disagreeing about the same list (the owner, 2026-10-07: "make her change image
+    # based on what she is working on and what is her emotion right now based on the task"). Every
+    # frame the pane draws has to publish a word its own cycle table knows, and for the states whose
+    # mood the pane decides without its own clock, it has to be exactly that state's mood.
+    mood_file = module.pip_mood_path()
+    module.note_pane_mood("work")
+    for mood, (st, kw) in moods.items():
+        module.render(dict(st, model="gpt-5"), True, watching=4242, width=68, height=24,
+                      now_ms=grid_now)
+        written = open(mood_file).read().strip()
+        assert written in module.BUFFY_CYCLE, (mood, written)
+        if not kw:
+            assert written == module.buffy_mood(st), (mood, written)
+    # ...written on a CHANGE, and again when the file has gone missing (one `stat` per frame is the
+    # whole cost of it), and never fatally — a cache nobody can write is a pose her window does
+    # without, not a frame that fails.
+    os.utime(mood_file, (1, 1))
+    module.note_pane_mood(open(mood_file).read().strip())
+    assert os.stat(mood_file).st_mtime == 1, "an unchanged mood was rewritten"
+    os.unlink(mood_file)
+    module.note_pane_mood("work")
+    assert open(mood_file).read().strip() == "work", (
+        "a mood file that went missing was not written again, so her window would keep wearing "
+        "whatever it read before the cache was cleared")
+    keep_mood = os.environ["FBTODO_PIP_MOOD"]
+    os.environ["FBTODO_PIP_MOOD"] = os.path.join(mood_file, "deeper", "mood")
+    module.note_pane_mood("idle")            # under a FILE, so makedirs fails
+    os.environ.pop("FBTODO_PIP_MOOD", None)
+    assert module.pip_mood_path() == os.path.join(os.path.expanduser("~"),
+                                                  ".cache", "fbtodo", "pip-mood"), \
+        module.pip_mood_path()
+    os.environ["FBTODO_PIP_MOOD"] = keep_mood
+    # ...and every frame her window's mood TABLE names has to exist, and every mood the pane can
+    # produce has to have a pose: the table lives in the Swift and the frames live in `assets`, so
+    # nothing but a check keeps the two ends of one feature honest. Read as text rather than run —
+    # the window is an AppKit program the suite does not open (see the pip phase) and the numbers
+    # are data.
+    with open(os.path.join(ROOT, "scripts", "buffy-pip.swift")) as fh:
+        swift = fh.read()
+    table = re.search(r"let moodCycles: \[String: \(frames: \[Int\], ms: Double\)\] = \[(.*?)\n\]",
+                      swift, re.S)
+    assert table, "her moods are not where `moodCycles` puts them, so nothing checks the poses"
+    # name -> (frames, pace), read off the Swift's own table: `work: ([20, 17], 2500),   // ...`
+    read_table = {name: ([int(n) for n in frames.split(",")], float(ms)) for name, frames, ms
+                  in re.findall(r'^\s*"(\w+)":\s*\(\[([0-9, ]+)\], ([0-9.]+)\)',
+                                table.group(1), re.M)}
+    named = {n for frames_of, _ms in read_table.values() for n in frames_of}
+    missing = sorted(set(module.BUFFY_CYCLE) - set(read_table))
+    assert not missing, (
+        f"a mood the pane can wear has no pose in her window's table, so she falls back to "
+        f"`work` while the border says something else: {missing}")
+    assert set(read_table) == set(module.BUFFY_CYCLE), (
+        f"her window has a pose for a mood the pane cannot produce, so she can never be seen in "
+        f"it: {sorted(set(read_table) ^ set(module.BUFFY_CYCLE))}")
+    frames_dir = os.path.join(ROOT, "assets", "buffy", "pip")
+    if not os.path.isdir(frames_dir):
+        frames_dir = os.path.join(ROOT, "assets", "buffy")
+    on_disk = len([n for n in os.listdir(frames_dir) if n.endswith(".png")])
+    assert named and max(named) <= on_disk, (
+        f"her window's mood table names frame {max(named)} of {on_disk} frames in "
+        f"{os.path.relpath(frames_dir, ROOT)}: {sorted(named)}")
+    # ...and ALL of them are worn: the owner drew twenty stickers and asks to see them all
+    # (2026-10-07: "trying to use all of buffy-chan images"), so the frames no mood names are art that
+    # exists and is never on screen — the one thing about her art that a picture of the sheet cannot
+    # check, because a sheet shows the files rather than the poses she can reach.
+    unused_frames = sorted(set(range(1, on_disk + 1)) - named)
+    assert not unused_frames, (
+        f"{len(unused_frames)} of her {on_disk} frames are worn by no mood, so they are art nobody "
+        f"ever sees: frames {unused_frames}")
+    # ...and the table the WINDOW actually runs on is the one just read: `fbtodo-pip --moods` prints
+    # it (name, frames, pace) without a window, a pane or a frame on disk, so the Swift's own answer
+    # can be compared with the pane's vocabulary and with what she really renders rather than with
+    # the source text. The binary is a build product: when it is missing (or older than the Swift it
+    # was built from) that is said out loud rather than checked, because a suite that fails on an
+    # unbuilt machine is a suite about the machine.
+    pip_bin = os.path.expanduser(os.environ.get("FBTODO_PIP_BIN")
+                                 or "~/.cache/fbtodo/bin/fbtodo-pip")
+    fresh = (os.path.exists(pip_bin)
+             and os.path.getmtime(pip_bin) >= os.path.getmtime(os.path.join(
+                 ROOT, "scripts", "buffy-pip.swift")))
+    if fresh:
+        table_run = subprocess.run([pip_bin, "--moods"], capture_output=True, text=True,
+                                   timeout=60)
+        assert table_run.returncode == 0, (table_run.stdout, table_run.stderr)
+        rows = [line.split("\t") for line in table_run.stdout.splitlines() if line.strip()]
+        poses = {name: ([int(n) for n in frames.split(",")], float(ms))
+                 for name, frames, ms in rows}
+        assert poses == read_table, (poses, read_table)      # the binary and its own source
+        # the same table, word for word, and no pose for a mood the pane cannot produce
+        assert set(poses) == set(module.BUFFY_CYCLE), (
+            f"her window and the pane disagree about which moods exist: "
+            f"{sorted(set(poses) ^ set(module.BUFFY_CYCLE))}")
+        for name, (frames_of, ms) in poses.items():
+            assert frames_of and all(1 <= n <= on_disk for n in frames_of), (name, frames_of)
+            # a mood the PANE holds still on is one her window has to hold too (one face in its
+            # cycle), and the swap is the other way round as well: two of the seven are moments
+            # rather than states, so a pace there would be the picture fidgeting over the reading
+            still = len(module.BUFFY_CYCLE[name]) == 1
+            assert still == (ms == 0), (name, ms, module.BUFFY_CYCLE[name])
+        # ...and she really WEARS a different pose per mood: seven renders through the window's own
+        # drawing path, all of them different pictures. A table that is right and a drawing path
+        # that ignores it is a smile that never changes.
+        painted = {}
+        for name in sorted(poses):
+            out = os.path.join(TEST_HOME, f"pose-{name}.png")
+            art = subprocess.run([pip_bin, "--art", out, "--art-size", "192", "--art-mood", name],
+                                 capture_output=True, text=True, timeout=120)
+            assert art.returncode == 0, (name, art.stdout, art.stderr)
+            assert f"frame={poses[name][0][0] - 1} " in art.stdout, (name, art.stdout)
+            with open(out, "rb") as fh:
+                painted[name] = fh.read()
+        assert len(set(painted.values())) == len(painted), (
+            "two moods draw the same picture, so one of them is a pose nobody would notice: "
+            + ", ".join(sorted(painted)))
+        # ...and the table is a FILE you can retune without rebuilding her window, in the same shape
+        # `--moods` prints, read while she runs. Three properties make that safe, and the last one is
+        # the one that matters: a half-edited file must never leave a mood the pane can put her in
+        # without a pose, and must never drop the moods it does not mention.
+        def moods_from(path=None):
+            run_env = dict(os.environ)
+            if path:
+                run_env["FBTODO_PIP_MOODS"] = path
+            else:
+                run_env.pop("FBTODO_PIP_MOODS", None)
+            done = subprocess.run([pip_bin, "--moods"], capture_output=True, text=True,
+                                  env=run_env, timeout=60)
+            assert done.returncode == 0, (done.stdout, done.stderr)
+            rows = [line.split("\t") for line in done.stdout.splitlines() if line.strip()]
+            assert all(len(row) == 3 for row in rows), rows
+            return {row[0]: (row[1], float(row[2])) for row in rows}
+
+        # The baseline is a path that does not exist rather than the machine's own file: a suite
+        # whose answer depends on whether the operator has retuned her table is a suite about the
+        # operator (the same lesson the pinned pip paths carry above).
+        built = moods_from(os.path.join(TEST_HOME, "moods-absent.tsv"))
+        assert set(built) == set(module.BUFFY_CYCLE), (sorted(built), sorted(module.BUFFY_CYCLE))
+        tuned_file = os.path.join(TEST_HOME, "moods-tuned.tsv")
+        with open(tuned_file, "w") as fh:
+            fh.write("# a retune, half-finished on purpose\n"
+                     "work 6,20 1200\n"          # pose and pace
+                     "done 14 0\n"              # a different pose, and held
+                     "nonsense 3,4 9\n"         # not a mood the pane can produce
+                     "work 99\n"                # a frame past the end of the art
+                     "idle\t1,2\t\n")           # frames only: the pace stays built in
+        tuned = moods_from(tuned_file)
+        assert tuned["work"] == ("6,20", 1200.0), tuned["work"]
+        assert tuned["done"] == ("14", 0.0), tuned["done"]
+        assert tuned["idle"] == ("1,2", built["idle"][1]), (tuned["idle"], built["idle"])
+        assert "nonsense" not in tuned, sorted(tuned)
+        assert set(tuned) == set(built), ("a retune dropped moods it never named", sorted(tuned))
+        for name in set(built) - {"work", "done", "idle"}:
+            assert tuned[name] == built[name], (name, tuned[name], built[name])
+        # a file that only says one thing is an OVERRIDE, not a new table
+        with open(tuned_file, "w") as fh:
+            fh.write("work 8\n")
+        partial = moods_from(tuned_file)
+        assert partial["work"] == ("8", built["work"][1]), partial["work"]
+        assert set(partial) == set(built), sorted(partial)
+        # ...and a file that is missing, empty or rubbish leaves the built-in table alone
+        for junk in ("nope.tsv", "empty.tsv"):
+            path = os.path.join(TEST_HOME, junk)
+            if junk == "empty.tsv":
+                open(path, "w").close()
+            assert moods_from(path) == built, junk
+        rubbish = os.path.join(TEST_HOME, "rubbish.tsv")
+        with open(rubbish, "wb") as fh:
+            fh.write(b"\x00\x01\x02 not a table at all \xff\nwork\n\n")
+        assert moods_from(rubbish) == built, "a rubbish file changed her table"
+        # ...and everything she does BETWEEN two states is one transition with one length, which the
+        # still path must not depend on at all: `--art` is a PICTURE, and the dissolve is the window's
+        # own drawing of it (the owner, 2026-10-07: "can you make transition between 2 panes slow
+        # down"). A knob that changed the art would be a knob that changed her, and `0` — the hard cut
+        # she started with, which is now the A/B arm — has to be a value like any other rather than a
+        # special case, so the default, off, a retune and two rubbish values all have to run and all
+        # have to render the same bytes.
+        stills_by_transition = {}
+        for value in ("0", "700", "2000", "rubbish", "-5"):
+            out = os.path.join(TEST_HOME, f"pose-work-{value}.png")
+            done = subprocess.run([pip_bin, "--art", out, "--art-size", "192", "--art-mood", "work"],
+                                  capture_output=True, text=True, timeout=120,
+                                  env=dict(os.environ, FBTODO_PIP_TRANSITION=value))
+            assert done.returncode == 0, (value, done.stdout, done.stderr)
+            with open(out, "rb") as fh:
+                stills_by_transition[value] = fh.read()
+        assert len(set(stills_by_transition.values())) == 1, (
+            "her transition length changed the picture she renders, so the dissolve is in the art "
+            "rather than in the drawing of it: " + ", ".join(sorted(stills_by_transition)))
+        # ...and it is really a TRANSITION of all three things rather than a number nothing reads: the
+        # window's own source has to default it from the environment, ease a move, fade in, fade out,
+        # and dissolve a pose — and the old hard cuts have to be GONE, every call that puts her on the
+        # screen and takes her off it being one of the two fades.
+        assert '("transition", "--transition", "FBTODO_PIP_TRANSITION", "10000", true)' in swift, (
+            "her window does not read a default transition length out of FBTODO_PIP_TRANSITION")
+        for wanted in ("var move: (from: NSRect, to: NSRect, started: Date, seconds: Double)?",
+                       "var fade: (from: CGFloat, to: CGFloat, started: Date, seconds: Double)?",
+                       "let glide: (NSRect) -> Void", "let showWindow: () -> Void",
+                       "let hideWindow: () -> Void", "let stepTransitions: () -> Void",
+                       "func poseFade()"):
+            assert wanted in swift, f"her window does not ease it: nothing named `{wanted}`"
+        # ...and every one of them is REACHED from where the state change happens: a ramp nobody starts
+        # is a transition that never runs, and the fine clock is the only thing that finishes one.
+        for wanted in ("glide(want)", "if !wantShown { showWindow() }", "hideWindow()",
+                       "if move != nil || fade != nil { stepTransitions() }",
+                       "if view.posing || view.bubbleOpen { view.needsDisplay = true }",
+                       "Date().timeIntervalSince(since) >= hideDebounceS"):
+            assert wanted in swift, f"her window declares a transition nothing runs: `{wanted}`"
+        assert swift.count("orderFrontRegardless") == 1 and swift.count("window.orderOut(") == 1, (
+            "a window that pops is still in there: the one call that puts her on the screen and the "
+            "one that takes her away have to be the arrival and the fade OUT, and nothing else at "
+            "all (got "
+            f"{swift.count('orderFrontRegardless')} and {swift.count('window.orderOut(')})")
+        # ...and ARRIVING is a cut rather than a fade, which is the second half of the owner's ask: the
+        # window is ordered in at full opacity (the balloon pops instead of fading up), while going away is
+        # still a fade — a window that pops out is a flash in the corner of the eye.
+        assert "window.alphaValue = 1" in swift and "return CGFloat(down)" in swift, (
+            "she still fades IN: the arrival has to be full opacity and the balloon at full strength, "
+            "with only the way off the screen a fade (2026-10-07: 'also remove fade in')")
+        # ...and the number is a length you can SEE, which is what the owner asked for ("i let the
+        # transition take at least 10s"): anything below the floor is raised to it, `0` is the cut and
+        # is passed through untouched, and a value that is not a number is the default. Read off `--art`,
+        # which prints the length it would run at — the suite never opens her window.
+        for asked, effective in (("", "10000"), ("700", "10000"), ("2000", "10000"),
+                                 ("10000", "10000"), ("20000", "20000"), ("0", "0"),
+                                 ("-5", "0"), ("rubbish", "10000")):
+            run_env = dict(os.environ)
+            if asked:
+                run_env["FBTODO_PIP_TRANSITION"] = asked
+            else:
+                run_env.pop("FBTODO_PIP_TRANSITION", None)
+            out = os.path.join(TEST_HOME, "transition-floor.png")
+            done = subprocess.run([pip_bin, "--art", out, "--art-size", "192", "--art-mood", "wait"],
+                                  capture_output=True, text=True, env=run_env, timeout=120)
+            assert done.returncode == 0, (asked, done.stdout, done.stderr)
+            assert f"transition={effective}ms" in done.stdout, (asked, effective, done.stdout)
+        # ...and a POSE is capped by the mood it is arriving at but never made FAST by that cap: the owner
+        # asked for the pose transition to be a slow one too ("make transition between pose take 10s"),
+        # then for the cap back and a floor under it ("you can have the cap, but sometimes i don't want
+        # it to be too fast transition") — so both halves of that arithmetic are checked, and a mood that
+        # HOLDS has no step to cap against and takes the whole length.
+        assert "min(transitionS, max(mood.ms > 0 ? mood.ms / 1000 : transitionS, poseFloorS))" in swift, (
+            "a pose dissolve is not capped by its own pace with a floor under the cap, so a fast mood "
+            "either smears for the whole transition or snaps")
+        assert '("pose-min", "--pose-min", "FBTODO_PIP_POSE_MIN", "10", true)' in swift, (
+            "her window does not read a default floor for a pose dissolve out of FBTODO_PIP_POSE_MIN — "
+            "or the floor is back below the transition itself, which is the 'too fast' the owner asked "
+            "up (2026-10-07: 'increase default transition per pose up, i dont want it to be too fast'))")
+        # ...and the slide is a SLIDE: her size is settled when the move begins and only the corner
+        # travels, because a window that grows on the way across is one the pane's own rows cannot
+        # account for (the owner, 2026-10-07: "don't resize the window for slide in transition").
+        assert "width: m.to.width, height: m.to.height" in swift, (
+            "her move interpolates her size as well as her corner, so she is the wrong size for the "
+            "whole of the slide")
+        # ...and she TALKS: a bubble drawn inside her own square (never over the pane's list), one line
+        # per mood picked at random and never the one she just said, on a mood change and at most once
+        # every `bubbleGapS` — with the one exception of a finished list, which also gets the burst, so
+        # "every step is ticked" is something you can see rather than read ("add a chat bubble..." and
+        # "add transition after she's done with all the job").
+        lines_block = re.search(r"let bubbleLines: \[String: \[String\]\] = \[(.*?)\n\]", swift, re.S)
+        assert lines_block, "her lines are not where `bubbleLines` puts them, so nothing checks them"
+        spoken_for = set(re.findall(r'^\s*"(\w+)":\s*\[', lines_block.group(1), re.M))
+        assert spoken_for <= set(module.BUFFY_CYCLE), (
+            "she has a line for a mood the pane cannot put her in: "
+            f"{sorted(spoken_for - set(module.BUFFY_CYCLE))}")
+        assert {"done", "wait", "work"} <= spoken_for, (
+            f"the moods worth a word have none: {sorted({'done', 'wait', 'work'} - spoken_for)}")
+        # ...and every mood she can be put in has a POOL, not one line: the clock says these too now
+        # ("use bubble cloud talk more often"), so a thin row is a line she repeats within the minute —
+        # which is the tape loop the table exists to avoid. Four is the floor for a mood that flashes
+        # past and six for the two she spends whole turns in.
+        pools, split_rows = {}, re.split(r'"(\w+)":\s*\[', lines_block.group(1))
+        for i in range(1, len(split_rows) - 1, 2):
+            pools[split_rows[i]] = re.findall(r'"([^"]*)"', split_rows[i + 1].split("]", 1)[0])
+        assert set(pools) == spoken_for, (sorted(pools), sorted(spoken_for))
+        for name, words in pools.items():
+            assert len(words) >= 4, (name, words)
+            assert len(set(words)) == len(words), (name, words)
+            assert all(len(w) <= 16 for w in words), (name, words)
+        for name in ("work", "idle"):
+            assert len(pools[name]) >= 6, (name, pools[name])
+        # ...and ONE line is deliberately shared between two moods rather than copied into both: the
+        # reuse is the point (the same words mean the same thing in the two moods), and a check is what
+        # keeps a later edit from "tidying" it back into two strings that then drift apart.
+        shared = sorted(w for w in set(sum(pools.values(), []))
+                        if sum(1 for words in pools.values() if w in words) > 1)
+        assert shared == ["one more step"], shared
+        assert "one more step" in pools["work"] and "one more step" in pools["nudge"], pools
+        for wanted in ("let bubbleLines: [String: [String]]", "func bubbleLine(_ mood: String",
+                       "func drawBubble(_ alpha: CGFloat)", "func say(_ text: String",
+                       "func celebrate()", "Date().timeIntervalSince(lastLineAt) >= bubbleGapS"):
+            assert wanted in swift, f"her bubble is declared but not drawn or not reached: `{wanted}`"
+        # ...and she talks on the CLOCK as well as on a mood change, which is what makes the bubble
+        # company rather than a caption: the line the clock picks is the CURRENT mood's (so it cannot
+        # say something she is not feeling), it is gated on the same reused `bubbleGapS`, and it never
+        # talks over a line still up or over the finished burst.
+        assert "if bubbleOn && bubbleClockMoods.contains(mood) && !view.bubbleOpen && !view.bursting" \
+            in swift, (
+            "the clock does not talk, so a mood that lasts a turn says one line and nothing after it")
+        assert "pickLine(mood, avoid: lastLine," in swift \
+            and "on=tick kind=\\(kind)" in swift, (
+            "the clock's line is not the current mood's, or is not named as the clock's in her log")
+        # ...and the two FLAVOURS every mood has: a cringe line and, once in a while, a whole short
+        # sentence ("make her say cringe things often as well, once in a while she should say something a
+        # bit longer like a short sentence"). They are tables of their own rather than rows spliced into
+        # `bubbleLines`, one row per mood in each, chosen by the two rate knobs in `pickLine` — which is
+        # reached from BOTH places that speak, so "cringe sometimes" cannot come true on only one of them.
+        def _rows(head):
+            block = swift.split(head, 1)[1].split("\n]", 1)[0]
+            parts = re.split(r'"(\w+)":\s*\[', block)
+            out = {}
+            for i in range(1, len(parts) - 1, 2):
+                out[parts[i]] = re.findall(r'"([^"]*)"', parts[i + 1].split("]", 1)[0])
+            return out
+
+        cringe_rows = _rows("let cringeLines: [String: [String]] = [")
+        long_rows = _rows("let longLines: [String: [String]] = [")
+        for label, rows in (("cringe", cringe_rows), ("sentence", long_rows)):
+            assert set(rows) == set(pools), (label, sorted(rows), sorted(pools))
+            for name, words in rows.items():
+                # cringe is the flavour she wears most often, so its pool has to be wider than its rate
+                # or the same joke comes back within three rolls and stops landing.
+                floor = 3 if label == "cringe" else 2
+                assert len(words) >= floor and len(set(words)) == len(words), (label, name, words)
+        for name, words in long_rows.items():
+            assert all(" " in w and len(w) >= 20 for w in words), (name, words)
+        # ...and no line she can say may sound like an AI wrote it ("i don't want her to say something too
+        # generic and sounds like an AI"): the bubble is her being a dork about the thing she is looking at,
+        # so the phrases that put an assistant in her mouth are banned by name — across all three tables,
+        # since the friendliest sentence in the file is exactly the one this rule exists for.
+        GENERIC_LINES = ("i'm here", "you've got this", "let me know", "happy to", "as an ai",
+                         "feel free", "no worries", "at your own pace", "take your time", "i'm proud",
+                         "everything will", "it's okay", "just say the word", "reach out")
+        for label, rows in (("say", pools), ("cringe", cringe_rows), ("sentence", long_rows)):
+            for name, words in rows.items():
+                for said in words:
+                    low = said.lower()
+                    hit = [p for p in GENERIC_LINES if p in low]
+                    assert not hit, f"her {label} line for {name} sounds like an AI: {said!r} ({hit})"
+        ordinary_all = {w for words in pools.values() for w in words}
+        cringe_all = {w for words in cringe_rows.values() for w in words}
+        long_all = {w for words in long_rows.values() for w in words}
+        assert not (cringe_all & ordinary_all), sorted(cringe_all & ordinary_all)
+        assert not (long_all & (ordinary_all | cringe_all)), (
+            "a sentence is a flavour of its own, not a repeat of a tag",
+            sorted(long_all & (ordinary_all | cringe_all)))
+        for wanted in ('("cringe", "--cringe", "FBTODO_PIP_CRINGE", "0.35", true)',
+                       '("sentence", "--sentence", "FBTODO_PIP_SENTENCE", "0.15", true)'):
+            assert wanted in swift, f"the knob `{wanted}` is missing from her window's own table"
+        # ...and she must not repeat herself ("also avoid her to repeat the same thing too often"): the
+        # memory is a LIST of her recent lines rather than only the one before, EVERY table she says lines
+        # from rolls through it, and both places that speak write back to it — a pool of four tags with a
+        # 12-second clock came back around inside the minute before this.
+        assert "let recentDepth = 6" in swift and "var recentLines: [String] = []" in swift, (
+            "her memory of what she just said is missing, so the clock repeats her within the minute")
+        assert "!recentLines.contains($0)" in swift \
+            and "let notLast = avoid.isEmpty ? pool : pool.filter { $0 != avoid }" in swift, (
+            "a pool with nothing fresh in it either repeats immediately or says nothing at all")
+        for call in ("freshIn(table.pool, avoid: avoid)", "pickFresh(surpriseTable)",
+                     "pickFresh(all, avoid: avoid)", "func freshIn(_ pool: [String], avoid: String = \"\") -> [String]"):
+            assert call in swift, f"a table she says lines from ignores her recent history: `{call}`"
+        # ...and a flavour with nothing fresh left HANDS OVER rather than repeating itself: the memory is
+        # longer than a flavour table (six against three), so rolling the table first and filtering after it
+        # would have made "no repeats" a rule for the mood's own pool only.
+        assert "order += (cringeTable + sentenceTable + sayTable).filter { $0.kind != order[0].kind }" \
+            in swift, "a worn-out flavour repeats itself instead of letting the other tables answer"
+        assert swift.count("noteSaid(text)") >= 2, (
+            "a line can be said without being remembered, so the next roll may repeat it at once")
+        assert swift.count("pickLine(") >= 3 and "kind=\\(picked?.1 ?? \"say\")" in swift, (
+            "a flavour is picked at one place and not the other (the mood change and the clock)")
+        assert "guard let ordinary = bubbleTable[mood], !ordinary.isEmpty else { return nil }" in swift, (
+            "a mood the lines file silenced still talks, so \"she says nothing in this one\" is a lie")
+        # ...and the clock is quiet in the three moods that are a FACT rather than a feeling: those hold
+        # their pose (see `moodCycles`), say their line once on arrival, and then stop, while the five
+        # that mean "she is here with you" keep talking. A companion that keeps reminding you the list is
+        # stale is nagging, so the two sets are checked against each other and against the table.
+        clock_moods = set(re.findall(r'"(\w+)"',
+                                     swift.split("let bubbleClockMoods", 1)[1].split("\n", 1)[0]))
+        assert clock_moods == {"work", "done", "idle", "none", "wait"}, sorted(clock_moods)
+        # her pose HOLDS for a mood whose row in her own table has no step (`ms` 0), read out of the
+        # Swift rather than assumed, so the two halves of "a fact, not a feeling" cannot drift apart.
+        hold_block = swift.split("let moodCycles:", 1)[1].split("\n]", 1)[0]
+        held = set(re.findall(r'"(\w+)":\s*\(\[[^\]]*\],\s*0\)', hold_block))
+        assert held == {"wait", "error", "nudge", "stale"}, sorted(held)
+        assert clock_moods & held == {"wait"}, sorted(clock_moods & held)
+        assert clock_moods | held == set(pools), sorted(clock_moods | held)
+        # ...and the switch itself is one of the KNOBS, so its environment name and its default live in
+        # the tune table beside every other one (`tuneKnobs`) and are read through `tuneValue`, not from a
+        # second `?? "1"` of its own: the row IS the contract — env name, default, and live — and the row
+        # being read is what this checks (a knob in the table that nothing consults is a knob that lies).
+        assert '("bubble", "--bubble", "FBTODO_PIP_BUBBLE", "1", true)' in swift \
+            and 'tuneValue("bubble")' in swift, (
+            "her window does not read a default bubble setting out of FBTODO_PIP_BUBBLE")
+        assert "let want = view.bursting ? celebrateMs" in swift, (
+            "the celebration is not on the clock, so a finished list still steps at its mood's pace")
+        assert "if finished { view.celebrate() }" in swift, (
+            "nothing starts the celebration when the list is finished")
+        # ...and it is a MANGA BALLOON rather than a card: the line is measured FIRST and the cloud is the
+        # ring of scallops that wraps that measurement, the mood decides what those scallops are (round and
+        # spangled, a row of detached thought dots, or a jagged shock balloon), and no part of it — puff,
+        # dot, tail or outline — can reach past her own square ("a bubble cloud box like in manga wrap
+        # around text to show her emotion").
+        assert "bounds.height * 0.5" in swift, (
+            "her balloon is not capped at half her height, so it could grow over the pane's list")
+        assert "func bubbleLayout() -> (ring: NSRect, r: CGFloat, pad: CGFloat, font: NSFont," in swift \
+            and "let room = (line as NSString).boundingRect(" in swift, (
+            "her balloon is not laid out AROUND the measured line, so the cloud does not wrap the text")
+        # ...the ring being the LINE's own rect, hung flush to the side `say` picked rather than centred
+        # on her square (which is the older shape of this check, and the reason the balloon sat over one
+        # corner of her art for every line).
+        assert "let ring = NSRect(x: x, y: bounds.height - inset - text.height," in swift, (
+            "the ring her scallops sit on is not the line's own rect, so the cloud still has a size of "
+            "its own")
+        assert "private func puff(_ path: NSBezierPath, _ centre: NSPoint, _ radius: CGFloat" in swift \
+            and ".intersection(bounds.insetBy(dx: 0.5, dy: 0.5))" in swift, (
+            "a puff of her balloon is drawn without being clipped to her square, so a bubble could "
+            "reach over the pane's list")
+        for wanted in ("private func cloudBody(", "private func cloudPuffs(", "private func cloudSpikes(",
+                       "private func cloudTail(", "private func cloudSparkles("):
+            assert wanted in swift, f"her balloon is missing the piece that draws it: `{wanted}`"
+        assert swift.count("grow: grow).fill()") >= 4, (
+            "her balloon is not drawn twice — the outline and the body — so its edge is a stroke over "
+            "the arcs inside the union")
+        # ...and the SHAPE is the mood's: one row of `bubbleShapes` per mood, no mood without one, no two
+        # rows alike, and the jagged balloon kept for the two moods that are actually cross about it — a
+        # shape nobody can wear, or two moods that draw the same balloon, is an emotion that shows nothing.
+        head = "let bubbleShapes: [String: BubbleShape] = ["
+        assert head in swift, "her balloon's shapes are not where `bubbleShapes` puts them"
+        block = swift.split(head, 1)[1].split("\n]", 1)[0]
+        rows = block.splitlines()
+
+        def spikes_of(args):
+            return args.split("spikes:", 1)[1].split(",", 1)[0].strip()
+
+        # one row per mood, read as `name` and everything the row was built with — the puff, the gap,
+        # the spikes, the stars, the tail and the colour — so the table can be compared with the pane's
+        # own vocabulary and with itself rather than with the source text.
+        shaped = []
+        for i, ln in enumerate(rows):
+            if "BubbleShape(puff:" not in ln:
+                continue
+            shaped.append((ln.split('"')[1], (ln + " " + rows[i + 1]).split("BubbleShape(", 1)[1]))
+        assert len(shaped) == len(module.BUFFY_CYCLE), (
+            f"her balloon's table has {len(shaped)} rows for {len(module.BUFFY_CYCLE)} moods, so one of "
+            f"them is unwritten or unreadable: {[name for name, _ in shaped]}")
+        assert {name for name, _ in shaped} == set(module.BUFFY_CYCLE), (
+            "her balloon has a shape for a mood the pane cannot put her in (or none for one it can): "
+            f"{sorted({name for name, _ in shaped} ^ set(module.BUFFY_CYCLE))}")
+        assert len({args for _, args in shaped}) == len(shaped), (
+            "two moods are drawn the same balloon, so the shape shows no emotion: "
+            + ", ".join(name for name, _ in shaped))
+        for name, args in shaped:
+            puff = float(args.split("puff:", 1)[1].split(",", 1)[0])
+            gap = float(args.split("gap:", 1)[1].split(",", 1)[0])
+            assert 0.1 < puff < 0.9 and 1.0 <= gap <= 2.0, (
+                f"{name}'s balloon is measured in units of nothing: puff={puff} gap={gap}")
+        jagged = {name for name, args in shaped if spikes_of(args) != "0"}
+        assert jagged == {"error", "nudge"}, (
+            "the jagged balloon is worn by the wrong moods, so it says nothing about how she feels: "
+            f"{sorted(jagged)}")
+        # ...and the SURPRISE one, which is not a mood at all: a rate with two ends a test can pin, a line
+        # that belongs to no mood, and a balloon that is all the shapes at once — so "she sometimes does
+        # something you did not expect" is something the owner can make her do on demand rather than
+        # something only luck can show.
+        assert '("surprise", "--surprise", "FBTODO_PIP_SURPRISE", "0.12", true)' in swift \
+            and "surpriseChance = min(1, max(0," in swift, (
+            "her window does not read a default surprise rate out of FBTODO_PIP_SURPRISE")
+        assert "let surpriseShape = BubbleShape(" in swift \
+            and "Double.random(in: 0 ..< 1) < surpriseChance" in swift \
+            and "let surpriseLines: [String] = [" in swift \
+            and "if args.contains(\"--art-surprise\") { canvas.surprise() }" in swift, (
+            "nothing ever wears the surprise balloon, so the only way to see one is luck by hand")
+        assert "surpriseShape" not in block, (
+            "the surprise is a row of the mood table, so it is a mood the pane can never put her in")
+        assert "balloon=" in swift and "shape=" in swift \
+            and "bubbleMeasure" in swift and "bubbleShapeName" in swift, (
+            "the record does not say which balloon she is wearing, so a surprising run cannot be told "
+            "from an ordinary one")
+        # ...and a surprise is a POSE as well as a balloon: she borrows a sticker from OUTSIDE her mood's
+        # own cycle, her mood's stepping HOLDS while she wears it, and the way back is the ordinary dissolve
+        # rather than the cut it arrived on ("make the surprise change her pose as well: a sticker
+        # from outside the mood's own cycle for a few seconds, then back").
+        for wanted in ("private func wearSurprise()", "private func cutTo(", "func endSurprise()",
+                       "var surpriseExpired: Bool", "if view.surpriseExpired {",
+                       "view.endSurprise()",
+                       "let pool = (0..<frames.count).filter { !worn.contains($0) }",
+                       "guard !surpriseOn else { return }", "surprise=yes pose=",
+                       "surprise=over back=pose="):
+            assert wanted in swift, (
+                f"the surprise has no pose of its own, or no way back to hers: `{wanted}` is missing")
+        # ...and the balloon hangs on the OTHER side of her head for the next line, so her ahoge is not
+        # covered by every single one of them, and it POPS into place instead of fading up.
+        assert "bubbleRight.toggle()" in swift \
+            and "let x = bubbleRight ? bounds.width - inset - text.width : inset" in swift \
+            and 'var balloonSide: String { line.isEmpty ? "none" : (bubbleRight ? "right" : "left") }' \
+            in swift and r'balloon=\(view.balloonSide)' in swift, (
+            "the balloon always hangs on the same side of her head, so the same corner of her art is "
+            "covered by every line she says")
+        # ...and WHERE she stands has to be the pane: a blank panel with a pane's shape, and a bigger
+        # rectangle than the pane, must not win the choice between them (2026-10-08: the owner's preview
+        # panel did, and she stood outside the fbtodo pane — "sometimes it still appear out of the fbtodo
+        # pane"). A synthetic window answers it with no screen involved: a pane drawn the way the frame
+        # draws it (a list above the slack its own hint published) beside a taller, blank panel. The old
+        # answer — "the biggest pane-shaped pair of lines" — picked a rectangle that SPANNED the two; the
+        # answer has to be the pane's own borders, with her INSIDE them.
+        if fresh:
+            import struct
+            import zlib
+            fw, fh = 2456, 1380                      # the owner's window, at scale 2
+            pane_px = (100, 628, 100, 1340)          # left, right, top, bottom
+            rows_hint, cols_hint, start_hint, count_hint = 37, 33, 22, 13
+            bg, line, text_c = bytes((28, 28, 30)), (120, 120, 126), (200, 200, 205)
+            buf = bytearray(bg * (fw * fh))
+
+            def fill(x0, y0, x1, y1, colour):
+                for yy in range(max(0, y0), min(fh, y1 + 1)):
+                    row = yy * fw * 3
+                    for xx in range(max(0, x0), min(fw, x1 + 1)):
+                        at = row + xx * 3
+                        buf[at:at + 3] = bytes(colour)
+
+            cell = (pane_px[3] - pane_px[2]) / rows_hint
+            fill(pane_px[0], pane_px[2], pane_px[0] + 1, pane_px[3], line)
+            fill(pane_px[1] - 1, pane_px[2], pane_px[1], pane_px[3], line)
+            for row_n in range(start_hint):                 # the list: ink ABOVE the slack
+                yy = int(pane_px[2] + row_n * cell + cell / 2)
+                for mark in range(8):
+                    x0 = pane_px[0] + 14 + mark * 60
+                    fill(x0, yy - 2, x0 + 26, yy + 2, text_c)
+            fill(1500, 60, 1502, 1370, line)                # the decoy: bigger, and blank throughout
+            fill(2198, 60, 2200, 1370, line)
+            raw = b"".join(b"\x00" + bytes(buf[y * fw * 3:(y + 1) * fw * 3]) for y in range(fh))
+
+            def chunk(kind, data):
+                return (struct.pack(">I", len(data)) + kind + data
+                        + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+            shot = os.path.join(TEST_HOME, "fit-two-panes.png")
+            with open(shot, "wb") as out:
+                out.write(b"\x89PNG\r\n\x1a\n"
+                          + chunk(b"IHDR", struct.pack(">IIBBBBB", fw, fh, 8, 2, 0, 0, 0))
+                          + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+            hint = os.path.join(TEST_HOME, "fit-slack.txt")
+            with open(hint, "w", encoding="utf-8") as out:
+                out.write(f"{rows_hint} {cols_hint} {start_hint} {count_hint} 1\n")
+            # `--slack` names the hint on purpose: the machine's own pane may be publishing a
+            # different grid, and a geometry check that reads it would be a check about this
+            # machine rather than about this window.
+            fit_run = subprocess.run(
+                [pip_bin, "--fit", shot, "--fit-width", str(fw // 2), "--slack", hint],
+                capture_output=True, text=True, timeout=180)
+            fit_line = next((ln for ln in fit_run.stdout.splitlines() if ln.startswith("fit=")), "")
+            assert fit_run.returncode == 0 and "inside=yes" in fit_line, (fit_line, fit_run.stderr)
+            found = re.search(r"pane=(\d+),(\d+)-(\d+),(\d+)", fit_line)
+            assert found, fit_line
+            got = tuple(int(n) for n in found.groups())
+            # `pane=` prints left, TOP, right, bottom — the fixture names its own pane left, right,
+            # top, bottom, which is the order a rectangle is easiest to draw in.
+            expected = (pane_px[0], pane_px[2], pane_px[1], pane_px[3])
+            assert all(abs(got[i] - expected[i]) <= 6 for i in range(4)), (
+                f"her window was placed in a rectangle that is not the pane: {got} against "
+                f"{expected} — a blank panel beside it won the choice ({fit_line})")
+            say("her window is placed in the PANE, not in a panel that merely has a pane's shape "
+                f"({fit_line})")
+            # ...and the same measurement EXPLAINED (`fbtodo pip doctor`'s words, over a file so this
+            # needs no screen): every pair of lines with the reason it was kept or thrown away, and the
+            # blank panel named for what it is. This is the verb's whole job — a placement nobody can
+            # interrogate is a placement nobody can fix — so what is checked is the REASONS, not just
+            # the answer the `--fit` above already gives.
+            doctor_run = subprocess.run(
+                [pip_bin, "--fit", shot, "--fit-width", str(fw // 2), "--slack", hint, "--trace"],
+                capture_output=True, text=True, timeout=180)
+            doctor_lines = doctor_run.stdout.splitlines()
+            assert doctor_run.returncode == 0 and "inside=yes" in doctor_run.stdout, (
+                doctor_run.returncode, doctor_run.stdout, doctor_run.stderr)
+            assert any("pair 1500..2198" in ln and "blank panel" in ln for ln in doctor_lines), (
+                "the doctor does not say why the blank panel beside the pane was turned down: "
+                f"{doctor_lines}")
+            assert any("pair 100..627" in ln and "kept" in ln for ln in doctor_lines), (
+                f"the doctor does not say that the pane's own two borders were kept: {doctor_lines}")
+            assert any(ln.startswith("  pane (pt)=") for ln in doctor_lines), (
+                f"the doctor does not say where inside it she would stand: {doctor_lines}")
+            say("`pip doctor` explains a placement: every candidate pair with its reason, the blank "
+                "panel named as one, and the pane that won")
+            # ...and the WATCH: the same measurement taken again and again, reporting only what CHANGES.
+            # A hop is intermittent by nature — one capture catches an answer and never the jump — and no
+            # screen is needed to check the reporting either: the file is re-read every tick, so a HINT
+            # rewritten mid-watch is a placement that moved while the pixels stood still. That is exactly
+            # the intermittent hop the verb exists to catch in one command.
+            watch_hint = os.path.join(TEST_HOME, "fit-slack-watch.txt")
+            with open(watch_hint, "w", encoding="utf-8") as out:
+                out.write(f"{rows_hint} {cols_hint} {start_hint} {count_hint} 1\n")
+            watcher = subprocess.Popen(
+                [pip_bin, "--fit", shot, "--fit-width", str(fw // 2), "--slack", watch_hint,
+                 "--watch", "4"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            time.sleep(1.5)
+            # The hint is replaced ATOMICALLY, as the watch reads it once a tick: a half-written file
+            # would be a hint of nothing, which is a different placement rather than the one this checks.
+            moved_hint = os.path.join(TEST_HOME, "fit-slack-watch.new")
+            with open(moved_hint, "w", encoding="utf-8") as out:
+                out.write(f"{rows_hint} {cols_hint} {start_hint} 5 1\n")   # the blank band moved
+            os.replace(moved_hint, watch_hint)
+            watch_out, watch_err = watcher.communicate(timeout=120)
+            watch_lines = watch_out.splitlines()
+            assert watcher.returncode == 0, (watcher.returncode, watch_out, watch_err)
+            start_line = next((ln for ln in watch_lines if " start " in ln), "")
+            change_lines = [ln for ln in watch_lines if " changed=" in ln]
+            summary_line = next((ln for ln in watch_lines if "samples=" in ln), "")
+            assert start_line and "anchor=" in start_line, watch_lines
+            assert change_lines, ("the watch reported no change while the pane's own hint moved",
+                                  watch_lines)
+            assert re.match(r"watch=\d+\.\d+s at=\d\d:\d\d:\d\d changed=\S+ "
+                            r"pane=\d+,\d+-\d+,\d+ anchor=-?\d+,-?\d+ size=\d+ inside=(yes|no) "
+                            r"slot=-?\d+,-?\d+ \d+x\d+ was pane=\d+,\d+-\d+,\d+ "
+                            r"anchor=-?\d+,-?\d+",
+                            change_lines[0]), f"a change line a reader cannot use: {change_lines[0]}"
+            assert "anchor" in change_lines[0].split(" was ")[0], (
+                f"the moved blank band did not move her square: {change_lines[0]}")
+            counts = dict(re.findall(r"(samples|changes|outside|refused|no-pane)=(\d+)", summary_line))
+            assert int(counts.get("samples", 0)) >= 3, summary_line
+            assert int(counts.get("changes", 0)) >= 1, summary_line
+            # ...and the watch must not disagree with the single-shot verb about the same pixels: its
+            # baseline is the same measurement `--fit` reported two checks above.
+            assert f"pane={got[0]},{got[1]}-{got[2]},{got[3]}" in start_line, (start_line, got)
+            say("`pip doctor --watch` reports every change of pane or anchor with a clock, keeps both "
+                "readings, and counts them in one summary")
+            # ...and the CLI hands the duration to her window's own binary, which is where the argv is
+            # built: a stub in the binary's place records exactly what would have been run, so this is
+            # checked without a screen, a window, or a minute of waiting.
+            stub = os.path.join(TEST_HOME, "pip-stub.sh")
+            seen = os.path.join(TEST_HOME, "pip-stub-argv.txt")
+            with open(stub, "w", encoding="utf-8") as out:
+                out.write('#!/bin/sh\nprintf "%s\\n" "$@" > "$PIP_STUB_OUT"\n')
+            os.chmod(stub, 0o755)
+            stub_env = dict(os.environ, FBTODO_PIP_BIN=stub, PIP_STUB_OUT=seen)
+            for words, wanted, unwanted in ((["--watch", "7"], ["--doctor", "--watch", "7"], []),
+                                            (["--watch", "7", "--json", "--stop-on-change"],
+                                             ["--doctor", "--watch", "7", "--json", "--stop-on-change"], []),
+                                            ([], ["--doctor"], ["--watch", "--json"])):
+                if os.path.exists(seen):
+                    os.unlink(seen)
+                done = subprocess.run([sys.executable, FB, "pip", "doctor", *words],
+                                      capture_output=True, text=True, env=stub_env, timeout=120)
+                assert done.returncode == 0, (words, done.returncode, done.stdout, done.stderr)
+                argv = open(seen, encoding="utf-8").read().split()
+                for want in wanted:
+                    assert want in argv, (words, want, argv)
+                for unwanted_word in unwanted:
+                    assert unwanted_word not in argv, (words, argv)
+                # ...in the order the verb means them, and once each
+                assert argv.count("--doctor") <= 1 and argv.count("--watch") <= 1, argv
+            bad = subprocess.run([sys.executable, FB, "pip", "doctor", "--watch", "0"],
+                                 capture_output=True, text=True, env=stub_env, timeout=120)
+            assert bad.returncode == 64 and "seconds" in bad.stderr, (bad.returncode, bad.stderr)
+            stray = subprocess.run([sys.executable, FB, "pip", "doctor", "now"],
+                                   capture_output=True, text=True, env=stub_env, timeout=120)
+            assert stray.returncode == 64 and "--watch" in stray.stderr, (stray.returncode, stray.stderr)
+            say("`pip doctor --watch N` reaches her window's binary as `--doctor --watch N`, and a "
+                "value that is not a duration is a usage error rather than a default")
+            # `--json` and `--stop-on-change` belong to a watch: on their own they are a usage error.
+            lone = subprocess.run([sys.executable, FB, "pip", "doctor", "--json"],
+                                  capture_output=True, text=True, env=stub_env, timeout=120)
+            assert lone.returncode == 64 and "belong to --watch" in lone.stderr, (lone.returncode, lone.stderr)
+            # ...and the watch can be READ by a program and STOPPED at its first hop. The fixture's own pixels are one
+            # reading; a copy moved 40px right (20pt, several borders) is the other, a frame caught half-drawn. The feed
+            # writes them while the watch runs, atomically, so a reading that disagrees with the saved pane is HELD and a
+            # change only ever arrives as the second of two readings that agree.
+            sys.path.insert(0, os.path.join(ROOT, "src"))
+            from fbtodo.buffy_pixels import read_png, write_png  # noqa: E402 (the pane's own PNG reader)
+            flap_dir = os.path.join(TEST_HOME, "flap")
+            os.makedirs(flap_dir, exist_ok=True)
+            px_w, px_h, px_rgba = read_png(shot)
+            moved = bytearray(len(px_rgba))
+            for y in range(px_h):
+                row = px_rgba[y * px_w * 4:(y + 1) * px_w * 4]
+                moved[y * px_w * 4 + 160:(y + 1) * px_w * 4] = row[:(px_w - 40) * 4]
+            shifted = os.path.join(flap_dir, "shifted.png")
+            write_png(shifted, px_w, px_h, bytes(moved))
+            live = os.path.join(flap_dir, "live.png")
+            flap_hint = os.path.join(flap_dir, "slack.txt")
+            with open(flap_hint, "w", encoding="utf-8") as out:
+                out.write(f"{rows_hint} {cols_hint} {start_hint} {count_hint} 1\n")
+
+            def feed(schedule):
+                # (picture, seconds) in order, each one put in place atomically: the watch reads whatever is there.
+                for picture, seconds in schedule:
+                    tmp = live + ".tmp"
+                    shutil.copyfile(picture, tmp)
+                    os.replace(tmp, live)
+                    time.sleep(seconds)
+
+            def watch_flapping(schedule, seconds, extra, env=None):
+                shutil.copyfile(shot, live)
+                feeder = threading.Thread(target=feed, args=(schedule,), daemon=True)
+                feeder.start()
+                done = subprocess.run([pip_bin, "--fit", live, "--fit-width", str(fw // 2), "--slack", flap_hint,
+                                       "--watch", str(seconds), "--json", *extra],
+                                      capture_output=True, text=True, env=env, timeout=120)
+                feeder.join(timeout=60)
+                return done
+
+            flapping = watch_flapping([(shot if i % 2 == 0 else shifted, 0.3) for i in range(20)], 6, [])
+            assert flapping.returncode in (0, 1), (flapping.returncode, flapping.stderr[-500:])
+            lines = [json.loads(ln) for ln in flapping.stdout.splitlines() if ln.strip()]
+            wanted_keys = {"t", "elapsed_s", "state", "pane", "anchor", "size", "inside", "changed", "note", "window"}
+            assert lines and all(wanted_keys <= set(row) for row in lines), lines[:1]
+            states = [row["state"] for row in lines]
+            assert "held" in states, ("the half-drawn frame was never held", states)
+            for i, state in enumerate(states):
+                if state == "changed":
+                    assert i > 0 and states[i - 1] == "held", ("a hop was accepted on one reading", states)
+            assert "samples=" in flapping.stderr, flapping.stderr
+            say("`--watch --json` writes one object per sample, and a half-drawn frame is held: a change is only "
+                "ever the second of two readings that agree")
+            # ...and the first hop ends the watch and is FILED with both captures, both explanations and both readings.
+            stop_home = os.path.join(TEST_HOME, "hop-home")
+            os.makedirs(stop_home, exist_ok=True)
+            hop_root = os.path.join(stop_home, "pip-hops")
+            hop_env = dict(os.environ, FBTODO_PIP_HOPS=hop_root)
+            stopped = watch_flapping([(shot, 1.5), (shifted, 4.0), (shot, 1.5)], 12, ["--stop-on-change"], hop_env)
+            assert stopped.returncode == 1, (stopped.returncode, stopped.stdout[-300:], stopped.stderr[-500:])
+            filed = re.search(r"filed=(\S+)", stopped.stderr)
+            assert filed and os.path.isdir(filed.group(1)), stopped.stderr
+            hop_dir = filed.group(1)
+            assert hop_dir.startswith(hop_root + os.sep), ("the hop was filed outside the test home", hop_dir)
+            for name in ("before.png", "after.png", "explain-before.txt", "explain-after.txt", "readings.json"):
+                assert os.path.getsize(os.path.join(hop_dir, name)) > 0, name
+            with open(os.path.join(hop_dir, "readings.json"), encoding="utf-8") as handle:
+                readings = json.load(handle)
+            assert readings["changed"] and readings["before"]["pane"] and readings["after"]["pane"], readings
+            assert readings["before"]["pane"] != readings["after"]["pane"], readings
+            last = json.loads(stopped.stdout.splitlines()[-1])
+            assert last["state"] == "changed", last
+            say("`--stop-on-change` ends the watch at the first hop and files both captures, both explanations and the "
+                "readings either side")
+            # ...and the two knobs: the pose holds for at least `pose-hold` (the burst is not held), and a line stays up
+            # for `bubble-seconds` (nine by default, five was gone before it could be read).
+            assert "max(view.cycleMs, poseHoldS * 1000)" in swift and "view.bursting ? celebrateMs" in swift, (
+                "a mood's pose can change faster than its hold, or the burst is held too")
+            # ...and the TWO knobs under that step cannot contradict each other: the dissolve is
+            # `min(transition, max(step, pose-min))`, so a pose floor ABOVE the pose's own hold makes the
+            # fade outlast the picture it is arriving at — she never settles on a frame, which is exactly
+            # how "she's currently change her pose too much" looked with the old floor of ten seconds.
+            assert "var poseFloorS = 2.0" in swift and "var poseHoldS = 8.0" in swift, (
+                "the pose floor or the pose hold is back to a value the dissolve cannot live under")
+            assert 'tuneNumber("pose-min", 2)' in swift and 'tuneNumber("pose-hold", 8.0)' in swift, (
+                "the resolved defaults and the tune table's own rows disagree about the two knobs")
+            assert '("pose-min", "--pose-min", "FBTODO_PIP_POSE_MIN", "2", true)' in swift \
+                and '("pose-hold", "--pose-hold", "FBTODO_PIP_POSE_HOLD", "8", true)' in swift, (
+                "a pose floor of ten is what made the dissolve longer than every pose")
+            assert "var bubbleSeconds = 9.0" in swift and 'tuneNumber("bubble-seconds", 9, 1)' in swift, (
+                "the bubble still stays up for five seconds")
+            say("a mood's pose is held for `pose-hold` seconds (the burst keeps its own pace), and a line stays up for "
+                "`bubble-seconds`, nine by default")
+        assert "private func bubblePop()" in swift and "ctx.scaleBy(x: pop.x, y: pop.y)" in swift, (
+            "her balloon appears without a pop, so an arriving line reads the same as a leaving one")
+        # ...and every KNOB her window reads is in one table a test can pin: `--tune` prints the name, the
+        # value she would run with, WHERE that value came from and whether a change is worn while she runs —
+        # so `fbtodo pip tune` asks the program rather than keeping a second copy of the list.
+        clean_env = {k: v for k, v in os.environ.items() if not k.startswith("FBTODO_PIP_")}
+        absent_tune = os.path.join(TEST_HOME, "tune-absent.tsv")
+        knobs = subprocess.run([pip_bin, "--tune", "--tune-file", absent_tune], capture_output=True,
+                               text=True, env=clean_env, timeout=60)
+        assert knobs.returncode == 0, (knobs.stdout, knobs.stderr)
+        rows = [line.split("\t") for line in knobs.stdout.splitlines() if line.strip()]
+        assert rows and all(len(row) == 4 for row in rows), rows
+        tuned = {row[0]: row for row in rows}
+        for name in ("transition", "pose-min", "pose-hold", "bubble", "bubble-gap", "bubble-seconds", "surprise", "pop",
+                     "fit-every", "fit-retry", "side", "tick"):
+            assert name in tuned, (name, sorted(tuned))
+            assert tuned[name][2] in ("cli", "env", "file", "default"), tuned[name]
+            assert tuned[name][3] in ("live", "restart"), tuned[name]
+        assert all(row[2] == "default" for row in rows), (rows,)     # nothing set: the defaults
+        # the same table, read out of her window's own source: every name and every default agree
+        knob_block = swift.split("let tuneKnobs: [(name: String, flag: String, env: String, off: String, "
+                                 "live: Bool)] = [", 1)[1].split("\n]", 1)[0]
+        source_knobs = {}
+        for ln in knob_block.splitlines():
+            quotes = ln.split('"')
+            if len(quotes) >= 8:
+                source_knobs[quotes[1]] = (quotes[3], quotes[5], quotes[7])
+        assert set(source_knobs) == set(tuned), (sorted(source_knobs), sorted(tuned))
+        # The loop variable is NOT `env`: this suite is a flat script, so `env` here is the module's own
+        # environment dict — and rebinding it to a knob's variable name (a str) handed every later
+        # child process a string instead of an environment, which is what `AttributeError: 'str' object
+        # has no attribute 'items'` was (2026-10-08, caught only because the checks after this line still
+        # spawn things).
+        for name, (flag, env_name, off) in source_knobs.items():
+            assert tuned[name][1] == off, (name, tuned[name], off)
+            assert env_name.startswith("FBTODO_PIP_") and flag.startswith("--"), (name, flag, env_name)
+        # ...and the file BEHIND those knobs is read in the order the program promises: the flag beats the
+        # environment, the environment beats the file, and the file beats the default — measured off `--art`,
+        # which prints the lengths she would really run with.
+        tuned_file = os.path.join(TEST_HOME, "pip-tune")
+        with open(tuned_file, "w") as fh:
+            fh.write("# a tune, half-edited on purpose\npop 0.6\ntransition 20000\nbubble 0\n"
+                     "nonsense 3\n")
+        out = os.path.join(TEST_HOME, "tuned.png")
+        done = subprocess.run([pip_bin, "--art", out, "--art-size", "192", "--art-mood", "done",
+                               "--tune-file", tuned_file], capture_output=True, text=True,
+                              env=clean_env, timeout=120)
+        assert done.returncode == 0, (done.stdout, done.stderr)
+        assert "transition=20000ms" in done.stdout and "pop=600ms" in done.stdout \
+            and "bubble=off" in done.stdout, done.stdout
+        run_env = dict(clean_env, FBTODO_PIP_POP="0.2")
+        done = subprocess.run([pip_bin, "--art", out, "--art-size", "192", "--art-mood", "done",
+                               "--tune-file", tuned_file, "--transition", "30000"],
+                              capture_output=True, text=True, env=run_env, timeout=120)
+        assert "transition=30000ms" in done.stdout and "pop=200ms" in done.stdout, done.stdout
+        shown = subprocess.run([pip_bin, "--tune", "--tune-file", tuned_file,
+                                "--transition", "30000"], capture_output=True, text=True,
+                               env=run_env, timeout=60)
+        seen = {row.split("\t")[0]: row.split("\t")[1:] for row in shown.stdout.splitlines()
+                if row.strip()}
+        assert seen["pop"][:2] == ["0.2", "env"], seen["pop"]
+        assert seen["transition"][:2] == ["30000", "cli"], seen["transition"]
+        assert seen["bubble"][:2] == ["0", "file"], seen["bubble"]
+        assert seen["transition"][2] == "live" and seen["side"][2] == "restart", seen
+        # ...and WHAT SHE SAYS is a file too: `--lines` prints the table in the shape the file takes, a mood
+        # the file names is REPLACED, a mood it does not name keeps the built-in lines, a row with no words
+        # takes that mood's lines away, and a name the pane cannot produce is ignored.
+        lines_file = os.path.join(TEST_HOME, "pip-lines")
+        with open(lines_file, "w") as fh:
+            fh.write("# what she says\nwork\tchop chop\nwork\ton it twice\nidle\t\nnonsense\tno\n"
+                     "surprise\tboo number two\n")
+        said = subprocess.run([pip_bin, "--lines", "--lines-file", lines_file], capture_output=True,
+                              text=True, env=clean_env, timeout=60)
+        assert said.returncode == 0, (said.stdout, said.stderr)
+        spoken = {}
+        for row in said.stdout.splitlines():
+            if "\t" in row:
+                name, words = row.split("\t", 1)
+                spoken.setdefault(name, []).append(words)
+        assert spoken["work"] == ["chop chop", "on it twice"], spoken.get("work")
+        assert "no" not in spoken.get("nonsense", []), spoken
+        assert spoken["surprise"] == ["boo number two"], spoken.get("surprise")
+        assert len(spoken["done"]) >= 3, spoken.get("done")        # a mood the file never named
+        assert "so quiet" not in [w for words in spoken.values() for w in words], (     # idle, cleared
+            "a row with no words did not clear that mood's lines: " + repr(spoken.get("idle")))
+        plain = subprocess.run([pip_bin, "--lines", "--lines-file", absent_tune], capture_output=True,
+                               text=True, env=clean_env, timeout=60)
+        assert "head down" in plain.stdout and "so quiet" in plain.stdout, plain.stdout
+        # ...and the bubble is really DRAWN, and drawn where it has to be: the top strip of her square is
+        # her own hair with nothing said and a near-white card with a line said, so the check is a pixel
+        # one rather than a claim. `--art-say` is what makes it measurable without a window — and it is
+        # also the fixture a human looks at (see the mood sheet).
+        quiet = os.path.join(TEST_HOME, "bubble-quiet.png")
+        spoken = os.path.join(TEST_HOME, "bubble-spoken.png")
+        for out, extra in ((quiet, []), (spoken, ["--art-say", "all done!"])):
+            done = subprocess.run([pip_bin, "--art", out, "--art-size", "192", "--art-mood", "done"]
+                                  + extra, capture_output=True, text=True, timeout=120)
+            assert done.returncode == 0, (out, done.stdout, done.stderr)
+        with open(quiet, "rb") as fh:
+            before = fh.read()
+        with open(spoken, "rb") as fh:
+            after = fh.read()
+        assert before != after, "a line did not change the picture, so her bubble is not drawn at all"
+
+        def top_strip(path):
+            w, h, d = module.buffy_pixels.read_png(path)
+            total = 0.0
+            for y in range(max(1, h // 6)):
+                for x in range(w):
+                    i = (y * w + x) * 4
+                    a = d[i + 3] / 255
+                    total += ((0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) * a
+                              + 40 * (1 - a))
+            return total / (w * max(1, h // 6))
+
+        assert top_strip(spoken) > top_strip(quiet) + 60, (
+            "her bubble is drawn but it is not the card it should be up there: "
+            f"{top_strip(quiet):.1f} without a line, {top_strip(spoken):.1f} with one")
+        # ...and the balloon really IS the line: the same mood and the same square, three lines of three
+        # lengths, and the cloud the program reports is wider for the longer ones and taller and higher up
+        # for the one that has to WRAP — the wrap-around-text part as a number rather than a look.  The
+        # spikes come off the same line, so the shape the mood asked for is the shape the drawing path used.
+        def balloon_of(text, mood="done"):
+            out = os.path.join(TEST_HOME, "balloon.png")
+            done = subprocess.run([pip_bin, "--art", out, "--art-size", "192", "--art-mood", mood,
+                                   "--art-say", text], capture_output=True, text=True, timeout=120)
+            assert done.returncode == 0, (text, done.stdout, done.stderr)
+            fields = dict(part.split("=", 1) for part in done.stdout.split() if "=" in part)
+            assert "balloon" in fields and "x" in fields["balloon"], (text, done.stdout)
+            wide, tall = (int(n) for n in fields["balloon"].split("x"))
+            left, low = (int(n) for n in fields["box"].split(","))
+            return [wide, tall, int(fields["r"]), left, low, int(fields["spikes"])]
+
+        wide, tall, _r, _x, low, _spikes = balloon_of("waiting on you")
+        narrow, same_tall, _r, _x, same_low, _spikes = balloon_of("hi")
+        assert wide > narrow + 40, (
+            "her balloon is as wide for 'hi' as for a whole sentence, so it is not wrapping the text: "
+            f"{narrow}pt against {wide}pt")
+        assert (same_tall, same_low) == (tall, low), (
+            "two one-line balloons came out different sizes, so the cloud is not the line's own rect: "
+            f"{narrow}x{same_tall} at {same_low} against {wide}x{tall} at {low}")
+        wrapped, wr_tall, _r, _x, wr_low, _spikes = balloon_of("the list needs a rewrite")
+        assert wr_tall > tall + 10 and wr_low < low, (
+            "a line that wraps draws the same balloon as one that does not, so the cloud is not the "
+            f"words' height either: {tall}pt against {wr_tall}pt, {low} against {wr_low}")
+        assert wrapped > wide, (wrapped, wide)
+        assert balloon_of("on it!", "error")[5] > 0 and balloon_of("on it!", "done")[5] == 0, (
+            "the jagged balloon's spikes do not reach the drawing path, so the mood's own shape is a "
+            "table nobody reads")
+        # ...and the same line in every mood is a different picture: eight renders of one line, each in the
+        # mood's own shape and colour, which is what makes her bubble an emotion rather than one frame with
+        # the words swapped out.
+        balloons = {}
+        for name in sorted(poses):
+            out = os.path.join(TEST_HOME, f"balloon-{name}.png")
+            said = subprocess.run([pip_bin, "--art", out, "--art-size", "192", "--art-mood", name,
+                                   "--art-say", "on it!"], capture_output=True, text=True, timeout=120)
+            assert said.returncode == 0, (name, said.stdout, said.stderr)
+            with open(out, "rb") as fh:
+                balloons[name] = fh.read()
+        assert len(set(balloons.values())) == len(balloons), (
+            "two moods say the same line in the same picture, so one of their balloons says nothing: "
+            + ", ".join(sorted(balloons)))
+        # ...and the SURPRISE is a picture and not just a name in a table: same mood, same line, and the
+        # one she wears when it is a surprise is told apart in the record AND in what was drawn.
+        plain, shocked = (os.path.join(TEST_HOME, "surprise-off.png"),
+                          os.path.join(TEST_HOME, "surprise-on.png"))
+        for out, extra, want in ((plain, [], "shape=done"),
+                                 (shocked, ["--art-surprise"], "shape=surprise")):
+            done = subprocess.run([pip_bin, "--art", out, "--art-size", "192", "--art-mood", "done",
+                                   "--art-say", "still cute?"] + extra,
+                                  capture_output=True, text=True, timeout=120)
+            assert done.returncode == 0, (out, done.stdout, done.stderr)
+            assert want in done.stdout, (want, done.stdout)
+        with open(plain, "rb") as fh:
+            off = fh.read()
+        with open(shocked, "rb") as fh:
+            on = fh.read()
+        assert off != on, (
+            "the surprise balloon is a name in a record and not a picture, so nobody would see one")
+        # ...and the sticker it borrows is one her mood would never have shown her — every mood, one render
+        # each, the frame in the record against that mood's own cycle.
+        for name in sorted(poses):
+            out = os.path.join(TEST_HOME, f"surprise-pose-{name}.png")
+            said = subprocess.run([pip_bin, "--art", out, "--art-size", "192", "--art-mood", name,
+                                   "--art-say", "boo!", "--art-surprise"],
+                                  capture_output=True, text=True, timeout=120)
+            assert said.returncode == 0, (name, said.stdout, said.stderr)
+            fields = dict(part.split("=", 1) for part in said.stdout.split() if "=" in part)
+            borrowed = int(fields["frame"]) + 1
+            assert fields["shape"] == "surprise", (name, said.stdout)
+            assert borrowed not in poses[name][0], (
+                f"{name}'s surprise wears frame {borrowed}, which its own mood already shows "
+                f"({poses[name][0]}), so it is not a surprise at all")
+        for asked, said in (("1", "bubble=on"), ("0", "bubble=off"), ("", "bubble=on"),
+                            ("rubbish", "bubble=on")):
+            run_env = dict(os.environ)
+            if asked:
+                run_env["FBTODO_PIP_BUBBLE"] = asked
+            else:
+                run_env.pop("FBTODO_PIP_BUBBLE", None)
+            out = os.path.join(TEST_HOME, "bubble.png")
+            done = subprocess.run([pip_bin, "--art", out, "--art-size", "192", "--art-mood", "done"],
+                                  capture_output=True, text=True, env=run_env, timeout=120)
+            assert done.returncode == 0, (asked, done.stdout, done.stderr)
+            assert said in done.stdout, (asked, said, done.stdout)
+        say("buffy-chan's transitions are ONE number: the slot the pane moved her into is eased (the "
+            "corner only — her size is settled before the slide starts), she ARRIVES at full opacity and "
+            "leaves with a fade, and a pose change cross-dissolves — all of them "
+            "`FBTODO_PIP_TRANSITION` (10 s by default and a FLOOR under any smaller one, `0` the hard "
+            "cuts she started with, rubbish the default), a pose capped at one step of its own mood's "
+            "length, a pose capped at one step of its own mood but never shorter than "
+            "`FBTODO_PIP_POSE_MIN` (10 s, the transition itself), a still frame renders the same at any "
+            "value, a "
+            "finished list bursts "
+            "through her poses, and she sometimes says something in a MANGA balloon built around the "
+            "line itself — the mood's own shape, colour, scallops, thought dots or spikes, measured "
+            "wider for a longer line and higher up for one that wraps, always inside her own "
+            "square (`FBTODO_PIP_BUBBLE`, a line for "
+            f"{len(spoken_for)} of her {len(module.BUFFY_CYCLE)} moods, never the one she just said, "
+            "and now and then the whole of that table at once (`FBTODO_PIP_SURPRISE`, and "
+            "`--art-surprise` to look at one) in a line no mood would have said): ok")
+    else:
+        print(f"  not checked: {pip_bin} is not built (or predates scripts/buffy-pip.swift), so "
+              f"her window's own table and its poses were read from the source only\n"
+              f"  build it with: swiftc -O scripts/buffy-pip.swift -o {pip_bin}")
+    stills = [name for name in sorted(module.BUFFY_CYCLE) if len(module.BUFFY_CYCLE[name]) == 1]
+    ladder = " ".join(f"{name}:{','.join(str(n) for n in read_table[name][0])}"
+                      + ("(hold)" if read_table[name][1] == 0 else f"({int(read_table[name][1])}ms)")
+                      for name in sorted(read_table))
+    say("buffy-chan's mood reaches her WINDOW: the pane publishes the word its own face wears, "
+        f"all {len(read_table)} moods have a pose ({ladder}) in frames 1..{on_disk} with every one of "
+        f"her {on_disk} frames worn by some mood, "
+        f"{len(stills)} of them hold still ({', '.join(stills)}) exactly where the pane does, "
+        f"every mood draws a different picture, and the whole table is a FILE she re-reads while "
+        f"she runs — a half-edited one keeps every mood it does not name and can never leave a "
+        f"mood the pane can put her in without a pose: ok")
+    # ...and she MOVES, on the pane's own clock: one second per step of that mood's cycle, which
+    # is exactly what `now_ms // 1000` is. Every frame in the wardrobe has to be one a real state
+    # reaches at some tick — a frame no state can produce is a frame she cannot be caught in.
+    worn = set()
+    for mood, (st, kw) in moods.items():
+        cycle = module.BUFFY_CYCLE[mood]
+        stepped = [module.buffy_face(st, now_ms=tick * 1000, **kw)
+                   for tick in range(len(cycle) + 2)]
+        assert set(stepped) == set(cycle), (mood, stepped, cycle)
+        worn |= set(stepped)
+    assert worn == wardrobe, (
+        "a face in her wardrobe that no state and no tick produces is one nobody can reach: "
+        f"{sorted(wardrobe - worn)}")
+    assert any(len(cycle) > 1 for cycle in module.BUFFY_CYCLE.values()), (
+        "she never moves, so the pane is a picture again: " + repr(module.BUFFY_CYCLE))
+    # ...and the precedence AROUND the turn-ended mood, which is the one rule that could quietly
+    # make her unreadable: a FINISHED list still celebrates (the finished-task bell rings on that,
+    # and it is the news), a turn that ended with no list at all is still "waiting for you" rather
+    # than "there is nothing to point at", and a turn already under way is never wait — the flag and
+    # the transcript are read from the same file, so the new turn can arrive before the old flag
+    # clears.
+    finished = dict(buffy_list, done=2, total=2, turn_ended=True,
+                    todos=[{"task": "a", "completed": True}, {"task": "b", "completed": True}])
+    assert module.buffy_mood(finished) == "done", module.buffy_mood(finished)
+    bare = {"backend": "cli", "session": "S", "goal": "g", "todos": [], "turn_ended": True}
+    assert module.buffy_mood(bare) == "wait", module.buffy_mood(bare)
+    rushing = dict(buffy_list, turn_ended=True, turn_running=True)
+    assert module.buffy_mood(rushing) == "work", module.buffy_mood(rushing)
+    say("buffy-chan reads the pane's own state and animates on the pane's own clock: one face "
+        f"per mood, every mood and every frame reachable, {module.BUFFY_CELLS} cells in all of "
+        "them: ok")
+
+    # ---- and she is COLOURFUL: each mood asks for a role the frame can actually paint, and the
+    #      only mood left in the frame's own grey is the doze — a supporting character drawn in
+    #      the border's ink is a character the reader has to hunt for.
+    roles = set(module._styles(module.THEME_DEFAULTS, False))
+    missing = sorted(set(module.BUFFY_INK.values()) - roles)
+    assert not missing, f"a mood's ink is not a role the pane can paint: {missing}"
+    assert {m for m, role in module.BUFFY_INK.items() if role == "faint"} == {"idle"}, (
+        "every mood but the doze has to be drawn in an ink of its own: " + repr(module.BUFFY_INK))
+    accent_ink = module._styles(module.THEME_DEFAULTS, False)["accent"]
+    painted = module.render(buffy_list, True, watching=4812, width=80, now_ms=grid_now,
+                            height=24, theme=module.THEME_DEFAULTS, truecolor=False)
+    # the frame and the expectation share the clock, or she could be one frame of her cycle out
+    # from what the assertion looked for — the face is a function of both, and so is this
+    assert f"\x1b[{accent_ink}m{module.buffy_face(buffy_list, now_ms=grid_now)}" in painted, (
+        "buffy-chan is drawn in the frame's own grey rather than in her mood's ink")
+    say("buffy-chan's moods wear the frame's own roles — the accent at work, the green at the "
+        "finish, the yellow on a nudge, the red on a failure, grey only while she dozes: ok")
+
+    # ---- her effect on the border is bounded, and what bounds it is the METADATA's columns. She
+    #      stands in a slot that is a truncation by construction, so the contract is not `nothing
+    #      changed` — it is three things, asserted as properties over every width a pane can be:
+    #      the row is still exactly the width it was asked for; what the slot says with her is the
+    #      HEAD of what it says without her (she truncates a tail, she never rewords the reading);
+    #      and where her six cells would be the reason the tag left the border she is the one who
+    #      goes, so she is never the reason a pane loses the name of what it is following.
+    def slot_of(drawn: str) -> str:
+        """The metadata a border actually carries: what stands between the chip and the corner."""
+        tail = drawn.split("FREEBUFF TODOS ", 1)[1]
+        body = tail.split(" ──┐", 1)[0] if " ──┐" in tail else ""
+        return body.strip("─ ").strip()
+
+    face = faces["work"]
+    drawn = {w: module._top_border(w, str, "FREEBUFF TODOS", "watcher: pid 999", str, face=face)
+             for w in range(32, 98)}
+    for probe_w, row in drawn.items():
+        assert module._cell_width(row) == probe_w, (probe_w, row)
+    for probe_w, row in drawn.items():
+        kept = slot_of(row)
+        if face not in row or not kept:
+            # either she is not on this border, or this pane is too narrow to carry a tag at all
+            # (and then there is no reading for her to have truncated)
+            continue
+        whole = slot_of(module._top_border(probe_w, str, "FREEBUFF TODOS", "watcher: pid 999",
+                                           str))
+        assert kept and whole.startswith(kept.rstrip("…")), (
+            f"at {probe_w} columns she rewrote the metadata instead of truncating its tail:\n"
+            f"  with her {row!r} → {kept!r}\n  without  {whole!r}")
+    # She pays for herself at exactly the widths where the tag is sitting on its own floor (the
+    # twelve columns below which `_top_border` does not draw it at all): those are the only ones
+    # she sits out, they are contiguous, and the pair either side of them shows what they are for
+    # — at the width where the tag has its floor she stands and the tag pays her out of its tail,
+    # and one column narrower the tag is gone anyway and she takes her cells back.
+    gives_up = sorted(w for w, row in drawn.items() if face not in row)
+    assert len(gives_up) == module.BUFFY_CELLS, (
+        f"she should pay for herself at exactly {module.BUFFY_CELLS} widths — the ones where the "
+        f"tag is on its floor — and she sits out {gives_up}")
+    assert gives_up == list(range(gives_up[0], gives_up[0] + module.BUFFY_CELLS)), gives_up
+    assert all(slot_of(drawn[w]) for w in gives_up), (
+        "she sits out a width with no tag to protect: " + repr(gives_up))
+    assert all(face in drawn[w] for w in drawn if w not in gives_up), (
+        "she is missing from a width where the tag is not on its floor: "
+        f"{sorted(w for w in drawn if w not in gives_up and face not in drawn[w])}")
+    assert face in drawn[gives_up[0] - 1] and face in drawn[gives_up[-1] + 1], (gives_up,)
+
+    # The border the owner is actually reading, and the case that failed: a 42-column frame whose
+    # chip carries the mute note and whose right slot is the session's (already truncated) label.
+    # The rule before this one asked the metadata to say the same words with her as without her,
+    # which on a real pane never happens, so she was not drawn on any pane the owner looked at.
+    owned = module._top_border(42, str, "muted · u", "desktop · 53d4cd37-…", str, face=face)
+    assert face in owned, f"buffy-chan is not on the owner's own border: {owned!r}"
+    assert module._cell_width(owned) == 42, owned
+    # ...and the same pane while the chip carries the LONGER note — a mute set outside the pane
+    # says `notifications off · m`, which is four cells short of the whole border: the chip gives
+    # up its own tail for her rather than the tag, so she is on this border and so is the tag.
+    long_note = module._plain(module.render(
+        dict(buffy_list, backend="desktop", session="53d4cd37-1111-4444"),
+        True, watching=None, width=42, height=24, now_ms=grid_now,
+        chip_note="notifications off · m", theme=module.THEME_DEFAULTS,
+        truecolor=False).splitlines()[0])
+    # ...on the clock the frame was drawn at, which is a frame of her cycle rather than always
+    # the resting one: the face is a function of the state AND the tick (see `buffy_face`).
+    assert module.buffy_face(buffy_list, now_ms=grid_now) in long_note, (
+        f"the long mute note took her off the border: {long_note!r}")
+    assert module._cell_width(long_note) == 42, long_note
+    assert "desktop" in long_note, f"the note's tail did not pay for her: {long_note!r}"
+    say("buffy-chan is on the pane the owner reads — at 42 columns, with the mute chip up and the "
+        "session's label in the right slot — and steps aside only for the tag's own floor: ok")
+
+    # ---- and on a real frame: every row still the pane's width with her on it, and never a
+    #      content row — she is chrome, and chrome that moved into the list would be a character
+    #      standing in front of the work.
+    # ---- and her PORTRAIT: `BUFFY_ART` is her drawn out, standing in the pane's own margin below
+    #      the list (see `buffy_art`). Four properties: it is a grid of its own (every row the same
+    #      width, one cell each, the frame's own families of glyphs); it wears the SAME face the
+    #      border is wearing, so the two forms are one character; it keeps its HEAD first when the
+    #      pane can only afford some of it; and it costs the list nothing — the pane with her and
+    #      the pane without her draw the same steps, the same bar and the same state.
+    art = module.BUFFY_ART
+    worn = module.buffy_art("~(o_o)")
+    assert len(worn) == len(art) >= 4, (len(worn), len(art))
+    assert {module._cell_width(row) for row in worn} == {module.BUFFY_ART_W}, (
+        f"a row of her portrait is not {module.BUFFY_ART_W} cells: "
+        f"{[(row, module._cell_width(row)) for row in worn]}")
+    odd = sorted({ch for row in worn for ch in row if module._cell_width(ch) != 1})
+    assert not odd, f"her portrait draws a glyph a terminal may measure at another width: {odd!r}"
+    # Every NON-ASCII glyph she is drawn with has to be one of the frame's own vetted ones (see
+    # `FRAME_CHROME`); ASCII is the one family no terminal disagrees about.
+    vetted = set("".join(module.FRAME_CHROME))
+    strange = sorted({ch for row in worn for ch in row
+                      if not ch.isascii() and ch not in vetted})
+    assert not strange, (
+        f"her portrait draws a glyph the frame has never vetted at one cell: {strange!r}")
+    # ...wearing the border's own face, mood for mood: one source of moods, two sizes of her.
+    for mood, (st, kw) in moods.items():
+        live = module.buffy_face(st, now_ms=grid_now, **kw)
+        rows_here = module.buffy_art(live)
+        carrying = [row for row in rows_here if live[1:] in row]
+        assert len(carrying) == 1, (
+            f"her portrait does not wear the border's {mood} face on exactly one row: {rows_here}")
+    # ...and a pane that can only afford PART of her gets her face: the window is chosen to contain
+    # it at every size, from one row up, because a crop of her drawing that is all hair is not her.
+    for room in (1, 2, 3, 4, len(art)):
+        part = module.buffy_art("~(o_o)", room)
+        assert len(part) == min(room, len(worn)), (room, part)
+        assert any("(o_o)" in row for row in part), (
+            f"a {room}-row window onto her portrait has no face on it: {part}")
+        assert all(module._cell_width(row) == module.BUFFY_ART_W for row in part), (room, part)
+    say(f"buffy-chan is drawn out: {len(art)} rows and {module.BUFFY_ART_W} columns of one-width "
+        "glyphs, wearing the border's own face in every mood, and her face is on every window "
+        "onto her: ok")
+
+    # ....and she is a CHARACTER, not part of the list: she is drawn below the list, she is never
+    # a step's row, and her being there does not move a step, the bar or the state. That last one is
+    # the whole promise — the rows she stands on are rows the list did not want.
+    # The pane only draws her when the knob ASKS for her (`FBTODO_BUFFY_ROWS`: she is in a window of
+    # her own over this pane by default — `fbtodo pip` — so the drawn half is the opt-in), which is
+    # what the "on" side of this comparison is: the knob, at `auto`.
+    # ...and she has to be turned off in EVERY form she has, which is now two: the drawn portrait
+    # (`BUFFY_ART`) and the picture (`buffy_panel`'s pixel path, which never reads `BUFFY_ART`).
+    # Blanking the portrait alone leaves the picture standing — and then both frames come back the
+    # same height, which is exactly how this check failed. So the pixel floor is lifted out of
+    # reach (`room >= BUFFY_PIXEL_MIN` is never true), the panel hands its reservation back to the
+    # list (`FBTODO_BUFFY_ROWS=0`), and only then is she off the frame.
+    # ...patched through the RENDERER's own globals, for the reason given at the finish line: this
+    # suite re-imports the package between phases, so `set_knob` on the package can land on a copy
+    # the renderer does not read (both frames then come back with her in them).
+    art_global = module.buffy_panel.__globals__
+    was_art = art_global["BUFFY_ART"]
+    was_pixel_min = art_global["BUFFY_PIXEL_MIN"]
+    was_panel_rows = os.environ.get("FBTODO_BUFFY_ROWS")
+    frames = {}
+    try:
+        for turned_on in (True, False):
+            if turned_on:
+                art_global["BUFFY_ART"] = was_art
+                art_global["BUFFY_PIXEL_MIN"] = was_pixel_min
+                os.environ["FBTODO_BUFFY_ROWS"] = "auto"    # ...the pane has to be ASKED for her
+            else:
+                art_global["BUFFY_ART"] = ()
+                art_global["BUFFY_PIXEL_MIN"] = 10 ** 9   # no legible room is ever room enough
+                os.environ["FBTODO_BUFFY_ROWS"] = "0"
+            frames[turned_on] = STRIP(module.render(
+                dict(buffy_list), True, watching=4812, width=68, now_ms=grid_now, height=30,
+                theme={}, truecolor=False)).split("\n")
+    finally:
+        art_global["BUFFY_ART"] = was_art
+        art_global["BUFFY_PIXEL_MIN"] = was_pixel_min
+        if was_panel_rows is None:
+            os.environ.pop("FBTODO_BUFFY_ROWS", None)
+        else:
+            os.environ["FBTODO_BUFFY_ROWS"] = was_panel_rows
+    hers, bare = frames[True], frames[False]
+    # What says she is DRAWN is her own rows being in one frame and not the other — never the
+    # frame being taller. The pane is a fixed grid and paints exactly the height it was handed
+    # (the rows the list did not want included), so a frame with her in it and a frame without
+    # are the SAME height, which is the whole point of the blanks: measured 2026-10-07, both
+    # came back 30 rows and this check, written when the frame grew with her, called that "she
+    # is not drawn at all".
+    assert len(hers) == len(bare), ("her rows changed the pane's height", len(hers), len(bare))
+
+    def _her_cell_row(row: str) -> bool:
+        """Is this row one of her PICTURE's? The half-block grid writes the upper pixel in the
+        glyph and the lower one in the cell's background, so her drawing is cells made of the
+        block elements — and the one other row on the frame that uses them is the progress bar,
+        which carries its own `[`/`]`, and hers never do."""
+        inside = row.strip("│ ")
+        return bool(inside) and "[" not in inside and all(ch in "▀▄█ " for ch in inside)
+
+    her_rows = [i for i, row in enumerate(hers) if _her_cell_row(row)]
+    assert her_rows and not any(_her_cell_row(row) for row in bare), (
+        "she is not drawn at all, or is drawn with her turned off: "
+        f"{her_rows} in hers, "
+        f"{[i for i, row in enumerate(bare) if _her_cell_row(row)]} in the bare frame")
+    assert all(module._cell_width(line) == 68 for line in hers), hers
+    keep = lambda rows, keys: [r for r in rows if any(k in r for k in keys)]  # noqa: E731
+    for what, keys in (("a step", ("step", "Goal:", "earlier")),
+                       ("the bar or the state", ("ALL DONE", "WORKING", "IDLE", "LIVE:", "["))):
+        assert keep(hers, keys) == keep(bare, keys), (
+            f"her portrait moved or cost {what}:\n  with her {keep(hers, keys)}\n"
+            f"  without  {keep(bare, keys)}")
+    live = module.buffy_face(buffy_list, now_ms=grid_now)
+    assert live in hers[0], hers[0]
+    assert not any(live in line for line in hers[1:]), (
+        "her six-cell border face is drawn off the border:" + "\n".join(hers))
+    say("with buffy-chan on the border and drawn out below it — when the knob asks for her, which "
+        "is no longer the default — every row keeps the pane's width, she is never a step's row, "
+        "and the list, the bar and the state are unchanged: ok")
+
+    # ---- and her PICTURE, which is the drawn portrait's replacement where the terminal can show
+    #      one: the real art the owner drew, averaged down to half-block pixels and read by the
+    #      pane itself (`buffy_pixels`, and `scripts/buffy-thumbs.py` for the small copies in
+    #      `assets/buffy`). A pane cannot put a PNG on screen, so a cell IS one pixel wide and two
+    #      tall — the upper pixel in the cell's foreground, the lower in its background, drawn with
+    #      `▀` — which is a picture every terminal already knows how to show.
+    #
+    #      What has to hold for that to be a picture rather than a smear: the reader decodes what
+    #      a real encoder writes, with every row filter and not just the one this module emits (it
+    #      was also checked pixel for pixel against `sips`' own decoder on the 900x900 originals);
+    #      a cell's colour is the AVERAGE of the pixels it covers, because one source pixel picked
+    #      out of a 20-pixel cell is a lottery; transparency is a HOLE, not a black pixel; a row is
+    #      exactly the width it was asked for, escapes and all; and which frame she is showing is a
+    #      function of the clock and nothing else, so a pane that repainted twice shows one frame.
+    px = module.buffy_pixels
+    import struct as _struct
+    import zlib as _zlib
+
+    def _paeth(a, b, c):
+        p = a + b - c
+        pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+        return a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+
+    def png_bytes(w, h, pixels, filters):
+        """A PNG built from bytes, one filter per row: the FORMAT's test rather than our writer's."""
+        raw, prior = bytearray(), bytes(w * 4)
+        for y in range(h):
+            cur = bytes(v for cell in pixels[y] for v in cell)
+            line = bytearray(w * 4)
+            for i in range(w * 4):
+                left = cur[i - 4] if i >= 4 else 0
+                up = prior[i]
+                upleft = prior[i - 4] if i >= 4 else 0
+                kind = filters[y]
+                pred = (0 if kind == 0 else left if kind == 1 else up if kind == 2
+                        else (left + up) // 2 if kind == 3 else _paeth(left, up, upleft))
+                line[i] = (cur[i] - pred) & 0xFF
+            raw.append(filters[y])
+            raw += line
+            prior = cur
+
+        def chunk(name, body):
+            return (_struct.pack(">I", len(body)) + name + body
+                    + _struct.pack(">I", _zlib.crc32(name + body) & 0xFFFFFFFF))
+
+        return (b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", _struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                + chunk(b"IDAT", _zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b""))
+
+    picture_home = os.path.join(TEST_HOME, "buffy-picture")
+    os.makedirs(picture_home, mode=0o700, exist_ok=True)
+    width_px, height_px = 4, 5
+    drawn = [[((40 + 9 * x + 3 * y) % 256, (200 - 7 * y) % 256, (x * 30 + y) % 256,
+               0 if (x + y) % 5 == 0 else 255) for x in range(width_px)]
+             for y in range(height_px)]
+    filtered = os.path.join(picture_home, "filters.png")
+    with open(filtered, "wb") as fh:
+        fh.write(png_bytes(width_px, height_px, drawn, [0, 1, 2, 3, 4]))
+    got_w, got_h, got_rgba = px.read_png(filtered)
+    assert (got_w, got_h) == (width_px, height_px), (got_w, got_h)
+    for y in range(height_px):
+        for x in range(width_px):
+            at = (y * width_px + x) * 4
+            assert tuple(got_rgba[at:at + 4]) == drawn[y][x], (
+                f"the reader got row {y} of a file written with every filter wrong at {x}: "
+                f"{tuple(got_rgba[at:at + 4])} != {drawn[y][x]}")
+    # ...and what our own writer emits is what our own reader reads: the round trip is what makes
+    # the thumbnail builder's output trustworthy at all.
+    roundish = os.path.join(picture_home, "round.png")
+    flat = bytes(v for row in drawn for cell in row for v in cell)
+    px.write_png(roundish, width_px, height_px, flat)
+    assert px.read_png(roundish)[2] == bytearray(flat), "the png round trip does not agree"
+    # ...and the formats it refuses, it refuses LOUDLY: an interlaced or 16-bit file must name
+    # itself rather than decode into a smear nobody would notice at sixteen pixels.
+    for bad, why in ((png_bytes(2, 2, drawn[:2], [0, 0]).replace(b"\x08", b"\x10", 1), "depth"),
+                     (b"\x89PNG\r\n\x1a\n" + b"nonsense", "signature")):
+        refused = os.path.join(picture_home, f"bad-{why}.png")
+        with open(refused, "wb") as fh:
+            fh.write(bad)
+        try:
+            px.read_png(refused)
+        except (ValueError, OSError, _zlib.error):
+            pass
+        else:
+            raise AssertionError(f"the reader accepted a {why} it cannot draw")
+    say("buffy-chan's picture is read from real PNG bytes — every row filter, the round trip, "
+        "and the two formats it must refuse rather than guess at: ok")
+
+    # ---- a cell is the AVERAGE of the pixels under it, and a pixel with no source under it is a
+    #      HOLE. The grid is `rows` rows of `cols` pairs, so the unpacking drops into the ROW
+    #      before it drops into the PAIR: the top half is the upper pixel, the bottom half lower.
+    half = (4, 2, bytearray(
+        bytes([255, 255, 255, 255]) * 2 + bytes([0, 0, 0, 255]) * 2    # white white black black
+        + bytes([0, 0, 0, 0]) * 4))                                   # and nothing beneath them
+    left, right = px.cells(half, 2, 1)[0]
+    assert left == ((255, 255, 255), None), (
+        f"two same-coloured pixels over a hole are not that colour over a hole: {left}")
+    assert right == ((0, 0, 0), None), right
+    # ...and a cell that spans pixels of DIFFERENT colours AVERAGES them rather than picking one,
+    # because one source pixel out of a twenty-pixel cell is a lottery on the edge of her hair.
+    (avg_up, _avg_down) = px.cells(
+        (2, 2, bytearray([255, 255, 255, 255, 0, 0, 0, 255,
+                          255, 255, 255, 255, 0, 0, 0, 255])), 1, 1)[0][0]
+    assert avg_up in ((127, 127, 127), (128, 128, 128)), (
+        f"a cell is not the average of the pixels it covers: {avg_up}")
+    holes = px.paint_cells(px.cells((1, 1, bytearray([1, 2, 3, 0])), 3, 2), lambda rgb, bg: "38;2;1;2;3")
+    assert all(row.strip() == "" for row in holes), f"transparency drew something: {holes!r}"
+    assert not any("\x1b" in row for row in holes), (
+        "an empty picture row still spends escapes on the pane: " + repr(holes))
+    say("buffy-chan's pixels are averaged, not sampled, and what the art does not cover is left "
+        "as a hole in the pane: ok")
+
+    # ---- a row is exactly `cols` cells, and flat colour costs ONE escape for the run. That second
+    #      property is not tidiness: this row is rewritten every second the pane repaints.
+    solid = (4, 4, bytearray(bytes([10, 20, 30, 255]) * 16))
+    grid = px.cells(solid, 6, 2)
+    assert all(len(line) == 6 for line in grid), grid
+    painted = px.paint_cells(grid, lambda rgb, bg: ("4" if bg else "3") + "8;2;" + ";".join(
+        str(v) for v in rgb))
+    assert len(painted) == 2, painted
+    for row in painted:
+        assert module._cell_width(row) == 6, (module._cell_width(row), row)
+        assert row.count("\x1b") == 2, f"a flat row is not one run: {row!r}"
+        assert row.endswith("\x1b[0m"), f"an ink that never ends: {row!r}"
+    # ...and a cell with two different pixels in it carries both: foreground on top, background
+    # beneath, which is the whole trick.
+    duo = (1, 2, bytearray([255, 255, 255, 255, 0, 0, 0, 255]))   # white above, black below
+    two = px.paint_cells(px.cells(duo, 1, 1), lambda rgb, bg: ("4" if bg else "3") + "8;2;" +
+                         ";".join(str(v) for v in rgb))
+    assert "\x1b[38;2;255;255;255m" in two[0] and "\x1b[48;2;0;0;0m" in two[0], two
+    say("buffy-chan's picture rows are exactly the width they were asked for, one escape a run, "
+        "with the upper pixel in the ink and the lower beneath it: ok")
+
+    # ---- and the OTHER grid, which is the default: a braille cell is a 2x4 block of pixels in one
+    #      glyph (U+2800 + a bitmask), so the same panel holds FOUR times the pixels the half-block
+    #      grid can — the difference between a blob and a silhouette on a pane nine rows tall. What
+    #      it trades away is nothing: a cell carries TWO colours, the glyph in one and its own
+    #      ground in the other, so a dot below the alpha floor must contribute neither a mask bit
+    #      nor a colour - and a cell inside her outline is her DARK line art in the ink over the
+    #      rest of the cell behind it, which is where her face is kept (see `braille_cells`).
+    #      Everything else the half-block rows guarantee holds here too (a hole spends no escapes,
+    #      one run is one escape) for the same reason: this row is rewritten every second.
+    for raw, want in (("", "blocks"), ("blocks", "blocks"), ("tpyo", "blocks"),
+                      ("Half", "blocks"), ("braille", "braille"), (" DOTS ", "braille")):
+        was_style = os.environ.get(px.BUFFY_STYLE_ENV)
+        try:
+            if raw:
+                os.environ[px.BUFFY_STYLE_ENV] = raw
+            else:
+                os.environ.pop(px.BUFFY_STYLE_ENV, None)
+            assert px.buffy_style() == want, (raw, px.buffy_style())
+        finally:
+            if was_style is None:
+                os.environ.pop(px.BUFFY_STYLE_ENV, None)
+            else:
+                os.environ[px.BUFFY_STYLE_ENV] = was_style
+    # ...and the dot bits are Unicode's, or she is drawn mirrored and upside down: dots 1,2,3 down
+    # the left of the cell, 4,5,6 down the right, and 7,8 beneath them.
+    black, clear = bytes([0, 0, 0, 255]), bytes([0, 0, 0, 0])
+
+    def _dot(w, h, rows):
+        return (w, h, bytearray(b for row in rows for cell in row for b in cell))
+
+    assert px.braille_cells(_dot(2, 4, [[black] * 2] * 4), 1, 1) == [
+        [((0, 0, 0), None, px.BRAILLE_SOLID)]], "a cell that is all dark is not one solid ink"
+    assert px.braille_cells(_dot(2, 4, [[black, black]] + [[clear] * 2] * 3), 1, 1) == [
+        [((0, 0, 0), None, chr(0x2800 + 0x09))]], "dots 1 and 4 are not the top row"
+    assert px.braille_cells(_dot(2, 4, [[clear] * 2] * 3 + [[black, black]]), 1, 1) == [
+        [((0, 0, 0), None, chr(0x2800 + 0xC0))]], "dots 7 and 8 are not the bottom row"
+    assert px.braille_cells(_dot(2, 4, [[black, clear]] * 4), 1, 1) == [
+        [((0, 0, 0), None, chr(0x2800 + 0x47))]], "the left column is not dots 1,2,3,7"
+    assert px.braille_cells(_dot(2, 4, [[clear, black]] * 4), 1, 1) == [
+        [((0, 0, 0), None, chr(0x2800 + 0xB8))]], "the right column is not dots 4,5,6,8"
+    # a cell with nothing opaque under it is a hole, exactly as in the half-block grid: no mask,
+    # no ink, and no escape spent on saying so.
+    assert px.braille_cells(_dot(2, 4, [[clear] * 2] * 4), 1, 1) == [
+        [(None, None, " ")]], "a hole is not a hole"
+    assert px.paint_braille([[((1, 2, 3), None, " ")]], lambda rgb, bg: "38;2;1;2;3") == [" "], (
+        "a hole drew something")
+    empty_glyph = px.paint_braille(px.braille_cells(_dot(2, 4, [[clear] * 2] * 4), 1, 1),
+                                   lambda rgb, bg: "38;2;1;2;3")
+    assert not any("\x1b" in row for row in empty_glyph), (
+        "an empty picture row still spends escapes on the pane: " + repr(empty_glyph))
+    # ...and a pixel the art barely covers pulls neither the mask nor the colour: black beside a
+    # white pixel too faint to be a dot is pure black, not grey.
+    assert px.BUFFY_ALPHA_MIN > 100, "the alpha floor no longer makes a soft edge a non-dot"
+    assert px.braille_cells(_dot(2, 4, [[black, bytes([255, 255, 255, 100])]] + [[clear] * 2] * 3),
+                            1, 1) == [[((0, 0, 0), None, chr(0x2800 + 0x01))]], (
+        "a dot below the alpha floor is pulling on the ink")
+    # ...a hole after ink DROPS the ink first (the gap right of her must not carry her hair's
+    # colour), and a flat run is still ONE escape however many glyphs it covers.
+    two_cells = _dot(4, 4, [[black, black, clear, clear]] * 4)
+    painted_br = px.paint_braille(px.braille_cells(two_cells, 2, 1), lambda rgb, bg: "38;2;7;8;9")
+    assert painted_br == [f"\x1b[38;2;7;8;9m{px.BRAILLE_SOLID}\x1b[0m "], (
+        f"a blank run after ink did not drop the ink: {painted_br!r}")
+    wide_br = px.paint_braille(px.braille_cells(_dot(8, 4, [[black] * 8] * 4), 4, 1),
+                               lambda rgb, bg: "38;2;7;8;9")
+    assert wide_br == [f"\x1b[38;2;7;8;9m{px.BRAILLE_SOLID * 4}\x1b[0m"], wide_br
+    assert wide_br[0].count("\x1b") == 2 and module._cell_width(wide_br[0]) == 4, (
+        "a flat braille row is not one run of four cells: " + repr(wide_br[0]))
+    # ...and a FULL cell is a solid block, not its eight dots. This is the difference between a
+    # picture that is easy to see and one that is not: the dots of a braille glyph light about a
+    # third of the cell they stand in (measured on the owner's own pane, 2026-10-07), so a solid
+    # area of her hair drawn as `\u28ff` is a grey stipple. A cell that is only part-covered keeps
+    # its braille glyph, because that is the half of the job only braille can do.
+    assert px.BRAILLE_FULL == 0xFF and px.BRAILLE_SOLID == "█", "the solid-cell rule was renamed"
+    for glyph in ("█", chr(0x287F), chr(0x2801)):
+        drawn = px.paint_braille([[( (9, 9, 9), None, glyph)]], lambda rgb, bg: "38;2;9;9;9")[0]
+        assert drawn == f"\x1b[38;2;9;9;9m{glyph}\x1b[0m", (glyph, drawn)
+    # ...and a cell that IS split sets BOTH colours, the ink first and its ground after it - the
+    # escape order matters because the second one is what the dots sit on.
+    two_ink = lambda rgb, bg: ("4" if bg else "3") + "8;2;" + ";".join(str(v) for v in rgb)
+    with_ground = px.paint_braille(
+        [[((1, 2, 3), (4, 5, 6), chr(0x2801))]], two_ink)[0]
+    assert with_ground == f"\x1b[38;2;1;2;3m\x1b[48;2;4;5;6m{chr(0x2801)}\x1b[0m", with_ground
+    # ...and the solid cell is the SAME ink as the dots it replaces: the rule costs no colour.
+    assert px.braille_cells(_dot(2, 4, [[black] * 2] * 4), 1, 1) == [
+        [((0, 0, 0), None, px.BRAILLE_SOLID)]], (
+        "a fully covered cell is no longer full, so the solid rule can never fire")
+    # ...and her INSIDE is where the picture is won or lost: a cell she fully covers, half dark
+    # and half light, is drawn as TWO colours - the dark half as the ink, the light half behind
+    # it. Read off the alpha alone every such cell held one averaged ink, and that average of an
+    # eye and the skin around it is what made her face a band of flat colour.
+    white = bytes([255, 255, 255, 255])
+    mixed = _dot(2, 4, [[black, black], [black, black], [white, white], [white, white]])
+    got_mixed = px.braille_cells(mixed, 1, 1)
+    assert got_mixed == [[((0, 0, 0), (255, 255, 255), chr(0x2800 + 0x1B))]], (
+        "her line art over her own colour is not two inks: " + repr(got_mixed))
+    # ...and the level is ABSOLUTE rather than the cell's own midpoint, which is the measured
+    # part: a cell of two mid-tones holds no line art and stays ONE solid colour, where a split
+    # against the cell's own midpoint splits wherever the art has any gradient at all (56 of the
+    # 200 cells at the owner's panel size, which is a face drawn in dots).
+    mid = _dot(2, 4, [[bytes([180, 180, 180, 255])] * 2, [bytes([230, 230, 230, 255])] * 2] * 2)
+    got_mid = px.braille_cells(mid, 1, 1)
+    assert got_mid == [[((205, 205, 205), None, px.BRAILLE_SOLID)]], (
+        "a cell of mid-tones was split as if it held line art: " + repr(got_mid))
+    assert px.BUFFY_INK_LEVEL < 180, "the ink level no longer leaves mid-tones alone"
+    # ...and the four-times claim, on a witness rather than on arithmetic: a 2x4 strip of four
+    # single-pixel stripes, two of them opaque and alternating. In ONE braille cell those are four
+    # sub-pixel rows, and the alternation survives as a mask of four dots (2,5,7,8 — the two
+    # opaque rows, both columns); the half-block grid over the same cell has only TWO pixels to put
+    # them in, so whatever it decides, the two halves come out the SAME and the stripes are gone.
+    stripes = _dot(2, 4, [[clear, clear], [black, black], [clear, clear], [black, black]])
+    assert px.braille_cells(stripes, 1, 1) == [
+        [((0, 0, 0), None, chr(0x2800 + 0xD2))]], (
+        "four source rows in one braille cell did not keep the stripes: "
+        + repr(px.braille_cells(stripes, 1, 1)))
+    flat = px.cells(stripes, 1, 1)[0][0]
+    assert flat == (None, None) or flat[0] == flat[1], (
+        f"the half-block grid resolved stripes it cannot hold: {flat}")
+    # ...the two grids are the same SHAPE, so the cache key has to name the grid as well: a shared
+    # key hands one of them the other's cells, and the pane repaints once a second.
+    px._CELLS.clear()
+    same_path = os.path.join(picture_home, "cached.png")
+    px.write_png(same_path, 4, 4, bytes(bytes([10, 20, 30, 255]) * 16))
+    got_blocks = px.frame_cells(same_path, 4, 2, "blocks")
+    got_braille = px.frame_cells(same_path, 4, 2, "braille")
+    assert got_blocks is not got_braille and got_blocks != got_braille, (
+        "the grid is not part of the cell cache's key")
+    assert got_blocks == px.frame_cells(same_path, 4, 2, "blocks"), "the cache forgot the blocks grid"
+    assert got_braille == px.frame_cells(same_path, 4, 2, "braille"), "the cache forgot braille"
+    # ...and `panel()` is where the choice lands: braille unless the pane is told otherwise, the
+    # caller's own style beating the environment, and the geometry the same either way (the same
+    # rows, and the picture still square in pixels: `2*cols` sub-pixel columns, `4*rows` rows).
+    probe_ink = lambda rgb, bg: ("4" if bg else "3") + "8;2;" + ";".join(str(v) for v in rgb)
+    was = os.environ.get(px.BUFFY_STYLE_ENV)
+    try:
+        os.environ[px.BUFFY_STYLE_ENV] = "blocks"
+        rows_blocks = px.panel(3, probe_ink, clock_ms=grid_now, tick_ms=900)
+        os.environ[px.BUFFY_STYLE_ENV] = "braille"
+        rows_braille = px.panel(3, probe_ink, clock_ms=grid_now, tick_ms=900)
+        os.environ.pop(px.BUFFY_STYLE_ENV, None)
+        # ...and the default is blocks, which is the measured part of this: it is the grid that
+        # reads at the size the pane gives her (see `buffy_style`).
+        assert px.buffy_style() == "blocks", px.buffy_style()
+        assert px.panel(3, probe_ink, clock_ms=grid_now, tick_ms=900) == rows_blocks, (
+            "the panel without a style is not the default one")
+        os.environ[px.BUFFY_STYLE_ENV] = "braille"
+        assert px.panel(3, probe_ink, clock_ms=grid_now, tick_ms=900,
+                        style="blocks") == rows_blocks, "a caller's style did not beat the env"
+    finally:
+        if was is None:
+            os.environ.pop(px.BUFFY_STYLE_ENV, None)
+        else:
+            os.environ[px.BUFFY_STYLE_ENV] = was
+    assert rows_blocks != rows_braille, "the two grids draw the same picture"
+    assert len(rows_blocks) == len(rows_braille) == 3, (rows_blocks, rows_braille)
+    for row in rows_blocks:
+        assert all(ch == " " or ch in "▀▄" for ch in STRIP(row)), row
+    for row in rows_braille:
+        assert all(ch == " " or ch == px.BRAILLE_SOLID or 0x2800 <= ord(ch) < 0x2900
+                   for ch in STRIP(row)), row
+    # ---- and the panel spends its pixels on her FACE rather than on her whole canvas. Resolution
+    #      is not the same thing as recognisability: the frames are square, she is a chibi hung in
+    #      the middle of one, and a WHOLE character in a twenty-six-column panel is a body whose
+    #      face is three pixels across. The window is taken from her alpha content box (the canvas
+    #      is no guide to the character) and anchored at `BUFFY_FACE_AT` of the way down it, which
+    #      was measured as a picture rather than assumed: hung from the TOP it zooms past her face
+    #      and shows a head of hair and a onesie, and at 0.30 it is hair and no face at all.
+    zoom_env = os.environ.get(px.BUFFY_ZOOM_ENV)
+    try:
+        case = os.path.join(picture_home, "zoomed.png")
+        px.write_png(case, 16, 16, bytes(bytes([9, 40, 200, 255]) * 256))
+        full = px.read_png(case)
+        # ...and the default is the WHOLE character, because the closer window was checked at
+        # every panel height this pane will reserve and lost at all of them: a head that fills the
+        # panel is mostly flat colour, and a flat area has no detail for a bigger window to reveal.
+        assert px.BUFFY_ZOOM_DEFAULT == 1.0, (
+            "the default is not the whole character: " + str(px.BUFFY_ZOOM_DEFAULT))
+        os.environ.pop(px.BUFFY_ZOOM_ENV, None)
+        assert px.buffy_zoom() == px.BUFFY_ZOOM_DEFAULT, px.buffy_zoom()
+        for raw, want in (("1", 1.0), ("1.0", 1.0), ("2.5", 2.5), ("0.5", px.BUFFY_ZOOM_DEFAULT),
+                          (str(px.BUFFY_ZOOM_MAX * 2), px.BUFFY_ZOOM_DEFAULT), ("nonsense",
+                          px.BUFFY_ZOOM_DEFAULT)):
+            os.environ[px.BUFFY_ZOOM_ENV] = raw
+            assert px.buffy_zoom() == want, (raw, px.buffy_zoom())
+        os.environ.pop(px.BUFFY_ZOOM_ENV, None)
+        # a zoom of 1 is the image itself, and past it the window is a SQUARE inside the frame
+        assert px.zoomed(full, 1.0) is full, "a zoom of 1 is not the whole character"
+        near = px.zoomed(full, 2.0)
+        assert near[0] == near[1] < full[0], (near[0], near[1], full[0])
+        assert px.content_box(full) == (0, 16, 0, 16), px.content_box(full)
+        assert px.content_box((2, 2, bytearray(16))) is None, "an empty frame has a content box"
+        # ...and the window is anchored where her FACE is, not on the top of the box: measured on
+        # the shipped art, this is the difference between her face and a head of hair.
+        assert 0.2 < px.BUFFY_FACE_AT < 0.8, px.BUFFY_FACE_AT
+        real_path = px.frames()[0]
+        real = px.read_png(real_path)
+        assert px.zoomed(real, 2.0)[2] != px.zoomed(real, 2.0, face_at=0.05)[2], (
+            "the zoom window ignores where her face is")
+        # ...the zoom is part of the cell cache's key as well as the panel's own answer, and the
+        # picture at two zooms is two different pictures (asserted on the art, not on arithmetic).
+        px._CELLS.clear()
+        wide = px.frame_cells(real_path, 4, 2, "braille", 1.0)
+        near_cells = px.frame_cells(real_path, 4, 2, "braille", 2.0)
+        assert wide != near_cells, "the cell cache forgot which zoom it was asked for"
+        assert wide == px.frame_cells(real_path, 4, 2, "braille", 1.0), "the cache forgot the zoom"
+        at_one = px.panel(3, probe_ink, clock_ms=grid_now, zoom=1.0)
+        at_two = px.panel(3, probe_ink, clock_ms=grid_now, zoom=2.0)
+        assert at_one and at_two and at_one != at_two, "the panel ignores the zoom it is handed"
+        os.environ[px.BUFFY_ZOOM_ENV] = "2.0"
+        assert px.panel(3, probe_ink, clock_ms=grid_now) == at_two, (
+            "the panel does not take its zoom from the environment")
+        os.environ.pop(px.BUFFY_ZOOM_ENV, None)
+        assert px.panel(3, probe_ink, clock_ms=grid_now) == px.panel(
+            3, probe_ink, clock_ms=grid_now, zoom=px.buffy_zoom()), (
+            "a panel with no zoom of its own is not the default one")
+    finally:
+        if zoom_env is None:
+            os.environ.pop(px.BUFFY_ZOOM_ENV, None)
+        else:
+            os.environ[px.BUFFY_ZOOM_ENV] = zoom_env
+    say("buffy-chan's picture is a grid of cells the pane can be told to use — braille's 2x4 "
+        "dots, dot order, holes, one ink a cell, a FULL cell as a solid block, one escape a run — "
+        "and the two-colour half-block grid the pane draws by DEFAULT, where a cell is one pixel "
+        "wide and two tall and the lower one is the cell's background: "
+        "`FBTODO_BUFFY_STYLE` is the pane's say: ok")
+    say("buffy-chan's picture is spent on her FACE, not on her canvas — one window, square, "
+        "anchored where her eyes and mouth are, with `FBTODO_BUFFY_ZOOM` as the owner's say "
+        "for the whole character: ok")
+
+    # ---- which frame she is showing is a function of the clock: two panes at the same instant show
+    #      the same pose, a second later she has stepped, the walk wraps, and a frame that cannot be
+    #      read falls FORWARD rather than leaving a hole in the pane.
+    shelf = os.path.join(picture_home, "frames")
+    os.makedirs(shelf, exist_ok=True)
+    for i, colour in enumerate(((200, 30, 30), (30, 200, 30), (30, 30, 200)), 1):
+        px.write_png(os.path.join(shelf, f"{i:02d}.png"), 4, 4,
+                     bytes(bytes(colour + (255,)) * 16))
+    with open(os.path.join(shelf, "99.png"), "wb") as fh:
+        fh.write(b"not a png at all")
+    was_dir = os.environ.get(px.BUFFY_DIR_ENV)
+    os.environ[px.BUFFY_DIR_ENV] = shelf
+
+    def _ink(rgb, bg):
+        return ("4" if bg else "3") + "8;2;" + ";".join(str(v) for v in rgb)
+
+    # The walk is a function of the CLOCK, and its own clock is pinned: `grid_now` is a wall-clock
+    # SECOND stamped into a millisecond parameter, so which frame it lands on is `now // tick % 4`
+    # and the value moves every 1000 seconds. Written against that, this check passed only when the
+    # second happened to divide into the frame count - one run in four - and it was found failing,
+    # not passing, on 2026-10-07. Pinned to a whole number of walk cycles it tests what it means to:
+    # the step, the wrap, and a frame that cannot be read falling FORWARD.
+    walk_now = 4 * 1000 * 1000
+    try:
+        assert len(px.frames()) == 4, px.frames()
+        here = px.panel(2, _ink, clock_ms=walk_now, tick_ms=1000)
+        assert here and here == px.panel(2, _ink, clock_ms=walk_now, tick_ms=1000), here
+        assert px.panel(2, _ink, clock_ms=walk_now + 1000, tick_ms=1000) != here, (
+            "she does not step with the clock, so the pane is a picture again")
+        assert px.panel(2, _ink, clock_ms=walk_now + 3000, tick_ms=1000) == here, (
+            "her walk does not wrap: the fourth frame is unreadable and falls forward to the first, "
+            "which is the frame the walk started on")
+        assert all(module._cell_width(row) == 4 for row in here), here
+        empty = os.path.join(picture_home, "empty")
+        os.makedirs(empty, exist_ok=True)
+        os.environ[px.BUFFY_DIR_ENV] = empty
+        assert px.panel(2, _ink, clock_ms=walk_now) is None, (
+            "a machine with no frames must fall back, not draw an empty panel")
+    finally:
+        if was_dir is None:
+            os.environ.pop(px.BUFFY_DIR_ENV, None)
+        else:
+            os.environ[px.BUFFY_DIR_ENV] = was_dir
+    say("buffy-chan's picture steps on the pane's own clock, wraps, and falls back where the "
+        "frames are missing or unreadable: ok")
+
+    # ---- the frames that SHIP are real pictures: square, readable, and painted in more than a
+    #      handful of colours. A blank or half-scaled frame would pass every check above.
+    shipped = px.frames()
+    assert shipped, "her frames are not in the checkout, so the pane can only draw the ASCII one"
+    palette = set()
+    for path in shipped:
+        fw, fh, _ = px.read_png(path)
+        assert fw == fh and fw >= 16, (path, fw, fh)
+        for line in px.cells(px.read_png(path), 8, 8):
+            for upper, lower in line:
+                palette |= {upper, lower} - {None}
+        # ...and every one of them is the SAME character, which is the only thing that makes the
+        # walk an animation: the frames agree about where she is (their centres are all hers).
+        assert px.cells(px.read_png(path), 8, 8)[3][3] != (None, None), (
+            f"the middle of a frame is empty, so the crop is not on the character: {path}")
+    assert len(palette) >= 40, (
+        f"her frames are painted in {len(palette)} colours, which is not the art: {sorted(palette)[:8]}")
+    say(f"buffy-chan's {len(shipped)} frames are the art itself — square, centred on her, and "
+        f"{len(palette)} colours between them: ok")
+
+    # ---- and the panel she stands in is RESERVED out of the pane's height, so she is on the frame
+    #      of a pane that is FULL of steps (which is the pane a reader is looking at while the work
+    #      runs). The reservation is bounded on both sides and asserted here as arithmetic: nothing
+    #      without a pane to stand in, nothing where the steps would fall below their floor, half of
+    #      what is left over at most, never more than the knob asks for, and the knob's own zero is
+    #      the way to give the list every row back.
+    #
+    #      The DEFAULT is that this reservation is zero, and that is the whole point of the knob
+    #      now: she is drawn in a window of her own OVER this pane (`fbtodo pip`, at her real
+    #      resolution — see `buffy_panel`), so the character in the middle of the frame was the
+    #      same character twice, standing where the steps go. Reaching her here is asking for
+    #      her: `-1`/`auto`, or a row count.
+    was_rows = os.environ.get("FBTODO_BUFFY_ROWS")
+    try:
+        os.environ.pop("FBTODO_BUFFY_ROWS", None)
+        assert module.buffy_panel_rows(None, 8) == 0, "a pane with no height reserved rows for her"
+        assert module.buffy_panel_rows(24, 8) == 0, (
+            "the pane reserved rows for her without being asked: "
+            + str(module.buffy_panel_rows(24, 8)))
+        assert module.buffy_panel_rows(40, 8, 46) == 0, (
+            "the default pane still spends its width on her")
+        os.environ["FBTODO_BUFFY_ROWS"] = "auto"
+        assert module.buffy_panel_rows(None, 8) == 0, "a pane with no height reserved rows for her"
+        assert module.buffy_panel_rows(24, 8) == 8, module.buffy_panel_rows(24, 8)
+        assert module.buffy_panel_rows(12, 8) == 0, (
+            "she took rows from a pane that had no room for both her and the list")
+        # ...and the pane's WIDTH is part of her budget, which is the one thing a terminal image
+        # renderer does that a fixed panel did not: her picture is square in PIXELS, and a cell is
+        # one wide and two tall in the grid she is drawn in, so a square is `2*rows` columns - on a
+        # forty-six-column pane a nine-row panel spent eighteen columns on her and left the rest of
+        # the row empty. A tall pane can hold a bigger square; a short one is unchanged by it.
+        grew = module.buffy_panel_rows(40, 8, 46)
+        assert grew > module.BUFFY_PANEL_MAX, (
+            "the pane's width does not grow her panel: " + str(grew))
+        assert grew <= (40 - 8) // 2, "she took more than half of what the steps left: " + str(grew)
+        assert 2 * grew <= 46, "her square is wider than the pane it is drawn in"
+        assert module.buffy_panel_rows(24, 8, 46) == module.buffy_panel_rows(24, 8), (
+            "a short pane's panel moved when the width was handed in")
+        assert module.buffy_panel_rows(40, 8, None) == module.BUFFY_PANEL_MAX, (
+            "a caller that hands in no width lost the old cap")
+        assert module.buffy_panel_rows(40, 8) == module.BUFFY_PANEL_MAX, (
+            "she grew past what the panel is allowed to be")
+        for height in range(6, 60):
+            for chrome in range(0, 14):
+                rows_here = module.buffy_panel_rows(height, chrome)
+                assert rows_here <= module.BUFFY_PANEL_MAX, (height, chrome, rows_here)
+                assert rows_here == 0 or height - chrome - rows_here >= module.BUFFY_LIST_FLOOR, (
+                    f"at {height} rows with {chrome} of chrome she left the list "
+                    f"{height - chrome - rows_here} rows")
+        os.environ["FBTODO_BUFFY_ROWS"] = "0"
+        assert module.buffy_panel_rows(24, 8) == 0, "the knob does not turn her panel off"
+        os.environ["FBTODO_BUFFY_ROWS"] = "off"
+        assert module.buffy_panel_rows(24, 8) == 0, "the knob's own word for off is not off"
+        os.environ["FBTODO_BUFFY_ROWS"] = "5"
+        assert module.buffy_panel_rows(40, 8) == 5, (
+            "the knob does not cap her panel: " + str(module.buffy_panel_rows(40, 8)))
+        os.environ["FBTODO_BUFFY_ROWS"] = "nonsense"
+        assert module.buffy_panel_rows(24, 8) == 0, (
+            "a knob that is not a number must leave her undrawn rather than guess: "
+            + str(module.buffy_panel_rows(24, 8)))
+    finally:
+        if was_rows is None:
+            os.environ.pop("FBTODO_BUFFY_ROWS", None)
+        else:
+            os.environ["FBTODO_BUFFY_ROWS"] = was_rows
+    say("buffy-chan's panel is reserved out of the pane's height, half of what is left and never "
+        "below the steps' own floor, with `FBTODO_BUFFY_ROWS` as the owner's say — and the "
+        "default is that the pane draws her not at all, since she is in a window of her own: ok")
+
+    # ---- and on a real framed pane: her PICTURE is what stands in it, in 24-bit ink; the pane is
+    #      still exactly its own height and width; the steps she does not show are the ones the
+    #      window elides (never a step invented, never one drawn twice); and the knob's zero gets
+    #      every one of them back.
+    long_list = {"backend": "cli", "session": "S", "goal": "a pane full of steps",
+                 "todos": [{"task": f"step number {i}", "completed": i < 2}
+                           for i in range(14)], "done": 2, "total": 14}
+    panel_env = os.environ.get("FBTODO_BUFFY_ROWS")
+    style_env = os.environ.get(px.BUFFY_STYLE_ENV)
+
+    def _glyph_row(raw: str, style: str) -> bool:
+        """Is this row one of the picture's? Each grid has its own signature, and the pane's own
+        chrome must not answer yes to the wrong one: the strip's spinner is braille too and the
+        progress bar is block elements, so a COUNT is what separates a picture row from both.
+        The half-block grid's signature is the lower pixel in the background, which nothing else
+        in the frame writes; braille writes no background at all."""
+        if style == "braille":
+            return sum(1 for ch in raw if 0x2800 <= ord(ch) < 0x2900) >= 2
+        return "\x1b[48;2;" in raw
+
+    panels = {}
+    try:
+        for style in ("blocks", "braille"):
+            os.environ[px.BUFFY_STYLE_ENV] = style
+            os.environ["FBTODO_BUFFY_ROWS"] = "auto"
+            raw_her = module.render(long_list, True, watching=4812, width=46, height=24,
+                                    now_ms=grid_now, theme=module.THEME_DEFAULTS,
+                                    truecolor=True).split("\n")
+            os.environ["FBTODO_BUFFY_ROWS"] = "0"
+            without = STRIP(module.render(long_list, True, watching=4812, width=46, height=24,
+                                          now_ms=grid_now, theme=module.THEME_DEFAULTS,
+                                          truecolor=True)).split("\n")
+            # ...and the pane nobody asked anything of, which must be the pane with her turned
+            # off rather than a third answer: "not asked for her" and "asked for none of her"
+            # are the same frame.
+            os.environ.pop("FBTODO_BUFFY_ROWS", None)
+            default = STRIP(module.render(long_list, True, watching=4812, width=46, height=24,
+                                          now_ms=grid_now, theme=module.THEME_DEFAULTS,
+                                          truecolor=True)).split("\n")
+            panels[style] = (raw_her, STRIP("\n".join(raw_her)).split("\n"), without, default)
+    finally:
+        if panel_env is None:
+            os.environ.pop("FBTODO_BUFFY_ROWS", None)
+        else:
+            os.environ["FBTODO_BUFFY_ROWS"] = panel_env
+        if style_env is None:
+            os.environ.pop(px.BUFFY_STYLE_ENV, None)
+        else:
+            os.environ[px.BUFFY_STYLE_ENV] = style_env
+
+    for style, (raw_her, with_her, without, default) in panels.items():
+        assert len(with_her) == len(without) == len(default) == 24, (
+            style, len(with_her), len(without), len(default))
+        assert default == without, (
+            f"the pane nobody asked anything of differs from the pane with her turned off "
+            f"in {style}")
+        assert all(module._cell_width(row) == 46 for row in with_her + without), (
+            f"her panel broke the grid in {style}")
+        picture_rows = [i for i, row in enumerate(raw_her) if _glyph_row(row, style)]
+        assert picture_rows, (
+            f"a full pane of steps has no {style} picture on it at all:\n" + "\n".join(with_her))
+        assert max(picture_rows) < len(with_her) - 2, (
+            f"her {style} picture is standing on the state row or the bottom border")
+        assert min(picture_rows) > max(
+            i for i, row in enumerate(with_her) if "step number" in row or "▸" in row), (
+            f"her {style} picture is drawn above the list")
+        assert picture_rows == list(range(min(picture_rows), max(picture_rows) + 1)), (
+            f"her {style} picture is not one block of rows: {picture_rows}")
+        steps_with = [row for row in with_her if "step number" in row]
+        steps_without = [row for row in without if "step number" in row]
+        assert 0 < len(steps_with) < len(steps_without), (
+            f"her {style} panel did not take rows from the list "
+            f"({len(steps_with)} vs {len(steps_without)}) — or took all of them")
+        assert all(row in steps_without for row in steps_with), (
+            "the steps she shows are not the steps the pane would have shown: "
+            f"{steps_with} vs {steps_without}")
+        assert not any(_glyph_row(row, style) for row in without), (
+            f"her {style} picture is on the pane with the panel turned off")
+        # The heading and the state row are found by their own SHAPE rather than by the strip's
+        # status word: that word is read off the process table (`watching` is a pid), so asserting
+        # on `WORKING` is asserting on whether this machine happens to have that pid — it read IDLE
+        # here and the check went quiet rather than wrong. The state row is the second-to-last row
+        # of the frame, and its live clock is what says it is still the state row.
+        assert any("▸" in row for row in with_her), (
+            f"the heading did not survive her {style} panel")
+        assert with_her[-2].startswith("│") and "LIVE:" in with_her[-2], (
+            f"the state row did not survive her {style} panel: {with_her[-2]!r}")
+        panels[style] = (picture_rows, len(steps_with))
+    # ...and the default grid is the one the pane actually draws: the same long list, a full pane,
+    # and NO style set at all is the pane's DEFAULT one, which is blocks: the grid that reads at the
+    # size this pane gives her (see `buffy_style`). The variable is cleared for the probe rather than
+    # trusted to be unset, so an operator who exported a style of their own still runs this check.
+    try:
+        os.environ.pop(px.BUFFY_STYLE_ENV, None)
+        plain_pane = module.render(long_list, True, watching=4812, width=46, height=24,
+                                   now_ms=grid_now, theme=module.THEME_DEFAULTS, truecolor=True)
+    finally:
+        if style_env is None:
+            os.environ.pop(px.BUFFY_STYLE_ENV, None)
+        else:
+            os.environ[px.BUFFY_STYLE_ENV] = style_env
+    assert not [i for i, row in enumerate(plain_pane.split("\n")) if _glyph_row(row, "blocks")], (
+        "the pane drew her picture without being asked for it — the default pane is the list, "
+        "and she is in a window of her own")
+    say(f"on a full 24-row pane she stands in {len(panels['braille'][0])} reserved rows below "
+        f"the list in braille and {len(panels['blocks'][0])} in the half-block grid — but only "
+        f"when the knob asks for her, since she is drawn in a window of her own now: the default "
+        f"pane keeps its height and width and shows {24 - len(panels['blocks'][0])} step rows "
+        "where the panel takes 24 − that, and the knob is the only way to spend them on her: ok")
+
+    # ---- ...and the pane is a FIXED grid: whatever the list is worth, the frame it paints is
+    #      exactly the height it was asked for. A frame one row short leaves that row holding
+    #      whatever was painted there before, and the list lands there easily — measured
+    #      2026-10-07, 14 steps in a 24-row pane came out 23 rows tall with her panel off, while
+    #      the same pane with it came out 24, because her slack drawing happened to fill the row.
+    #      Both halves are checked: what she takes is a RESERVATION and what she draws is the
+    #      slack that reservation left over, and either one can be a row out on its own.
+    rows_env = os.environ.get("FBTODO_BUFFY_ROWS")
+    try:
+        for steps_n in (1, 2, 14, 40):
+            for pane_h in (12, 24, 40):
+                sized = {"todos": [{"task": f"step number {i}", "completed": i < 2}
+                                   for i in range(steps_n)],
+                         "done": min(2, steps_n), "total": steps_n}
+                os.environ.pop("FBTODO_BUFFY_ROWS", None)
+                tall = STRIP(module.render(sized, True, watching=4812, width=46, height=pane_h,
+                                           now_ms=grid_now, theme=module.THEME_DEFAULTS,
+                                           truecolor=True)).split("\n")
+                os.environ["FBTODO_BUFFY_ROWS"] = "0"
+                short = STRIP(module.render(sized, True, watching=4812, width=46, height=pane_h,
+                                            now_ms=grid_now, theme=module.THEME_DEFAULTS,
+                                            truecolor=True)).split("\n")
+                assert len(tall) == len(short) == pane_h, (
+                    f"{steps_n} steps in a {pane_h}-row pane painted {len(tall)} rows with her "
+                    f"and {len(short)} without")
+                assert short[-1].startswith("└") and tall[-1].startswith("└"), (
+                    "the frame's bottom border is not its last row")
+    finally:
+        if rows_env is None:
+            os.environ.pop("FBTODO_BUFFY_ROWS", None)
+        else:
+            os.environ["FBTODO_BUFFY_ROWS"] = rows_env
+    say("the pane is a fixed grid: a frame is exactly the height it was asked for, with her "
+        "panel and without it: ok")
+
+    # ---- ...and she is framed-pane chrome ONLY. The plain renderer is the machine-readable
+    #      path (`snap`, pipes, the fixtures), and a character drawn there would be a character
+    #      in every script's output.
+    buffy_plain = module.render(
+        {"backend": "cli", "session": "S", "goal": "g",
+         "todos": [{"task": "a step", "completed": False}], "done": 0, "total": 1},
+        False, watching=4812, width=80, now_ms=grid_now)
+    in_plain = sorted(f for f in faces.values() if f in buffy_plain)
+    assert not in_plain, f"the machine-readable frame grew a character: {in_plain}"
+    say("buffy-chan is framed-pane only; the plain, script-facing frame has no character: ok")
+
+    # ---- and what she SAYS at the finish costs the list nothing. Her line goes on the pane's
+    #      spare row — the one blank line between the list and the footer, which is there because
+    #      the steps did not want it — so the property is that the same finished list, drawn with
+    #      different things for her to say (including nothing at all), comes out with the same
+    #      steps in the same rows and the same number of rows: only that blank line changed. A
+    #      line that wrapped, grew the frame or took a row off a step would break one of those.
+    buffy_done = {
+        "backend": "cli", "session": "S", "goal": "a heading over a list that has finished",
+        "todos": [{"task": f"step {i}", "completed": True} for i in range(3)],
+        "done": 3, "total": 3,
+    }
+    # ...with what she says moved through the renderer's OWN globals, which is the copy it reads:
+    # `from .render import *` gives the package a second binding (see `set_knob`), and this suite
+    # re-imports the package between phases, so the object bound here is not always the one
+    # `sys.modules` holds for `set_knob` to patch. Patching the function's own module cannot miss.
+    said_global = module.buffy_line.__globals__
+    was_said = said_global["BUFFY_DONE_LINE"]
+    try:
+        said_frames = {}
+        for saying in ("", "nice work", "the whole list is done"):
+            said_global["BUFFY_DONE_LINE"] = saying
+            said_frames[saying] = STRIP(module.render(
+                buffy_done, True, watching=None, width=68, height=24, now_ms=grid_now,
+                theme=module.THEME_DEFAULTS, truecolor=False)).split("\n")
+    finally:
+        said_global["BUFFY_DONE_LINE"] = was_said
+    quiet, short_said, long_said = (said_frames[""], said_frames["nice work"],
+                                    said_frames["the whole list is done"])
+    # She speaks on a row of her OWN block, below the bar: the list has been fitted by then, so the
+    # property is that saying something adds exactly that one row and moves nothing — the steps,
+    # the bar and the state come out identical to the same pane with her silent.
+    assert "nice work" in "\n".join(short_said), (
+        "buffy-chan had nothing to say at the finish:\n" + "\n".join(short_said))
+    # Her line takes one row of the slack her portrait was standing in, so the frame comes out the
+    # same height either way — and the pane she is on still shows the same list.
+    assert not any("nice work" in row for row in quiet), quiet
+    assert len(long_said) == len(short_said) == len(quiet), (len(quiet), len(short_said),
+                                                            len(long_said))
+    keep = lambda rows, keys: [r for r in rows if any(k in r for k in keys)]  # noqa: E731
+    for what, keys in (("a step", ("step", "Goal:", "earlier")),
+                       ("the bar or the state", ("ALL DONE", "WORKING", "IDLE", "LIVE:", "["))):
+        assert keep(quiet, keys) == keep(long_said, keys), (
+            f"her line moved or cost {what}:\n  with her line {keep(long_said, keys)}\n"
+            f"  without  {keep(quiet, keys)}")
+    spoken = [row for row in long_said if "the whole list is done" in row]
+    assert len(spoken) == 1, spoken
+    assert "nice work" not in spoken[0], spoken[0]
+    assert len([row for row in short_said if "nice work" in row]) == 1, short_said
+    say("buffy-chan speaks at the finish on a row of her own below the bar — one line, and the "
+        "steps, the bar and the state unchanged: ok")
 
     # ---- the OTHER frame. Everything above renders a pane that HAS a list, but a pane
     #      spends real time without one — a turn opens before the agent writes its first

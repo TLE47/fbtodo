@@ -732,6 +732,17 @@ def _is_negation_of(a, b) -> bool:
     return False
 
 
+def _match_binders() -> tuple:
+    """The `match` node types that can BIND a name — empty on a Python that has no `match` statement.
+
+    `()` is deliberately the fallback: `isinstance(x, ())` is False, so on 3.9 the clause is simply never
+    taken, which is exactly what a 3.9 parser needs (it can produce no such node).
+    """
+    return tuple(
+        node for node in (getattr(ast, "MatchAs", None), getattr(ast, "MatchStar", None)) if node is not None
+    )
+
+
 def _assigned_names(node) -> set:
     """Every name a subtree BINDS: assignment, loop and `with` targets, imports, defs, …
 
@@ -751,9 +762,15 @@ def _assigned_names(node) -> set:
             out.add(child.name)
         elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             out.add(child.name)
-        elif isinstance(child, (ast.MatchAs, ast.MatchStar)) and child.name:
+        # ...and the names a `match` statement binds. `ast.MatchAs`, `ast.MatchStar` and `ast.MatchMapping`
+        # are 3.10 nodes and this project still declares 3.9 (`pyproject.toml`), where `ast.MatchAs` is not
+        # an attribute COLLECTABLE by `isinstance` at all — a bare mention of it is an AttributeError the
+        # moment this module loads, not a slow path (measured 2026-10-08, running the selfcheck under 3.9:
+        # "watcher holding, the new build does not load: module 'ast' has no attribute 'MatchAs'"). Asking
+        # for the node with a tuple fallback keeps the 3.10 binding analysis and keeps 3.9 working.
+        elif isinstance(child, _match_binders()) and getattr(child, "name", ""):
             out.add(child.name)
-        elif isinstance(child, ast.MatchMapping) and child.rest:
+        elif isinstance(child, getattr(ast, "MatchMapping", ())) and child.rest:
             out.add(child.rest)
     return out
 

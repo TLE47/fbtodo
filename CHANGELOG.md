@@ -5,7 +5,693 @@ Entries start at the newest release; each one is a contract change, not a diff.
 
 ## Unreleased
 
+### Fixed
+- **The pane imports on the Python it promises again (3.9).** `base.py` named `ast.MatchAs`, `ast.MatchStar`
+  and `ast.MatchMapping` directly, and those do not exist before 3.10 — so on 3.9 the module raised
+  `AttributeError: module 'ast' has no attribute 'MatchAs'` the moment it LOADED, not on some slow path
+  (measured by running the suite under 3.9, where it aborted with "the new build does not load"). The
+  `match`-statement nodes are now asked for by name with an empty fallback, which is a no-op on 3.9 (`isinstance`
+  against `()` is False, and a 3.9 parser cannot produce such a node) and the same binding analysis on 3.10+.
+  `pyproject.toml`'s `requires-python = ">=3.9"` and the matrix's 3.9 leg are the contract this keeps.
+- **A half-drawn frame no longer moves her.** A fresh reading of the pane that disagrees with the saved one by more
+  than a border (`paneBorderPt`, 8pt) on any edge is HELD: the saved placement stays, and a change is accepted only
+  when the next reading agrees. The live fit and the watch share that rule (`settle`). The log that showed it had
+  the pane alternating between two rectangles, and her window with it.
+- **She shows only while Freebuff is the app in front.** `onscreen` stays true while another app covers the
+  window, so she floated over Discord with the Freebuff window behind it. She now hides whenever the host app is
+  not frontmost (measured: Finder in front hides her, Freebuff in front shows her).
+
 ### Added
+- **A watch can be READ by a program and STOPPED at its first hop: `fbtodo pip doctor --watch N --json [--stop-on-change]`.**
+  `--json` prints ONE object per sample on stdout (`t`, `elapsed_s`, `state` — start, same, changed, held, no-pane,
+  refused — the pane as `[left, top, right, bottom]` in window points, `anchor`, `size`, `inside`, `changed`,
+  `note`, `window`), with the summary on stderr, so stdout is only the samples and can be charted or diffed
+  across runs. `--stop-on-change` ends the watch at the first accepted change and FILES the evidence under
+  `~/.cache/fbtodo/pip-hops/<stamp>/`: both captures (`before.png`, `after.png`), the full explanation of each
+  (`explain-before.txt`, `explain-after.txt` — the words `--doctor` prints), and `readings.json` with the two
+  readings, their times and the slack hint they were measured with. `FBTODO_PIP_HOPS` moves the filing. Exit 1 when it stops on a hop.
+- **A mood's pose is held for a minimum time: `--pose-hold` (seconds, default 8).** Without it a mood that steps
+  every 600–900ms changed pose faster than the eye could settle on one; 1.5 stopped the strobe but still moved her
+  to a new pose every second and a half at the quickest, 4 halved that, and neither fixed it — the held number only
+  ever bit the two quick moods, because a mood's own `ms` is what it says (work steps every 2.5s). At 8 every mood
+  takes one pose per eight seconds whatever its own pace says. The finished burst keeps its own pace, and the knob
+  is live: `fbtodo pip tune pose-hold 15` slows her further without a restart.
+- **...and the pose floor no longer outlasts the pose: `--pose-min` (default 2, was 10).** The dissolve is
+  `min(transition, max(pose's own step, pose-min))`, so a floor ABOVE the step made the fade longer than the
+  picture it was arriving at: with the old ten she was never once settled on a frame for the whole cycle, which is
+  what "she's currently change her pose too much" was looking at. The floor keeps its job — a fade is never
+  instant — while the POSE is the ceiling again, and the suite pins that the floor stays under the hold, because
+  two knobs that contradict each other are a bug in the defaults rather than a taste.
+- **She talks on the CLOCK, and not only when her mood moves.** A mood lasts a whole turn, so a line per mood
+  change was one line in twenty minutes — a caption rather than company. She now says a line whenever her bubble
+  has come down and she has been quiet for `bubble-gap`, and the line is always the CURRENT mood's, so the clock
+  cannot say something she is not feeling. Two knobs were already there and are REUSED rather than joined by a
+  third: `bubble-gap` was the silence after a line and is now also the cadence she breaks it on (default 20 → 12,
+  because 20 was tuned for a job it no longer has), and `bubble-seconds` is still how long a line stays up. Her log
+  names the clock's lines (`says=hm hm hm mood=work balloon=right on=tick`) so "she talks more often" is checkable
+  from outside, and she still never talks over a line that is up or over the finished burst.
+- **...and she has two more FLAVOURS of every line: `--cringe` and `--sentence`.** `--cringe` (default 0.35 —
+  "make her say cringe things often as well") is the chance a line is one of her dorky ones ("notice me, senpai",
+  "*nuzzles the keyboard*", "i didn't break it, it was already like that"), and `--sentence` (default 0.15 —
+  "once in a while she should say something a bit longer like a short sentence") is the chance it is a whole
+  clause instead of a tag ("this list is from a turn that already ended, ugh"). Both are tables of their own,
+  one row per mood, so the flavour still fits the emotion; `pickLine` is the ONE place a line is chosen, and
+  both places that speak — a mood change and the clock — go through it, so "she is cringe sometimes" cannot
+  come true on only one of them. Her log names the table (`kind=cringe`, `kind=sentence`, `kind=say`).
+- **...and she does not repeat herself.** "Never the one she just said" was enough while a line only arrived
+  on a mood change; with the clock talking three times a minute, a pool of four tags came back around inside
+  the minute. Her memory of what she has said is now a LIST of the last six (`recentDepth`), every table she
+  says lines from rolls through it — the mood's own, cringe, sentences, surprises — and both places that
+  speak write back to it. A pool with nothing fresh left falls back rather than going silent: the pool minus
+  only the last line, and the pool itself if even that is empty, because repeating a line beats saying
+  nothing.
+- **...and a line may not sound like an AI wrote it.** Every row is about the thing she is looking at — the
+  step, the tick box, the leftovers, the cat — and the suite holds a denylist of the phrases that put an
+  assistant in her mouth ("i'm here", "let me know", "take your time", "i'm proud", …), so a later
+  "friendlier" sentence cannot quietly turn her back into one. `wait` lost "take your time" to it.
+- **...and every mood she can be in has a POOL of lines, not one.** Eight for `work`, six for `done`, `error` and
+  `idle`, five for `wait` and `none`, four for the two she only flashes through (`nudge`, `stale`): with the clock
+  talking again a thin row is a line she repeats within the minute, which is the tape
+  loop the table exists to avoid. The new lines are hers in the same voice, and ONE of them is a REUSE — "one more
+  step" is `work`'s own line, shared with `nudge` rather than copied into it, because the two moods mean the same
+  thing about it. The suite pins the pools, the no-duplicates rule and the single shared line.
+- **The chat bubble stays up longer: `--bubble-seconds` (default 9, was 5).** Five seconds was gone before a line
+  could be read. Both knobs are in `fbtodo pip tune`.
+- **...and every knob her window reads is a FILE, set from the shell: `fbtodo pip tune`.** `transition`,
+  `pose-min`, `bubble`, `bubble-gap`, `surprise`, `pop`, `fit-every`, `fit-retry`, `side` and `tick` live in
+  `~/.cache/fbtodo/pip-tune` (`FBTODO_PIP_TUNE`), which her window re-reads on its own pin tick — so a knob
+  set here is worn WITHOUT a restart, which was the whole ask ("so I never have to export an environment
+  variable again"). The precedence is the usual one — a flag beats an environment variable, the environment
+  beats the file, the file beats the built-in default — and `fbtodo pip tune` shows every knob with the
+  value she would run with, WHERE that value came from (`cli`/`env`/`file`/`default`) and whether her
+  running window wears a change to it. The list of knobs is asked of the PROGRAM (`fbtodo-pip --tune`)
+  rather than kept in the CLI, so the two ends cannot drift; setting one writes the file atomically (0600,
+  same directory, rename).
+- **...and WHAT SHE SAYS is a file too: her lines are retunable without rebuilding her window.**
+  `~/.cache/fbtodo/pip-lines` (`FBTODO_PIP_LINES`), in exactly the shape `fbtodo-pip --lines` prints
+  (`work<TAB>chop chop`), re-read on the pin tick: a mood the file names is REPLACED, a mood it does not
+  name keeps its built-in lines (a file naming one mood is an override, so a new joke cannot delete the
+  other seven), every row for a mood is a line she may say in the file's order, a row with NO words clears
+  that mood's lines — how "she says nothing in this one" is written down — and `surprise` is a key here as
+  well, for the lines that belong to no mood. `fbtodo-pip --lines` prints the effective table, so
+  `--lines > ~/.cache/fbtodo/pip-lines` seeds a complete file to edit, and her log names the reload
+  (`buffy-pip lines=… moods=2`).
+- **...and any placement can be INTERROGATED: `fbtodo pip doctor` takes one capture and explains it.**
+  Where she stands is decided from a screenshot — the strongest vertical lines in the app's window, the
+  pane's own published row grid, and the blank rows its frame left — and when that goes wrong the answers
+  are all in pixels. The verb says all of them out loud: the window it measured, the hint the pane
+  published, every long column with its ink run, every PAIR of them with the reason it was kept or
+  thrown away ("nothing above the slack at all — a blank panel, not the pane", "the pane's slack band is
+  NOT blank … kept, against a candidate that wears it", "wider than 60% of the window"), the pane that
+  won, the blank band she was given, and `anchor=`/`inside=` — her square and whether it is inside that
+  pane. Exit 0 when she would be inside it, 1 when the pixels say otherwise, 66 with no window to look
+  at, 69 when a capture is refused; `--fit <png> --trace` is the same explanation over a file, which is
+  how the suite checks it with no screen involved (and a capture is a second process's problem: while
+  her window is up this verb measures with her down and puts her back, saying so on stderr).
+- **...and a placement that comes and goes can be WATCHED: `fbtodo pip doctor --watch [SECONDS]`.** A
+  hop is intermittent by nature — one capture catches an answer and never the jump — so the same
+  measurement is taken again every second for that long (bare `--watch` is a minute) and only what
+  CHANGES is reported: the pane rectangle, her square in it, or the window they were read out of, with
+  the wall clock and both readings, then one summary counting samples, changes, refusals and captures
+  with no pane in them (each failure printed once, when it starts, rather than once a second over the
+  change it is about). The exit code is the gate the request implied: 0 when every sample found her
+  inside the pane, 1 when any did not (or when a capture came back with no pane-shaped thing in it, the
+  single-shot verb's own answer to that), 69 when no capture came back at all — so an intermittent hop
+  makes the command fail; a duration outside 0..3600s is a usage error rather than a default.  One
+  capture attempt a tick, deliberately: a watch IS the retry (the next sample is a second away), while
+  the doctor's six attempts with 800ms between them would cost half a minute per sample. Measured live (2026-10-08): 14 samples in 10.8s at
+  about a second a tick, and a change caught on the real window — `changed=anchor … was pane=1907,…
+  anchor=982,494` one second after the pane's own hint moved. The duration is the verb's own word
+  (`args.rest`), because `--watch` is `status`'s flag: `split_verb_words` now cuts after `pip doctor`
+  too, exactly as it does for `tune` and `sheet`. `--fit <png> --watch 30` watches a capture on disk
+  with no screen at all, which is how the suite checks the reporting — the file is re-read every tick,
+  so a hint rewritten mid-watch is a placement that moved while the screen stood still.
+- **...and `--shot` keeps a capture at last.** `--shot <png>` ("the same capture written to disk, so
+  what the live path actually saw can be looked at") was left at the top level when `--doctor` was moved
+  inside the app, and from there it was refused on EVERY run: measured 2026-10-08, exit 69 with "no
+  screenshot for --shot" from a shell, while the same binary's own scheduled capture measured the pane
+  perfectly. It is a `shotRun` now, scheduled after the run loop like the doctor, and both take their
+  capture through one `captureWithRetries` (6 attempts, 800ms apart, refusals on stderr) so the two
+  verbs cannot disagree about how a window is captured. Verified live: with her window down,
+  `--shot /tmp/shot-final.png` wrote 2456x1380 for window 71608 by pid 99995 (rc=0) and
+  `--fit /tmp/shot-final.png --fit-width 1228 --trace --slack …` over that file put her at
+  `anchor=982,489 size=192 inside=yes`. It needs her window down — a second pip process cannot capture
+  while she is up, the same reason `pip doctor` measures with her stopped and puts her back.
+ `scripts/buffy-sheet.py` renders
+  the whole cast into ONE self-contained HTML file — a mood with a line in it (the balloon, its shape and
+  the words that fit it) and the mood alone (the pose the pane's word means) for all eight, then the
+  surprise and the frames on disk — because a change to the art, the shapes or the table is a change you
+  cannot review by reading the code. `--out`, `--size`, `--line`, `--no-frames`, `--no-surprise`,
+  `--open`, `--json`; every picture is a data URI, so the page travels; the path is the one line on
+  stdout, progress is on stderr, and it exits 66 with a build command when there is no window to draw.
+- **...and the surprise changes her POSE, not just her words.** It borrows a sticker from OUTSIDE the
+  mood's own cycle (the pool is every frame that mood would never show) for as long as the line lasts, and
+  then dissolves back to the step she was on — her cycle HOLDS for the surprise, so the picture she
+  returns to is the one she left. It arrives as a CUT rather than a dissolve, the one cut she makes on
+  purpose: a surprise you can see coming is not one. `--art-surprise` renders the borrowed sticker on
+  demand, the log names it both ways — which pose she borrowed (`surprise=yes pose=15`) and which of her
+  own she came back to (`surprise=over back=pose=20`) — and the suite checks for every mood that the frame it
+  borrows is not one that mood already shows ("make the surprise change her pose as well: a sticker from
+  outside the mood's own cycle for a few seconds, then back").
+- **...and her balloon hangs on the OTHER side of her head for the next line, and POPS into place.** The
+  sides alternate per line (a still render is always the same side, so the sheet and the suite stay
+  repeatable), which is what stops every line landing on her ahoge — and the log names the side it landed
+  on (`balloon=left`/`right`), so the alternation is something a reader can check without watching her
+  window; the tail mirrors with it, pointing at
+  her head from whichever side she is on. And the line arrives with a squash-and-stretch pop
+  (`FBTODO_PIP_POP`, `--pop`, 0.34 s, `0` off) instead of fading up: it lands flat and springs open, and it
+  is anchored at the balloon's top edge and never scales wider than the settled cloud, so a pop can only
+  grow inward and can never leave her square.
+- **...and she ARRIVES rather than fades in, and a pose is never the fast one.** Two more asks, both about
+  the same thing — the transition was still too quick to watch somewhere: her window is now ordered in at
+  FULL OPACITY (the way off the screen is still a fade, and the balloon's arrival is the pop instead of a
+  ramp), and the pose floor `FBTODO_PIP_POSE_MIN` defaults to **10 s** — the transition's own length — so
+  a pose change is the slow morph whatever pace its mood steps at ("increase default transition per pose
+  up, i dont want it to be too fast", "also remove fade in").
+- **...and her bubble is a MANGA BALLOON whose shape is her mood: the cloud wraps the LINE, not her
+  square.** The words are measured first (`bubbleLayout`) and the balloon is the ring of scallops that
+  wraps that measurement, so a longer line is a wider cloud and one that has to wrap is a taller one
+  that sits lower — measured, not claimed: `--art-say "hi"` reports `balloon=69x74`, `"waiting on you"`
+  `balloon=169x74`, and `"the list needs a rewrite"` `balloon=183x99` twenty-three points higher up.
+  Which scallops those are is the MOOD's (`bubbleShapes`, one row per mood): a soft pink cloud with two
+  stars while she works, the roundest, pinkest, four-star one when the list is done, a lilac cloud with
+  no stars and three DETACHED dots for a tail where she is only thinking, waiting or left over — a
+  thought balloon — and a jagged SHOCK balloon for `error` (eleven spikes, red) and `nudge` (seven,
+  orange). No puff is a circle of its own size: a fixed wobble of the radius, index by index, so the edge
+  undulates instead of reading as a rounded rectangle with beads on it ("the bubble cloud text looks a
+  bit too rectangle"), and the card underneath is inset exactly as far as the puffs can hide it, so the
+  visible boundary is the arcs. Two invariants survive every shape: every circle is clipped to her own
+  square (`puff` is the only way in), so a line can never reach the pane's list, and the balloon is
+  never more than half her height. `--art-say` renders one and the same record line measures it
+  (`balloon=169x74 r=16 box=29,135 spikes=0`), which is how the wrap is a number in the suite rather
+  than a squint at a picture (the owner, 2026-10-07: "using a bubble cloud box like in manga wrap
+  around text to show her emotion").
+- **...and now and then she SURPRISES you.** `FBTODO_PIP_SURPRISE` (`--surprise`, 12% by default, `0`
+  never and `1` every time) is the chance that a mood change gets the surprise instead of the line the
+  mood would have said: words that belong to no mood ("boo!", "still cute?", "*pomf*"), in the one
+  balloon that is all of them at once — spiked, spangled and dotted, in violet (`surpriseShape`, which is
+  deliberately NOT a row of the mood table: a surprise is nobody's mood) — and her log names it,
+  `surprise=yes`. A surprise is allowed past `FBTODO_PIP_BUBBLE_GAP` on a mood change, because a line
+  nobody expected is the whole of it, and `--art-surprise` renders one on demand instead of waiting for
+  luck ("you can have some mood sometimes appear to surprise users").
+- **...and every one of her twenty frames is worn by some mood.** Frames 4, 5, 6, 8, 13, 14 and 15 were
+  in no cycle at all — art that existed and was never on screen. The four moods that MOVE carry them
+  (`work` 20, 17, 8, 4; `done` 12, 18, 9, 1, 15, 14; `idle` 3, 2, 16, 13; `none` 19, 10, 5, 6) and the
+  four that HOLD keep their single picture each, and the suite now checks the UNION of the table against
+  the art on disk rather than only that the frames it names exist — a frame no mood names fails the run
+  ("trying to use all of buffy-chan images").
+- **...and she TALKS, and CELEBRATES: a speech bubble in her own square, and a burst when the list is
+  finished.** The bubble is drawn INSIDE her square — never over the pane's list, never outside the pane
+  —  as a CLOUD with a pair of puffs for a tail — a union of circles drawn as one path, and drawn twice so
+  the outline cannot show the arcs the union ate ("more round and a bit cloudy form") — sized to her own
+  width and never more than half her height, so a line cannot reach anywhere she does not already stand
+  (the owner, 2026-10-07: "add a chat bubble so sometimes she says something cute and cool, or even
+  silly").  `--art-say "we did it"` renders one without a window, which is how the shape is looked at
+  and how the suite measures it. One short line per
+  mood, picked at random and never the one she just said — a companion program that repeats itself is a
+  tape loop — put up on a MOOD change and at most once every `FBTODO_PIP_BUBBLE_GAP` (20 s), for 5 s,
+  fading in and out over 0.35 s on its OWN clock rather than the transition's: two words are read at a
+  glance. `--bubble 0` (`FBTODO_PIP_BUBBLE`) takes it away, and a mood with no line says nothing.
+  The celebration is the exception the other way: a FINISHED list always gets a line AND a burst — she
+  rattles through her own poses at 220ms each for three and a half seconds instead of the mood's
+  two-and-a-half seconds a pose, so "every step is ticked" is something you can see rather than read
+  ("add transition after she's done with all the job"). Verified both ways: her log says
+  `says=we did it mood=done` when the list finishes, and the same square captured 1.3 s later and 6 s
+  later reads `188.5` against `62.7` on the top strip of her art — the card is on the screen and then it
+  is not.
+- **...and her transitions are SLOWED DOWN: she eases, fades and dissolves instead of teleporting.**
+  Every change of state she makes used to be drawn inside a single tick — a slot the pane's layout
+  moved under her, a window that had to go away because the list filled the pane, a pose following
+  the pane's mood — so she hopped to the new corner, popped in and out, and blinked between two
+  stickers. There is now ONE number for the length of all three (`FBTODO_PIP_TRANSITION`,
+  `--transition`, 10 s by default and a FLOOR under any smaller value, because a transition is meant to
+  be SEEN — "i let the transition take at least 10s"): the move is eased (smoothstep, so the corner and
+  the size travel together and both ends of it are at rest), the window fades in and out, and a change
+  of pose is a cross-dissolve of the picture she is leaving over the one she is arriving at. The ramps
+  are driven by her OWN 30 Hz clock rather than AppKit's, and that is a measurement rather than a
+  preference: her window's animation behaviour is `.none` (she is furniture, and a window that animates
+  its own ordering-in flashes in the middle of the chat), and against that a 700ms `animator().setFrame`
+  landed as ONE step of a 60ms sampler — a cut wearing a transition's name. `0` is the old behaviour
+  exactly — every one of them a hard cut, and the one value the floor does not touch — which is how the
+  two are compared rather than argued about. THE SLIDE IS A SLIDE: her size is settled the moment a move
+  begins and only the corner travels, because a window that grows on the way across is one the pane's
+  own rows cannot account for (the owner, 2026-10-07: "don't resize the window for slide in
+  transition"). A POSE takes the same length too ("make transition between pose take 10s"), capped at
+  one step of the mood it is arriving at and never made fast by that cap ("you can have the cap, but
+  sometimes i don't want it to be too fast transition"): `min(transition, max(pace, POSE_MIN))`, with
+  `FBTODO_PIP_POSE_MIN` at 6 s, so a mood that steps every 900ms still settles while a held pose takes
+  the whole of it.
+  The visibility flip the slow fade made loud: a single refused measurement between two good ones used
+  to be a one-frame blink and is a twenty-second pulse at this length, so the way OUT now waits one pin
+  tick (`hideDebounceS`, 0.5 s) — a measurement that found nothing is mostly a pane mid-relayout —
+  while the way back IN is still immediate.
+  Three rules the ease had to keep: the move is compared against the slot she is GOING to rather than
+  the frame she is sitting at (the pin's clock is half a second apart, and a re-issued move would
+  restart the ease on every tick and never arrive), a slot that got SHORTER takes her SIZE at once and
+  eases only her position (easing a shrink would hang her over the pane's own border for the length of
+  the ease, which is the one thing the containment rule is about), and there is no resample of her
+  frames for the sizes she merely passes through — the pin prepares her for the slot she is arriving
+  at, because twenty Core Image renders per intermediate size is the one thing that could make the
+  move itself stutter.
+  Measured live on this display (2026-10-07), off the window server rather than off the source: her
+  window's own alpha, sampled every 100ms as she was shown, reads `0.01 → 0.03 → 0.08 → 0.13 → 0.19 →
+  0.26 → 0.34 → 0.42 → 0.50 → 0.58 → 0.66 → 0.73 → 0.80 → 0.86 → 0.92 → 0.96 → 0.99 → 1.00` — a
+  ~9.4s fade with the ease visible in the spacing (and, at `--transition 5000` before the floor existed,
+  seventy distinct values over the same ramp); a 1229→560 resize of the app's window while she was
+  shown moved her `1032 → … → 592` through the whole of a ten-second glide with the alpha ramping
+  underneath it (and at the old 700ms length, `1034 → 1025 → 985 → 920 → 844 → 794 → 711 → 678 → 675`,
+  nine intermediate positions), `size=192` throughout; and a recording of her own square through one
+  mood change is `1026 1026 1082` — a single frame — at `--transition 0`, against `1026 … 1060 1061
+  1062 1063 1064 1066 1067 1069 1071 1073 1075 1076 1077 1078 1079 1080 1082` with the dissolve on, and
+  at the ten-second length the same measurement is a ramp of some two hundred frames rather than a
+  handful. She
+  was also caught doing the thing the ordering is for: on the tick she came back from a failed
+  measurement she was ALREADY at `1034,461` while her alpha was `0.02`.
+- **...and she is a SUBCOMMAND, pinned where the drawing used to stand.** `fbtodo pip` owns the
+  floating window: `pip start` (idempotent, launched in its own session so a short-lived shell
+  cannot take her down with it), `pip stop`, `pip status`, and the two that are the button —
+  `pip free` releases her so she is draggable and stays where she is put, `pip stuck` puts the pin
+  back, and `pip forget` drops the pin she was taught so she stands in the middle again. The pin is
+  anchored IN the window the PANE lives in — the place the drawn buffy-chan stood — and it is
+  re-checked twice a second rather than read once: the host window is resized, moved between Spaces
+  and dragged, and a pin that only held at launch would be over the wrong thing by teatime. Which window that is, is read off the PANE's OWN PROCESS CHAIN
+  (`--pids`, the ancestry `fbtodo pip start` walks while it is still a child of the pane's shell —
+  the detached window itself is reparented to `launchd` and can no longer see it), so a window
+  whose OWNER pid is on that chain is her home and the app's NAME (`--host`, `FBTODO_PIP_HOST`) is
+  only the fallback; a SET-BUT-EMPTY name (`FBTODO_PIP_HOST=`, or `-`/`none`/`off`) is how a caller
+  asks for the middle of the display, which is also what she falls back to when no window is found,
+  and her log says which of the two she got.
+  The search is not restricted to the on-screen windows: measured 2026-10-07, the desktop app's own
+  window reported `onscreen=false` while a pane was live in it, so an on-screen-only search answered
+  `none` and pinned her to the screen — the on-screen pass is simply tried first, because it is the
+  cheap one, and an on-screen window wins over an off-screen one so a Space nobody is looking at
+  cannot take the pin.  The switch is a FILE (`~/.cache/fbtodo/pip-free`), the same shape the notify kit uses for the
+  phone, so a shell command, the pane's own key and the running window can never disagree; the window prints a line on every state CHANGE, which is the only way anything outside
+  it can tell that the button it just pressed was read. Verified end to end: `pip start` → a
+  window at `layer=3` (the window server's own list) whose log line names the host it found
+  (`hostBounds=51,30 1229x690 pid=3294 owner=Freebuff`), `pip free` → `buffy-pip mode=free` in her
+  log within half a second, `pip stuck` → `mode=stuck` and her snapped back.
+- **...and the draw-in-the-pane is GONE: the pane does not draw her at all any more.** Two
+  drawings of one character, one of them standing in the rows the steps want, is worse than one,
+  and the window is the better one — so the pane draws neither of them now. Both halves came out:
+  `buffy_panel` used to fall back to the ASCII portrait when the terminal could not show her
+  picture (`return []`), AND the picture itself is no longer drawn by default, because it was the
+  second copy of a character who is now in a window of her own over this very frame. The switch
+  that brings the drawing back is `FBTODO_BUFFY_ROWS`, and its grammar changed with the default:
+  unset (or `0`/`off`) is a pane that is only the list and a picture in the middle of the frame is
+  an explicit `-1`/`auto` (sized to the pane, as before) or a row count, which is also now the
+  CEILING of the slack she may stand in rather than a hint about it — the pane used to draw her in
+  leftover rows even with the knob at `0`, which is how a picture could still appear on a pane that
+  had been told not to draw one. A value that is not a number is read as "not asked for her"
+  rather than as "size her to the pane": guessing is what a pane does with a list it cannot read,
+  not with a knob. `BUFFY_ART` and `buffy_art` stay in the module with their own checks as the
+  thing `fbtodo pip` can print for a machine with no window to float her in, and the list gets
+  every row the panel used to reserve — 6 to 15 of a 24-row pane, measured on a 46-column pane -
+  back. The pane's own six-cell border face is NOT part of this: it is the state, not a drawing.
+- **...and the pin is TAUGHT by dragging, not guessed from the window.** The middle of a window is
+  only the pane's own middle when the pane IS the middle of its window, and it often is not:
+  measured 2026-10-07, the desktop app's window keeps a chat and a file list on the left and the
+  terminal panel on the right, so the window's centre put her over the chat — the owner's words,
+  "it's in the middle of my screen, not in the fbtodo pane". Nothing outside the app can be told
+  where that panel is (the app's own UI geometry lives in its renderer, behind a launch token it
+  strips on purpose), so the pin is taught instead: `p` releases her, you drag her where she
+  belongs, `p` again — and wherever she was left is remembered as an offset from the pane's
+  window's TOP-LEFT corner, which is what makes it survive that window being moved, resized, or
+  carried to another Space. The file is `~/.cache/fbtodo/pip-pin` (a plain `x,y`, `FBTODO_PIP_PIN`
+  to move it), re-read twice a second so a rewrite moves her on the next tick, and `fbtodo pip
+  forget` drops it. With no pin taught she stands in the middle, which is the best anyone outside
+  the app can know — and either way her CENTRE is kept inside the window, so a pin taught in a
+  bigger window cannot park her off it. Verified against the window server: pin `620,150` on a host
+  at `51,30` → `at=(671,180)`; free with the file rewritten → she does not move; stuck again → the
+  file is rewritten to her actual position (`taught pin=620,150` in her log); rewritten live to
+  `300,60` → `at=(351,90)`; `forget` → back to the window's middle.
+- **...and she finds the pane by HERSELF, from the pane's own drawing.** A taught pin only ever
+  existed because nothing outside the app can be told where the terminal panel is; it can, however,
+  be SEEN. Her window now captures its host window (ScreenCaptureKit — measured 2026-10-07: 112ms a
+  shot plus 19ms to RGBA, against `screencapture`'s 52 SECONDS, which is why the CLI is not used)
+  and finds the one thing in it shaped like a pane: the frame fbtodo draws is the window's only
+  PAIR of solid vertical ink lines, so the detector takes the columns carrying the most ink, pairs
+  them by how long they run in parallel, and keeps the pair whose rectangle is a column of the
+  window rather than the window. She stands at the centre of that pane's LAST BLANK BLOCK — the
+  space the ASCII picture used to be drawn in, above the state row — or at the pane's middle when
+  the list fills it. Re-measured every four seconds and again the moment the window she was
+  measured in is not the window in front of her, which is what makes a resize move her with the
+  pane; a pin you TAUGHT still wins, and `fbtodo pip forget` hands her back to the drawing.
+- **...and the pane publishes the one thing pixels cannot tell: which of its rows are empty.** The
+  pane's background is transparent onto a textured wallpaper (`.terminal-panel{--terminal-canvas:
+  #00000000}`), so on a real screenshot a blank row reads exactly like the wallpaper's own pattern
+  — forty rows of "ink" where the pane is empty. The pane therefore writes `rows cols start count
+  epoch` (its grid, the first row of its slack, how many rows that is) to
+  `~/.cache/fbtodo/pip-slack` (`FBTODO_PIP_SLACK`), rewritten only when the numbers change, and her
+  window turns that into a place with the cell height it reads off the frame it found. The COLUMN
+  count is the second half of the note: her window has to pick the pane out of a screenshot, and the
+  shapes in that window are not all panes — measured 2026-10-07, the explorer sidebar was a
+  better-looking pair of vertical lines than the pane was — so a candidate rectangle whose width is
+  nothing like `cols` cell-widths for the height it claims is passed over. Hint first, pixels
+  second, refused rather than guessed: a hint that does not fit the frame's row count is ignored, and
+  a window in which no pane is found leaves her hidden rather than parked somewhere plausible.
+- **...and the pane makes ROOM for her window rather than letting her sit on a step.** The rows the
+  note publishes above are the pane's own reservation, not just whatever the list left over: while
+  her window is RUNNING (the pid file, so a stale one reserves nothing) `fbtodo pane` reserves
+  `pip_slot_rows()` rows for it — `FBTODO_PIP_ROWS`, whose default is "as many as her drawn panel
+  would have taken" (`buffy_panel_rows`), `0`/off is a pane that reserves none, and a number is
+  that many — through the same guards the drawn panel always had, so the steps keep
+  `BUFFY_LIST_FLOOR` rows and a pane too short for both loses her before it loses the list. A pane
+  with her over it therefore shows a shorter list and an empty slot, instead of a character covering
+  three steps. Her window is FIT to that slot and never outside it: the size is the largest whole
+  number of ART PIXELS that fits (the frames are 128px and the display is 2x, so 64pt units — 192pt
+  is exactly three screen pixels per art pixel, where the 201pt she was drawn at before resampled
+  her at 3.125), drawn with the context's high-quality filter; the square is centred in the slot and
+  then CLAMPED inside the pane's borders; a pane that published no room at all orders her out
+  instead of drawing her over the list; and with no measurement for the host window — at launch, or
+  after a refusal — she is not shown at all rather than put at the middle of the app's window, which
+  is the chat, not the pane. She is also not shown while the host window is not on screen: her
+  window joins every Space, so a fit measured for a window the reader is not looking at would float
+  her on the desktop by herself. Verified live, window server against `fbtodo pip status`: pane
+  `1831,125-2407,1369` px (915.5..1203.5 x 62.5..684.5 pt), published slot `rows 22..34 of 37`,
+  `size=192 anchor=963,445 inside=yes` → her window at `1014,476 192x192`, and the host window's own
+  capture blank from `783..1297` where she stands. The pixels were being read UPSIDE DOWN until this
+  and she stood 52pt above her slot: a `CGContext`'s buffer counts rows from the BOTTOM, so the
+  frame's own border row came out at the top of the array in one reading and the bottom in another —
+  the pane's top edge read as 5pt below the window's when a `screencapture -R` region and the
+  project's own PNG reader both put it at 62.5pt. `captureWindow` and `screenshotOnDisk` now flip
+  once, where the pixels are made, and `--shot <png>` (the same capture written to disk, for looking
+  at what the live path actually saw) agrees with the fit and with a screenshot of the same window.
+- **...and the pin has a button on the pane, the way the phone does.** `p` releases her (and pins
+  her again), and the pane's TITLE CHIP carries the switch while it is in force — `pip stuck · p`
+  or `pip free · p`, the same slot and the same rule as the mute chip: the chip is the one place
+  the pane says a switch exists at all, and it names its own key, because a switch nobody can find
+  is a switch nobody trusts. The chip appears only while her window is RUNNING (a pid file naming a
+  live process is the test): with no window there is no pin, and a chip offering to release one
+  would be the pane describing something that is not on the screen. `p` is asked only when the mute
+  kit has nothing to say about the key, so one byte can never mean two things, and the chip is part
+  of the pane's repaint signature — a keypress changes no row of the list, so without that the
+  frame would sit there showing the state she just left.
+- **...and she can float over the whole screen, the way a video sits in a picture-in-picture
+  corner.** Everything above is a CEILING and not a limitation of effort: the pane can only ever
+  draw her in cells, and a cell is worth two pixels, so on a short pane she is a small blob by
+  geometry — no rendering rule changes that. `scripts/buffy-pip.swift` is the other half: the SAME
+  frames the pane averages down, at their real resolution, in a borderless window of her own that
+  is always on top (`level = .floating`, which the window server reports as layer 3 against the
+  layer-0 windows everything else is drawn in). She cycles the frames on the pane's own tick, she
+  is draggable from anywhere on her body (`isMovableByWindowBackground`), she leaves on Escape or a
+  right-click, and she is an ACCESSORY app: no Dock tile, and she never takes focus from what is
+  being typed. Built by `scripts/buffy-pip.sh` (`swiftc`, which is already on this machine), which
+  compiles to `~/.cache/fbtodo/bin/fbtodo-pip` rather than into the checkout, and rebuilds only
+  when the Swift is newer than the binary. Two things learned building it, both recorded because
+  they cost time: a launch from a shell that then exits takes her with it unless she is started in
+  her OWN session (the script is launched with `start_new_session`), and the only trustworthy
+  check that a floating window exists is the window server's own list — a screenshot crop was
+  believed once and was the YouTube video behind the crop.
+- **...and she is drawn at the resolution she exists at, not resampled into it.** The frames her
+  window draws were 128px and she is 192pt on a 2x display — 384 device pixels, a 3x upscale of
+  every pixel of the owner's drawing, filtered by whatever the window server does to a bitmap — and
+  the owner's words for the result were "still a bit low resolution". Both halves are fixed. The
+  900px Discord stickers the owner made the frames from were on disk all along, so
+  `scripts/buffy-thumbs.py --size 384` derives a second set from them (`assets/buffy/pip`, next to
+  the 128px set the PANE reads; the pre-shrink it feeds `sips` now follows the size asked for,
+  because a 192px intermediate behind a 384px frame is an upscale of a downscale), and 384 is
+  exactly her size: **the render is byte-identical to the art** (`rmse 0.00` against
+  `assets/buffy/pip/20.png` at 192pt, where the 128px frames come out `rmse 7.16` of the same
+  picture — a number, from `scripts/buffy-artcheck.py`, rather than an opinion). Where a resample
+  does happen — a slot smaller than 192pt, the fallback frames, or the 128px set on a checkout that
+  has not regenerated the large one — it is done ONCE, off the screen: `renderedArt` pre-renders
+  every frame at the exact device pixel size with Core Image's Lanczos scale plus a light unsharp
+  mask (radius 1.4, intensity 0.5, and only when pixels were actually put back), the view draws the
+  result 1:1 with interpolation off, and `--sharp=0` / `FBTODO_PIP_SHARP=0` restores the old drawing
+  path for an A/B. Measured, 192pt against the same frame's `.high` drawing path: edge energy 137%,
+  and the round trip back down to the 128px source is 37% closer (a sharper resampler and a truer
+  one at the same time). `--art <png> [--art-size PT] [--art-mood NAME]` renders one frame through
+  that same path without a window at all, which is how the two are compared.
+- **...and she wears a POSE for what the agent is doing, so her face and the pane's agree.** The
+  pane already has one word for her mood — `buffy_mood`, the same word that picks the face on its
+  top border (a failure, the rewrite-the-list nudge, a finished list, no list at all, idle past the
+  pane's own threshold, a heading left over from an earlier turn, or the ordinary working frame) —
+  and her window draws a picture rather than text, so it can only be TOLD. The pane now publishes
+  that word to `~/.cache/fbtodo/pip-mood` (`FBTODO_PIP_MOOD`), rewritten only when it changes and
+  again if the file has gone missing, and her window wears the pose it means, on her own clock:
+  sitting at the laptop and then thinking it over while a step is in progress (`work`, 20 and 17),
+  both arms up twice over when every step is ticked (`done`), dozing with the cat and then just
+  standing there when the session has gone quiet (`idle`), puzzled and then peering out from behind
+  the frame's edge when there is no list to point at (`none`), and HOLDING still for the three that
+  are over by the time they are drawn (`error`, `nudge`, `stale` — the pane holds still on those
+  faces too). Which pose means what is one table in the Swift (`moodCycles`, with the frame numbers
+  `assets/buffy` gives them), every mood the pane can produce has to have one, and every frame it
+  names has to exist — both checked, so the two ends of the feature cannot drift apart. The whole
+  table, with the condition behind each mood, what she wears for it and how to see one without a
+  window, is [docs/MOODS.md](docs/MOODS.md); `fbtodo-pip --moods` prints it, `--art-mood NAME`
+  draws one pose, and the suite asks her window for both (a stale or missing binary is said out
+  loud rather than assumed). Live:
+  `echo done > ~/.cache/fbtodo/pip-mood` moves her to the celebration within half a second and says
+  `buffy-pip mood=done frames=12,18,9,1 step=900ms` in her log.
+- **...and the window server's own `onscreen` flag is not to be believed about this app.** It is a
+  per-Space flag, and measured 2026-10-07 the desktop app's window reported `onscreen=false` while
+  its pane was live, capturable and in front of the reader — so the gate that hides her off-Space
+  hid her over a pane she belongs in, which is half of "she should be always in there". It is a HINT
+  now: the ACTIVE application settles it (`NSWorkspace.frontmostApplication`, refreshed on every pin
+  tick), so a window belonging to the app in front counts as one the reader can see whatever its
+  Space says, and only a window that is neither on screen nor the app in front hides her. Verified
+  live with the app in front and the flag false: `buffy-pip shown=… size=192` and her window
+  `onscreen=true 1009,461 192x192` over the pane.
+- **...and she FOLLOWS A RESIZE, measured.** The app window was resized under her twice
+  (1229x690 → 560 → 520 → back, through accessibility, restored before the tool exits) with her log
+  watched to the millisecond: at 560 the capture came back `2458x1120`, the pane was re-read as
+  `1805,108-2413,1119 cell=28px slack=rows 20..32 of 35`, and she moved to `anchor=958,341` — then
+  re-measured again when the pane settled (`cell=32px rows 17..26 of 29`, `anchor=958,328`) — with
+  her window at `1009,371` and then `1009,359`, both `size=192`. At 520 the whole thing again, and
+  the contract check on the live capture her own window took (`FBTODO_PIP_DUMP`):
+  `fit=pane=1805,125-2413,1011 slack=rows 16..24 of 27 cell=32px size=192 anchor=959,303
+  inside=yes scale=2.000`. Restoring the window put her back at `1009,461` — the same numbers as
+  before the resize, to the point. The pane's published grid was also changed under her on its own
+  (a fake slack note, a hint from a pane three rows off), which is what a resize looks like from her
+  side: she refit inside a second, and refit back when the real note returned.
+- **...and she HOLDS a pose while the agent is waiting on you, and her whole table is a file.** Two
+  halves of one ask (2026-10-07: "make her hold a mood's pose still while the agent is waiting on me,
+  and give the mood table a knob so I can retune paces without rebuilding").
+
+  The first is a new MOOD rather than a new mechanism: `turn_ended` is a state the pane has always
+  known — it prints it as "turn ended — waiting for you", the ask and stall watches exist for it, and
+  it is the one moment the ball is in the owner's court — and the pane now says it on her face too
+  (`wait`, a patient `~(^.^)`) and publishes it like any other mood. She HOLDS it: a turn nobody is
+  driving is not a moment to be seen cycling through poses. Four of the eight moods hold still now
+  and they are exactly the pane's own still faces, which the suite asserts both ways. Precedence is
+  argued rather than guessed: below `done` (a finished list still celebrates — that is the news, and
+  what the finished-task bell rings on) and above `none` (a turn that ended with no list at all is
+  still *waiting for you*), with `turn_running` asked as well, because both flags come from one
+  transcript and a new turn can arrive before the old one clears.
+
+  The second: the table is `FBTODO_PIP_MOODS` (or `--moods-file`) — one line per mood, `name frames
+  ms`, which is exactly what `--moods` prints, so `fbtodo-pip --moods > ~/.cache/fbtodo/pip-moods`
+  and an editor IS the retune. Her window re-reads it on its next half-second tick (one `stat`
+  otherwise), re-wears the mood she is in with the new numbers, and says so —
+  `buffy-pip moods=… rows=2 moods-on-disk=20` — so "did my edit land" is answerable from outside.
+  Three rules make a live knob safe, and each is a check: a file naming only SOME moods is an
+  override (the rest keep their built-in rows); a line naming a mood the pane cannot produce, or
+  with the wrong field count, is ignored; and a row whose frames are all past the end of the art is
+  ignored whole, because losing a pose is worse than ignoring a typo. `--moods` prints the EFFECTIVE
+  table, a missing or rubbish file leaves the defaults alone, and deleting it puts them back.
+- **...and she does not VANISH — not on a fresh pane, and not on a minimize.** Two snapshots were
+  being treated as live state. The pane's process chain is a snapshot taken when `pip start` ran, so
+  a pane reopened, a session restarted or the app relaunched left every pid on it dead and a window
+  that insisted on the chain answered "no window" for a window that was right there: `findHost` now
+  falls back to the owner NAME, which is what it was always documented as. The measurement is the
+  other half — a capture of a window that is minimized or mid-redraw can come back empty, and an
+  empty measurement used to overwrite the only placement she had: a FAILED attempt no longer counts
+  as "none yet" while the window is the same window (the last good fit for that number stands until
+  a new one lands), a state that measured nothing is retried on its own 1.5s clock
+  (`--fit-retry`) instead of waiting out `--fit-every`, and a window coming BACK ON SCREEN forces a
+  re-measure on that tick ("she does have quite a bit delay to show up back if i minimize the window
+  then come back" — the delay was that clock, not the capture). She is also placed BEFORE she is
+  shown: the ordering flip and the `setFrame` happen in the same tick, so there is no frame where
+  she appears at the corner she had while she was away, and with no host window at all she is
+  hidden rather than dropped at the middle of the screen — the middle of the screen is the chat
+  behind the pane, and "always in there" also means "never anywhere else".
+
+
+### Added
+- **The pane has a supporting character, and her whole face is the state.** buffy-chan is six
+  ASCII cells and an ahoge (`~(o_o)`) standing at the left of the top border, and her face is
+  chosen from the facts the rows under her are drawn from: `(>_<)` is the nudge row, `(._.)` is a
+  heading left over from an earlier turn, `(-_-)` is a list nobody has moved in the pane's own
+  idle window, `(x_x)` is the failure about to be printed under her, `(^o^)` is a list that
+  finished. Her mood is also her INK, resolved out of `_styles` rather than invented — the
+  accent at work, the success green at the finish, the warning yellow on a nudge, the error red
+  on a failure, and the frame's own grey only while she dozes. She animates, and all of her
+  does: every living mood is a cycle of whole faces (eyes and mouth together — eight seconds a
+  loop for the work mood), stepped once a second on the pane's OWN clock (`now_ms // 1000`, the
+  tick the status strip's spinner already runs on), so she keeps no timer of her own and a frame
+  remains a pure function of the state and the clock. The three moments hold still on purpose: a
+  failure is already over by the time it is drawn, and a squint and a doubt are instants rather
+  than states. At the finish she SPEAKS: one line (`BUFFY_DONE_LINE`, `every step done — nice
+  work`) on the pane's spare row — the blank line between the list and the footer, which exists
+  because no step wanted it — so she is heard at the moment the work ends and the list pays no
+  row for it, while a pane with no spare row simply has her stay quiet. Her six columns come out
+  of the METADATA's budget rather than the list's: that slot is a truncation by construction (it
+  clips to whatever the title leaves it), so what she shortens is a tail  the border was already
+  clipping, and where her cells would take the tag off the border entirely she is the one who
+  goes. When the chip is carrying a process note (a mute, or a reload) that note gives up its
+  own tail first: a note clipped six cells early still says the phone is off, while those six
+  columns are the difference between the pane's character being on the border and not. Every face is the same six cells and pure ASCII, so the pane cannot reflow because she
+  blinked or because a terminal disagrees with the code's ruler, and she belongs to the framed
+  pane alone — the plain, machine-readable frame carries no character. `BUFFY_CYCLE`,
+  `BUFFY_REST`, `BUFFY_FRAMES`, `BUFFY_INK`, `BUFFY_CELLS`, `buffy_mood`, `buffy_face` and
+  `buffy_line` are the whole of her.
+- **...and she is drawn out, below the list.** `BUFFY_ART` is her at nine rows and twenty-six
+  columns — the ahoge, the hair over her head and falling past her shoulders, the bow, the face,
+  the hoodie with the F on it and a fist with a spark — drawn in the pane's own margin between the
+  last fact and the state strip, in her mood's ink. It is the same character at a second size:
+  the row where her face is holds `{face}`, the border's own six cells without their ahoge (the
+  portrait draws the hair around her), so the mood and the tick the border is wearing are the ones
+  she is wearing, and a check asserts the two forms agree mood for mood. She is drawn only with the
+  families the frame already trusts — ASCII, box drawing and the block elements the progress bar is
+  made of — every row padded to `BUFFY_ART_W`, so a portrait can never be the thing that breaks the
+  grid. She stands in the rows the frame has LEFT OVER and in nothing else: the room is measured on
+  the finished frame (after the list, the heading, the bar, the facts and the state have taken
+  theirs), she is not in the row budget at all, and turning her portrait off draws the same steps,
+  the same bar and the same state — asserted as a property. `buffy_art(face, room)` returns the
+  WINDOW that contains her face, from one row of room up, so the pane that can only afford two rows
+  of her gets her face rather than two rows of hair; the whole portrait is returned when it fits,
+  so her ahoge is there too. A pane with no slack has her on the top border alone, and an unbounded
+  frame — a pipe, a fixture that asked for no height — draws no portrait at all.
+- **...and she is a PICTURE, where the terminal can show one.** The drawn portrait is the fallback,
+  not the character: with room for `BUFFY_PIXEL_MIN` rows, the pane draws the art itself out of
+  `assets/buffy`, averaged down to pixel cells; in the half-block grid a cell is one pixel wide and
+  TWO tall, the upper pixel in the cell's foreground and the lower in its background, so a `▀` is a
+  picture every terminal already knows how to show and no graphics protocol is needed. `src/fbtodo/buffy_pixels.py`
+  is the whole of it, standard library only: a PNG reader that handles every row filter and refuses
+  a 16-bit or interlaced file OUT LOUD rather than decoding a smear (it was also checked pixel for
+  pixel against `sips`' own decoder on the 900×900 originals); a cell is the ALPHA-WEIGHTED average
+  of the pixels under it, because a plain mean drags every edge of her white hair towards black and
+  one source pixel picked out of a twenty-pixel cell is a lottery; transparency is a HOLE rather
+  than a black pixel, and a blank run after ink drops the colour first so the cutout does not carry
+  her hair's colour out to the row's end; equal neighbouring cells collapse into ONE escape, which
+  is what keeps a row that is rewritten every second cheap. Her walk is the clock and nothing else —
+  `clock_ms // tick_ms`, one tick per mood (`BUFFY_TICK_MS`: 900ms at work, 600 at the finish, two
+  seconds while she dozes) — so two panes at the same instant show the same pose, a frame that
+  cannot be read is stepped OVER rather than left as a hole, and a machine with no frames at all
+  falls back to the drawn portrait. Frames are found the way the pane finds everything else:
+  `FBTODO_BUFFY_DIR`, then `~/.config/fbtodo/buffy/`, then the checkout's own `assets/buffy` — the
+  twenty 128×128 frames `scripts/buffy-thumbs.py` derives from the owner's own stickers (`sips` to
+  pre-shrink, an alpha-derived content box so the crop is on the character rather than the canvas,
+  and an averaged down-scale). She stands in rows RESERVED out of the pane's height before the list
+  is fitted (`buffy_panel_rows`), never more than half of what is left over and never below the
+  steps' own `BUFFY_LIST_FLOOR`, so a pane with the room always has her and a pane without it has
+  exactly the list it would have had; `FBTODO_BUFFY_ROWS` is the owner's say, and its `0` gives
+  every row back to the steps. The ink depth is deliberately NOT one of the conditions: a
+  256-colour pane gets the same picture posterised rather than a different one, because the frame's
+  geometry has to be identical at every colour depth — that is the property the bar's own check
+  asserts for the frame as a whole. All of it is pinned: the filter round trip and the two
+  refusals, the average and the hole, the one-escape-per-run rule, the clock's stepping, its wrap
+  and its fallback, the shipped frames' shape and palette, the reservation's arithmetic and its
+  knob, and a full 46×24 pane of fourteen steps where her picture is below the list, the pane keeps
+  its height and its width, and the knob gets the steps back.
+- **...and she is drawn in BRAILLE by default, at four times the pixels.** A half-block cell spends
+  a whole cell on two pixels; a braille glyph is U+2800 plus a bitmask, so one cell is a 2×4 block
+  — eight sub-pixels — and the same `cols × rows` panel is a `2*cols × 4*rows` pixel picture
+  instead of `cols × 2*rows`. On the pane this character is actually judged on (nine to thirteen
+  rows of panel) that is the difference between a blob and a silhouette: her ahoge, the sweep of
+  her hair and the line of her hood resolve, where the two-pixel grid averages each of them into a
+  chunk. What the finer grid trades away is colour — a cell carries one ink, the coverage-weighted
+  mean of the dots that are ON, so a dot below `BUFFY_ALPHA_MIN` contributes neither a mask bit nor
+  a colour — and it puts the shape partly in the FONT's hands. That would have been the end of it,
+  and it was, for one afternoon: the braille grid did carry four times the pixels and still looked
+  WORSE in the pane, because a braille glyph's dots do not FILL the cell they stand in. Measured on
+  the owner's own pane, a `⣿` lights about a third of its cell, so a solid area of her hair drew as
+  a dim grey stipple rather than as hair — more resolution, harder to see. So a cell whose block is
+  FULL is drawn as a solid `█` instead of its eight dots: the same ink and no extra escape, because
+  a block paints every pixel of the cell, and it is exactly the cells that are solid in the art
+  that were paying the most for the dots. A part-covered cell keeps its braille glyph, which is the
+  half of the job only braille can do, so the silhouette keeps its four-times detail AND the solid
+  parts of her are solid — on the owner's pane, 122 of the 191 lit cells of a thirteen-row panel
+  are full, so roughly two and a half times the panel's lit area. It is the default rather than an
+  opt-in because the pane already requires those glyphs: the status strip's spinner is `⠋`, so a
+  terminal that can draw this frame at all can draw U+2800. `FBTODO_BUFFY_STYLE=blocks` is the way
+  back to the two-colour grid, for a terminal whose monospace face draws the dots small; anything
+  that is not `blocks`/`block`/`half` is read as braille, because a typo in a knob must not be the
+  reason a pane draws nothing. The cell cache is keyed by the grid as well as the frame and the
+  panel size — the two grids have the same SHAPE, so a shared key would hand one of them the
+  other's cells — and a caller's own `style=` beats the environment. Pinned in the suite: the dot
+  order (1,2,3 down the left of the cell, 4,5,6 down the right, 7,8 beneath them — get it wrong and
+  she is mirrored and upside down), a hole spending no escapes, one escape a run, the knob's
+  parsing and its precedence, the cache's key, and a WITNESS for the four-times claim rather than
+  arithmetic on it: four single-pixel stripes in one cell survive braille as a four-dot mask and
+  vanish into a hole in the half-block grid, which has only two pixels to put them in. The
+  framed-pane check now runs in BOTH grids — the default one among them — and finds her picture by
+  each grid's own signature (the lower pixel in the background, or two braille glyphs where the
+  strip's spinner is one), because a picture found by the half-block grid's escapes alone is a
+  check that goes quiet the moment the default changes.
+- **...and the panel's pixels are spent on her FACE, not on her canvas.** A frame is a square canvas
+  with a chibi hung in the middle of it, so the whole character in a twenty-six-column panel is a
+  body whose face is three pixels across: more resolution and still nothing a reader recognises,
+  which is what the pane was actually reporting after both of the changes above. `buffy_pixels` now
+  takes its window from the alpha content box (`content_box` — the canvas is no guide to the
+  character), squares it, and anchors it at `BUFFY_FACE_AT` of the way down her (`zoomed`). That is
+  the same rule `buffy_art` already keeps — a crop takes her feet, never her face — and the anchor
+  was measured as a PICTURE rather than assumed: hung from the TOP of the box the window zooms past
+  her face and shows a head of hair and a white onesie, and at 0.30 it is hair and no face at all,
+  where 0.42 puts her eyes and mouth in the middle of the panel. `BUFFY_ZOOM_DEFAULT` is now `1.0`
+  — the WHOLE character — and that is a retreat with a measurement behind it: the closer window was
+  checked at every panel height the pane will reserve (9, 12 and 16 rows, against the whole
+  character at each) and it lost at all of them, for a reason worth writing down. A head that fills
+  the panel is mostly FLAT colour, and a flat area has no detail for a bigger window to reveal, so
+  the zoom bought bands of hair and onesie while giving up the ahoge, the hood and the spark that
+  make her recognisable in the first place. `FBTODO_BUFFY_ZOOM=2` is still the owner's say and the
+  window, the anchor and the content box are still there for it; what changed is which one is the
+  default. The shipped frames stay at 128×128 to feed a closer window (`scripts/buffy-thumbs.py
+  --size 128`, 556 KB for the twenty), the zoom is part of the cell cache's key, and the suite pins
+  the knob's parsing and its clamping, the default, the window's squareness, the anchor's effect on
+  the real art, the cache key, and the panel's answer at each zoom.
+- **...and inside her outline a braille cell carries TWO colours, so her line art survives.** The
+  braille grid took its dots from the ALPHA channel, so every cell inside her silhouette held one
+  averaged ink — the eyes, the mouth and the seams of the hood averaged into the skin around them.
+  On the owner's pane that is what the picture was: her face as unbroken horizontal bands of skin
+  and cream, described in the pane's own words before it was diagnosed. A cell she FULLY covers is
+  now split at an ABSOLUTE ink level (`BUFFY_INK_LEVEL`): the sub-pixels darker than it are the
+  dots, in their own colour, and the lighter rest of the cell is set as the glyph's GROUND as well
+  (`paint_braille` writes both, ink first), so an eye is dark against the skin it sits in rather
+  than a slightly darker grey. A cell with nothing dark in it, or nothing light, is still one solid
+  colour, which is what keeps the flat areas of her bright; a cell she only partly covers is still
+  her silhouette, one ink and no ground, because what is not her is the PANE. The level is absolute
+  rather than measured against the cell, and that is the measured part: a split at the cell's own
+  midpoint fires wherever the art has any gradient at all — 56 of the 200 cells at the owner's
+  panel size — so her face came out as a field of dots. Two further findings are recorded here
+  because they bound what the pane can ever draw. The desktop's terminal is xterm.js (`@xterm` in
+  the app bundle, and no sixel, kitty, iTerm2 or image protocol of any kind), so there is no path
+  to real pixels in that pane and cell art is the ceiling; and among the cell grids, braille's 2×4
+  is already the densest there is — sextants (U+1FB00) and the quadrant block are ruled out by the
+  FONT, since the app ships DM Mono and its charset has no legacy-computing block. The suite pins
+  the three rules, the two-colour escape order, the level's effect on a cell of mid-tones, and the
+  two-ink cell that the grid is now built around.
+- **...and the grid she is drawn in is the HALF-BLOCK one, which is the smaller of the two.**
+  `buffy_style()` defaulted to braille for its four-times pixel count, and at the size this pane
+  actually gives her that trade is a loss: checked as pictures side by side, at the panel's own
+  nine-row cap the two grids are 18×18 and 36×36 pixels and the 18×18 half-block one is the one a
+  reader recognises — a round white head with a dark hood and a spark, against a pale field of dots
+  with the same features smeared through it. The reason is the art: a chibi is FLAT COLOUR with
+  thin dark lines in it, which is exactly the case where a cell's second COLOUR (half-block: two
+  exact pixels a cell) beats its second pair of pixels (braille: a 1-bit dot pattern whose ink and
+  ground are each one averaged colour). Braille is not removed and is not a fallback — it is one
+  `FBTODO_BUFFY_STYLE=braille` away, it carries two colours a cell as well, and it is the grid to
+  reach for on a pane with the rows to spend for four times the sub-pixels; on THIS pane it is the
+  second-best picture. The suite keeps both grids' rules, and `buffy_style` now takes an explicit
+  value as well as reading the environment, so a caller can name the grid it wants.
+- **...and her panel is sized to the pane's WIDTH, the way a terminal image renderer sizes an
+  image.** `BUFFY_PANEL_MAX` was a flat nine rows, and a nine-row panel is eighteen columns
+  wide, because her picture is SQUARE in pixels and a cell is one column wide and two rows tall
+  in the grid she is drawn in. On a forty-six-column pane that spent eighteen columns on her and
+  left twenty-eight of the row empty — the same waste a terminal renderer would never make, and
+  the reason a `chafa` or `timg` preview of the same art looks different from this panel: those
+  spend the whole cell grid. `buffy_panel_rows` now takes the pane's width and lets the cap grow
+  to the square the pane could hold (`width // 2` rows), still bounded by half the room the steps
+  left and by their own floor, so a SHORT pane is unchanged by it. Measured on a real frame:
+  forty-six columns by forty rows gives her a 32×32-pixel panel where it used to give her 18×18 —
+  three times the pixels, which is the difference our own renders show between a blob and a face —
+  while the same pane at twenty-four rows still reserves eight. The suite pins the growth, the
+  half-of-the-room bound, the square never outgrowing the pane, and the short pane that must not
+  move. Not fixed, and now known: on a narrow pane the WRAPPED heading and steps are not part of
+  the `chrome` the reservation is computed from, so at thirty columns a long list can still push
+  her reserved rows off the bottom of the frame. She is dropped rather than drawn wrong, and the
+  frame keeps its exact height, but she is not drawn.
 - **Idle dead time is reported, not assumed.** AGENTS.md tells a session never to `sleep`
   merely to wait and never to poll in a loop with no useful work between the polls, and the
   journal already records every call a session made, in order, with its timestamp — so the rule
@@ -627,6 +1313,17 @@ Entries start at the newest release; each one is a contract change, not a diff.
   observation, so a desktop pane mid-turn is headed exactly as a CLI pane would be.
 
 ### Fixed
+- **A frame is exactly the height the pane asked for, whatever the list is worth.** The pane is a
+  FIXED grid and it repaints in place, so a frame one row short leaves that row showing whatever
+  was painted there before — and the step area reached exactly that state on its own, with no
+  character involved: measured 2026-10-07, a 14-step list in a 24-row pane came out 23 rows tall
+  (the fit held back a spare row for the goal line, the goal line had no total to print, and the
+  row was then simply never painted), while the SAME pane with her panel came out 24 because the
+  slack drawing happened to fill the row. The frame is now padded to `height` after the list, her
+  art first and blank content rows after it, so the two halves of the drawing can never disagree
+  about how tall the pane is. Caught by a new check that walks a step count against a pane height
+  with her panel on and off — the case the old "she must not change the frame" check could not see,
+  because it only compared the two frames to each other.
 - **A pane the desktop app opens holds the thread it is drawn beside, not the CLI chat that
   happened to be live.** The app spawns one terminal per thread and runs a bare `fbtodo` in it;
   that pane asked `auto`, which prefers a live CLI chat, so every desktop pane latched the SAME
@@ -1294,6 +1991,18 @@ Entries start at the newest release; each one is a contract change, not a diff.
   derives the hold it demands from the same two numbers the child was given, the number of
   looks a child gets at a tree it must *not* reload is unchanged, so the assertion keeps its
   teeth while the seconds go.
+- **The rectangle she stands in is the PANE, not merely something pane-shaped.** The pane's own
+  hint already said which of its rows its frame left blank (`FBTODO_PIP_SLACK`); that hint now decides
+  the CHOICE as well as the slot, because a candidate whose blank rows are not blank — or whose half
+  above them is blank too — is not a list at all, it is a hole in the window. A panel with a pane's
+  proportions and a bigger rectangle therefore no longer wins it, which is the case that was
+  photographed: the app's own preview panel took her and left her standing outside the fbtodo pane
+  ("sometimes it still appear out of the fbtodo pane", 2026-10-08). A saved measurement is also reused
+  only for the window it was taken in **at the size it was taken at** — a fit is window-relative, so a
+  window that only MOVED still has its pane where it was, while a RESIZED one does not, and she waits
+  for the next capture (a fraction of a second) rather than standing at the old pane's points. The
+  suite pins both ends against a synthetic window: a real pane beside a taller blank panel, where the
+  answer must be the pane's own two borders, with her inside them.
 
 ### Removed
 - **`FBTODO_FB_MARKER` is no longer carried into a pane.** It named the file the watcher read

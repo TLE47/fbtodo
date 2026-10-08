@@ -3056,6 +3056,11 @@ def cmd_pane(args) -> int:
                     where = f"button click at {pressed.x},{pressed.y}"
                 else:
                     key_chip, key_said = apply_pane_key(pressed, state or {})
+                    if not key_said:
+                        # ...and the pane's other switch: her window's pin (`pip_pane_key`). Asked
+                        # only when the mute kit has nothing to say about this key, so one byte
+                        # can never mean two things.
+                        key_chip, key_said = pip_pane_key(pressed)
                     where = f"key '{pressed}'"
                 if key_said:
                     pane_log(f"pane {where}: {key_said}")
@@ -3112,6 +3117,13 @@ def cmd_pane(args) -> int:
                                 else (f": {said}" if said else "")))
             # What the chip says about the notifications right now, whatever put them there.
             quiet_chip = mute_chip()
+            # ...and the same slot for her window: a fact about the PROCESS rather than about the
+            # list, and one the reader can act on — the chip names the key that releases her pin
+            # (and, while it is released, the key that puts it back). Read here and handed to the
+            # renderer for the reason the button's own state is: a frame is a function of its
+            # arguments, and a golden file has no window behind it.
+            pin_chip = pip_chip()
+            chip_note = " · ".join(part for part in (quiet_chip, pin_chip) if part)
             # ...and the BUTTON's own fact, which is a different switch from the one above: the
             # push alone (`toggle_push`). Read here and HANDED to the renderer rather than read
             # by it, because a frame is a function of its arguments — a golden file has no notify
@@ -3144,8 +3156,13 @@ def cmd_pane(args) -> int:
                     goal_lines=args.goal_lines,
                     height=_shutil.get_terminal_size(fallback=(80, 24)).lines,
                     reloaded=note,
-                    mute_note=quiet_chip,
+                    chip_note=chip_note,
                     ntfy=push_on,
+                    # ...and the room her floating window needs, while it is up: she stands IN this
+                    # pane, so the pane makes a slot for her instead of letting her sit on a step
+                    # (only while the window is actually running — a reservation with nothing
+                    # standing in it is a pane with a hole in it).
+                    reserve_rows=(pip_slot_rows() if pip_running() else None),
                 )
             except Exception as exc:
                 # ...and the drawing half of the same tick, for the same reason: a frame the
@@ -3180,6 +3197,9 @@ def cmd_pane(args) -> int:
                 # list, so without this the frame would sit there unchanged and the reader
                 # would not learn that the phone just went quiet.
                 quiet_chip,
+                # ...and her pin's chip with it, which changes for the same reason and on the
+                # same tick: `p`, or the button, or `fbtodo pip free` from another window.
+                pin_chip,
                 # ...and the button's own state, which is neither note nor chip: a click on it
                 # changes no row of the list either, and the word on it has to follow the switch
                 # on the same tick or the button would answer with the state it just left.
@@ -3692,6 +3712,596 @@ def cmd_dead(args) -> int:
     return EX_CODES["ex_software"]
 
 
+# ------------------------------------------------------------------ her, as a floating window
+# The pane draws her in CELLS and a cell is worth two pixels, so on a short pane she is a small
+# blob by geometry (`buffy_pixels`). `scripts/buffy-pip.swift` is the other half: the same frames
+# at their real resolution, in a borderless always-on-top window. This is the button for it, and
+# it has the same shape as the notify kit's — a SWITCH FILE that the other side only reads, so the
+# pane's key, this command and the running window can never disagree about which state she is in.
+#
+#   pip start   launch her (idempotent: an already-running window is left alone)
+#   pip stop    take her down
+#   pip free    release the pin: she becomes draggable and stays where she is put
+#   pip stuck   pin her back — where she was TAUGHT to stand, else the pane's own middle
+#   pip forget  drop the taught pin, so she stands in that middle again
+#   pip status  what is in force (a verb-less `fbtodo pip` prints what is in force, as `mute` does)
+#   pip tune    show every knob her window reads, and set one, from the shell: the values live in a
+#               FILE her window re-reads (see `pip_tune_path`) so setting one is not exporting an
+#               environment variable into whatever shell happened to start her — and the list of knobs
+#               is asked of the PROGRAM (`fbtodo-pip --tune`), never kept here, so it cannot drift
+#   pip sheet   one HTML page with every mood's balloon and pose on it (scripts/buffy-sheet.py)
+#   pip doctor  take ONE measurement and explain it: the hint the pane published, every long column in
+#               the window, every pair of them with the reason it was kept or thrown away, the pane that
+#               won and where she would stand in it — so "she is outside the pane" is answered by a
+#               command instead of by reading her log (see `--doctor` in the Swift)
+#
+# The pin is taught by DRAGGING: no process outside the app can be told where the app's terminal
+# panel is (its UI geometry lives in its renderer, behind a token it strips on purpose), so she is
+# not placed there by arithmetic — she is placed there by hand, once, and remembered as an offset
+# from the pane's WINDOW, which is what makes it survive the window being moved or resized.
+PIP_BIN = os.path.expanduser("~/.cache/fbtodo/bin/fbtodo-pip")
+PIP_SH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "scripts", "buffy-pip.sh")
+
+
+def pip_free_path() -> str:
+    """Where her pin's switch lives: `FBTODO_PIP_FREE`, else the cache beside her binary."""
+    return os.path.expanduser(
+        os.environ.get("FBTODO_PIP_FREE") or "~/.cache/fbtodo/pip-free")
+
+
+def pip_pid_path() -> str:
+    """Where her pid is written, so `stop` and `status` find the window this command started."""
+    return os.path.expanduser(os.environ.get("FBTODO_PIP_PID") or "~/.cache/fbtodo/pip.pid")
+
+
+def pip_running() -> int | None:
+    """The pid of a live floating window, or `None`. A stale pid file is not a running window."""
+    try:
+        with open(pip_pid_path()) as fh:
+            pid = int((fh.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError):
+        return None
+    return pid
+
+
+def pip_is_free() -> bool:
+    """Is her pin released? The switch file's existence IS the state, as with the mute kit."""
+    return os.path.exists(pip_free_path())
+
+
+def pip_pin_path() -> str:
+    """Where her TAUGHT pin lives: `FBTODO_PIP_PIN`, else the cache beside her switch.
+
+    A text file, `x,y`: the offset of her window's own top-left corner from the top-left corner of
+    the window the pane is in. She is pinned there and follows that window around; with no file she
+    stands in the middle of it.
+    """
+    return os.path.expanduser(os.environ.get("FBTODO_PIP_PIN") or "~/.cache/fbtodo/pip-pin")
+
+
+def pip_pin_offset() -> tuple | None:
+    """The pin she was taught as `(x, y)`, or `None` when nobody has taught her one."""
+    try:
+        with open(pip_pin_path()) as fh:
+            parts = (fh.read() or "").replace(",", " ").split()
+        return (int(float(parts[0])), int(float(parts[1])))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def pip_clear_pin() -> str | None:
+    """Drop the taught pin: an error message, or None when she is back to the window's middle."""
+    try:
+        os.unlink(pip_pin_path())
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"cannot clear {pip_pin_path()}: {exc}"
+    return None
+
+
+def pip_place() -> str:
+    """Where she is stuck, in words: the pane's middle, or the pin she was taught there."""
+    offset = pip_pin_offset()
+    if not offset:
+        return "stuck over the pane's own middle"
+    return f"stuck over the pane at pin {offset[0]:+d},{offset[1]:+d}"
+
+
+def pip_set_free(free: bool) -> str | None:
+    """Release or pin her, by the switch file alone. An error message, or None when it is done."""
+    switch = pip_free_path()
+    if not free:
+        try:
+            os.unlink(switch)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            return f"cannot clear {switch}: {exc}"
+        return None
+    try:
+        os.makedirs(os.path.dirname(switch), mode=0o700, exist_ok=True)
+        with open(switch, "w") as fh:
+            fh.write("free\n")
+    except OSError as exc:
+        return f"cannot write {switch}: {exc}"
+    return None
+
+
+def pip_host_owner() -> str:
+    """The app whose window is her home when there is no chain to follow: `FBTODO_PIP_HOST`.
+
+    Only a fallback — the chain below is what identifies the window on a machine whose pane is in
+    something other than this app — and the value is read as WRITTEN: unset is this app's name,
+    while an EMPTY one (or `-`/`none`/`off`) is how a caller asks for the middle of the screen.
+    The difference matters and is why this does not use `or`: `FBTODO_PIP_HOST=` is somebody
+    saying "no window, the screen", not somebody saying nothing at all.
+    """
+    raw = os.environ.get("FBTODO_PIP_HOST")
+    if raw is None:
+        return "Freebuff"
+    raw = raw.strip()
+    return "" if raw.casefold() in ("", "-", "none", "off") else raw
+
+
+def pip_host_pids() -> str:
+    """The pane's own process chain as `pid,pid,…`, this process first — her window's anchor.
+
+    Her window is started DETACHED (`start_new_session`), so by the time it looks, its parent is
+    `launchd` and the chain that says which window the pane is drawn in is gone. It has to be
+    read HERE, while this process is still a child of the pane's own shell: the chain reaches
+    the app hosting the terminal (the desktop app, iTerm2, anything), and the window whose
+    OWNER PID is on that chain is the window the pane is in. One `ps` for the whole table rather
+    than one per hop, and an empty answer when there is no `ps` to ask: the window then falls
+    back to its owner-name guess rather than pinning itself to nothing.
+    """
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    parents: dict = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                parents[int(parts[0])] = int(parts[1])
+            except ValueError:
+                continue
+    chain: list = []
+    pid = os.getpid()
+    while pid > 1 and pid not in chain and len(chain) < 32:
+        chain.append(pid)
+        pid = parents.get(pid, 0) or 0
+    return ",".join(str(one) for one in chain)
+
+
+# Her window's pin, as a BUTTON on the pane: the same shape the mute kit uses for the phone — a
+# switch FILE the window only ever reads — so the pane's key, `fbtodo pip free|stuck` and the
+# running window cannot disagree about which state she is in. The chip is the pane's one slot for
+# a fact about the PROCESS, and it names its own key for the reason the mute chip does: a switch
+# nobody can find is a switch nobody trusts.
+PIP_PANE_KEY = "p"
+PIP_CHIPS = {True: "pip free · p", False: "pip stuck · p"}
+
+
+def pip_chip() -> str | None:
+    """What the pane's title chip says about her window, or nothing when there is no window.
+
+    Only while she is RUNNING: with no window there is no pin to report, and a chip offering to
+    release one would be the pane describing something that is not on the screen.
+    """
+    if not pip_running():
+        return None
+    return PIP_CHIPS[pip_is_free()]
+
+
+def pip_pane_key(key: str) -> tuple[str | None, str]:
+    """One keypress on the pin: `(chip, note)`, or `(None, "")` for any other key.
+
+    Pure enough to test without a window or a terminal — the terminal is `PaneKeys`' half, this is
+    the decision — and total enough that any other byte changes nothing at all.
+    """
+    if key != PIP_PANE_KEY:
+        return None, ""
+    if not pip_running():
+        return None, "pip: no window to release (`fbtodo pip start`)"
+    if pip_is_free():
+        error = pip_set_free(False)
+        return (None, f"pip: {error}") if error else (pip_chip(), "pip: stuck — back over the pane")
+    error = pip_set_free(True)
+    if error:
+        return None, f"pip: {error}"
+    return pip_chip(), "pip: released — drag her anywhere, `p` pins her again"
+
+
+def pip_stop() -> str | None:
+    """Stop her window: `None` when she is down afterwards, else the sentence to say.
+
+    Nothing to stop is not a failure — `pip stop` on a quiet machine says "not running" and exits 0,
+    and a caller that wanted her down does not care which of the two it was.
+    """
+    pid = pip_running()
+    if not pid:
+        return None
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        return f"cannot stop pid {pid}: {exc}"
+    return None
+
+
+def pip_start(size: str, tick: str, switch: str) -> str | None:
+    """Start her window: `None` when she is up (or already was), else the sentence to say.
+
+    Started in its OWN session: a window launched from a shell that then exits is a window that dies
+    with it, which is the mistake this cost once already.
+    """
+    if pip_running():
+        return None
+    if not os.path.exists(PIP_SH):
+        return f"{PIP_SH} is not in the checkout"
+    log = os.path.expanduser("~/.cache/fbtodo/pip.log")
+    os.makedirs(os.path.dirname(log), mode=0o700, exist_ok=True)
+    try:
+        with open(log, "a") as out:
+            proc = subprocess.Popen(
+                ["bash", PIP_SH, size, tick, switch, pip_host_owner(), pip_host_pids(),
+                 pip_pin_path()],
+                stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True,
+            )
+    except OSError as exc:
+        return f"cannot start her: {exc}"
+    with open(pip_pid_path(), "w") as fh:
+        fh.write(f"{proc.pid}\n")
+    return None
+
+
+def pip_doctor_watch(words) -> tuple[str | None, list[str], str | None]:
+    """`--watch [SECONDS] [--json] [--stop-on-change]` for `fbtodo pip doctor`.
+
+    Returns `(seconds as text or None, the switches her window is given, None)`, or `(None, [], why not)`.
+
+    The words are the VERB's own rather than flags of this command line (see `split_verb_words`):
+    `--watch` is `status`'s flag, so a doctor that borrowed it would be a doctor whose argument the shared
+    parser could swallow and then refuse as belonging to another command. Bare `--watch` is the minute that
+    was asked for, and the seconds are passed on as TEXT so this side and her window's own binary cannot
+    disagree about what a duration is. `--json` and `--stop-on-change` only mean anything to a watch.
+    """
+    seconds = None
+    switches: list[str] = []
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word == "--watch":
+            nxt = words[i + 1] if i + 1 < len(words) and not words[i + 1].startswith("--") else None
+            seconds = nxt if nxt is not None else "60"
+            i += 2 if nxt is not None else 1
+        elif word.startswith("--watch="):
+            seconds = word.split("=", 1)[1]
+            i += 1
+        elif word in ("--json", "--stop-on-change"):
+            switches.append(word)
+            i += 1
+        else:
+            return None, [], ("doctor takes no words but `--watch [SECONDS] [--json] [--stop-on-change]` "
+                              f"— got {' '.join(words)}")
+    if seconds is None:
+        if switches:
+            return None, [], f"{' and '.join(switches)} belong to --watch"
+        return None, [], None
+    try:
+        value = float(seconds)
+    except ValueError:
+        return None, [], f"--watch wants seconds, not {seconds!r}"
+    if not 0 < value <= 3600:
+        return None, [], f"--watch wants seconds between 0 and 3600, not {seconds}"
+    return seconds, switches, None
+
+
+def watch_timeout(watch: str | None) -> int:
+    """How long to wait for a doctor: a watch runs for its own duration, so the cap has to clear it
+    (plus the app's start and the last capture) or the verb would kill the watch it was asked for.
+    """
+    return 300 if not watch else int(float(watch)) + 90
+
+
+def cmd_pip(args) -> int:
+    """`fbtodo pip [start|stop|free|stuck|status]` — her floating window, from the shell.
+
+    Started in its OWN session: a window launched from a shell that then exits is a window that
+    dies with it, which is the mistake this cost once already (the pane is a long-lived process
+    and `start` may well be called from a short-lived one). The pane's chain is read before that
+    happens, because it is the only thing that knows which window she belongs over.
+    """
+    verb = (args.verb or "status").strip().lower()
+    size = str(getattr(args, "pip_size", None) or 200)
+    tick = str(getattr(args, "pip_tick", None) or 900)
+    switch = pip_free_path()
+    if verb in ("status", ""):
+        pid = pip_running()
+        if pip_is_free():
+            state = "free (draggable)"
+        else:
+            state = pip_place()
+        if pid:
+            print(f"pip: running (pid {pid}), {state}")
+        else:
+            print(f"pip: not running; would start {state}")
+        return 0
+    if verb in ("free", "off", "release"):
+        error = pip_set_free(True)
+        if error:
+            print(f"pip: {error}", file=sys.stderr)
+            return 74   # EX_IOERR
+        print("pip: released — she is draggable now"
+              + ("" if pip_running() else " (nothing is running: `fbtodo pip start`)"))
+        return 0
+    if verb in ("stuck", "on", "pin"):
+        error = pip_set_free(False)
+        if error:
+            print(f"pip: {error}", file=sys.stderr)
+            return 74   # EX_IOERR
+        print("pip: stuck — she is back "
+              + ("where you taught her" if pip_pin_offset() else "over the pane's own middle"))
+        return 0
+    if verb in ("forget", "centre", "center"):
+        error = pip_clear_pin()
+        if error:
+            print(f"pip: {error}", file=sys.stderr)
+            return 74   # EX_IOERR
+        print("pip: pin forgotten — she is back over the pane's own middle")
+        return 0
+    if verb in ("stop", "down", "quit"):
+        was = pip_running()
+        error = pip_stop()
+        if error:
+            print(f"pip: {error}", file=sys.stderr)
+            return 69   # EX_UNAVAILABLE
+        # Not `running` yet on purpose: the window paints a moment later, and a caller that needs to
+        # know should ask `fbtodo pip status` or look at the window server's own list.
+        print(f"pip: stopped (pid {was})" if was else "pip: not running")
+        return 0
+    if verb in ("start", "up", "run"):
+        if pip_running():
+            print(f"pip: already running (pid {pip_running()})")
+            return 0
+        if not os.path.exists(PIP_SH):
+            print(f"pip: {PIP_SH} is not in the checkout", file=sys.stderr)
+            return 66   # EX_NOINPUT
+        error = pip_start(size, tick, switch)
+        if error:
+            print(f"pip: {error}", file=sys.stderr)
+            return 69   # EX_UNAVAILABLE
+        print(f"pip: started (pid {pip_running()}), log ~/.cache/fbtodo/pip.log")
+        return 0
+    if verb in ("tune", "knobs", "settings"):
+        return cmd_pip_tune(args)
+    if verb in ("sheet", "moods"):
+        return cmd_pip_sheet(args)
+    if verb == "doctor":
+        if not os.path.exists(PIP_SH):
+            print(f"pip: {PIP_SH} is not in the checkout", file=sys.stderr)
+            return 66   # EX_NOINPUT
+        # The diagnosis IS the data, so it goes to stdout untouched (and its status is hers): the words
+        # are all in `--doctor` (see the Swift), asked for through the same launcher `start` uses, so the
+        # argv — her frames, the app whose window is her home, the pane's chain, the hint the pane
+        # publishes — is built in exactly one place. A refused measurement is exit 69 and no pane found
+        # is exit 1: the doctor's own answer, passed through rather than flattened to a success.
+        #
+        # A SECOND pip PROCESS CANNOT CAPTURE while hers is running (measured 2026-10-08: six attempts,
+        # six refusals with her up, every attempt fine with her stopped), so a doctor asked for while she
+        # is up takes her down, measures, and puts her back — and SAYS so, on stderr, because a verb that
+        # quietly moves someone's window is a verb nobody trusts. The pane is what is measured; her own
+        # window is not part of the answer.
+        watch, switches, error = pip_doctor_watch(getattr(args, "rest", None) or [])
+        if error:
+            print(f"pip: {error}", file=sys.stderr)
+            return 64   # EX_USAGE
+        running = bool(pip_running())
+        if running:
+            print("pip: her window is up, and a second process cannot take a capture while it is — "
+                  + f"measuring with her down{' for ' + watch + 's' if watch else ''}, then putting "
+                  + "her back", file=sys.stderr)
+            error = pip_stop()
+            if error:
+                print(f"pip: {error}", file=sys.stderr)
+                return 74   # EX_IOERR
+        try:
+            proc = subprocess.run(
+                ["bash", PIP_SH, size, tick, switch, pip_host_owner(), pip_host_pids(),
+                 pip_pin_path(), "doctor"] + ([watch] + switches if watch else []),
+                stdin=subprocess.DEVNULL, timeout=watch_timeout(watch))
+        except subprocess.TimeoutExpired:
+            print(f"pip: the measurement did not come back in {watch_timeout(watch)}s",
+                  file=sys.stderr)
+            return 75   # EX_TEMPFAIL
+        except OSError as exc:
+            print(f"pip: cannot measure her window: {exc}", file=sys.stderr)
+            return 69   # EX_UNAVAILABLE
+        finally:
+            if running:
+                # ...and put back BEFORE the answer is returned, whatever the measurement said: leaving
+                # her down because a capture was refused is a doctor that breaks its patient.
+                back = pip_start(size, tick, switch)
+                if back:
+                    print(f"pip: {back}", file=sys.stderr)
+        return proc.returncode
+    print(f"pip: unknown verb {verb!r} (start, stop, free, stuck, forget, status, tune, sheet, doctor)",
+          file=sys.stderr)
+    return 64   # EX_USAGE
+
+
+def pip_tune_path() -> str:
+    """Where her window's knobs live: `FBTODO_PIP_TUNE`, else the cache beside her mood."""
+    return os.path.expanduser(
+        os.environ.get("FBTODO_PIP_TUNE") or "~/.cache/fbtodo/pip-tune")
+
+
+def pip_tune_knobs(path: str) -> dict:
+    """The knobs her window would run with, read off the WINDOW ITSELF: `fbtodo-pip --tune` prints the
+    name, the value, where that value came from (a flag, the environment, this file, the default) and
+    whether her running window can wear a change to it. Asking the program is the point of this: a
+    second copy of the table here would be a copy that drifts, and the drift would be invisible.
+    """
+    try:
+        done = subprocess.run([PIP_BIN, "--tune", "--tune-file", path], capture_output=True,
+                              text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    knobs = {}
+    for line in done.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 4:
+            knobs[parts[0]] = {"value": parts[1], "source": parts[2], "live": parts[3] == "live"}
+    return knobs
+
+
+def pip_tune_write(path: str, changes: dict, drop: tuple = ()) -> str | None:
+    """Rewrite the tune file with `changes` applied and `drop` taken out, atomically.
+
+    A knob is a LINE, so everything the file already said is kept — including its comments, which is
+    where a person writing a tune writes down why. The new file lands by rename in the target's own
+    directory: a half-written one would be a window reading rubbish, and `/tmp` is a different
+    filesystem from the cache (atomic writes: AGENTS.md).
+    """
+    rows = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for raw in fh:
+                words = raw.split("#", 1)[0].split()
+                if len(words) == 2 and words[0] in drop:
+                    continue
+                if len(words) == 2 and words[0] in changes:
+                    rows.append(f"{words[0]} {changes[words[0]]}")
+                    continue
+                rows.append(raw.rstrip("\n"))
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        return str(exc)
+    named = {row.split()[0] for row in rows
+             if len(row.split()) == 2 and not row.lstrip().startswith("#")}
+    for name, value in changes.items():
+        if name not in named:
+            rows.append(f"{name} {value}")
+    text = "\n".join(rows).rstrip("\n") + "\n"
+    directory = os.path.dirname(path) or "."
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".tune.", dir=directory)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o600)          # a knob file is the owner's, and 0600 is what a config is
+        os.replace(tmp, path)
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def cmd_pip_tune(args) -> int:
+    """`fbtodo pip tune` — every knob her window reads, and how to set one.
+
+    Showing: `name`, the value she would run with, WHERE that value came from, and whether her
+    running window wears a change to it — so "my edit did nothing" has an answer (the environment
+    outranks the file, and the row says so). Setting: `fbtodo pip tune NAME VALUE`, or `NAME=VALUE`,
+    or `--unset NAME`, or `--reset` for the defaults; the value lands in the file her window re-reads
+    on its own tick, which is the whole reason this command exists (2026-10-07: "so I never have to
+    export an environment variable again").
+    """
+    words = list(getattr(args, "rest", None) or [])
+    as_json = "--json" in words
+    words = [word for word in words if word != "--json"]
+    path = pip_tune_path()
+    knobs = pip_tune_knobs(path)
+    if not knobs:
+        print(f"pip: no window to tune ({PIP_BIN}) — build it with: "
+              f"swiftc -O scripts/buffy-pip.swift -o {PIP_BIN}", file=sys.stderr)
+        return 69   # EX_UNAVAILABLE
+
+    def show() -> None:
+        if as_json:
+            print(json.dumps(dict(path=path, knobs=knobs), sort_keys=True))
+            return
+        for name, knob in knobs.items():
+            print(f"{name}\t{knob['value']}\t{knob['source']}\t{'live' if knob['live'] else 'restart'}")
+
+    changes, drop = {}, []
+    while words:
+        word = words.pop(0)
+        if word == "--reset":
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                print(f"pip: cannot reset {path}: {exc}", file=sys.stderr)
+                return 74   # EX_IOERR
+            print(f"pip: tune reset — every knob is back to its default ({path} removed)")
+            return 0
+        if word in ("--unset", "--drop") and words:
+            name = words.pop(0)
+            if name not in knobs:
+                print(f"pip tune: {name!r} is not a knob — {' '.join(knobs)}", file=sys.stderr)
+                return 64   # EX_USAGE
+            drop.append(name)
+            continue
+        if "=" in word:
+            name, _, value = word.partition("=")
+        elif words:
+            name, value = word, words.pop(0)
+        else:
+            print(f"pip tune: {word!r} needs a value — `fbtodo pip tune {word} <value>`", file=sys.stderr)
+            return 64   # EX_USAGE
+        if name not in knobs:
+            print(f"pip tune: {name!r} is not a knob — {' '.join(knobs)}", file=sys.stderr)
+            return 64   # EX_USAGE
+        changes[name] = value
+    if not changes and not drop:
+        show()
+        return 0
+    error = pip_tune_write(path, changes, tuple(drop))
+    if error:
+        print(f"pip: cannot write {path}: {error}", file=sys.stderr)
+        return 74   # EX_IOERR
+    after = pip_tune_knobs(path) or knobs
+    for name in list(changes) + list(drop):
+        knob = after.get(name) or dict(value="(unset)", source="default", live=False)
+        print(f"pip: {name}={knob['value']} ({knob['source']}, {'live' if knob['live'] else 'restart'})"
+              + ("" if knob["live"] else " — the next window she starts will wear it"))
+    if as_json:
+        print(json.dumps(dict(path=path, knobs=after), sort_keys=True))
+    return 0
+
+
+def cmd_pip_sheet(args) -> int:
+    """`fbtodo pip sheet` — one HTML page with every mood's balloon and pose on it.
+
+    The work is `scripts/buffy-sheet.py` (a script on purpose: it is a renderer, and a renderer is
+    the kind of thing you want to be able to run and point at a directory without going through the
+    CLI). This verb is the way to reach it from the shell with her own binary, and it forwards its
+    words untouched — the sheet's own `--help` is the list, not this one.
+    """
+    script = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "scripts", "buffy-sheet.py")
+    if not os.path.exists(script):
+        print(f"pip: {script} is not in the checkout", file=sys.stderr)
+        return 66   # EX_NOINPUT
+    words = list(getattr(args, "rest", None) or [])
+    try:
+        return subprocess.call([sys.executable, script] + words)
+    except OSError as exc:
+        print(f"pip: cannot run the sheet: {exc}", file=sys.stderr)
+        return 69   # EX_UNAVAILABLE
+
+
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="fbtodo",
@@ -3701,7 +4311,7 @@ def build_parser():
     ap.add_argument("command", nargs="?", default="pane",
                     choices=["pane", "snap", "json", "bar", "daemon", "stop", "status",
                              "prune", "pane-watch", "pin", "why", "panes", "ledger", "doctor",
-                             "push", "init", "keep", "locks", "dead", "board", "mute"])
+                             "push", "init", "keep", "locks", "dead", "board", "mute", "pip"])
     ap.add_argument("verb", nargs="?", default=None, metavar="VERB",
                     help="the command's own verb (omitted: print what is in force): "
                          "keep: on resumes the pane-repair, off keeps a drifted pane as it "
@@ -3709,6 +4319,14 @@ def build_parser():
                          "mute: on/off switch the notifications (see `fbtodo mute --help`)")
     ap.add_argument("--pane", dest="keep_pane", metavar="ID",
                     help="keep: the pane whose knob to read or set (default: the pane you are in)")
+    ap.add_argument("--pip-size", dest="pip_size", metavar="PT", default=None,
+                    help="pip: how big her floating window is, in points (default 200)")
+    ap.add_argument("--pip-tick", dest="pip_tick", metavar="MS", default=None,
+                    help="pip: how long each of her frames is held (default 900)")
+    # NOT a `nargs=argparse.REMAINDER` positional: it would swallow every option that follows the
+    # command word (`daemon --foreground` then starts the watcher in the background, and
+    # `status --json` answers in prose). `split_verb_words` is how `pip tune`/`pip sheet` get their
+    # own trailing words instead, with the rest of the line still parsed as a line.
     ap.add_argument("--server", dest="keep_server", action="store_true",
                     help="keep: apply to the whole tmux server instead of one pane")
     ap.add_argument(
@@ -3747,8 +4365,8 @@ def build_parser():
     ap.add_argument("--once", action="store_true", help="pane: render once and exit")
     ap.add_argument(
         "--no-keys",
-        action="store_true",
-        help="pane: ignore the keyboard, so m/M/u/n do nothing (FBTODO_PANE_KEYS=off)",
+        action="store_true",                help="pane: ignore the keyboard, so m/M/u/n and p do nothing "
+                     "(FBTODO_PANE_KEYS=off)",
     )
     ap.add_argument(
         "--no-mouse",
@@ -3914,6 +4532,31 @@ def probe_answer() -> int:
     return 0
 
 
+def split_verb_words(ap, argv):
+    """`(head, tail)` — the words this CLI's own parser should read, and the verb's own.\n\n    `pip tune`, `pip sheet` and `pip doctor --watch 30` carry words that belong to THEM
+    (`transition 10`, `--out /tmp/sheet.html`, the drink duration) and not to this command line.
+    They are cut off here rather than captured by a `nargs=argparse.REMAINDER` positional, which is
+    the same thing until a GLOBAL flag follows the command word — and then it is not: REMAINDER took
+    `daemon --foreground --quiet --cwd …` as data, so the watcher's own spawn (and `status --json`)
+    silently lost every option after the command. Scanning token by token SKIPS each option's value,
+    so a flag whose value happens to be `pip` cannot be mistaken for the command either.
+    `doctor` is the third of them for a sharper reason: `--watch` is `status`'s OWN flag, and left in
+    the shared head it would be read as a watch on the wrong command and refused as a usage error.
+    """
+    words = list(argv)
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word == "pip" and i + 1 < len(words) and words[i + 1] in ("tune", "sheet", "doctor"):
+            return words[:i + 2], words[i + 2:]
+        action = ap._option_string_actions.get(word)
+        if action is not None and action.nargs != 0:
+            i += 2                      # the flag and the value it is about to take
+            continue
+        i += 1
+    return words, []
+
+
 def main(argv=None) -> int:
     if os.environ.get(RELOAD_PROBE_ENV):
         # The self-reload's own pre-flight (`reload_probe_error`): a child run of this very
@@ -3928,15 +4571,21 @@ def main(argv=None) -> int:
     # parser is built, so a flag whose default is a path defaults to the real one.
     init_state_root()
     ap = build_parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    head, tail = split_verb_words(ap, argv)
     try:
-        args, extra = ap.parse_known_args(argv)
+        args, extra = ap.parse_known_args(head)
     except SystemExit:
         return EX_CODES["usage"]
     if extra:
         print(f"unexpected arguments: {' '.join(extra)}", file=sys.stderr)
         return EX_CODES["usage"]
+    # ...and the words held back above are the VERB's own: `cmd_pip_tune`/`cmd_pip_sheet` read them
+    # from `rest`, which is what they were reading when `REMAINDER` happened to fill it.
+    args.rest = tail
     args.keep_verb = getattr(args, "keep_verb", None)
     args.mute_verb = None
+    args.pip_verb = None
     if args.verb is not None:
         # One positional, several commands' verbs: argparse would hand `mute on` to the
         # FIRST positional (whose choices are `keep`'s), so the words are routed here
@@ -3944,7 +4593,10 @@ def main(argv=None) -> int:
         # none, and a word that is not one of its verbs, are both the caller's usage error
         # (64) — the same answer the choices= used to give, from one place.
         allowed = {"keep": ("on", "off", "default"),
-                   "mute": ("on", "off", "list", "until-done")}.get(args.command)
+                   "mute": ("on", "off", "list", "until-done"),
+                   "pip": ("start", "stop", "free", "stuck", "forget", "status", "up", "down",
+                           "on", "off", "release", "pin", "centre", "center", "run",
+                           "quit", "tune", "sheet", "doctor")}.get(args.command)
         if not allowed:
             print(f"unexpected argument: {args.verb!r} — {args.command} takes no verb",
                   file=sys.stderr)
@@ -3955,8 +4607,14 @@ def main(argv=None) -> int:
             return EX_CODES["usage"]
         if args.command == "keep":
             args.keep_verb = args.verb
+        elif args.command == "pip":
+            args.pip_verb = args.verb
         else:
             args.mute_verb = args.verb
+    # `cmd_pip` reads `args.verb`, and argparse's own `verb` is the shared positional: the
+    # per-command one is the routed value (see above), so it is copied into place here.
+    if args.command == "pip":
+        args.verb = getattr(args, "pip_verb", None)
     if args.watch and args.command not in ("status", "locks"):
         print("unexpected argument: --watch — it belongs to `status` and `locks`",
               file=sys.stderr)
@@ -4029,6 +4687,8 @@ def main(argv=None) -> int:
         return cmd_keep(args)
     if args.command == "mute":
         return cmd_mute(args)
+    if args.command == "pip":
+        return cmd_pip(args)
     if args.command == "locks":
         return cmd_locks(args)
     if args.command == "status":

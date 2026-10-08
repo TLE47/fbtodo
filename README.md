@@ -128,6 +128,7 @@ fbtodo bar          # show "todos 3/5" in your status bar
 fbtodo snap         # print one snapshot
 fbtodo board        # every live session in one frame (--live keeps redrawing)
 fbtodo status       # show pane info and why it might be empty
+fbtodo pip start    # float buffy-chan in a window of her own, pinned over the pane (pip stop)
 ```
 
 ### Pane keys
@@ -140,6 +141,71 @@ While you are looking at a pane, the keyboard is the quickest way to mute the ph
 | `M` | quiet until you press `u` |
 | `u` | loud again |
 | `n` | the ntfy push alone — the same switch as the button on the frame |
+| `p` | her floating window: release her so she can be dragged, or pin her back over the pane's own middle |
+
+The last one is only read while her window is RUNNING (`fbtodo pip start`): it is the button for
+`fbtodo pip free` / `pip stuck`, and the title chip says which state is in force (`pip stuck · p`)
+for exactly as long as there is a window to report. With no window, `p` says so and changes
+nothing.
+
+She finds the pane by herself. Her window photographs the window the pane lives in and looks for the
+one thing in it shaped like a pane — the frame fbtodo draws is the only pair of tall vertical lines
+in the picture — then stands in that pane's own empty space, the rows the frame left blank above its
+state row (the place the ASCII picture used to be drawn). The pane helps: it publishes its own grid
+(`rows cols start count`), so her window knows which rows are empty without reading a background
+that is transparent onto a wallpaper, and knows the pane's shape well enough to pass over the one
+other thing in that window that is a pair of vertical lines — the explorer sidebar. It re-measures
+every few seconds and whenever the window changes, so resizing the window or the pane carries her
+with it.
+
+The empty space is HERS rather than whatever happened to be left over: while her window is running
+the pane reserves rows for it ( `FBTODO_PIP_ROWS`, by default as many as her drawn panel would have
+taken, and never at the steps' expense), so a busy list shows a few rows fewer rather than a
+character sitting on top of them. She is fitted into that slot — at a whole number of art pixels, so
+nothing is resampled — and never drawn outside the pane: centred in the slot and clamped inside the
+frame's own borders, ordered out while the pane has no room for her, and not shown at all until a pane
+has been found, or while the app's window is on another Space. A taught pin is the exception — where
+you put her is where she stays.
+
+A pin you TEACH is an override: press `p` to release her, drag her where you want her, press `p`
+again, and that offset from the window is what she follows from then on. `fbtodo pip forget` drops
+it and hands her back to the measured fit.
+
+She moves like furniture rather than like a slideshow: when the pane's layout puts her somewhere
+new she eases over there instead of hopping, she fades in and out instead of popping when the list
+fills her slot and gives it back, and she cross-dissolves from one pose to the next. One number is
+the length of all of it — `FBTODO_PIP_TRANSITION`, 700 ms by default, `0` for the hard cuts she
+started with.
+
+She is drawn at the resolution she exists at. The owner's stickers are 900px square, the frames the
+PANE averages into cells are 128px, and the frames her window floats are the same twenty poses at
+384px (`assets/buffy/pip`, `scripts/buffy-thumbs.py --size 384`) — which is exactly her size on a 2x
+display, 192pt, so what the screen shows is the drawing and not a resampling of it. Where a resample
+is needed (a smaller slot, a checkout with only the small frames) it happens once, off the screen,
+with a Lanczos filter and a light unsharp mask, and the result is copied to the screen 1:1.
+`scripts/buffy-artcheck.py` measures any two renders side by side — sharpness, ringing and how far
+the round trip back to the original art lands — because "sharper" is otherwise an opinion.
+
+And she is in a MOOD rather than a loop. The pane already decides one word for how things are going
+— the same word that chooses the face on its top border — and publishes it where her window can read
+it (`~/.cache/fbtodo/pip-mood`): so she sits at the laptop while a step is being worked on and thinks
+it over, throws both arms up when the list finishes, dozes with the cat once the session has gone
+quiet, peers about puzzled when there is no list at all, and HOLDS still — hands to her face,
+annoyed, sitting with it — for the failure, the rewrite-the-list nudge and a heading left over from
+an earlier turn. All twenty of her stickers are worn by one mood or another, which the suite checks as
+a union against the art on disk. Which sticker means which mood is one table (`moodCycles` in
+`scripts/buffy-pip.swift`), checked against the pane's own vocabulary and against the frames on disk —
+and the whole table of conditions, poses and paces, with how to see and retune one, is
+[docs/MOODS.md](docs/MOODS.md).
+
+When she says something, it is a MANGA balloon rather than a card: the line is measured first and the
+cloud is the scallops that wrap it, so a longer line is a wider cloud and one that has to wrap sits
+lower; the mood picks the shape — a soft pink cloud, a spangled one for a finished list, a row of
+detached thought dots while she is only thinking or waiting, a jagged shock balloon for a failure or a
+nudge — and one of them, now and then (12% of mood changes, `FBTODO_PIP_SURPRISE`), is the surprise:
+words that belong to no mood at all, in the one balloon that is all of them at once. It is drawn inside
+her own square and never past it, so a line can never land on the pane's list, and `--art-say` renders
+one where you can measure it.
 
 The push also has a **button** on the pane's status row, saying whether the phone will ring
 (`[ ntfy on · n ]`): click it, or press `n`. It is drawn in the widest form the row has room for

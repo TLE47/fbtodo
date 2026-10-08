@@ -17,6 +17,7 @@ from .base import *  # noqa: F401,F403 (the package is one namespace)
 from .alerts import *  # noqa: F401,F403 (the package is one namespace)
 from .scan import *  # noqa: F401,F403 (the package is one namespace)
 from .tasks import *  # noqa: F401,F403 (the package is one namespace)
+from . import buffy_pixels as _pixels  # her picture, as PNGs the pane reads itself (see below)
 
 def _window_anchor(cur_index: int | None, count: int) -> int:
     """Which step the elided window keeps on screen when the list is longer than the pane.
@@ -722,7 +723,8 @@ def _source_title(state: dict, width: int, right: str) -> str:
     return head + _clip_cells(why, budget) if budget >= 12 else "FREEBUFF TODOS"
 
 
-def _top_border(width: int, frame, title: str, right: str, badge) -> str:
+def _top_border(width: int, frame, title: str, right: str, badge, face: str = "",
+                face_ink=None) -> str:
     """The top border: the title on an accent badge, faint metadata right.
 
     `frame` is the border's painter and `badge` the title's chip — both role-bound, so
@@ -738,16 +740,487 @@ def _top_border(width: int, frame, title: str, right: str, badge) -> str:
     top rule stopped three pixels short of its own corner on the rule's outer row while
     reaching the border's column on its core row, so the corner read as a notch against
     the crisp T-junctions a few rows below it. One box, one kind of join.
+
+    `face` is buffy-chan — the pane's supporting character, from `buffy_face` — standing at
+    the head of this border, painted by `face_ink` with her mood's own role (`BUFFY_INK`)
+    rather than in the frame's grey. She costs no rows: the height budgets below are spent on
+    the list. Her `BUFFY_CELLS` come out of the METADATA's columns, which is the one budget on
+    this border that can afford them — the right slot is a truncation by construction (it is
+    clipped to whatever the title leaves it), and the tail it gives up first is the model, the
+    newest thing standing there. What she never does is spend the slot itself: where the right
+    tag would drop off the border entirely with her standing in the head, she is the one who
+    goes.
     """
     label = f" {title} "
-    left = f"┌── {label} "
+    head = "┌── "
+    ink = face_ink or frame
+    # She stands unless her cells would cost the border something a reader needs, and all three
+    # questions are about the METADATA'S columns, because that is the budget that pays for her:
+    #
+    #   * does she fit between the corner and the chip at all? (below that the row would be
+    #     wider than the pane it was asked for, which is a broken grid rather than a choice)
+    #   * would her six cells take the tag off the border where it would otherwise have been
+    #     drawn? The tag has a floor of its own — `room >= 12` below, under which it is not
+    #     drawn because it could no longer say anything a reader can use — so she steps aside
+    #     for the six widths where the tag has just barely enough columns, and takes her cells
+    #     back below them, where the tag is gone anyway.
+    #
+    # The rule before this one asked a second thing as well: that the right slot say the SAME
+    # words with her as without it. On a real pane that is never true — the slot is already
+    # clipped to fit by the time it reaches the border — so she surrendered on every pane the
+    # owner actually looked at and was never seen at all. Measured 2026-10-07 on the 46-column
+    # pane in use, where the old rule dropped her and this one lets her stand.
+    if face:
+        room_with = width - _cell_width(f"{head}{face}{label} ") - 2
+        room_none = width - _cell_width(f"{head}{label} ") - 2
+        if room_with < 0 or (right and room_with < 12 <= room_none):
+            face = ""
+    left = f"{head}{face}{label} "
     room = width - _cell_width(left) - 2  # corner cell, plus the space before it
     if right and room >= 12:
         tail = f" {_clip_cells(right, room - 4)} ──┐"
     else:
         tail = "┐"
     fill = max(0, width - _cell_width(left) - _cell_width(tail))
-    return frame("┌── ") + badge(label) + frame(" ") + frame("─" * fill) + frame(tail)
+    return (frame(head) + (ink(face) if face else "") + badge(label)
+            + frame(" ") + frame("─" * fill) + frame(tail))
+
+
+# ------------------------------------------------------------------------ buffy-chan
+# The pane's supporting character: one ASCII face and her ahoge at the left of the top border.
+#
+# She is not decoration with a fixed smile. Her face is chosen from the facts the rows under her
+# are drawn from, so the moods a reader learns first are the ones that matter: `(>_<)` is the
+# nudge row (`rewrite the list, then continue`), `(x_x)` is the failure about to be printed under
+# her, `(o_o)` is work in progress, `(^o^)` is a list that finished. The ahoge (`~`) is what
+# identifies her at this size; a body would cost rows, and the frame's rows belong to the list.
+#
+# TWO RULES make her safe to leave in a frame that is a grid:
+#
+#   * every frame she can wear is the SAME width (`BUFFY_CELLS`) and pure ASCII, so the pane
+#     cannot reflow because she blinked or because a terminal disagrees with the code's ruler;
+#     and
+#   * her cells come out of the METADATA's budget rather than the list's, and never take the slot
+#     itself — where the right tag would drop off the border entirely with her standing there,
+#     she is the one who goes (see the rule in `_top_border`).
+#
+# She ANIMATES, and all of her does: a cycle is a run of whole faces — the eyes and the mouth
+# move together, not one eye blinking in a still picture — and a cycle is long enough to read as
+# a mood rather than as a glitch (the work loop is eight seconds). She runs on the pane's own
+# clock (`now_ms // 1000`, the tick the status strip's spinner already runs on) and keeps no
+# timer of her own, so a frame stays a pure function of the state and the clock and a recorded
+# frame still reproduces.
+#
+# The three MOMENTS hold still on purpose: a failure is already over by the time it is drawn, and
+# a squint (`>_<`) and a doubt (`._.`) are instants rather than states, so a face that kept moving
+# through them would be the frame fidgeting over the reading instead of making it.
+BUFFY_CELLS = 6
+BUFFY_CYCLE = {
+    # working: awake, looking about, and blinking once a loop
+    "work": ("~(o_o)", "~(o_o)", "~(*_*)", "~(o_o)", "~(-_-)", "~(o_o)", "~(o_o)", "~(O_o)"),
+    # finished: the celebration, the twinkle and the grin answering each other
+    "done": ("~(^o^)", "~(*^*)", "~(^_^)", "~(*^*)"),
+    # idle past the pane's own window: a slow breath, with the odd snore
+    "idle": ("~(-_-)", "~(-_-)", "~(-_-)", "~(z_z)", "~(-_-)", "~(-_-)", "~(-_-)", "~(Z_z)"),
+    # the turn is OVER and the ball is in the owner's court (`turn_ended`, the state the ask and
+    # stall watches exist for): a small patient smile, and she HOLDS it — a turn nobody is driving
+    # is not a moment to be seen fidgeting through (see the same rule on the three moments below).
+    # It is also the one mood her WINDOW holds still for without being told: the pane's still faces
+    # are exactly the moods that are over when they are drawn.
+    "wait": ("~(^.^)",),
+    # no list to point at: the gaze sweeps the pane looking for one
+    "none": ("~(o_O)", "~(O_o)", "~(O_O)", "~(o_o)"),
+    # ...and the three that hold still (see above)
+    "error": ("~(x_x)",),
+    "nudge": ("~(>_<)",),
+    "stale": ("~(._.)",),
+}
+# What she wears on the first tick, and the whole wardrobe. One source for the checks, so that a
+# frame nobody can reach and a frame no check knows about are both impossible.
+BUFFY_REST = {mood: cycle[0] for mood, cycle in BUFFY_CYCLE.items()}
+BUFFY_FRAMES = tuple(sorted({frame for cycle in BUFFY_CYCLE.values() for frame in cycle}))
+
+# The ink each mood is drawn in — her moods reuse the frame's own meanings instead of inventing a
+# palette, and every value here is a role the frame already paints in, resolved out of `_styles`
+# at the call site: a failure is the error red, the nudge is the warning yellow, a finished list is
+# the success green, a doze is the frame's faint grey, and the rest is the accent the title chip is
+# already in. The face is not drawn in the frame's grey on purpose: a mood the reader has to
+# squint at is a mood that is not doing its job.
+BUFFY_INK = {
+    "error": "error",
+    "nudge": "warn",
+    "done": "success",
+    "idle": "faint",
+    "work": "accent",
+    "none": "accent",
+    "stale": "accent",
+    "wait": "accent",
+}
+
+# What she says on the frame's spare row when a list finishes. Short, because it shares a row with
+# nothing, and in the pane's own voice: no emoji, one line.
+BUFFY_DONE_LINE = "every step done — nice work"
+
+# ...and her, DRAWN OUT: `BUFFY_ART_W` columns of her standing in the pane's own margin, in the
+# lower half of the frame where the list has already had its rows — the ahoge, the hair over her
+# head and falling past her shoulders on both sides, the hoodie below it, a fist and a spark. The
+# face in the middle of it is `{face}`: the border's face WITHOUT its own ahoge (the portrait draws
+# the hair around her), so the two forms are one character — the mood and the blink the border is
+# wearing are the mood and the blink she is wearing, and one source of moods serves both.
+#
+# She is drawn with the same families the frame already trusts — ASCII, box drawing and the block
+# elements the bar is made of (vetted by `frame_chrome_is_single_cell`, see `FRAME_CHROME`) — and
+# every row is padded to the same width, because a frame is a grid and a portrait is not allowed to
+# be the thing that breaks it. HEAD FIRST: the rows go from her ahoge down to her feet, and the
+# row budget gives her up from the feet up, so a pane with room for three of them shows her face.
+BUFFY_ART = (
+    "      ,~.                 ",
+    "  ▄▀▀▀▀▀▀▀▀▀▀▀▀▄          ",
+    " ▐   {face}     █▓▓       ",
+    " ▐▄▄▄▄▄▄▄▄▄▄▄▄▄▌▓▓   *    ",
+    "  ▀█▀▀▀▀▀▀▀▀▀█▀           ",
+    "   █ █▀▀▀▀▀█ █            ",
+    "   █ █  F  █ █      ▄█    ",
+    "   █▄▄▄▄▄▄▄▄▄█            ",
+    "    ▀▀▀   ▀▀▀             ",
+)
+BUFFY_ART_W = max(_cell_width(row.format(face=BUFFY_REST["work"][1:])) for row in BUFFY_ART)
+# The row her face is on, read off the art itself rather than counted here: the window below is
+# chosen so that a pane which can only afford part of her still gets the face.
+BUFFY_ART_FACE = next(i for i, row in enumerate(BUFFY_ART) if "{face}" in row)
+
+
+def buffy_art(face: str, room: int | None = None) -> list:
+    """Her portrait wearing `face` — the border's own six cells, mood and all, in a body.
+
+    Every row comes back padded to `BUFFY_ART_W`, because the face slot is one cell narrower than
+    the placeholder it stands in and a portrait whose rows are different widths is not a portrait.
+
+    `room` asks for at most that many rows, and the window is the one that CONTAINS HER FACE: a pane
+    with room for two rows of her gets the top of her head and her face, never two rows of hair. The
+    whole portrait is returned when it fits, so an uncropped pane still gets the ahoge as well.
+    """
+    rows = [row.format(face=face[1:]).ljust(BUFFY_ART_W) for row in BUFFY_ART]
+    if room is None or room >= len(rows):
+        return rows
+    # ...one row of room is her face itself: the row above it (the top of her head) is worth having
+    # when there is a second row to put it on, and not worth losing her face for.
+    start = max(0, min(BUFFY_ART_FACE - (1 if room > 1 else 0), len(rows) - room))
+    return rows[start:start + max(0, room)]
+
+
+# Her panel: the rows she stands in, at the bottom of the frame — when the pane has been asked to
+# draw her at all (`_buffy_rows_setting`; the default is that it has not, because she is in a window
+# of her own over this frame). It is RESERVED out of the pane's own height before the list is
+# fitted, so on a pane with the room she is always there — standing in the frame rather than on its
+# border, which is the difference between a character in the pane and a glyph on it — and on a pane
+# without it she is back to the six cells on the top border, with nothing else displaced. Nine rows is an 18x18-pixel picture in the default
+# grid - two colours a cell, and it is the grid that reads at this size (see `buffy_style` in
+# `buffy_pixels`); the list keeps `BUFFY_LIST_FLOOR` rows whatever
+# she asks for, because the steps are what the pane is for, and she never takes more than half
+# of what is left over (see `buffy_panel_rows`).
+BUFFY_PANEL_MAX = 9
+BUFFY_PANEL_MIN = 4
+BUFFY_LIST_FLOOR = 4
+# ...and below this the picture is not a picture: four rows is eight pixels tall in the default
+# grid and sixteen in the other, and the drawn portrait reads better than either. It is the same
+# floor as the panel's.
+BUFFY_PIXEL_MIN = BUFFY_PANEL_MIN
+
+
+# Where her window reads the pane's own grid off (see `note_pane_slack`). Overridable so a test
+# writes its own file rather than the machine's one.
+PIP_SLACK_ENV = "FBTODO_PIP_SLACK"
+_PIP_SLACK_LAST: tuple | None = None
+
+# ...and how many rows the pane RESERVES for her window, which is the same reservation the drawn
+# picture used to get (see `buffy_panel_rows`). The default is that it makes room for her: she stands
+# in the pane now, and the space she stands in is space the list would otherwise paint, so the pane
+# gives it up deliberately rather than letting her sit on top of a step (the owner's ask,
+# 2026-10-07: "give her space so she doesn't block any information"). `0` is a pane that reserves
+# nothing — she then has only the slack the list happened to leave, and steps aside when it left
+# none — and a number is that many rows.
+PIP_ROWS_ENV = "FBTODO_PIP_ROWS"
+
+
+def pip_slot_rows() -> int:
+    """How many rows the pane should hold for her window: `FBTODO_PIP_ROWS`, or the default.
+
+    `-1`/unset is "as many as her panel would take" (`buffy_panel_rows` decides, and the steps keep
+    `BUFFY_LIST_FLOOR` rows whatever it decides); `0`/off is no reservation at all; a number is that
+    many rows, still bounded by the same guards.
+    """
+    raw = os.environ.get(PIP_ROWS_ENV, "").strip().casefold()
+    if not raw or raw in ("-1", "auto", "on", "yes", "true"):
+        return -1
+    if raw in ("0", "off", "no", "false", "none"):
+        return 0
+    try:
+        want = int(raw)
+    except ValueError:
+        return -1
+    return want if want > 0 else 0
+
+
+def pip_slack_path() -> str:
+    """The file the pane publishes its slack in: `FBTODO_PIP_SLACK`, else the cache beside her pin."""
+    return os.path.expanduser(os.environ.get(PIP_SLACK_ENV)
+                              or "~/.cache/fbtodo/pip-slack")
+
+
+# What she is FEELING, published for her WINDOW. Her face on the border is six cells and a mood
+# (`buffy_mood`), and her window is a picture of the same character 192pt tall — one that draws art
+# rather than text, so it cannot read a mood out of the frame it is not drawing. This is the one fact
+# the pane has and the window does not: WHICH MOOD, so the picture she is wearing and the face on the
+# border cannot say two different things about the same list (the owner, 2026-10-07: "make her change
+# image based on what she is working on and what is her emotion right now based on the task").
+PIP_MOOD_ENV = "FBTODO_PIP_MOOD"
+_PIP_MOOD_LAST: str | None = None
+
+
+def pip_mood_path() -> str:
+    """The file the pane publishes her mood in: `FBTODO_PIP_MOOD`, else the cache beside her pin."""
+    return os.path.expanduser(os.environ.get(PIP_MOOD_ENV) or "~/.cache/fbtodo/pip-mood")
+
+
+def note_pane_mood(mood: str) -> None:
+    """One word for how she feels, in the file her window reads: `buffy_mood`'s own vocabulary.
+
+    Written when the mood CHANGES and when the file has gone missing (this runs on every frame, and
+    the check is one `stat`), never fatally: a cache nobody can write is a mood her window does
+    without, and it falls back to its own default rather than disappearing over it.
+    """
+    global _PIP_MOOD_LAST
+    path = pip_mood_path()
+    if _PIP_MOOD_LAST == mood and os.path.exists(path):
+        return
+    _PIP_MOOD_LAST = mood
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(f"{mood}\n")
+    except OSError:
+        pass
+
+
+def note_pane_slack(rows: int, cols: int, start: int, count: int) -> None:
+    """The pane's grid, and which of its rows the frame left blank: one line of numbers.
+
+    Her window stands OVER the pane, so it has to know where the pane is — and where in it the
+    empty space is, which is the space the ASCII picture used to be drawn in. The pane knows both
+    exactly (it is `height` rows tall and this frame filled `start` of them before the state strip);
+    a screenshot only shows them, and on this machine the terminal's background is transparent onto
+    a textured wallpaper, so "this row has nothing on it" cannot be told from the wallpaper's own
+    pattern (measured 2026-10-07: a blank pane read as forty rows of ink).
+
+    The COLUMN count is in there for a second job: her window has to pick the pane out of a
+    screenshot, and the shapes in a window are not all panes — measured 2026-10-07, the explorer
+    sidebar was a better-looking pair of vertical lines than the pane was. `cols` against `rows` is
+    the pane's own shape, so a candidate whose rectangle is nothing like it can be passed over.
+
+    Written only when the numbers CHANGE — this runs on every frame — and never fatally: a cache
+    nobody can write is a hint her window does without.
+    """
+    global _PIP_SLACK_LAST
+    note = (rows, cols, start, count)
+    path = pip_slack_path()
+    # Written when the numbers CHANGE — this runs on every frame — and also when the file has
+    # gone: a cache directory somebody cleaned, or a reader who deleted the hint, must not leave
+    # the pane believing it has already said what it can no longer be read. One `stat` a frame is
+    # nothing next to the frame itself, and a hint that cannot be re-published is a hint her
+    # window silently does without.
+    if note == _PIP_SLACK_LAST and os.path.exists(path):
+        return
+    _PIP_SLACK_LAST = note
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(f"{rows} {cols} {start} {count} {time.time():.0f}\n")
+    except OSError:
+        pass
+
+
+def _buffy_rows_setting() -> int | None:
+    """How many rows of her the PANE draws: the default is NONE AT ALL.
+
+    She has a window of her own now (`scripts/buffy-pip.swift`, floated by `fbtodo pip` and pinned
+    over this very pane at her real resolution, which is what a terminal cell cannot be), so the
+    pane stops drawing her: the character in the middle of the frame and the window on top of it
+    were one character drawn twice, and the drawing was the worse of the two AND was paid for out
+    of the step rows. This is the one knob that brings it back, for a machine with no window to
+    float her in: `-1`/`auto` sizes her to the pane, a number is that many rows (still bounded by
+    `buffy_panel_rows`), and `0` — or nothing at all, which is the default — is a pane that is
+    only the list.
+    """
+    raw = os.environ.get("FBTODO_BUFFY_ROWS", "").strip().casefold()
+    if not raw or raw in ("0", "off", "no", "false", "none"):
+        return None
+    if raw in ("-1", "auto", "on", "yes", "true"):
+        return -1
+    try:
+        want = int(raw)
+    except ValueError:
+        return None
+    return want if want > 0 else None
+
+
+def buffy_panel_rows(height: int | None, chrome: int, width: int | None = None,
+                     want: int | None = None) -> int:
+    """How many rows her panel reserves in a pane of `height` that has spent `chrome` already.
+
+    Nothing at all where there is no pane (`height` is None: a pipe, `snap`, a fixture that
+    asked for no height), nothing where the knob is off — which is the DEFAULT, since she is
+    drawn in a window of her own now (`_buffy_rows_setting`) — and nothing where the frame cannot
+    both keep `BUFFY_LIST_FLOOR` rows of steps and give her `BUFFY_PANEL_MIN` to stand in: a
+    pane that is short of room loses her before it loses the list.
+
+    The picture wants the pane's WIDTH as well as its height, which is the one thing every
+    terminal image renderer does that a fixed panel does not: a cell is two pixels tall and one
+    wide in the grid she is drawn in, so a SQUARE picture is `2*rows` columns wide, and on a
+    forty-six-column pane a nine-row panel spends eighteen of those columns on her and leaves
+    twenty-eight empty. With `width` in hand the cap grows to the square the pane could hold
+    (`width // 2` rows) — still bounded below by everything already listed, and still half the
+    room, because the steps are what the pane is FOR.
+
+    `FBTODO_BUFFY_ROWS` is the owner's: `-1` sizes her to the pane, a number gives her exactly
+    that many rows (bounded by what is left after the chrome and the floor), and `0`/unset is
+    the pane that leaves her to her own window.
+
+    `want` overrides that knob for one call, which is how her WINDOW's slot is worked out: the
+    reservation it needs is the same one, with the size coming from `pip_slot_rows` instead of from
+    the panel's own knob (`-1` there means the same thing here).
+    """
+    want = _buffy_rows_setting() if want is None else want
+    if want is None or not height:
+        return 0
+    if want < 0:
+        want = max(BUFFY_PANEL_MAX, (width or 0) // 2)
+    if not want:
+        return 0
+    room = height - chrome                      # what the list and her panel have to share
+    # A pane that can only JUST fit them both gives her nothing: the steps' own floor, her
+    # smallest legible panel, and one more panel's worth of room before she takes a single row.
+    # A split pane in a short terminal is a pane about the list, and the goldens' own 18 rows are
+    # that case — a full-length list there is the check that a reservation has to leave alone.
+    if room < BUFFY_LIST_FLOOR + 2 * BUFFY_PANEL_MIN:
+        return 0
+    # Half the room, so the pane GROWS her rather than the list paying a fixed price: a tall
+    # pane gives her a bigger picture and a short one leaves the steps alone.
+    want = min(want, max(BUFFY_PANEL_MIN, room // 2))
+    rows = min(want, room - BUFFY_LIST_FLOOR)
+    return rows if rows >= BUFFY_PANEL_MIN else 0
+
+
+def _buffy_paint(truecolor: bool):
+    """How one pixel becomes ink: the pane's own colour depth, and its own theme path.
+
+    `paint(rgb, background)` answers the SGR parameters for one colour — the leading `3`/`4`
+    of `38;…`/`48;…` is the only difference between her foreground and her background — so a
+    pixel is a colour the pane already knows how to spell: 24-bit where the terminal takes it
+    and the nearest 256-colour entry where it does not, which is the same trade the bar and
+    the frame's own theme already make. What must NOT change with the depth is the picture's
+    SHAPE (the same cells, the same glyphs), because a frame whose geometry moved with the
+    terminal's colour would be a frame the pane's own repaint diff could not keep up with.
+    """
+    def paint(rgb, background: bool) -> str:
+        hexed = "#%02x%02x%02x" % (rgb[0], rgb[1], rgb[2])
+        return ("4" if background else "3") + _color_sgr(hexed, truecolor)[1:]
+    return paint
+
+
+def buffy_panel(face: str, mood: str, room: int, c, st: dict, truecolor: bool,
+                now_ms: int | None) -> list:
+    """Her body, `room` rows of it: the PICTURE where the terminal can show one, else the drawing.
+
+    The picture is the real art — the frames the owner drew, averaged down to pixel cells and
+    painted in their own colours (see `buffy_pixels`, and `FBTODO_BUFFY_STYLE` for the grid) —
+    and it needs two things: `BUFFY_PIXEL_MIN` rows to be legible, and the frames themselves on
+    this machine. Either missing and she is NOT drawn here at all: her place in the middle of the
+    frame is empty, and a pane that cannot show her is one where she is not pretended at.
+
+    She used to fall back to the drawn portrait here (`buffy_art`), and that is deliberately gone
+    (2026-10-07). The portrait was ASCII that read as a character at ten rows and as a diagram at
+    twenty — it was the best the pane had while the pane was all there was, and it is not any more:
+    `scripts/buffy-pip.swift` puts the SAME frames at their real resolution in a floating window,
+    which is what "show her" means when a terminal cell is worth two pixels. Two drawings of one
+    character, one of them crude and standing where the steps go, is worse than one. The portrait
+    stays in this module, with its own checks, as the thing `fbtodo pip` can print for a machine
+    with no window to float her in.
+
+    The ink depth is NOT one of those conditions. A 256-colour pane gets the same picture
+    posterised rather than a different one, because the frame's shape has to be the same at every
+    colour depth — that is the property the bar's own check asserts for the whole frame, and her
+    panel is part of the frame.
+    """
+    if room >= BUFFY_PIXEL_MIN:
+        pixels = _pixels.panel(
+            room, _buffy_paint(truecolor), clock_ms=now_ms or 0,
+            tick_ms=_pixels.BUFFY_TICK_MS.get(mood, 900),
+        )
+        if pixels:
+            return ["  " + row for row in pixels]
+    return []
+
+
+def buffy_mood(state: dict, idle_s: float | None = None, stale_after_s: float = 0.0) -> str:
+    """Which mood the pane's supporting character is in.
+
+    Precedence runs from the loudest fact to the quietest, which is the order the frame itself
+    reports them in: a failure, then the nudge, then a finished list, then a turn that has ENDED
+    (`turn_ended` — the state the pane prints as "turn ended — waiting for you", and the one the
+    owner asked to be shown on her face rather than left to the working cycle), then no list at
+    all, then idle, then a heading left over from an earlier turn, then the ordinary frame.
+    `idle_s` and `stale_after_s` are the pane's OWN idle threshold, so she falls asleep exactly
+    when the pane starts calling the session idle rather than on a timer she keeps herself —
+    `wait` is the sharper rule the sleep was standing in for: not "quiet for a while" but "nothing
+    is running because it is YOUR turn", which arrives at the end of every turn and, unlike the
+    idle clock, means it this second.
+
+    A finished list still outranks it: the celebration is the news, and it is what the finished-task
+    bell rings on. `turn_running` is asked as well as `turn_ended`, because the two are read from
+    one transcript that a new turn appends to, and "waiting on you" must not be shown over a turn
+    that is already under way.
+
+    There is no separate "content with nothing to do" mood: a list with an unfinished step in it
+    has a current step by construction (`current_index`), so that state IS `work`, and a mood for
+    it would be one no state could produce.
+    """
+    if state.get("error"):
+        return "error"
+    if str(state.get("nudge") or "").strip():
+        return "nudge"
+    done, total = drawn_counts(state)
+    if total and done >= total:
+        return "done"
+    if state.get("turn_ended") and not state.get("turn_running"):
+        return "wait"
+    if not any(group["todos"] for group in list_groups(state)):
+        return "none"
+    if idle_s is not None and stale_after_s and idle_s > stale_after_s:
+        return "idle"
+    if goal_stale_note(state):
+        return "stale"
+    return "work"
+
+
+def buffy_face(state: dict, idle_s: float | None = None, stale_after_s: float = 0.0,
+               now_ms: int = 0) -> str:
+    """The six cells she is wearing right now: her mood's cycle, stepped by the pane's clock."""
+    cycle = BUFFY_CYCLE[buffy_mood(state, idle_s, stale_after_s)]
+    return cycle[(now_ms // 1000) % len(cycle)]
+
+
+def buffy_line(state: dict) -> str:
+    """What she says on the frame's spare row, or "" when she has nothing to say.
+
+    One line, and only at the finish. The row it goes on is the breath between the list and the
+    footer — the padding a fixed-height pane can afford precisely because no step paid for it —
+    so saying something there costs the list no row at all (see `spare` in `_render_rich`).
+    """
+    if buffy_mood(state) != "done":
+        return ""
+    _done, total = drawn_counts(state)
+    return BUFFY_DONE_LINE if total else ""
 
 
 # The frame's palette. `accent` may be a `#rrggbb` colour or a raw SGR code (`1;36`);
@@ -944,10 +1417,18 @@ def _styles(theme: dict, truecolor: bool) -> dict:
     * `tick`    a finished step's marker: the success hue, dimmed so the row recedes
     * `track`   the progress bar's empty cells
     * `badge`   the accent as a chip: reverse video, so no background selector is used
+    * `warn`    a step past its estimate, a nudge, a patch that did not come out clean
+    * `error`   a failure, an overrun
+
+    The last two are the STATE colours and are deliberately not themable: a palette is not
+    a licence to hide a failure in grey. They are roles like the rest so that a drawing
+    path can ask for them by name — `BUFFY_INK` does — instead of reaching for a literal.
     """
     sgr = lambda key: _color_sgr(theme.get(key), truecolor)  # noqa: E731
     accent, muted = sgr("accent"), sgr("muted")
     return {
+        "warn": "33",
+        "error": "31",
         "accent": accent,
         "active": sgr("active"),
         "strong": f"1;{sgr('active')}",
@@ -977,6 +1458,10 @@ FRAME_CHROME = (
     "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏",  # the spinner
     BAR_EIGHTHS,        # the bar
     "·…—✓",             # punctuation used inside the frame
+    # ...and buffy-chan's portrait (`BUFFY_ART`): the block elements her hair and hoodie are drawn
+    # with, under the same rule as the bar's — one cell to the code's ruler and to `wcwidth`, and
+    # in the inventory here so a future character with the same ambiguity is caught by a check.
+    "▀▄▐█▓",
 )
 
 
@@ -1179,8 +1664,9 @@ def _render_rich(
     theme: dict | None = None,
     truecolor: bool | None = None,
     reloaded: str | None = None,
-    mute_note: str | None = None,
+    chip_note: str | None = None,
     ntfy: bool | None = None,
+    reserve_rows: int | None = None,
 ) -> str:
     """The framed, high-density pane shown on a colour terminal.
 
@@ -1193,15 +1679,15 @@ def _render_rich(
     (a pipe, a golden, a board), in which case no button is drawn at all.
     """
     c = paint(color)
-    # Only the two STATE colours are literals any more; everything else the drawing asks
-    # for is a role from `_styles`. `warn` is a step past its estimate, a nudge or a patch
-    # that did not come out clean; `red` is a failure or an overrun.
-    yellow, red = "33", "31"
     theme = read_theme() if theme is None else theme
     truecolor = _supports_truecolor() if truecolor is None else truecolor
     # Every colour decision lives in `_styles`; this function only asks for roles, so the
-    # drawing below reads the same whatever the palette resolves to.
+    # drawing below reads the same whatever the palette resolves to. The two STATE colours
+    # are roles there too (`warn` is a step past its estimate, a nudge or a patch that did
+    # not come out clean; `red` is a failure or an overrun) — never themable, so a palette
+    # cannot hide a failure in grey.
     st = _styles(theme, truecolor)
+    yellow, red = st["warn"], st["error"]
     accent, muted = st["accent"], st["muted"]
     active_ink, success = st["active"], st["success"]
     done_style, tick_style = st["done"], st["tick"]
@@ -1250,19 +1736,39 @@ def _render_rich(
     right = f"{who} · {model}" if model else who
     # A pane that has just replaced itself says which build it is now (`reloaded`, from
     # `cmd_pane`) on its own title chip for a few seconds, and a pane whose notifications
-    # are switched off says so for as long as they are (`mute_note`, from the mute key) — both
-    # from `cmd_pane`, both facts about the PROCESS rather than about the list. The chip is
-    # the one slot on the frame that belongs to the process, so neither note spends a data
-    # row or moves anything: the ruler beside it just gives the longer label its columns,
-    # and the chip is the pane's own name again when the transient note expires. Both can
-    # be true at once (a reload while quiet reads `reloaded · quiet until done · u`), and
-    # the clipping budget is the same one that already keeps the right-hand metadata its
-    # room — the note is secondary, the watcher's pid is not — so a narrow pane loses a
-    # note's tail rather than the whole right slot.
-    chip_notes = " · ".join(part for part in (reloaded, mute_note) if part)
-    title = (_clip_cells(chip_notes, max(8, width - 22)) if chip_notes
+    # are switched off says so for as long as they are (`chip_note`, from the mute key and from
+    # her window's pin) — both from `cmd_pane`, both facts about the PROCESS rather than about the
+    # list. The chip is the one slot on the frame that belongs to the process, so no note spends a
+    # data row or moves anything: the ruler beside it just gives the longer label its columns, and
+    # the chip is the pane's own name again when the transient note expires. Several can be true
+    # at once (a reload while quiet reads `reloaded · quiet until done · u`), and the clipping
+    # budget is the same one that already keeps the right-hand metadata its room — the note is
+    # secondary, the watcher's pid is not — so a narrow pane loses a note's tail rather than the
+    # whole right slot.
+    chip_notes = " · ".join(part for part in (reloaded, chip_note) if part)
+    # The pane's supporting character, before the chip is measured because the chip's own budget
+    # pays for her (see below): her face is the state, her ink is its mood.
+    mood = buffy_mood(state, idle_s, stale_after_s)
+    face = buffy_face(state, idle_s, stale_after_s, now_ms)
+    # ...and her window is TOLD the mood, because it draws art rather than text: the same fact, in
+    # the same vocabulary, so the picture in her window and the face on the border agree (see
+    # `note_pane_mood`).
+    note_pane_mood(mood)
+    # ...and when the chip carries a note it gives up her `BUFFY_CELLS` before the metadata does:
+    # a note clipped six cells early still says the phone is off, while those six columns are the
+    # difference between the pane's character standing on the border and not — and the tag in the
+    # right slot, which the note's tail would otherwise be paid for out of, is a READING.
+    title = (_clip_cells(chip_notes, max(8, width - 22 - _cell_width(face))) if chip_notes
              else _source_title(state, width, right))
-    rows = [_top_border(width, frame, title, right, badge)]
+    # The border carries her (`buffy_face`): drawn from the same facts the rows under her are, so
+    # a reader who learns her moods has a second and faster reading of the same list; painted in
+    # her MOOD's ink (`BUFFY_INK`, a role out of `_styles`) rather than in the frame's grey; and
+    # stepped one frame of that mood's cycle per second on the pane's own clock (`now_ms` — the
+    # tick the status strip's spinner already runs on), so she is colourful and alive without a
+    # timer of her own and a recorded frame still reproduces exactly.
+    rows = [_top_border(
+        width, frame, title, right, badge, face=face,
+        face_ink=lambda text, _ink=st[BUFFY_INK[mood]]: c(_ink, text))]
 
     if state.get("error"):
         rows.append(_divider_row(width, frame))
@@ -1529,10 +2035,23 @@ def _render_rich(
     # and refit facts, and the no-times explanation. That last one was missing here — it was
     # subtracted where the HEADING was clipped but not from the step area's budget, so a
     # session with no clocks to report painted one row past its pane and lost the title.
-    avail = None if not height else max(
-        1, height - len(head) - 6 - (1 if patch_row_here else 0)
-        - (1 if refit_row_here else 0) - (1 if no_times else 0)
-    )
+    chrome = (len(head) + 6 + (1 if patch_row_here else 0)
+              + (1 if refit_row_here else 0) + (1 if no_times else 0))
+    # ...and her panel comes out of that budget rather than out of the slack the list happened
+    # to leave: a reservation is the only way she is on the frame at all when the list is long,
+    # which is the pane a reader is looking at while the work is running. What she takes is
+    # bounded by the steps' own floor (see `buffy_panel_rows`), and she is drawn further down
+    # with whatever the list turned out not to want as well.
+    panel_rows = buffy_panel_rows(height, chrome, width)
+    # ...and her WINDOW's own slot, when one is standing in this pane: the SAME reservation, for the
+    # same reason. She is drawn in a window on top of this pane, so a row the list paints is a row
+    # she covers — and covering a step with a character is the one thing the owner asked her not to
+    # do ("give her space so she doesn't block any information", 2026-10-07). `reserve_rows` is
+    # None wherever nothing of hers is floating over this frame (a pipe, `snap`, a fixture, the
+    # goldens), so the frame is unchanged unless her own window is up (see `cmd_pane`).
+    if reserve_rows is not None:
+        panel_rows = max(panel_rows, buffy_panel_rows(height, chrome, width, want=reserve_rows))
+    avail = None if not height else max(1, height - chrome - panel_rows)
     anchor = _window_anchor(prefer if multi else cur_index, len(blocks))
     start, end = _fit_blocks(blocks, avail, anchor)
 
@@ -1856,10 +2375,18 @@ def _render_rich(
         # ...and a spare row past that is spent on a breath rather than on nothing: the one
         # blank line between the list and the footer is the vertical padding a fixed-height
         # pane can afford, because it is the row the steps did not want — never one taken
-        # off a step to buy it.
+        # off a step to buy it. When the list has just finished, buffy-chan says so HERE
+        # (`buffy_line`): her line lands on the row that was already blank, so she is heard at
+        # the moment the work ends and the list still pays nothing for her.
         if spare >= 2 or tot_ms is None:
-            rows.append(_frame_row("", width, frame))
+            said = buffy_line(state)
+            rows.append(_frame_row(
+                ("  " + c(st[BUFFY_INK["done"]], said)) if said else "", width, frame))
     goal_n = len(rows) - goal_at
+    # ---- buffy-chan, drawn out, on rows the list did not want at all: the portrait below sits
+    # between the list's own numbers and the footer's facts, and the row budget further down gives
+    # her up FIRST of anything on this frame — so on a pane with the room she is a character
+    # standing in it, and on a pane without it she is back to the six cells on the top border.
     if no_times:
         rows.append(_frame_row(c(muted, no_times), width, frame))
     facts_at = len(rows)
@@ -1870,6 +2397,40 @@ def _render_rich(
     facts_n = len(rows) - facts_at
     rows.append(_frame_row(status, width, frame))
     rows.append(_bottom_row(width, frame))
+    # ---- buffy-chan, drawn out, in the rows this frame has LEFT OVER — and ONLY when the pane
+    # has been asked to draw her at all (`FBTODO_BUFFY_ROWS`; the default is that it has not, since
+    # she is in a window of her own over this frame's middle). The room is measured here, on the
+    # finished frame, so it is the pane's real slack rather than rows the footer was about to use.
+    # She stands between the last fact and the state strip, from her ahoge down (a crop takes her
+    # feet, never her face), and a pane with no slack has her on the top border alone. She is not in
+    # the row budget above at all: nothing on this frame is displaced for her, and `len(art)` can
+    # never exceed what `height` had left, so the clamp below cannot cut a row for her either. (An
+    # unbounded frame — a pipe, a fixture that asked for no height — has no slack to stand in.)
+    # What she does not take the blanks take (see the padding below her): the frame ends exactly
+    # `height` rows tall either way, which is what the checks around her reserve assert.
+    want_rows = _buffy_rows_setting()
+    if height is not None and want_rows is not None:
+        room = max(0, height - len(rows))
+        if want_rows > 0:
+            room = min(room, want_rows)      # the knob is the CEILING of the slack, not a hint
+        art = buffy_panel(face, mood, room, c, st, truecolor, now_ms)
+        if art:
+            rows[-2:-2] = [_frame_row(line, width, frame) for line in art]
+    # ...and whatever is left of the pane after her is painted too, in blanks — whether she was
+    # drawn or not. The pane is a FIXED grid — `height` rows of it are on the screen at once — and
+    # the step area can end a row short of it (a list whose last row did not want the row it had:
+    # measured 2026-10-07 at 14 steps in a 24-row pane, where the frame came out 23 rows and left
+    # the pane's last row holding whatever was painted there before). Blank rows, never a step's:
+    # what the list is worth is still the reservation above and the fit below it, and a frame that
+    # is exactly `height` rows is what makes the pane unable to go stale.
+    if height is not None:
+        gap = height - len(rows)
+        if gap > 0:
+            rows[-2:-2] = [_frame_row("", width, frame)] * gap
+        # ...and the pane TELLS her window where that slack is, because the pane is the only party
+        # that knows: it measured how many rows its grid has and how many the frame filled, while a
+        # window looking at the pane has a screenshot and a wallpaper to read them off.
+        note_pane_slack(height, width, max(0, len(rows) - 2 - gap), max(0, gap))
     # ...and the frame still FITS: a row that scrolls off the top takes the title with it,
     # which is what a short pane used to show — a list with nothing over it. What is given
     # up is given up in the order of how little it changes what the pane is FOR: the patch
@@ -1901,8 +2462,9 @@ def render(
     theme: dict | None = None,
     truecolor: bool | None = None,
     reloaded: str | None = None,
-    mute_note: str | None = None,
+    chip_note: str | None = None,
     ntfy: bool | None = None,
+    reserve_rows: int | None = None,
 ) -> str:
     """Pick the framed pane (colour terminal) or the plain machine-readable text.
 
@@ -1910,13 +2472,13 @@ def render(
     here from the environment and the theme files, which is how every command calls this; passed
     in, the frame is a function of the arguments alone — the same state and clock give the same
     bytes, whatever the terminal says. That is what makes a recorded frame a contract and lets
-    the pane diff one paint against the last (see `pane_repaint`). `reloaded` and `mute_note`
+    the pane diff one paint against the last (see `pane_repaint`). `reloaded` and `chip_note`
     are notes for the framed pane's title chip only — a plain frame has no chrome to say them
     on. They differ in LIFE, which is why one chip carries both: a reload is a fact about the
-    last few seconds and goes away on its own, while a mute is a switch the reader set and can
-    only undo by pressing the key its own words name, so it stays for as long as it is true.
-    `ntfy` is the push's state (True = the phone will ring) and draws the frame's one BUTTON;
-    it too is framed-pane chrome, and a plain frame ignores it.
+    last few seconds and goes away on its own, while a switch the reader set — the mute, her
+    window's pin — can only be undone by pressing the key its own words name, so it stays for as
+    long as it is true. `ntfy` is the push's state (True = the phone will ring) and draws the
+    frame's one BUTTON; it too is framed-pane chrome, and a plain frame ignores it.
     """
     # The second half of the text filter (see `clean_text`): a state that came off disk —
     # this process's own cache, or a file an older build wrote — is filtered here, so no
@@ -1926,7 +2488,8 @@ def render(
     if color and width >= 30:
         frame = _render_rich(
             state, color, watching, width, now_ms, idle_s, stale_after_s, goal_lines, height,
-            theme=theme, truecolor=truecolor, reloaded=reloaded, mute_note=mute_note, ntfy=ntfy,
+            theme=theme, truecolor=truecolor, reloaded=reloaded, chip_note=chip_note, ntfy=ntfy,
+            reserve_rows=reserve_rows,
         )
     else:
         frame = _render_plain(
@@ -1971,7 +2534,14 @@ __all__ = [
     "_clamp_widths", "_clamp_rows",
     "_frame_row", "_divider_row", "_bottom_row", "_SESSION_RE", "_session_label",
     "_source_title",
-    "_top_border", "THEME_DEFAULTS", "THEME_KEYS", "THEME_FILE_LOCAL", "THEME_FILE_GLOBAL",
+    "_top_border", "BUFFY_CELLS", "BUFFY_CYCLE", "BUFFY_REST", "BUFFY_FRAMES", "BUFFY_INK",
+    "BUFFY_DONE_LINE", "BUFFY_ART", "BUFFY_ART_W", "buffy_art",
+    "BUFFY_PANEL_MAX", "BUFFY_PANEL_MIN", "BUFFY_LIST_FLOOR", "BUFFY_PIXEL_MIN",
+    "buffy_panel_rows", "buffy_panel", "PIP_SLACK_ENV", "pip_slack_path", "note_pane_slack",
+    "PIP_MOOD_ENV", "pip_mood_path", "note_pane_mood",
+    "PIP_ROWS_ENV", "pip_slot_rows",
+    "buffy_mood", "buffy_face", "buffy_line",
+    "THEME_DEFAULTS", "THEME_KEYS", "THEME_FILE_LOCAL", "THEME_FILE_GLOBAL",
     "_hex_rgb", "_rgb_256", "_color_sgr", "_theme_stamp", "_THEME_CACHE", "THEME_VALUE_RE",
     "THEME_PROBLEMS", "_theme_value", "read_theme", "_theme_gradient", "_supports_truecolor",
     "_styles", "BAR_EIGHTHS", "SPINNER", "FRAME_CHROME", "frame_chrome_is_single_cell",
